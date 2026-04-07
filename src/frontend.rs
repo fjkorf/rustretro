@@ -214,8 +214,9 @@ impl Frontend {
             if self.frame_count % 60 == 0 {
                 let ctx = &self.callback_context;
                 let title = format!(
-                    "RustRetro | run:{} vid:{} | {}x{} fmt={}",
-                    self.frame_count, ctx.video_frames, ctx.width, ctx.height, ctx.pixel_format
+                    "RustRetro | run:{} vid:{} real:{} | {}x{} fmt={}",
+                    self.frame_count, ctx.video_frames, ctx.video_real,
+                    ctx.width, ctx.height, ctx.pixel_format
                 );
                 let _ = self.graphics.set_title(&title);
             }
@@ -266,7 +267,8 @@ pub struct CallbackContext {
     pub input_state: [bool; 12],
     pub pending_av_info: Option<RetroSystemAVInfoC>,
     pub pending_audio: Vec<i16>,
-    pub video_frames: u64,
+    pub video_frames: u64,     // total calls to video_callback
+    pub video_real: u64,       // calls where data was non-null (real frames)
     system_dir_buffer: Vec<u8>,
     save_dir_buffer: Vec<u8>,
 }
@@ -290,6 +292,7 @@ impl CallbackContext {
             pending_av_info: None,
             pending_audio: Vec::with_capacity(4096),
             video_frames: 0,
+            video_real: 0,
             system_dir_buffer: sys,
             save_dir_buffer: sav,
         }
@@ -406,10 +409,17 @@ impl CallbackContext {
                 | RETRO_ENVIRONMENT_SET_SUBSYSTEM_INFO
                 | RETRO_ENVIRONMENT_SET_CONTROLLER_INFO
                 | RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS => true,
+                RETRO_ENVIRONMENT_GET_CAN_DUPE => {
+                    // Tell core it may submit NULL to video_refresh to repeat last frame.
+                    // MAME does this; returning false doesn't stop it, just breaks timing.
+                    if !data.is_null() {
+                        *(data as *mut bool) = true;
+                    }
+                    true
+                }
                 RETRO_ENVIRONMENT_GET_LED_INTERFACE
                 | RETRO_ENVIRONMENT_GET_PERF_INTERFACE
                 | RETRO_ENVIRONMENT_GET_OVERSCAN
-                | RETRO_ENVIRONMENT_GET_CAN_DUPE
                 | RETRO_ENVIRONMENT_GET_USERNAME => false,
                 _ => false,
             }
@@ -417,19 +427,33 @@ impl CallbackContext {
     }
 
     fn video_callback(&mut self, data: *const c_void, width: u32, height: u32, pitch: usize) {
+        self.video_frames += 1;
         if !data.is_null() && width > 0 && height > 0 && pitch > 0 {
             let bytes = pitch * height as usize;
             unsafe {
                 let slice = std::slice::from_raw_parts(data as *const u8, bytes);
+                // Sample actual pixel bytes for diagnostics (every 300 real frames)
+                if self.video_real % 300 == 0 {
+                    let non_zero_pos = slice.iter().position(|&b| b != 0);
+                    let sample: Vec<u8> = slice.iter()
+                        .filter(|&&b| b != 0)
+                        .take(8)
+                        .copied()
+                        .collect();
+                    eprintln!(
+                        "[VIDEO] real={} {}x{} pitch={} fmt={} nz_pos={:?} nz_bytes={:?}",
+                        self.video_real, width, height, pitch, self.pixel_format,
+                        non_zero_pos, sample
+                    );
+                }
                 self.framebuffer.resize(bytes, 0);
                 self.framebuffer.copy_from_slice(slice);
             }
             self.width = width;
             self.height = height;
             self.pitch = pitch;
+            self.video_real += 1;
         }
-        // Count all calls including duplicate-frame (null data) calls
-        self.video_frames += 1;
     }
 
     fn input_state_callback(&self, port: u32, device: u32, _index: u32, id: u32) -> i16 {
