@@ -41,9 +41,6 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    // Initialize global environment strings
-    frontend::initialize_env_strings();
-    
     let args = Args::parse();
 
     // Validate inputs

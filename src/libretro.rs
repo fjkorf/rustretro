@@ -1,7 +1,6 @@
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_void};
 use std::path::Path;
-use std::io::Write;
 use thiserror::Error;
 
 pub const RETRO_API_VERSION: u32 = 1;
@@ -112,6 +111,42 @@ pub enum LibretroError {
     CoreNotLoaded,
     #[error("Failed to load game")]
     GameLoadFailed,
+}
+
+// C-compatible layout matching libretro.h retro_system_av_info
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct RetroSystemAVInfoC {
+    pub base_width: u32,
+    pub base_height: u32,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub aspect_ratio: f32,
+    pub fps: f64,
+    pub sample_rate: f64,
+}
+
+impl RetroSystemAVInfoC {
+    pub fn to_rust(&self) -> RetroSystemAVInfo {
+        let aspect = if self.aspect_ratio <= 0.0 {
+            self.base_width as f32 / self.base_height as f32
+        } else {
+            self.aspect_ratio
+        };
+        RetroSystemAVInfo {
+            geometry: RetroGameGeometry {
+                base_width: self.base_width,
+                base_height: self.base_height,
+                max_width: self.max_width,
+                max_height: self.max_height,
+                aspect_ratio: aspect,
+            },
+            timing: RetroSystemTiming {
+                fps: self.fps,
+                sample_rate: self.sample_rate,
+            },
+        }
+    }
 }
 
 pub type RetroEnvironmentFn = extern "C" fn(cmd: u32, data: *mut c_void) -> bool;
@@ -269,73 +304,49 @@ impl RetroCore {
             let c_path = game.path_cstring.as_ref()
                 .cloned()
                 .unwrap_or_else(|| std::ffi::CString::new(game.path.as_str()).unwrap());
-            
-            // Get pointer to C string data and keep it alive
+
             let path_ptr = c_path.as_ptr();
             let _leaked_path = Box::leak(Box::new(c_path));
-            
-            // Don't load ROM data - let cores request it if needed
-            // Cores with need_fullpath=false will request data via callbacks if needed
+
             let rom_data = game.data.clone();
-            
             let rom_size = rom_data.len();
-            
-            // Leak the ROM data to keep it alive
             let data_ptr = if !rom_data.is_empty() {
                 Box::leak(Box::new(rom_data)).as_ptr() as *const c_void
             } else {
                 std::ptr::null()
             };
-            
-            // Allocate game_info on the heap and leak it
-            let game_info_box = Box::new(RetroGameInfoC {
+
+            let game_info_ptr = Box::into_raw(Box::new(RetroGameInfoC {
                 path: path_ptr,
                 data: data_ptr,
                 size: rom_size,
                 meta: std::ptr::null(),
-            });
-            let game_info_ptr = Box::into_raw(game_info_box);
-            
-            eprintln!("\nCalling retro_load_game()...");
-            eprintln!("game_info_ptr = {:p}", game_info_ptr);
-            eprintln!("  path = {:p} ({:?})", (*game_info_ptr).path, (*game_info_ptr).path);
-            eprintln!("  data = {:p}", (*game_info_ptr).data);
-            eprintln!("  size = {}", (*game_info_ptr).size);
-            eprintln!("  meta = {:p}", (*game_info_ptr).meta);
-            
-            eprintln!("\nAbout to call retro_load_game()...");
-            eprintln!("Verifying ROM data...");
-            unsafe {
-                if !(*game_info_ptr).data.is_null() {
-                    eprintln!("  Data is not null, reading first bytes...");
-                    let first_bytes = std::slice::from_raw_parts(
-                        (*game_info_ptr).data as *const u8, 
-                        std::cmp::min(16, (*game_info_ptr).size as usize)
-                    );
-                    eprintln!("  First 16 bytes of ROM: {:?}", first_bytes);
-                } else {
-                    eprintln!("  Data is null (okay for fullpath cores)");
-                }
-            }
-            eprintln!("About to call func()...");
-            let _ = std::io::stderr().flush();
-            eprintln!("Calling func() now...");
+            }));
+
             let result = if func(game_info_ptr) {
                 eprintln!("✅ load_game() returned true");
-                let _ = std::io::stderr().flush();
                 Ok(())
             } else {
                 eprintln!("❌ load_game() returned false");
-                let _ = std::io::stderr().flush();
                 Err(LibretroError::GameLoadFailed)
             };
-            eprintln!("load_game() completed successfully\n");
-            let _ = std::io::stderr().flush();
-            
-            // Don't free - let it leak in case core keeps a reference
+
+            // Don't free — core may keep a pointer into this memory
             let _ = game_info_ptr;
-            
+
             result
+        }
+    }
+
+    pub fn get_av_info(&self) -> Result<RetroSystemAVInfo, LibretroError> {
+        unsafe {
+            let func: Symbol<extern "C" fn(*mut RetroSystemAVInfoC)> = self
+                .library
+                .get(b"retro_get_system_av_info")
+                .map_err(|_| LibretroError::CoreNotLoaded)?;
+            let mut info = RetroSystemAVInfoC::default();
+            func(&mut info);
+            Ok(info.to_rust())
         }
     }
 
