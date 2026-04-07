@@ -254,16 +254,12 @@ impl CallbackContext {
 
 // Static callback functions
 extern "C" fn static_environment_callback(cmd: c_uint, data: *mut c_void) -> bool {
-    eprintln!("Static environment callback called: cmd={}", cmd);
     unsafe {
         let ctx_ptr = CALLBACK_CONTEXT.load(Ordering::SeqCst);
         if ctx_ptr.is_null() {
-            eprintln!("  Context is null!");
             return false;
         }
-        let result = (*ctx_ptr).environment_callback(cmd as u32, data);
-        eprintln!("  Returning: {}", result);
-        result
+        (*ctx_ptr).environment_callback(cmd as u32, data)
     }
 }
 
@@ -318,98 +314,120 @@ extern "C" fn static_audio_batch_callback(data: *const i16, frames: usize) -> us
 
 impl CallbackContext {
     fn environment_callback(&self, cmd: u32, data: *mut std::ffi::c_void) -> bool {
-        eprintln!("Environment callback: cmd={}", cmd);
         unsafe {
             match cmd {
                 RETRO_ENVIRONMENT_SET_PIXEL_FORMAT => {
-                    eprintln!("  SET_PIXEL_FORMAT");
                     if !data.is_null() {
                         let format = *(data as *mut u32);
-                        if format == RETRO_PIXEL_FORMAT_XRGB8888 {
-                            return true;
-                        }
+                        // Accept XRGB8888 and RGB565; reject 0RGB1555 (legacy)
+                        return format == RETRO_PIXEL_FORMAT_XRGB8888
+                            || format == RETRO_PIXEL_FORMAT_RGB565;
                     }
                     false
                 }
                 RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY => {
-                    eprintln!("  GET_SYSTEM_DIRECTORY");
                     if !data.is_null() {
                         let ptr = data as *mut *const i8;
                         static SYS_DIR: &[u8] = b".\0";
-                        let cstr_ptr = SYS_DIR.as_ptr() as *const i8;
-                        unsafe {
-                            *ptr = cstr_ptr;
-                        }
-                        eprintln!("    Wrote pointer: {:p}", cstr_ptr);
+                        *ptr = SYS_DIR.as_ptr() as *const i8;
                         return true;
                     }
                     false
                 }
                 RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY => {
-                    eprintln!("  GET_SAVE_DIRECTORY");
                     if !data.is_null() {
                         let ptr = data as *mut *const i8;
-                        let buf_ptr = self.save_dir_buffer.as_ptr() as *const i8;
-                        unsafe {
-                            *ptr = buf_ptr;
-                        }
+                        *ptr = self.save_dir_buffer.as_ptr() as *const i8;
                         return true;
                     }
                     false
                 }
-                RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO => {
-                    eprintln!("  SET_SYSTEM_AV_INFO");
-                    true
-                }
-                RETRO_ENVIRONMENT_GET_VARIABLE => {
-                    eprintln!("  GET_VARIABLE");
-                    // Return null data (core options not supported)
+                RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO => true,
+                RETRO_ENVIRONMENT_GET_VARIABLE => false,
+                // VFS: return false so core falls back to stdio file I/O.
+                // Returning true without filling the struct would crash.
+                RETRO_ENVIRONMENT_GET_VFS_INTERFACE => false,
+                RETRO_ENVIRONMENT_GET_LOG_INTERFACE => {
+                    if !data.is_null() {
+                        unsafe extern "C" fn core_log(level: u32, msg: *const std::ffi::c_char) {
+                            let prefix = match level {
+                                0 => "[CORE DEBUG]",
+                                1 => "[CORE INFO]",
+                                2 => "[CORE WARN]",
+                                _ => "[CORE ERROR]",
+                            };
+                            if !msg.is_null() {
+                                let s = std::ffi::CStr::from_ptr(msg as *const _).to_string_lossy();
+                                eprintln!("{} {}", prefix, s.trim_end());
+                            }
+                        }
+                        (*(data as *mut RetroLogCallback)).log = core_log as *const std::ffi::c_void;
+                        return true;
+                    }
                     false
                 }
-                RETRO_ENVIRONMENT_GET_VFS_INTERFACE => {
-                    eprintln!("  GET_VFS_INTERFACE");
-                    // Returning true indicates we support VFS interface
-                    true
-                }
-                RETRO_ENVIRONMENT_GET_LOG_INTERFACE => {
-                    eprintln!("  GET_LOG_INTERFACE");
-                    false  // Return false - we don't support custom logging
-                }
                 RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION => {
-                    eprintln!("  GET_CORE_OPTIONS_VERSION");
+                    if !data.is_null() {
+                        *(data as *mut u32) = 0; // version 0 = don't send options
+                    }
                     true
                 }
-                RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2 => {
-                    eprintln!("  SET_CORE_OPTIONS_V2");
+                RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE => {
+                    if !data.is_null() {
+                        *(data as *mut bool) = false;
+                    }
                     true
                 }
-                RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK => {
-                    eprintln!("  SET_AUDIO_BUFFER_STATUS_CALLBACK");
+                RETRO_ENVIRONMENT_GET_LANGUAGE => {
+                    if !data.is_null() {
+                        *(data as *mut u32) = 0; // RETRO_LANGUAGE_ENGLISH
+                    }
                     true
                 }
-                RETRO_ENVIRONMENT_GET_LED_INTERFACE => {
-                    eprintln!("  GET_LED_INTERFACE");
-                    true
-                }
-                RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS => {
-                    eprintln!("  SET_INPUT_DESCRIPTORS");
-                    true
-                }
-                RETRO_ENVIRONMENT_SET_ROTATION => {
-                    eprintln!("  SET_ROTATION");
-                    true
-                }
-                RETRO_ENVIRONMENT_SET_GEOMETRY => {
-                    eprintln!("  SET_GEOMETRY");
+                RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE => {
+                    if !data.is_null() {
+                        *(data as *mut i32) = 1 | 2; // audio + video
+                    }
                     true
                 }
                 RETRO_ENVIRONMENT_SET_MESSAGE => {
-                    eprintln!("  SET_MESSAGE");
+                    if !data.is_null() {
+                        let msg = *(data as *const RetroMessage);
+                        if !msg.msg.is_null() {
+                            let s = std::ffi::CStr::from_ptr(msg.msg as *const _).to_string_lossy();
+                            eprintln!("[CORE MSG] {}", s.trim_end());
+                        }
+                    }
                     true
                 }
+                RETRO_ENVIRONMENT_SHUTDOWN => {
+                    eprintln!("[CORE] Shutdown requested");
+                    false
+                }
+                // Accept but ignore these
+                RETRO_ENVIRONMENT_SET_VARIABLES
+                | RETRO_ENVIRONMENT_SET_CORE_OPTIONS
+                | RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL
+                | RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2
+                | RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL
+                | RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY
+                | RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK
+                | RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS
+                | RETRO_ENVIRONMENT_SET_ROTATION
+                | RETRO_ENVIRONMENT_SET_GEOMETRY
+                | RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME
+                | RETRO_ENVIRONMENT_SET_SUBSYSTEM_INFO
+                | RETRO_ENVIRONMENT_SET_CONTROLLER_INFO
+                | RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS => true,
+                // Unsupported
+                RETRO_ENVIRONMENT_GET_LED_INTERFACE
+                | RETRO_ENVIRONMENT_GET_PERF_INTERFACE
+                | RETRO_ENVIRONMENT_GET_OVERSCAN
+                | RETRO_ENVIRONMENT_GET_CAN_DUPE
+                | RETRO_ENVIRONMENT_GET_USERNAME => false,
                 _ => {
-                    eprintln!("  UNKNOWN({}) - returning false", cmd);
-                    false  // Return false for unsupported commands
+                    eprintln!("[ENV] Unhandled cmd={}", cmd);
+                    false
                 }
             }
         }

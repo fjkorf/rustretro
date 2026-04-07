@@ -6,25 +6,49 @@ use thiserror::Error;
 
 pub const RETRO_API_VERSION: u32 = 1;
 
-// Environment callback commands
-pub const RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: u32 = 1;
-pub const RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO: u32 = 2;
-pub const RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY: u32 = 9;
-pub const RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY: u32 = 10;
-pub const RETRO_ENVIRONMENT_GET_VARIABLE: u32 = 4;
-pub const RETRO_ENVIRONMENT_GET_VFS_INTERFACE: u32 = 54;
-pub const RETRO_ENVIRONMENT_GET_LOG_INTERFACE: u32 = 11;
-pub const RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION: u32 = 46;
-pub const RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2: u32 = 47;
-pub const RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK: u32 = 17;
-pub const RETRO_ENVIRONMENT_GET_LED_INTERFACE: u32 = 36;
-pub const RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS: u32 = 21;
-pub const RETRO_ENVIRONMENT_SET_ROTATION: u32 = 16;
-pub const RETRO_ENVIRONMENT_SET_GEOMETRY: u32 = 25;
-pub const RETRO_ENVIRONMENT_SET_MESSAGE: u32 = 23;
+// Environment callback commands - values from libretro.h
+// https://github.com/libretro/libretro-common/blob/master/include/libretro.h
+pub const RETRO_ENVIRONMENT_EXPERIMENTAL: u32 = 0x10000;
 
-// Pixel format constants
-pub const RETRO_PIXEL_FORMAT_XRGB8888: u32 = 2;
+pub const RETRO_ENVIRONMENT_SET_ROTATION: u32 = 1;
+pub const RETRO_ENVIRONMENT_GET_OVERSCAN: u32 = 2;
+pub const RETRO_ENVIRONMENT_GET_CAN_DUPE: u32 = 3;
+pub const RETRO_ENVIRONMENT_SET_MESSAGE: u32 = 6;
+pub const RETRO_ENVIRONMENT_SHUTDOWN: u32 = 7;
+pub const RETRO_ENVIRONMENT_SET_PERFORMANCE_LEVEL: u32 = 8;
+pub const RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY: u32 = 9;
+pub const RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: u32 = 10;
+pub const RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS: u32 = 11;
+pub const RETRO_ENVIRONMENT_GET_VARIABLE: u32 = 15;
+pub const RETRO_ENVIRONMENT_SET_VARIABLES: u32 = 16;
+pub const RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE: u32 = 17;
+pub const RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME: u32 = 18;
+pub const RETRO_ENVIRONMENT_GET_LOG_INTERFACE: u32 = 27;
+pub const RETRO_ENVIRONMENT_GET_PERF_INTERFACE: u32 = 28;
+pub const RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY: u32 = 31;
+pub const RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO: u32 = 32;
+pub const RETRO_ENVIRONMENT_SET_SUBSYSTEM_INFO: u32 = 34;
+pub const RETRO_ENVIRONMENT_SET_CONTROLLER_INFO: u32 = 35;
+pub const RETRO_ENVIRONMENT_SET_GEOMETRY: u32 = 37;
+pub const RETRO_ENVIRONMENT_GET_USERNAME: u32 = 38;
+pub const RETRO_ENVIRONMENT_GET_LANGUAGE: u32 = 39;
+pub const RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS: u32 = 44;
+pub const RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION: u32 = 52;
+pub const RETRO_ENVIRONMENT_SET_CORE_OPTIONS: u32 = 53;
+pub const RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL: u32 = 54;
+pub const RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY: u32 = 55;
+pub const RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK: u32 = 62;
+pub const RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2: u32 = 67;
+pub const RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL: u32 = 68;
+// Experimental callbacks (base | 0x10000)
+pub const RETRO_ENVIRONMENT_GET_VFS_INTERFACE: u32 = 45 | RETRO_ENVIRONMENT_EXPERIMENTAL; // 65581
+pub const RETRO_ENVIRONMENT_GET_LED_INTERFACE: u32 = 46 | RETRO_ENVIRONMENT_EXPERIMENTAL; // 65582
+pub const RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE: u32 = 47 | RETRO_ENVIRONMENT_EXPERIMENTAL; // 65583
+
+// Pixel format constants (retro_pixel_format enum values)
+pub const RETRO_PIXEL_FORMAT_0RGB1555: u32 = 0; // legacy default
+pub const RETRO_PIXEL_FORMAT_XRGB8888: u32 = 1;
+pub const RETRO_PIXEL_FORMAT_RGB565: u32 = 2;
 
 // Input devices
 pub const RETRO_DEVICE_JOYPAD: u32 = 1;
@@ -96,6 +120,19 @@ pub type RetroAudioSampleFn = extern "C" fn(left: i16, right: i16);
 pub type RetroAudioSampleBatchFn = extern "C" fn(data: *const i16, frames: usize) -> usize;
 pub type RetroInputPollFn = extern "C" fn();
 pub type RetroInputStateFn = extern "C" fn(port: u32, device: u32, index: u32, id: u32) -> i16;
+pub type RetroCoreLogFn = unsafe extern "C" fn(level: u32, msg: *const std::ffi::c_char);
+
+#[repr(C)]
+pub struct RetroLogCallback {
+    pub log: *const c_void, // RetroCoreLogFn cast to *const c_void
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct RetroMessage {
+    pub msg: *const std::ffi::c_char,
+    pub frames: u32,
+}
 
 pub struct RetroCore {
     library: Library,

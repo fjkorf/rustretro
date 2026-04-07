@@ -2,187 +2,105 @@
 
 ## Executive Summary
 
-✅ **RustRetro libretro frontend is working correctly**
-✅ **ROM is valid and works in RetroArch** (proven: runs 300+ frames)
-❌ **MAME 2003-Plus core crashes when loaded by RustRetro** (segfault in load_game)
+✅ **MAME 2003-Plus core is now fully working in RustRetro**
+✅ **Nestopia (NES) core continues to work with no regression**
+✅ **Root cause identified and fixed**
 
-## Investigation Timeline
+## Root Cause
 
-### Phase 1: Initial Debugging (Previous Session)
-- Identified crash at `load_game()` call
-- Tried various CString lifetime fixes (Box::leak(), stack allocation, NULL paths)
-- Confirmed crash occurs in all 3 MAME cores
-- Conclusion: Problem is not ROM/CString related
+**All libretro environment callback constants were wrong.** The codebase used a sequential
+numbering scheme that didn't match the real libretro.h spec. Additionally, the pixel format
+enum values were incorrect.
 
-### Phase 2: Comparative Analysis (This Session)
-- ✅ Verified ROM works in RetroArch (loads and runs successfully)
-- Added `retro_set_audio_sample_batch` callback (found in MAME binary)
-- Added explicit environment command handlers (GET_VFS_INTERFACE, GET_LOG_INTERFACE, etc.)
-- Fixed pointer passing in load_game() (path_ptr vs Box pointer)
-- Result: All improvements made, crash still occurs
+### Example constant errors (before fix):
 
-## What RustRetro Does Correctly
+| Constant | Our (wrong) value | Spec (correct) value |
+|---|---|---|
+| `SET_PIXEL_FORMAT` | 1 | **10** |
+| `SET_SYSTEM_AV_INFO` | 2 | **32** |
+| `GET_VARIABLE` | 4 | **15** |
+| `GET_SAVE_DIRECTORY` | 10 | **31** |
+| `GET_LOG_INTERFACE` | 11 | **27** |
+| `GET_VFS_INTERFACE` | 54 | **65581** (45 \| 0x10000) |
+| `RETRO_PIXEL_FORMAT_XRGB8888` | 2 | **1** |
 
-1. ✅ Loads libretro core dynamically
-2. ✅ Verifies API version match
-3. ✅ Calls `get_system_info()` and receives correct data
-4. ✅ Registers all callbacks (environment, video, input, audio)
-5. ✅ Calls `retro_init()` successfully
-6. ✅ Sets environment variables correctly
-7. ✅ Responds to environment callback requests
+Only `GET_SYSTEM_DIRECTORY = 9` was correct by coincidence.
 
-## The Crash
+### Why Nestopia worked despite wrong constants
 
-**Signature**: Segmentation fault immediately inside MAME's `retro_load_game()` function
-**Timing**: Before any callbacks during load_game are executed
-**Deterministic**: Happens every time with Asura Blade ROM
-**Consistent**: Same crash point across MAME 2003-Plus, MAME 2003, and MAME current (bus error)
-**Platform**: Apple M4 (ARM64), macOS Sonoma
+Nestopia was accidentally functional because:
+- `cmd=9` (GET_SYSTEM_DIRECTORY) happened to be correct
+- Other mismatches were either ignored or caused non-fatal behavior
+- Nestopia is more lenient than MAME about which callbacks are handled
 
-## Likely Root Causes (Analysis)
+### Why MAME crashed
 
-### Most Likely: C++ Runtime Incompatibility
-MAME cores are written in C++. The crash might be:
-1. **C++ exception thrown** in MAME's ROM validation, converted to segfault by libretro
-2. **Dynamic memory allocation failure** in MAME's setup
-3. **C++ ABI mismatch** between the compiled MAME core and macOS system libraries
+MAME requires a broader set of callbacks to function. With wrong constants:
+- `SET_PIXEL_FORMAT` (cmd=10) was misidentified as `GET_SAVE_DIRECTORY` → wrote a directory
+  pointer where a pixel format enum should go
+- `GET_LOG_INTERFACE` (cmd=27) fell through to `_ => false`
+- `GET_SAVE_DIRECTORY` (cmd=31) fell through to `_ => false`
+- Multiple handlers fired for wrong commands, corrupting core state
 
-**Evidence**: 
-- RetroArch successfully runs the same ROM (uses different loading mechanism)
-- All three MAME cores crash at the same point (suggests shared C++ code issue)
-- MAME current gives different error (bus error vs segfault), suggesting different code path
+## Additional Issues Fixed
 
-### Secondary: ROM Version Mismatch
-MAME may expect specific ROM file versions for Asura Blade that don't match:
-- MAME 2003 expectations
-- The ROM set we have
+### 1. VFS interface returning `true` without a struct
+Our code returned `true` for `GET_VFS_INTERFACE` but didn't fill in the function pointer
+struct — this would crash any core that tried to call VFS functions. Fixed: return `false`
+so cores fall back to stdio file I/O.
 
-**Evidence**:
-- ROM works in RetroArch (which has access to full MAME database)
-- Could be the "Asura Blade (1996)" is for a different Fuuki board revision
+### 2. Log interface not implemented
+MAME calls `GET_LOG_INTERFACE` (cmd=27) during init. We now provide a real log callback
+that forwards messages to stderr with level prefixes.
 
-### Tertiary: Complex Callback Interaction
-MAME might be calling callbacks during load_game that we're not handling correctly:
-- Audio buffer status callback
-- Variable queries for core options
-- Unsupported features returning false when they should return true
-
-**Evidence**: 
-- Weak - would expect different error messages or failure modes
-- We're returning true for unknown commands
+### 3. `GET_VARIABLE_UPDATE` not returning a value
+Must write `false` to the `*mut bool` data pointer, not just return `true`.
 
 ## Changes Made
 
-### File: src/libretro.rs
-```rust
-// Added constants for all major environment commands
-pub const RETRO_ENVIRONMENT_GET_VFS_INTERFACE: u32 = 54;
-pub const RETRO_ENVIRONMENT_GET_LOG_INTERFACE: u32 = 11;
-// ... etc
+### `src/libretro.rs`
+- Fixed all environment callback constants to match libretro.h spec
+- Added `RETRO_ENVIRONMENT_EXPERIMENTAL = 0x10000`
+- Added correct `GET_VFS_INTERFACE = 45 | 0x10000 = 65581`
+- Fixed `RETRO_PIXEL_FORMAT_XRGB8888 = 1` (was 2)
+- Added `RETRO_PIXEL_FORMAT_0RGB1555 = 0` and `RGB565 = 2`
+- Added `RetroLogCallback` and `RetroMessage` structs
+- Added 15+ new constant definitions for complete coverage
 
-// Updated set_callbacks to support batch audio
-pub fn set_callbacks(..., audio_batch_callback: RetroAudioSampleBatchFn) -> Result<...>
-{
-    // Now calls both:
-    set_audio(audio_callback);  // Legacy mono samples
-    set_audio_batch(audio_batch_callback);  // Modern batch samples
-}
-```
+### `src/frontend.rs`
+- Rewrote `environment_callback()` with clean, minimal match arms
+- Removed per-call verbose logging that flooded output on MAME
+- Implemented `GET_LOG_INTERFACE` with a real log callback function
+- Changed `GET_VFS_INTERFACE` from `true` (dangerous) to `false` (safe stdio fallback)
+- Added proper data-writing for `GET_VARIABLE_UPDATE` and `GET_LANGUAGE`
+- Added `GET_AUDIO_VIDEO_ENABLE` handler
+- Expanded accepted pixel formats to include RGB565
 
-### File: src/frontend.rs
-```rust
-// Added static batch audio callback
-extern "C" fn static_audio_batch_callback(data: *const i16, frames: usize) -> usize {
-    unsafe {
-        let ctx_ptr = CALLBACK_CONTEXT.load(Ordering::SeqCst);
-        if !ctx_ptr.is_null() {
-            (*ctx_ptr).audio_batch_callback(data, frames)
-        } else {
-            0
-        }
-    }
-}
+## Verification
 
-// Expanded environment callback to handle more commands
-RETRO_ENVIRONMENT_GET_VFS_INTERFACE => true,
-RETRO_ENVIRONMENT_GET_LOG_INTERFACE => true,
-RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK => true,
-// ... etc
-```
-
-## What Doesn't Help
-
-❌ Adding more environment command handlers
-❌ Different CString lifetime management (all attempted)
-❌ Different RetroGameInfoC field values (all attempted)
-❌ Batch audio callback support
-❌ Better pointer handling in load_game()
-
-## Verification: RetroArch vs RustRetro
-
-### RetroArch Command (Works ✅)
 ```bash
-/Applications/RetroArch.app/Contents/MacOS/RetroArch \
-    -L ~/games/cores/mame2003_plus_libretro.dylib \
-    --max-frames=300 \
-    /Users/frankkorf/games/roms/asurabld.zip
-```
-Result: ROM loads, emulation runs for 300+ frames, exits cleanly
-
-### RustRetro Command (Fails ❌)
-```bash
+# MAME 2003-Plus - asurabld.zip (Asura Blade)
 ./target/release/rustretro \
     --core ~/games/cores/mame2003_plus_libretro.dylib \
-    --rom /Users/frankkorf/games/roms/asurabld.zip
+    --rom ~/games/roms/asurabld.zip
+# Result: ✅ load_game() returned true — Emulation ended cleanly.
+
+# Nestopia NES core
+./target/release/rustretro \
+    --core ~/Library/Application\ Support/RetroArch/cores/nestopia_libretro.dylib \
+    --rom ~/games/roms/test.nes
+# Result: ✅ load_game() returned true — Emulation ended cleanly.
 ```
-Result: Segmentation fault in MAME's load_game()
 
-## Recommendations for User
+## Lessons Learned
 
-### Short-term Options
+1. **Always cross-reference constants against the authoritative libretro.h** — never assume
+   a hand-rolled constant table is correct.
+2. **`GET_VFS_INTERFACE` returning `true` without a struct is a crash bomb** — cores call
+   function pointers immediately. Return `false` unless you implement it.
+3. **MAME is stricter than NES cores** about having correct callback behavior during init.
+   A wrong response to `SET_PIXEL_FORMAT` can corrupt core state before `load_game()` is called.
+4. **The libretro EXPERIMENTAL flag (0x10000)** is used for VFS, LED, and other newer interfaces.
+   These have large cmd values like 65581 that look like bugs but are intentional.
 
-**Option 1: Use RetroArch for MAME** (Proven to work)
-- MAME requires complex ROM database matching
-- RetroArch has pre-configured MAME integration
-- Stick with RetroArch for arcade emulation
 
-**Option 2: Test with Simple MAME ROM**
-- Try Pac-Man, Donkey Kong, or Street Fighter II
-- If these load successfully: Asura Blade is a version mismatch
-- If these also crash: Confirm MAME is incompatible with RustRetro
-
-**Option 3: Test with Console Cores**
-- Need to download SNES9x or NES core
-- Console emulation is simpler than MAME
-- Would prove RustRetro's libretro integration works correctly
-- Recommend this to verify frontend is sound
-
-### Long-term Solutions
-
-**For MAME Support**:
-1. Debug MAME source code
-   - Requires debug symbols in core
-   - Set breakpoints in MAME's ROM validation
-   - Inspect stack trace at crash point
-
-2. Use higher-level libretro bindings
-   - Switch to `ferretro` crate with better abstractions
-   - May have better C++ interop handling
-
-3. Reach out to MAME community
-   - Ask if MAME cores work with custom libretro frontends on macOS
-   - May be known issue
-
-## Conclusion
-
-**RustRetro's libretro integration is architecturally sound.** The crash is specific to MAME cores on this system, likely due to:
-- C++ ABI issues in MAME
-- ROM version incompatibility
-- Some undiscovered callback requirement MAME needs
-
-This is not a fundamental problem with RustRetro's libretro implementation. To move forward:
-1. Test with console games (safer, simpler)
-2. OR switch to RetroArch for MAME
-3. OR investigate MAME core compatibility further
-
-**Recommendation**: Test with a different core (NES or SNES) to confirm RustRetro works with simpler emulators. This would validate the frontend is production-ready for non-MAME systems.
