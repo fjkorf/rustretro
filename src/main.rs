@@ -1,3 +1,4 @@
+mod debug;
 mod frontend;
 mod libretro;
 mod sdl_interface;

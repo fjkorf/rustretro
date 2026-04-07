@@ -208,12 +208,14 @@ impl Audio {
 
 pub struct Input {
     pub joypad_state: [bool; 12],
+    pub f12_pressed: bool,
 }
 
 impl Input {
     pub fn new() -> Self {
         Input {
             joypad_state: [false; 12],
+            f12_pressed: false,
         }
     }
 
@@ -241,18 +243,19 @@ impl Input {
 
     fn update_key(&mut self, keycode: Keycode, pressed: bool) {
         match keycode {
-            Keycode::Z => self.joypad_state[0] = pressed,      // B
-            Keycode::A => self.joypad_state[1] = pressed,      // Y
-            Keycode::LShift | Keycode::RShift => self.joypad_state[2] = pressed, // Select
-            Keycode::Return => self.joypad_state[3] = pressed, // Start
+            Keycode::Z => self.joypad_state[0] = pressed,
+            Keycode::A => self.joypad_state[1] = pressed,
+            Keycode::LShift | Keycode::RShift => self.joypad_state[2] = pressed,
+            Keycode::Return => self.joypad_state[3] = pressed,
             Keycode::Up => self.joypad_state[4] = pressed,
             Keycode::Down => self.joypad_state[5] = pressed,
             Keycode::Left => self.joypad_state[6] = pressed,
             Keycode::Right => self.joypad_state[7] = pressed,
-            Keycode::X => self.joypad_state[8] = pressed,      // A
-            Keycode::S => self.joypad_state[9] = pressed,      // X
-            Keycode::Q => self.joypad_state[10] = pressed,     // L
-            Keycode::W => self.joypad_state[11] = pressed,     // R
+            Keycode::X => self.joypad_state[8] = pressed,
+            Keycode::S => self.joypad_state[9] = pressed,
+            Keycode::Q => self.joypad_state[10] = pressed,
+            Keycode::W => self.joypad_state[11] = pressed,
+            Keycode::F12 => { if pressed { self.f12_pressed = true; } }
             _ => {}
         }
     }

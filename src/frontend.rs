@@ -1,9 +1,11 @@
+use crate::debug::{SharedDebugState, DebugState};
+use crate::debug::window as debug_window;
 use crate::libretro::*;
 use crate::sdl_interface::{Audio, Graphics, Input};
 use anyhow::{anyhow, Result};
 use std::ffi::{CString, c_uint, c_void};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Arc, Mutex, atomic::{AtomicPtr, Ordering}};
 use std::time::Instant;
 
 // Global static for callback context access during libretro callbacks
@@ -20,6 +22,8 @@ pub struct Frontend {
     callback_context: Box<CallbackContext>,
     _game_path_cstring: Option<CString>,
     frame_count: u64,
+    debug_state: SharedDebugState,
+    debug_spawned: bool,
 }
 
 impl Frontend {
@@ -55,7 +59,8 @@ impl Frontend {
         eprintln!("Core: {} v{}", system_info.library_name, system_info.library_version);
         eprintln!("Valid extensions: {}", system_info.valid_extensions);
 
-        let callback_context = Box::new(CallbackContext::new(save_dir, system_dir));
+        let debug_state = Arc::new(Mutex::new(DebugState::new()));
+        let callback_context = Box::new(CallbackContext::new(save_dir, system_dir, Arc::clone(&debug_state)));
 
         let mut frontend = Frontend {
             sdl_context,
@@ -68,6 +73,8 @@ impl Frontend {
             callback_context,
             _game_path_cstring: None,
             frame_count: 0,
+            debug_state,
+            debug_spawned: false,
         };
 
         frontend.setup_callbacks()?;
@@ -158,8 +165,79 @@ impl Frontend {
                 break;
             }
 
-            // Sync input: copy SDL key state → callback context (what the core reads)
+            // F12: toggle debug window
+            if self.input.f12_pressed {
+                self.input.f12_pressed = false;
+                if !self.debug_spawned {
+                    debug_window::spawn(Arc::clone(&self.debug_state));
+                    self.debug_spawned = true;
+                }
+                // Toggle pause-on-open or just open; window manages itself
+                self.debug_state.lock().unwrap().debug_open = true;
+            }
+
+            // Sync input → callback context AND debug state
             self.callback_context.input_state = self.input.joypad_state;
+            {
+                let mut ds = self.debug_state.lock().unwrap();
+                ds.push_input(self.input.joypad_state, self.frame_count);
+                ds.frame_count = self.frame_count;
+            }
+
+            // --- Check pause / triggers ---
+            let paused = {
+                let mut ds = self.debug_state.lock().unwrap();
+
+                // Frame trigger
+                if let Some(tf) = ds.trigger_frame {
+                    if tf < u64::MAX - 12 && self.frame_count >= tf {
+                        ds.paused = true;
+                        ds.trigger_frame = None;
+                        ds.log(format!("⏸ Paused at frame {}", self.frame_count));
+                    }
+                    // Button trigger (encoded as u64::MAX - btn_index)
+                    if tf >= u64::MAX - 12 {
+                        let btn = (u64::MAX - tf) as usize;
+                        if btn < 12 && self.input.joypad_state[btn] {
+                            ds.paused = true;
+                            ds.trigger_frame = None;
+                            ds.log(format!("⏸ Button trigger fired: btn={}", btn));
+                        }
+                    }
+                }
+
+                // Pixel trigger — checked after video_callback populates fb_rgba
+                if let Some((px, py)) = ds.trigger_pixel {
+                    if px < ds.fb_width && py < ds.fb_height && !ds.fb_rgba.is_empty() {
+                        let idx = (py as usize * ds.fb_width as usize + px as usize) * 4;
+                        if idx + 2 < ds.fb_rgba.len() {
+                            let r = ds.fb_rgba[idx];
+                            let g = ds.fb_rgba[idx + 1];
+                            let b = ds.fb_rgba[idx + 2];
+                            if r != 0 || g != 0 || b != 0 {
+                                ds.paused = true;
+                                ds.trigger_pixel = None;
+                                ds.log(format!("⏸ Pixel trigger ({px},{py}) = #{r:02X}{g:02X}{b:02X}"));
+                            }
+                        }
+                    }
+                }
+
+                let p = ds.paused;
+                // Handle step-one: run one frame then re-pause
+                if ds.step_one {
+                    ds.step_one = false;
+                    false // run this frame
+                } else {
+                    p
+                }
+            };
+
+            if paused {
+                // Sleep briefly and loop without running the core
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                continue;
+            }
 
             // --- Run one emulation frame ---
             self.core
@@ -174,6 +252,13 @@ impl Frontend {
                 let w = av.geometry.base_width;
                 let h = av.geometry.base_height;
                 self.graphics.resize_window(w, h);
+                {
+                    let mut ds = self.debug_state.lock().unwrap();
+                    ds.av_width = w;
+                    ds.av_height = h;
+                    ds.fps = av.timing.fps;
+                    ds.log(format!("AV info updated: {}×{} @ {:.2}fps", w, h, av.timing.fps));
+                }
                 if self.enable_audio {
                     let sr = if av.timing.sample_rate > 0.0 {
                         av.timing.sample_rate
@@ -201,20 +286,25 @@ impl Frontend {
                     ctx.pitch,
                     ctx.pixel_format,
                 ) {
-                    // Log once per 60 frames to avoid spam
                     if self.frame_count % 60 == 1 {
                         eprintln!("[RENDER ERR] {}", e);
                     }
                 }
             }
 
-            // Update window title every 60 frames: shows run-frame count,
-            // video-callback count, dimensions and pixel format.
-            // If video_frames << frame_count, the video callback is not firing.
+            // Update debug state video counters
+            {
+                let ctx = &self.callback_context;
+                let mut ds = self.debug_state.lock().unwrap();
+                ds.video_frames = ctx.video_frames;
+                ds.video_real = ctx.video_real;
+            }
+
+            // Update window title every 60 frames
             if self.frame_count % 60 == 0 {
                 let ctx = &self.callback_context;
                 let title = format!(
-                    "RustRetro | run:{} vid:{} real:{} | {}x{} fmt={}",
+                    "RustRetro | run:{} vid:{} real:{} | {}x{} fmt={} [F12=debug]",
                     self.frame_count, ctx.video_frames, ctx.video_real,
                     ctx.width, ctx.height, ctx.pixel_format
                 );
@@ -267,16 +357,17 @@ pub struct CallbackContext {
     pub input_state: [bool; 12],
     pub pending_av_info: Option<RetroSystemAVInfoC>,
     pub pending_audio: Vec<i16>,
-    pub video_frames: u64,     // total calls to video_callback
-    pub video_real: u64,       // calls where data was non-null (real frames)
+    pub video_frames: u64,
+    pub video_real: u64,
     system_dir_buffer: Vec<u8>,
     save_dir_buffer: Vec<u8>,
+    debug_state: SharedDebugState,
 }
 
 impl CallbackContext {
-    fn new(save_dir: PathBuf, system_dir: PathBuf) -> Self {
+    fn new(save_dir: PathBuf, system_dir: PathBuf, debug_state: SharedDebugState) -> Self {
         let mut sys = system_dir.to_string_lossy().into_owned().into_bytes();
-        sys.push(0); // null terminate
+        sys.push(0);
         let mut sav = save_dir.to_string_lossy().into_owned().into_bytes();
         sav.push(0);
 
@@ -285,9 +376,7 @@ impl CallbackContext {
             width: 0,
             height: 0,
             pitch: 0,
-        // libretro default is 0RGB1555 (format=0) — cores that don't call
-        // SET_PIXEL_FORMAT send 15-bit frames. XRGB8888 must be explicitly requested.
-        pixel_format: RETRO_PIXEL_FORMAT_0RGB1555,
+            pixel_format: RETRO_PIXEL_FORMAT_0RGB1555,
             input_state: [false; 12],
             pending_av_info: None,
             pending_audio: Vec::with_capacity(4096),
@@ -295,6 +384,7 @@ impl CallbackContext {
             video_real: 0,
             system_dir_buffer: sys,
             save_dir_buffer: sav,
+            debug_state,
         }
     }
 
@@ -432,20 +522,6 @@ impl CallbackContext {
             let bytes = pitch * height as usize;
             unsafe {
                 let slice = std::slice::from_raw_parts(data as *const u8, bytes);
-                // Sample actual pixel bytes for diagnostics (every 300 real frames)
-                if self.video_real % 300 == 0 {
-                    let non_zero_pos = slice.iter().position(|&b| b != 0);
-                    let sample: Vec<u8> = slice.iter()
-                        .filter(|&&b| b != 0)
-                        .take(8)
-                        .copied()
-                        .collect();
-                    eprintln!(
-                        "[VIDEO] real={} {}x{} pitch={} fmt={} nz_pos={:?} nz_bytes={:?}",
-                        self.video_real, width, height, pitch, self.pixel_format,
-                        non_zero_pos, sample
-                    );
-                }
                 self.framebuffer.resize(bytes, 0);
                 self.framebuffer.copy_from_slice(slice);
             }
@@ -453,6 +529,14 @@ impl CallbackContext {
             self.height = height;
             self.pitch = pitch;
             self.video_real += 1;
+
+            // Push real frame to debug state
+            if let Ok(mut ds) = self.debug_state.try_lock() {
+                unsafe {
+                    let slice = std::slice::from_raw_parts(data as *const u8, bytes);
+                    ds.update_frame(slice, width, height, pitch, self.pixel_format);
+                }
+            }
         }
     }
 
