@@ -19,6 +19,7 @@ pub struct Frontend {
     av_info: Option<RetroSystemAVInfo>,
     callback_context: Box<CallbackContext>,
     _game_path_cstring: Option<CString>,
+    frame_count: u64,
 }
 
 impl Frontend {
@@ -66,6 +67,7 @@ impl Frontend {
             av_info: None,
             callback_context,
             _game_path_cstring: None,
+            frame_count: 0,
         };
 
         frontend.setup_callbacks()?;
@@ -164,6 +166,8 @@ impl Frontend {
                 .run()
                 .map_err(|e| anyhow!("Core execution failed: {}", e))?;
 
+            self.frame_count += 1;
+
             // --- Apply any AV info update from the core ---
             if let Some(new_info) = self.callback_context.pending_av_info.take() {
                 let av = new_info.to_rust();
@@ -184,8 +188,12 @@ impl Frontend {
             }
 
             // --- Render ---
-            let ctx = &self.callback_context;
-            if !ctx.framebuffer.is_empty() && ctx.width > 0 && ctx.height > 0 {
+            let has_frame = {
+                let ctx = &self.callback_context;
+                !ctx.framebuffer.is_empty() && ctx.width > 0 && ctx.height > 0
+            };
+            if has_frame {
+                let ctx = &self.callback_context;
                 let _ = self.graphics.render_frame(
                     &ctx.framebuffer,
                     ctx.width,
@@ -193,6 +201,16 @@ impl Frontend {
                     ctx.pitch,
                     ctx.pixel_format,
                 );
+            }
+
+            // Update window title every 60 frames with status info
+            if self.frame_count % 60 == 0 {
+                let ctx = &self.callback_context;
+                let title = format!(
+                    "RustRetro — frame {} | {}x{} fmt={}",
+                    self.frame_count, ctx.width, ctx.height, ctx.pixel_format
+                );
+                let _ = self.graphics.set_title(&title);
             }
 
             // --- Audio ---
@@ -257,7 +275,9 @@ impl CallbackContext {
             width: 0,
             height: 0,
             pitch: 0,
-            pixel_format: RETRO_PIXEL_FORMAT_XRGB8888,
+        // libretro default is 0RGB1555 (format=0) — cores that don't call
+        // SET_PIXEL_FORMAT send 15-bit frames. XRGB8888 must be explicitly requested.
+        pixel_format: RETRO_PIXEL_FORMAT_0RGB1555,
             input_state: [false; 12],
             pending_av_info: None,
             pending_audio: Vec::with_capacity(4096),
@@ -272,9 +292,8 @@ impl CallbackContext {
                 RETRO_ENVIRONMENT_SET_PIXEL_FORMAT => {
                     if !data.is_null() {
                         let format = *(data as *const u32);
-                        if format == RETRO_PIXEL_FORMAT_XRGB8888
-                            || format == RETRO_PIXEL_FORMAT_RGB565
-                        {
+                        // Accept all three libretro pixel formats
+                        if format <= RETRO_PIXEL_FORMAT_RGB565 {
                             self.pixel_format = format;
                             return true;
                         }

@@ -14,6 +14,7 @@ pub struct Graphics {
     texture_creator: TextureCreator<WindowContext>,
     tex_width: u32,
     tex_height: u32,
+    tex_fmt: PixelFormatEnum,
     pub scale: u32,
 }
 
@@ -48,6 +49,7 @@ impl Graphics {
             texture_creator,
             tex_width: 0,
             tex_height: 0,
+            tex_fmt: PixelFormatEnum::Unknown,
             scale,
         })
     }
@@ -59,8 +61,12 @@ impl Graphics {
             .set_size(width * self.scale, height * self.scale);
     }
 
+    pub fn set_title(&mut self, title: &str) {
+        let _ = self.canvas.window_mut().set_title(title);
+    }
+
     fn ensure_texture(&mut self, width: u32, height: u32, sdl_fmt: PixelFormatEnum) -> Result<()> {
-        if self.tex_width == width && self.tex_height == height {
+        if self.tex_width == width && self.tex_height == height && self.tex_fmt == sdl_fmt {
             return Ok(());
         }
         // Drop old texture before creating new one
@@ -75,6 +81,7 @@ impl Graphics {
         self.texture = Some(unsafe { std::mem::transmute(tex) });
         self.tex_width = width;
         self.tex_height = height;
+        self.tex_fmt = sdl_fmt;
         Ok(())
     }
 
@@ -86,12 +93,14 @@ impl Graphics {
         pitch: usize,
         pixel_format: u32, // libretro pixel format constant
     ) -> Result<()> {
-        // libretro XRGB8888 (=1) is layout-compatible with SDL ARGB8888 on little-endian
-        // libretro RGB565 (=2) matches SDL RGB565 directly
-        let sdl_fmt = if pixel_format == 2 {
-            PixelFormatEnum::RGB565
-        } else {
-            PixelFormatEnum::ARGB8888
+        // libretro pixel format → SDL pixel format mapping:
+        //   0 = 0RGB1555  → SDL ARGB1555 (1-bit A ignored, same layout)
+        //   1 = XRGB8888  → SDL ARGB8888 (X/A byte both at offset 3, direct blit)
+        //   2 = RGB565    → SDL RGB565   (direct blit)
+        let sdl_fmt = match pixel_format {
+            2 => PixelFormatEnum::RGB565,
+            1 => PixelFormatEnum::ARGB8888,
+            _ => PixelFormatEnum::ARGB1555, // default: 0RGB1555
         };
 
         self.ensure_texture(width, height, sdl_fmt)?;
