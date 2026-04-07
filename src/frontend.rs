@@ -99,18 +99,18 @@ impl Frontend {
         if let Ok(av_info) = frontend.core.get_av_info() {
             let w = av_info.geometry.base_width;
             let h = av_info.geometry.base_height;
+            let sr = av_info.timing.sample_rate;
             eprintln!(
                 "AV info: {}x{} @ {:.2} FPS, {:.0} Hz audio",
-                w, h, av_info.timing.fps, av_info.timing.sample_rate
+                w, h, av_info.timing.fps, sr
             );
             frontend.graphics.resize_window(w, h);
 
-            // Reinitialize audio with correct sample rate
+            // Reinitialize audio with correct sample rate (guard against 0)
             if enable_audio {
-                frontend.audio = Some(Audio::new(
-                    &frontend.sdl_context,
-                    av_info.timing.sample_rate,
-                )?);
+                let effective_rate = if sr > 0.0 { sr } else { 48000.0 };
+                frontend.audio =
+                    Some(Audio::new(&frontend.sdl_context, effective_rate)?);
             }
             frontend.av_info = Some(av_info);
         }
@@ -171,7 +171,12 @@ impl Frontend {
                 let h = av.geometry.base_height;
                 self.graphics.resize_window(w, h);
                 if self.enable_audio {
-                    if let Ok(new_audio) = Audio::new(&self.sdl_context, av.timing.sample_rate) {
+                    let sr = if av.timing.sample_rate > 0.0 {
+                        av.timing.sample_rate
+                    } else {
+                        48000.0
+                    };
+                    if let Ok(new_audio) = Audio::new(&self.sdl_context, sr) {
                         self.audio = Some(new_audio);
                     }
                 }
