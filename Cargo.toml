@@ -1,0 +1,17 @@
+[package]
+name = "rustretro"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+sdl2 = { version = "0.36", features = ["use-pkgconfig"] }
+libloading = "0.8"
+thiserror = "1.0"
+anyhow = "1.0"
+parking_lot = "0.12"
+memoffset = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true
