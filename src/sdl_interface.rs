@@ -93,29 +93,16 @@ impl Graphics {
         pitch: usize,
         pixel_format: u32, // libretro pixel format constant
     ) -> Result<()> {
-        // 0RGB1555 (format=0): expand to ARGB8888 on the CPU to avoid SDL
-        // Metal backend not supporting ARGB1555 streaming textures on macOS.
-        if pixel_format == 0 {
-            let expanded = expand_0rgb1555_to_argb8888(data, width, height, pitch);
-            let argb_pitch = width as usize * 4;
-            self.ensure_texture(width, height, PixelFormatEnum::ARGB8888)?;
-            if let Some(ref mut tex) = self.texture {
-                tex.update(None, &expanded, argb_pitch)
-                    .map_err(|e| anyhow!(e.to_string()))?;
-            }
-        } else {
-            // XRGB8888 (=1) → ARGB8888 direct blit (layout-compatible, little-endian)
-            // RGB565   (=2) → RGB565   direct blit
-            let sdl_fmt = if pixel_format == 2 {
-                PixelFormatEnum::RGB565
-            } else {
-                PixelFormatEnum::ARGB8888
-            };
-            self.ensure_texture(width, height, sdl_fmt)?;
-            if let Some(ref mut tex) = self.texture {
-                tex.update(None, data, pitch)
-                    .map_err(|e| anyhow!(e.to_string()))?;
-            }
+        // Always convert to ARGB8888 before uploading to SDL.
+        // SDL2's Metal renderer on macOS only reliably supports ARGB8888
+        // as a streaming texture format; RGB565 and ARGB1555 silently fail.
+        let argb_pitch = width as usize * 4;
+        let argb = to_argb8888(data, width, height, pitch, pixel_format);
+
+        self.ensure_texture(width, height, PixelFormatEnum::ARGB8888)?;
+        if let Some(ref mut tex) = self.texture {
+            tex.update(None, &argb, argb_pitch)
+                .map_err(|e| anyhow!(e.to_string()))?;
         }
 
         self.canvas.clear();
@@ -129,32 +116,63 @@ impl Graphics {
     }
 }
 
-/// Expand packed 0RGB1555 (2 bytes/pixel) to ARGB8888 (4 bytes/pixel).
-/// Each 16-bit word: `0RRRRRGGGGGBBBBB` → `00RRRRRR GGGGGGGG BBBBBBBB FF`
-fn expand_0rgb1555_to_argb8888(
-    src: &[u8],
-    width: u32,
-    height: u32,
-    src_pitch: usize,
-) -> Vec<u8> {
+/// Convert any libretro pixel format to packed ARGB8888 bytes.
+///
+/// libretro formats:
+///   0 = 0RGB1555  — 2 bytes/pixel, bits: `0RRRRRGGGGGBBBBB`
+///   1 = XRGB8888  — 4 bytes/pixel, little-endian: `[B, G, R, X]`
+///   2 = RGB565    — 2 bytes/pixel, bits: `RRRRRGGGGGGBBBBB`
+///
+/// Output: packed ARGB8888, little-endian: `[B, G, R, A]` per pixel.
+fn to_argb8888(src: &[u8], width: u32, height: u32, src_pitch: usize, fmt: u32) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
     let mut out = vec![0u8; w * h * 4];
+
     for y in 0..h {
-        let row = &src[y * src_pitch..y * src_pitch + w * 2];
-        let out_row = &mut out[y * w * 4..(y + 1) * w * 4];
-        for x in 0..w {
-            let lo = row[x * 2] as u16;
-            let hi = row[x * 2 + 1] as u16;
-            let pixel = lo | (hi << 8);
-            let b = ((pixel & 0x001F) << 3) as u8;
-            let g = (((pixel >> 5) & 0x001F) << 3) as u8;
-            let r = (((pixel >> 10) & 0x001F) << 3) as u8;
-            // ARGB8888 byte order on little-endian: [B, G, R, A]
-            out_row[x * 4]     = b;
-            out_row[x * 4 + 1] = g;
-            out_row[x * 4 + 2] = r;
-            out_row[x * 4 + 3] = 0xFF;
+        let in_row  = &src[y * src_pitch..];
+        let out_row = &mut out[y * w * 4..];
+
+        match fmt {
+            2 => {
+                // RGB565: RRRRRGGGGGGBBBBB
+                for x in 0..w {
+                    let lo = in_row[x * 2] as u16;
+                    let hi = in_row[x * 2 + 1] as u16;
+                    let p = lo | (hi << 8);
+                    let b = ((p & 0x001F) << 3) as u8;
+                    let g = (((p >> 5) & 0x003F) << 2) as u8;
+                    let r = (((p >> 11) & 0x001F) << 3) as u8;
+                    out_row[x * 4]     = b;
+                    out_row[x * 4 + 1] = g;
+                    out_row[x * 4 + 2] = r;
+                    out_row[x * 4 + 3] = 0xFF;
+                }
+            }
+            1 => {
+                // XRGB8888: already [B, G, R, X] in memory — copy with A=FF
+                for x in 0..w {
+                    out_row[x * 4]     = in_row[x * 4];     // B
+                    out_row[x * 4 + 1] = in_row[x * 4 + 1]; // G
+                    out_row[x * 4 + 2] = in_row[x * 4 + 2]; // R
+                    out_row[x * 4 + 3] = 0xFF;               // A
+                }
+            }
+            _ => {
+                // 0RGB1555: 0RRRRRGGGGGBBBBB
+                for x in 0..w {
+                    let lo = in_row[x * 2] as u16;
+                    let hi = in_row[x * 2 + 1] as u16;
+                    let p = lo | (hi << 8);
+                    let b = ((p & 0x001F) << 3) as u8;
+                    let g = (((p >> 5) & 0x001F) << 3) as u8;
+                    let r = (((p >> 10) & 0x001F) << 3) as u8;
+                    out_row[x * 4]     = b;
+                    out_row[x * 4 + 1] = g;
+                    out_row[x * 4 + 2] = r;
+                    out_row[x * 4 + 3] = 0xFF;
+                }
+            }
         }
     }
     out
