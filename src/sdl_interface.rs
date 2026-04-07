@@ -93,21 +93,29 @@ impl Graphics {
         pitch: usize,
         pixel_format: u32, // libretro pixel format constant
     ) -> Result<()> {
-        // libretro pixel format → SDL pixel format mapping:
-        //   0 = 0RGB1555  → SDL ARGB1555 (1-bit A ignored, same layout)
-        //   1 = XRGB8888  → SDL ARGB8888 (X/A byte both at offset 3, direct blit)
-        //   2 = RGB565    → SDL RGB565   (direct blit)
-        let sdl_fmt = match pixel_format {
-            2 => PixelFormatEnum::RGB565,
-            1 => PixelFormatEnum::ARGB8888,
-            _ => PixelFormatEnum::ARGB1555, // default: 0RGB1555
-        };
-
-        self.ensure_texture(width, height, sdl_fmt)?;
-
-        if let Some(ref mut tex) = self.texture {
-            tex.update(None, data, pitch)
-                .map_err(|e| anyhow!(e.to_string()))?;
+        // 0RGB1555 (format=0): expand to ARGB8888 on the CPU to avoid SDL
+        // Metal backend not supporting ARGB1555 streaming textures on macOS.
+        if pixel_format == 0 {
+            let expanded = expand_0rgb1555_to_argb8888(data, width, height, pitch);
+            let argb_pitch = width as usize * 4;
+            self.ensure_texture(width, height, PixelFormatEnum::ARGB8888)?;
+            if let Some(ref mut tex) = self.texture {
+                tex.update(None, &expanded, argb_pitch)
+                    .map_err(|e| anyhow!(e.to_string()))?;
+            }
+        } else {
+            // XRGB8888 (=1) → ARGB8888 direct blit (layout-compatible, little-endian)
+            // RGB565   (=2) → RGB565   direct blit
+            let sdl_fmt = if pixel_format == 2 {
+                PixelFormatEnum::RGB565
+            } else {
+                PixelFormatEnum::ARGB8888
+            };
+            self.ensure_texture(width, height, sdl_fmt)?;
+            if let Some(ref mut tex) = self.texture {
+                tex.update(None, data, pitch)
+                    .map_err(|e| anyhow!(e.to_string()))?;
+            }
         }
 
         self.canvas.clear();
@@ -119,6 +127,37 @@ impl Graphics {
         self.canvas.present();
         Ok(())
     }
+}
+
+/// Expand packed 0RGB1555 (2 bytes/pixel) to ARGB8888 (4 bytes/pixel).
+/// Each 16-bit word: `0RRRRRGGGGGBBBBB` → `00RRRRRR GGGGGGGG BBBBBBBB FF`
+fn expand_0rgb1555_to_argb8888(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    src_pitch: usize,
+) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let row = &src[y * src_pitch..y * src_pitch + w * 2];
+        let out_row = &mut out[y * w * 4..(y + 1) * w * 4];
+        for x in 0..w {
+            let lo = row[x * 2] as u16;
+            let hi = row[x * 2 + 1] as u16;
+            let pixel = lo | (hi << 8);
+            let b = ((pixel & 0x001F) << 3) as u8;
+            let g = (((pixel >> 5) & 0x001F) << 3) as u8;
+            let r = (((pixel >> 10) & 0x001F) << 3) as u8;
+            // ARGB8888 byte order on little-endian: [B, G, R, A]
+            out_row[x * 4]     = b;
+            out_row[x * 4 + 1] = g;
+            out_row[x * 4 + 2] = r;
+            out_row[x * 4 + 3] = 0xFF;
+        }
+    }
+    out
 }
 
 pub struct Audio {

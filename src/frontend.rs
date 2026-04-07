@@ -194,21 +194,28 @@ impl Frontend {
             };
             if has_frame {
                 let ctx = &self.callback_context;
-                let _ = self.graphics.render_frame(
+                if let Err(e) = self.graphics.render_frame(
                     &ctx.framebuffer,
                     ctx.width,
                     ctx.height,
                     ctx.pitch,
                     ctx.pixel_format,
-                );
+                ) {
+                    // Log once per 60 frames to avoid spam
+                    if self.frame_count % 60 == 1 {
+                        eprintln!("[RENDER ERR] {}", e);
+                    }
+                }
             }
 
-            // Update window title every 60 frames with status info
+            // Update window title every 60 frames: shows run-frame count,
+            // video-callback count, dimensions and pixel format.
+            // If video_frames << frame_count, the video callback is not firing.
             if self.frame_count % 60 == 0 {
                 let ctx = &self.callback_context;
                 let title = format!(
-                    "RustRetro — frame {} | {}x{} fmt={}",
-                    self.frame_count, ctx.width, ctx.height, ctx.pixel_format
+                    "RustRetro | run:{} vid:{} | {}x{} fmt={}",
+                    self.frame_count, ctx.video_frames, ctx.width, ctx.height, ctx.pixel_format
                 );
                 let _ = self.graphics.set_title(&title);
             }
@@ -259,6 +266,7 @@ pub struct CallbackContext {
     pub input_state: [bool; 12],
     pub pending_av_info: Option<RetroSystemAVInfoC>,
     pub pending_audio: Vec<i16>,
+    pub video_frames: u64,
     system_dir_buffer: Vec<u8>,
     save_dir_buffer: Vec<u8>,
 }
@@ -281,6 +289,7 @@ impl CallbackContext {
             input_state: [false; 12],
             pending_av_info: None,
             pending_audio: Vec::with_capacity(4096),
+            video_frames: 0,
             system_dir_buffer: sys,
             save_dir_buffer: sav,
         }
@@ -419,6 +428,8 @@ impl CallbackContext {
             self.height = height;
             self.pitch = pitch;
         }
+        // Count all calls including duplicate-frame (null data) calls
+        self.video_frames += 1;
     }
 
     fn input_state_callback(&self, port: u32, device: u32, _index: u32, id: u32) -> i16 {
