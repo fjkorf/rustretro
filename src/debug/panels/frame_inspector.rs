@@ -1,4 +1,4 @@
-use eframe::egui;
+use bevy_egui::egui;
 use std::sync::{Arc, Mutex};
 use crate::debug::DebugState;
 
@@ -28,7 +28,6 @@ impl FrameInspector {
             let image = egui::ColorImage {
                 size: [width as usize, height as usize],
                 pixels,
-                source_size: egui::Vec2::new(width as f32, height as f32),
             };
             self.texture = Some(ctx.load_texture(
                 "framebuffer",

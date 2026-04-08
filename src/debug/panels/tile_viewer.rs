@@ -1,4 +1,4 @@
-use eframe::egui;
+use bevy_egui::egui;
 use std::sync::{Arc, Mutex};
 use crate::debug::DebugState;
 
@@ -169,7 +169,6 @@ fn slice_tiles(rgba: &[u8], width: usize, height: usize, tile_size: usize) -> Ve
             tiles.push(egui::ColorImage {
                 size: [tile_size, tile_size],
                 pixels,
-                source_size: egui::Vec2::new(tile_size as f32, tile_size as f32),
             });
         }
     }

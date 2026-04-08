@@ -1,28 +1,20 @@
-use crate::debug::{SharedDebugState, DebugState};
+use crate::debug::SharedDebugState;
 use crate::libretro::*;
-use crate::sdl_interface::{Audio, Graphics, Input};
 use anyhow::{anyhow, Result};
 use std::ffi::{CString, c_uint, c_void};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, atomic::{AtomicPtr, Ordering}};
-use std::time::Instant;
+use std::sync::{Arc, atomic::{AtomicPtr, Ordering}};
 
 // Global static for callback context access during libretro callbacks
 static CALLBACK_CONTEXT: AtomicPtr<CallbackContext> = AtomicPtr::new(std::ptr::null_mut());
 
 pub struct Frontend {
-    sdl_context: sdl2::Sdl,
     core: RetroCore,
-    graphics: Graphics,
-    audio: Option<Audio>,
-    input: Input,
-    enable_audio: bool,
-    av_info: Option<RetroSystemAVInfo>,
+    pub av_info: Option<RetroSystemAVInfo>,
     callback_context: Box<CallbackContext>,
     _game_path_cstring: Option<CString>,
-    frame_count: u64,
+    pub frame_count: u64,
     debug_state: SharedDebugState,
-    debug_spawned: bool,
 }
 
 impl Frontend {
@@ -31,25 +23,10 @@ impl Frontend {
         rom_path: &str,
         save_dir: PathBuf,
         system_dir: PathBuf,
-        scale: u32,
-        fullscreen: bool,
-        enable_audio: bool,
         debug_state: SharedDebugState,
     ) -> Result<Self> {
         let core = RetroCore::load(core_path)
             .map_err(|e| anyhow!("Failed to load core: {}", e))?;
-
-        let sdl_context = sdl2::init().map_err(|e| anyhow!(e))?;
-
-        let graphics = Graphics::new(&sdl_context, 640, 480, scale, fullscreen)?;
-
-        let audio = if enable_audio {
-            Some(Audio::new(&sdl_context, 48000.0)?)
-        } else {
-            None
-        };
-
-        let input = Input::new();
 
         let system_info = core
             .get_system_info()
@@ -61,18 +38,12 @@ impl Frontend {
         let callback_context = Box::new(CallbackContext::new(save_dir, system_dir, Arc::clone(&debug_state)));
 
         let mut frontend = Frontend {
-            sdl_context,
             core,
-            graphics,
-            audio,
-            input,
-            enable_audio,
             av_info: None,
             callback_context,
             _game_path_cstring: None,
             frame_count: 0,
             debug_state,
-            debug_spawned: false,
         };
 
         frontend.setup_callbacks()?;
@@ -102,23 +73,13 @@ impl Frontend {
 
         frontend._game_path_cstring = path_cstring;
 
-        // Query AV info now that game is loaded
         if let Ok(av_info) = frontend.core.get_av_info() {
             let w = av_info.geometry.base_width;
             let h = av_info.geometry.base_height;
-            let sr = av_info.timing.sample_rate;
             eprintln!(
                 "AV info: {}x{} @ {:.2} FPS, {:.0} Hz audio",
-                w, h, av_info.timing.fps, sr
+                w, h, av_info.timing.fps, av_info.timing.sample_rate
             );
-            frontend.graphics.resize_window(w, h);
-
-            // Reinitialize audio with correct sample rate (guard against 0)
-            if enable_audio {
-                let effective_rate = if sr > 0.0 { sr } else { 48000.0 };
-                frontend.audio =
-                    Some(Audio::new(&frontend.sdl_context, effective_rate)?);
-            }
             frontend.av_info = Some(av_info);
         }
 
@@ -143,198 +104,190 @@ impl Frontend {
         Ok(())
     }
 
-    pub fn run(&mut self) -> Result<()> {
-        let mut event_pump = self
-            .sdl_context
-            .event_pump()
-            .map_err(|e| anyhow!(e))?;
+    /// Width of the emulated video frame (may be 0 before first frame).
+    pub fn video_width(&self) -> u32 {
+        self.callback_context.width
+            .max(self.av_info.as_ref().map_or(0, |a| a.geometry.base_width))
+    }
 
-        let mut last_frame = Instant::now();
+    /// Height of the emulated video frame.
+    pub fn video_height(&self) -> u32 {
+        self.callback_context.height
+            .max(self.av_info.as_ref().map_or(0, |a| a.geometry.base_height))
+    }
 
-        loop {
-            // --- Event polling ---
-            let mut should_quit = false;
-            for event in event_pump.poll_iter() {
-                if self.input.handle_event(&event) {
-                    should_quit = true;
+    /// Target FPS reported by the core.
+    pub fn fps(&self) -> f64 {
+        self.av_info.as_ref().map_or(60.0, |a| a.timing.fps)
+    }
+
+    /// Target audio sample rate.
+    pub fn sample_rate(&self) -> f64 {
+        self.av_info.as_ref().map_or(44100.0, |a| a.timing.sample_rate)
+    }
+
+    /// Push controller state into the callback context before calling run_frame().
+    pub fn set_input(&mut self, state: [bool; 12]) {
+        self.callback_context.input_state = state;
+    }
+
+    /// Capture M68K and Z80 CPU state from the core (fbalpha2012-specific).
+    fn capture_cpu_state(&self) {
+        if let Ok(mut ds) = self.debug_state.try_lock() {
+            // Try to read M68K registers (D0-D7)
+            for i in 0..8 {
+                let reg = match i {
+                    0 => SekRegister::D0, 1 => SekRegister::D1, 2 => SekRegister::D2, 3 => SekRegister::D3,
+                    4 => SekRegister::D4, 5 => SekRegister::D5, 6 => SekRegister::D6, 7 => SekRegister::D7,
+                    _ => continue,
+                };
+                if let Ok(val) = self.core.get_m68k_register(reg) {
+                    ds.m68k_d_regs[i as usize] = val;
                 }
             }
-            if should_quit {
-                break;
+            
+            // A0-A7
+            for i in 0..8 {
+                let reg = match i {
+                    0 => SekRegister::A0, 1 => SekRegister::A1, 2 => SekRegister::A2, 3 => SekRegister::A3,
+                    4 => SekRegister::A4, 5 => SekRegister::A5, 6 => SekRegister::A6, 7 => SekRegister::A7,
+                    _ => continue,
+                };
+                if let Ok(val) = self.core.get_m68k_register(reg) {
+                    ds.m68k_a_regs[i as usize] = val;
+                }
+            }
+            
+            // PC and SR
+            if let Ok(pc) = self.core.get_m68k_register(SekRegister::PC) {
+                ds.m68k_pc = pc;
+            }
+            if let Ok(sr) = self.core.get_m68k_register(SekRegister::SR) {
+                ds.m68k_sr = sr;
             }
 
-            // F12: signal main thread to open debug window
-            if self.input.f12_pressed {
-                self.input.f12_pressed = false;
-                self.debug_spawned = true; // flag used for title hint
-                self.debug_state.lock().unwrap().debug_open = true;
+            // Try to read Z80 registers (need to be careful about which CPU)
+            if let Ok(pc) = self.core.get_z80_pc(0) {
+                ds.z80_pc = (pc & 0xFFFF) as u16;
             }
-
-            // Sync input → callback context AND debug state
-            self.callback_context.input_state = self.input.joypad_state;
-            {
-                let mut ds = self.debug_state.lock().unwrap();
-                ds.push_input(self.input.joypad_state, self.frame_count);
-                ds.frame_count = self.frame_count;
+            if let Ok(bc) = self.core.get_z80_bc(0) {
+                ds.z80_bc = (bc & 0xFFFF) as u16;
             }
+            if let Ok(de) = self.core.get_z80_de(0) {
+                ds.z80_de = (de & 0xFFFF) as u16;
+            }
+            if let Ok(hl) = self.core.get_z80_hl(0) {
+                ds.z80_hl = (hl & 0xFFFF) as u16;
+            }
+        }
+    }
 
-            // --- Check pause / triggers ---
-            let paused = {
-                let mut ds = self.debug_state.lock().unwrap();
+    /// Run exactly one emulation frame. Returns true if a new video frame was produced.
+    pub fn run_frame(&mut self) -> Result<bool> {
+        // --- Check pause / triggers ---
+        let paused = {
+            let mut ds = self.debug_state.lock().unwrap();
+            ds.push_input(self.callback_context.input_state, self.frame_count);
+            ds.frame_count = self.frame_count;
 
-                // Frame trigger
-                if let Some(tf) = ds.trigger_frame {
-                    if tf < u64::MAX - 12 && self.frame_count >= tf {
+            if let Some(tf) = ds.trigger_frame {
+                if tf < u64::MAX - 12 && self.frame_count >= tf {
+                    ds.paused = true;
+                    ds.trigger_frame = None;
+                    ds.log(format!("⏸ Paused at frame {}", self.frame_count));
+                }
+                if tf >= u64::MAX - 12 {
+                    let btn = (u64::MAX - tf) as usize;
+                    if btn < 12 && self.callback_context.input_state[btn] {
                         ds.paused = true;
                         ds.trigger_frame = None;
-                        ds.log(format!("⏸ Paused at frame {}", self.frame_count));
+                        ds.log(format!("⏸ Button trigger fired: btn={}", btn));
                     }
-                    // Button trigger (encoded as u64::MAX - btn_index)
-                    if tf >= u64::MAX - 12 {
-                        let btn = (u64::MAX - tf) as usize;
-                        if btn < 12 && self.input.joypad_state[btn] {
+                }
+            }
+
+            if let Some((px, py)) = ds.trigger_pixel {
+                if px < ds.fb_width && py < ds.fb_height && !ds.fb_rgba.is_empty() {
+                    let idx = (py as usize * ds.fb_width as usize + px as usize) * 4;
+                    if idx + 2 < ds.fb_rgba.len() {
+                        let (r, g, b) = (ds.fb_rgba[idx], ds.fb_rgba[idx+1], ds.fb_rgba[idx+2]);
+                        if r != 0 || g != 0 || b != 0 {
                             ds.paused = true;
-                            ds.trigger_frame = None;
-                            ds.log(format!("⏸ Button trigger fired: btn={}", btn));
+                            ds.trigger_pixel = None;
+                            ds.log(format!("⏸ Pixel trigger ({px},{py}) = #{r:02X}{g:02X}{b:02X}"));
                         }
                     }
                 }
-
-                // Pixel trigger — checked after video_callback populates fb_rgba
-                if let Some((px, py)) = ds.trigger_pixel {
-                    if px < ds.fb_width && py < ds.fb_height && !ds.fb_rgba.is_empty() {
-                        let idx = (py as usize * ds.fb_width as usize + px as usize) * 4;
-                        if idx + 2 < ds.fb_rgba.len() {
-                            let r = ds.fb_rgba[idx];
-                            let g = ds.fb_rgba[idx + 1];
-                            let b = ds.fb_rgba[idx + 2];
-                            if r != 0 || g != 0 || b != 0 {
-                                ds.paused = true;
-                                ds.trigger_pixel = None;
-                                ds.log(format!("⏸ Pixel trigger ({px},{py}) = #{r:02X}{g:02X}{b:02X}"));
-                            }
-                        }
-                    }
-                }
-
-                let p = ds.paused;
-                // Handle step-one: run one frame then re-pause
-                if ds.step_one {
-                    ds.step_one = false;
-                    false // run this frame
-                } else {
-                    p
-                }
-            };
-
-            if paused {
-                // Sleep briefly and loop without running the core
-                std::thread::sleep(std::time::Duration::from_millis(16));
-                continue;
             }
 
-            // --- Run one emulation frame ---
-            self.core
-                .run()
-                .map_err(|e| anyhow!("Core execution failed: {}", e))?;
-
-            self.frame_count += 1;
-
-            // --- Apply any AV info update from the core ---
-            if let Some(new_info) = self.callback_context.pending_av_info.take() {
-                let av = new_info.to_rust();
-                let w = av.geometry.base_width;
-                let h = av.geometry.base_height;
-                self.graphics.resize_window(w, h);
-                {
-                    let mut ds = self.debug_state.lock().unwrap();
-                    ds.av_width = w;
-                    ds.av_height = h;
-                    ds.fps = av.timing.fps;
-                    ds.log(format!("AV info updated: {}×{} @ {:.2}fps", w, h, av.timing.fps));
-                }
-                if self.enable_audio {
-                    let sr = if av.timing.sample_rate > 0.0 {
-                        av.timing.sample_rate
-                    } else {
-                        48000.0
-                    };
-                    if let Ok(new_audio) = Audio::new(&self.sdl_context, sr) {
-                        self.audio = Some(new_audio);
-                    }
-                }
-                self.av_info = Some(av);
+            if ds.step_one {
+                ds.step_one = false;
+                false
+            } else {
+                ds.paused
             }
+        };
 
-            // --- Render ---
-            let has_frame = {
-                let ctx = &self.callback_context;
-                !ctx.framebuffer.is_empty() && ctx.width > 0 && ctx.height > 0
-            };
-            if has_frame {
-                let ctx = &self.callback_context;
-                if let Err(e) = self.graphics.render_frame(
-                    &ctx.framebuffer,
-                    ctx.width,
-                    ctx.height,
-                    ctx.pitch,
-                    ctx.pixel_format,
-                ) {
-                    if self.frame_count % 60 == 1 {
-                        eprintln!("[RENDER ERR] {}", e);
-                    }
-                }
-            }
+        if paused { return Ok(false); }
 
-            // Update debug state video counters
+        // --- Run emulation frame ---
+        self.core
+            .run()
+            .map_err(|e| anyhow!("Core execution failed: {}", e))?;
+        self.frame_count += 1;
+
+        // --- Capture CPU state (fbalpha2012 debug API) ---
+        self.capture_cpu_state();
+
+        // --- Apply pending AV info change ---
+        if let Some(new_info) = self.callback_context.pending_av_info.take() {
+            let av = new_info.to_rust();
             {
-                let ctx = &self.callback_context;
                 let mut ds = self.debug_state.lock().unwrap();
-                ds.video_frames = ctx.video_frames;
-                ds.video_real = ctx.video_real;
+                ds.av_width = av.geometry.base_width;
+                ds.av_height = av.geometry.base_height;
+                ds.fps = av.timing.fps;
+                ds.log(format!("AV info updated: {}×{} @ {:.2}fps",
+                    av.geometry.base_width, av.geometry.base_height, av.timing.fps));
             }
-
-            // Update window title every 60 frames
-            if self.frame_count % 60 == 0 {
-                let ctx = &self.callback_context;
-                let title = format!(
-                    "RustRetro | run:{} vid:{} real:{} | {}x{} fmt={} [F12=debug]",
-                    self.frame_count, ctx.video_frames, ctx.video_real,
-                    ctx.width, ctx.height, ctx.pixel_format
-                );
-                let _ = self.graphics.set_title(&title);
-            }
-
-            // --- Audio ---
-            if self.enable_audio {
-                if let Some(ref audio) = self.audio {
-                    let samples = &self.callback_context.pending_audio;
-                    if !samples.is_empty() {
-                        audio.queue_audio(samples);
-                    }
-                }
-            }
-            self.callback_context.pending_audio.clear();
-
-            // --- Frame timing ---
-            if let Some(ref av_info) = self.av_info {
-                let target = std::time::Duration::from_secs_f64(1.0 / av_info.timing.fps);
-                let elapsed = last_frame.elapsed();
-                if elapsed < target {
-                    std::thread::sleep(target - elapsed);
-                }
-            }
-            last_frame = Instant::now();
+            self.av_info = Some(av);
         }
 
-        self.core
-            .unload_game()
-            .map_err(|e| anyhow!("Failed to unload game: {}", e))?;
-        self.core
-            .deinit()
-            .map_err(|e| anyhow!("Failed to deinitialize core: {}", e))?;
+        // --- Update debug video counters ---
+        {
+            let ctx = &self.callback_context;
+            let mut ds = self.debug_state.lock().unwrap();
+            ds.video_frames = ctx.video_frames;
+            ds.video_real = ctx.video_real;
+        }
 
-        Ok(())
+        Ok(self.callback_context.video_real > 0)
+    }
+
+    /// Borrow the current framebuffer: (data, width, height, pitch, pixel_format).
+    pub fn framebuffer(&self) -> Option<(&[u8], u32, u32, usize, u32)> {
+        let ctx = &self.callback_context;
+        if ctx.framebuffer.is_empty() || ctx.width == 0 || ctx.height == 0 {
+            None
+        } else {
+            Some((&ctx.framebuffer, ctx.width, ctx.height, ctx.pitch, ctx.pixel_format))
+        }
+    }
+
+    /// Drain all queued audio samples (stereo interleaved i16).
+    pub fn drain_audio(&mut self) -> Vec<i16> {
+        std::mem::take(&mut self.callback_context.pending_audio)
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self.core.unload_game();
+        let _ = self.core.deinit();
+    }
+}
+
+impl Drop for Frontend {
+    fn drop(&mut self) {
+        CALLBACK_CONTEXT.store(std::ptr::null_mut(), Ordering::SeqCst);
     }
 }
 
@@ -388,7 +341,6 @@ impl CallbackContext {
                 RETRO_ENVIRONMENT_SET_PIXEL_FORMAT => {
                     if !data.is_null() {
                         let format = *(data as *const u32);
-                        // Accept all three libretro pixel formats
                         if format <= RETRO_PIXEL_FORMAT_RGB565 {
                             self.pixel_format = format;
                             return true;
@@ -404,16 +356,14 @@ impl CallbackContext {
                 }
                 RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY => {
                     if !data.is_null() {
-                        let ptr = data as *mut *const i8;
-                        *ptr = self.system_dir_buffer.as_ptr() as *const i8;
+                        *(data as *mut *const i8) = self.system_dir_buffer.as_ptr() as *const i8;
                         return true;
                     }
                     false
                 }
                 RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY => {
                     if !data.is_null() {
-                        let ptr = data as *mut *const i8;
-                        *ptr = self.save_dir_buffer.as_ptr() as *const i8;
+                        *(data as *mut *const i8) = self.save_dir_buffer.as_ptr() as *const i8;
                         return true;
                     }
                     false
@@ -423,62 +373,44 @@ impl CallbackContext {
                 RETRO_ENVIRONMENT_GET_LOG_INTERFACE => {
                     if !data.is_null() {
                         unsafe extern "C" fn core_log(level: u32, msg: *const std::ffi::c_char) {
-                            let prefix = match level {
-                                0 => "[CORE DBG]",
-                                1 => "[CORE INF]",
-                                2 => "[CORE WRN]",
-                                _ => "[CORE ERR]",
-                            };
+                            let prefix = match level { 0=>"[CORE DBG]", 1=>"[CORE INF]", 2=>"[CORE WRN]", _=>"[CORE ERR]" };
                             if !msg.is_null() {
                                 let s = std::ffi::CStr::from_ptr(msg).to_string_lossy();
                                 eprintln!("{} {}", prefix, s.trim_end());
                             }
                         }
-                        (*(data as *mut RetroLogCallback)).log =
-                            core_log as *const std::ffi::c_void;
+                        (*(data as *mut RetroLogCallback)).log = core_log as *const std::ffi::c_void;
                         return true;
                     }
                     false
                 }
                 RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION => {
-                    if !data.is_null() {
-                        *(data as *mut u32) = 0;
-                    }
+                    if !data.is_null() { *(data as *mut u32) = 0; }
                     true
                 }
                 RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE => {
-                    if !data.is_null() {
-                        *(data as *mut bool) = false;
-                    }
+                    if !data.is_null() { *(data as *mut bool) = false; }
                     true
                 }
                 RETRO_ENVIRONMENT_GET_LANGUAGE => {
-                    if !data.is_null() {
-                        *(data as *mut u32) = 0; // English
-                    }
+                    if !data.is_null() { *(data as *mut u32) = 0; }
                     true
                 }
                 RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE => {
-                    if !data.is_null() {
-                        *(data as *mut i32) = 1 | 2; // audio + video
-                    }
+                    if !data.is_null() { *(data as *mut i32) = 1 | 2; }
                     true
                 }
                 RETRO_ENVIRONMENT_SET_MESSAGE => {
                     if !data.is_null() {
                         let msg = *(data as *const RetroMessage);
                         if !msg.msg.is_null() {
-                            let s = std::ffi::CStr::from_ptr(msg.msg as *const _)
-                                .to_string_lossy();
+                            let s = std::ffi::CStr::from_ptr(msg.msg as *const _).to_string_lossy();
                             eprintln!("[CORE MSG] {}", s.trim_end());
                         }
                     }
                     true
                 }
-                RETRO_ENVIRONMENT_SHUTDOWN => {
-                    eprintln!("[CORE] Shutdown requested");
-                    false
-                }
+                RETRO_ENVIRONMENT_SHUTDOWN => { eprintln!("[CORE] Shutdown requested"); false }
                 RETRO_ENVIRONMENT_SET_VARIABLES
                 | RETRO_ENVIRONMENT_SET_CORE_OPTIONS
                 | RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL
@@ -493,12 +425,14 @@ impl CallbackContext {
                 | RETRO_ENVIRONMENT_SET_SUBSYSTEM_INFO
                 | RETRO_ENVIRONMENT_SET_CONTROLLER_INFO
                 | RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS => true,
-                RETRO_ENVIRONMENT_GET_CAN_DUPE => {
-                    // Tell core it may submit NULL to video_refresh to repeat last frame.
-                    // MAME does this; returning false doesn't stop it, just breaks timing.
+                RETRO_ENVIRONMENT_SET_MEMORY_MAPS => {
                     if !data.is_null() {
-                        *(data as *mut bool) = true;
+                        self.handle_set_memory_maps(data as *const RetroMemoryMap);
                     }
+                    true
+                }
+                RETRO_ENVIRONMENT_GET_CAN_DUPE => {
+                    if !data.is_null() { *(data as *mut bool) = true; }
                     true
                 }
                 RETRO_ENVIRONMENT_GET_LED_INTERFACE
@@ -506,6 +440,64 @@ impl CallbackContext {
                 | RETRO_ENVIRONMENT_GET_OVERSCAN
                 | RETRO_ENVIRONMENT_GET_USERNAME => false,
                 _ => false,
+            }
+        }
+    }
+
+    fn handle_set_memory_maps(&mut self, map: *const RetroMemoryMap) {
+        unsafe {
+            if map.is_null() {
+                return;
+            }
+            let map = *map;
+            if map.descriptors.is_null() {
+                return;
+            }
+
+            let mut regions = Vec::new();
+            for i in 0..map.num_descriptors {
+                let desc = &*map.descriptors.add(i as usize);
+                // Stop at null ptr (sentinel)
+                if desc.ptr.is_null() {
+                    break;
+                }
+
+                let addr_start = desc.start;
+                let addr_end = desc.start + desc.len - 1;
+                let name = if !desc.addrspace.is_null() {
+                    std::ffi::CStr::from_ptr(desc.addrspace)
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    if desc.flags & crate::libretro::RETRO_MEMDESC_VIDEO_RAM != 0 {
+                        "VRAM".to_string()
+                    } else if desc.flags & crate::libretro::RETRO_MEMDESC_SAVE_RAM != 0 {
+                        "SRAM".to_string()
+                    } else if desc.flags & crate::libretro::RETRO_MEMDESC_SYSTEM_RAM != 0 {
+                        "System RAM".to_string()
+                    } else if desc.flags & crate::libretro::RETRO_MEMDESC_CONST != 0 {
+                        "ROM".to_string()
+                    } else {
+                        "Memory".to_string()
+                    }
+                };
+
+                let region = crate::debug::MemoryRegion {
+                    name,
+                    addr_start,
+                    addr_end,
+                    size: desc.len,
+                    flags: desc.flags,
+                    ptr: desc.ptr as usize,
+                    offset: desc.offset,
+                    select: desc.select,
+                    disconnect: desc.disconnect,
+                };
+                regions.push(region);
+            }
+
+            if let Ok(mut ds) = self.debug_state.try_lock() {
+                ds.memory_regions = regions;
             }
         }
     }
@@ -524,7 +516,6 @@ impl CallbackContext {
             self.pitch = pitch;
             self.video_real += 1;
 
-            // Push real frame to debug state
             if let Ok(mut ds) = self.debug_state.try_lock() {
                 unsafe {
                     let slice = std::slice::from_raw_parts(data as *const u8, bytes);
@@ -559,18 +550,11 @@ impl CallbackContext {
 
 extern "C" fn static_environment_callback(cmd: c_uint, data: *mut c_void) -> bool {
     let ctx_ptr = CALLBACK_CONTEXT.load(Ordering::SeqCst);
-    if ctx_ptr.is_null() {
-        return false;
-    }
+    if ctx_ptr.is_null() { return false; }
     unsafe { (*ctx_ptr).environment_callback(cmd as u32, data) }
 }
 
-extern "C" fn static_video_callback(
-    data: *const c_void,
-    width: u32,
-    height: u32,
-    pitch: usize,
-) {
+extern "C" fn static_video_callback(data: *const c_void, width: u32, height: u32, pitch: usize) {
     let ctx_ptr = CALLBACK_CONTEXT.load(Ordering::SeqCst);
     if !ctx_ptr.is_null() {
         unsafe { (*ctx_ptr).video_callback(data, width, height, pitch) };
@@ -581,9 +565,7 @@ extern "C" fn static_input_poll_callback() {}
 
 extern "C" fn static_input_state_callback(port: u32, device: u32, index: u32, id: u32) -> i16 {
     let ctx_ptr = CALLBACK_CONTEXT.load(Ordering::SeqCst);
-    if ctx_ptr.is_null() {
-        return 0;
-    }
+    if ctx_ptr.is_null() { return 0; }
     unsafe { (*ctx_ptr).input_state_callback(port, device, index, id) }
 }
 
@@ -591,8 +573,6 @@ extern "C" fn static_audio_callback(_left: i16, _right: i16) {}
 
 extern "C" fn static_audio_batch_callback(data: *const i16, frames: usize) -> usize {
     let ctx_ptr = CALLBACK_CONTEXT.load(Ordering::SeqCst);
-    if ctx_ptr.is_null() {
-        return frames;
-    }
+    if ctx_ptr.is_null() { return frames; }
     unsafe { (*ctx_ptr).audio_batch_callback(data, frames) }
 }

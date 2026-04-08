@@ -1,4 +1,4 @@
-use eframe::egui;
+use bevy_egui::egui;
 use std::sync::{Arc, Mutex};
 use crate::debug::DebugState;
 

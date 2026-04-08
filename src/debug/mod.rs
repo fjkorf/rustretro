@@ -6,6 +6,63 @@ use std::sync::{Arc, Mutex};
 
 pub type SharedDebugState = Arc<Mutex<DebugState>>;
 
+/// Memory region descriptor (from libretro SET_MEMORY_MAPS callback)
+#[derive(Clone)]
+pub struct MemoryRegion {
+    pub name: String,           // e.g., "System RAM", "ROM"
+    pub addr_start: usize,      // emulated address start
+    pub addr_end: usize,        // emulated address end (inclusive)
+    pub size: usize,
+    pub flags: u64,             // RETRO_MEMDESC_* flags
+    pub ptr: usize,             // host pointer (cast to *const u8 for reads)
+    pub offset: usize,          // offset within ptr
+    pub select: usize,          // address mask
+    pub disconnect: usize,      // address disconnect mask
+}
+
+impl MemoryRegion {
+    /// Compute host pointer for an emulated address within this region.
+    pub fn host_ptr_for_addr(&self, emu_addr: usize) -> Option<usize> {
+        if emu_addr < self.addr_start || emu_addr > self.addr_end {
+            return None;
+        }
+        // Formula from libretro spec:
+        // host_addr = ptr + offset + (emu_addr & ~disconnect) - start
+        Some(self.ptr + self.offset + ((emu_addr & !self.disconnect) - self.addr_start))
+    }
+
+    /// Get region type as human-readable string.
+    pub fn region_type(&self) -> &'static str {
+        const RETRO_MEMDESC_CONST: u64 = 1 << 0;
+        const RETRO_MEMDESC_SYSTEM_RAM: u64 = 1 << 2;
+        const RETRO_MEMDESC_SAVE_RAM: u64 = 1 << 3;
+        const RETRO_MEMDESC_VIDEO_RAM: u64 = 1 << 4;
+
+        if self.flags & RETRO_MEMDESC_VIDEO_RAM != 0 { "VRAM" }
+        else if self.flags & RETRO_MEMDESC_SAVE_RAM != 0 { "SRAM" }
+        else if self.flags & RETRO_MEMDESC_SYSTEM_RAM != 0 { "RAM" }
+        else if self.flags & RETRO_MEMDESC_CONST != 0 { "ROM" }
+        else { "Unmapped" }
+    }
+
+    /// Get color for this region type (for UI display).
+    pub fn color(&self) -> (u8, u8, u8) {
+        match self.region_type() {
+            "ROM" => (100, 150, 255),    // blue
+            "RAM" => (200, 200, 200),    // white
+            "VRAM" => (255, 200, 100),   // yellow
+            "SRAM" => (200, 100, 255),   // magenta
+            _ => (100, 100, 100),        // gray
+        }
+    }
+
+    /// Check if region is read-only (ROM).
+    pub fn is_readonly(&self) -> bool {
+        const RETRO_MEMDESC_CONST: u64 = 1 << 0;
+        self.flags & RETRO_MEMDESC_CONST != 0
+    }
+}
+
 /// All data shared from the emulation thread → debug window.
 pub struct DebugState {
     // --- Framebuffer ---
@@ -20,6 +77,22 @@ pub struct DebugState {
     pub fb_rgba: Vec<u8>,
     /// Incremented every time a new real frame arrives.
     pub fb_generation: u64,
+
+    // --- Memory regions ---
+    /// Accessible memory regions (from SET_MEMORY_MAPS callback)
+    pub memory_regions: Vec<MemoryRegion>,
+
+    // --- M68K CPU State ---
+    pub m68k_d_regs: [u32; 8],     // D0-D7
+    pub m68k_a_regs: [u32; 8],     // A0-A7
+    pub m68k_pc: u32,              // Program Counter
+    pub m68k_sr: u32,              // Status Register
+
+    // --- Z80 CPU State ---
+    pub z80_pc: u16,               // Program Counter
+    pub z80_bc: u16,               // BC register pair
+    pub z80_de: u16,               // DE register pair
+    pub z80_hl: u16,               // HL register pair
 
     // --- Frame counters ---
     pub frame_count: u64,
@@ -61,6 +134,15 @@ impl DebugState {
             fb_fmt: 0,
             fb_rgba: Vec::new(),
             fb_generation: 0,
+            memory_regions: Vec::new(),
+            m68k_d_regs: [0; 8],
+            m68k_a_regs: [0; 8],
+            m68k_pc: 0,
+            m68k_sr: 0,
+            z80_pc: 0,
+            z80_bc: 0,
+            z80_de: 0,
+            z80_hl: 0,
             frame_count: 0,
             video_frames: 0,
             video_real: 0,

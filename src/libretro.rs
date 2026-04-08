@@ -43,6 +43,14 @@ pub const RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL: u32 = 68;
 pub const RETRO_ENVIRONMENT_GET_VFS_INTERFACE: u32 = 45 | RETRO_ENVIRONMENT_EXPERIMENTAL; // 65581
 pub const RETRO_ENVIRONMENT_GET_LED_INTERFACE: u32 = 46 | RETRO_ENVIRONMENT_EXPERIMENTAL; // 65582
 pub const RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE: u32 = 47 | RETRO_ENVIRONMENT_EXPERIMENTAL; // 65583
+pub const RETRO_ENVIRONMENT_SET_MEMORY_MAPS: u32 = 36 | RETRO_ENVIRONMENT_EXPERIMENTAL; // 65572
+
+// Memory descriptor flags
+pub const RETRO_MEMDESC_CONST: u64 = 1 << 0;
+pub const RETRO_MEMDESC_BIGENDIAN: u64 = 1 << 1;
+pub const RETRO_MEMDESC_SYSTEM_RAM: u64 = 1 << 2;
+pub const RETRO_MEMDESC_SAVE_RAM: u64 = 1 << 3;
+pub const RETRO_MEMDESC_VIDEO_RAM: u64 = 1 << 4;
 
 // Pixel format constants (retro_pixel_format enum values)
 pub const RETRO_PIXEL_FORMAT_0RGB1555: u32 = 0; // legacy default
@@ -167,6 +175,26 @@ pub struct RetroLogCallback {
 pub struct RetroMessage {
     pub msg: *const std::ffi::c_char,
     pub frames: u32,
+}
+
+#[repr(C)]
+#[derive(Clone)]
+pub struct RetroMemoryDescriptor {
+    pub flags: u64,
+    pub ptr: *mut c_void,
+    pub offset: usize,
+    pub start: usize,
+    pub select: usize,
+    pub disconnect: usize,
+    pub len: usize,
+    pub addrspace: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RetroMemoryMap {
+    pub descriptors: *const RetroMemoryDescriptor,
+    pub num_descriptors: u32,
 }
 
 pub struct RetroCore {
@@ -372,6 +400,100 @@ impl RetroCore {
         }
     }
 
+    // ========================================================================
+    // Debug APIs (fbalpha2012)
+    // ========================================================================
+
+    pub fn get_m68k_register(&self, reg: SekRegister) -> Result<u32, LibretroError> {
+        unsafe {
+            let func: Symbol<SekDbgGetRegisterFn> = self
+                .library
+                .get(b"__Z17SekDbgGetRegister11SekRegister")
+                .map_err(|_| LibretroError::CoreNotLoaded)?;
+            Ok(func(reg))
+        }
+    }
+
+    pub fn set_m68k_register(&self, reg: SekRegister, value: u32) -> Result<bool, LibretroError> {
+        unsafe {
+            let func: Symbol<SekDbgSetRegisterFn> = self
+                .library
+                .get(b"__Z17SekDbgSetRegister11SekRegisterj")
+                .map_err(|_| LibretroError::CoreNotLoaded)?;
+            Ok(func(reg, value))
+        }
+    }
+
+    pub fn get_m68k_cpu_type(&self) -> Result<i32, LibretroError> {
+        unsafe {
+            let func: Symbol<SekDbgGetCPUTypeFn> = self
+                .library
+                .get(b"__Z16SekDbgGetCPUTypev")
+                .map_err(|_| LibretroError::CoreNotLoaded)?;
+            Ok(func())
+        }
+    }
+
+    pub fn get_m68k_pending_irq(&self) -> Result<i32, LibretroError> {
+        unsafe {
+            let func: Symbol<SekDbgGetPendingIRQFn> = self
+                .library
+                .get(b"__Z19SekDbgGetPendingIRQv")
+                .map_err(|_| LibretroError::CoreNotLoaded)?;
+            Ok(func())
+        }
+    }
+
+    pub fn get_z80_pc(&self, cpu: i32) -> Result<i32, LibretroError> {
+        unsafe {
+            let func: Symbol<ZetGetPCFn> = self
+                .library
+                .get(b"__Z8ZetGetPCi")
+                .map_err(|_| LibretroError::CoreNotLoaded)?;
+            Ok(func(cpu))
+        }
+    }
+
+    pub fn get_z80_bc(&self, cpu: i32) -> Result<i32, LibretroError> {
+        unsafe {
+            let func: Symbol<ZetBcFn> = self
+                .library
+                .get(b"__Z5ZetBci")
+                .map_err(|_| LibretroError::CoreNotLoaded)?;
+            Ok(func(cpu))
+        }
+    }
+
+    pub fn get_z80_de(&self, cpu: i32) -> Result<i32, LibretroError> {
+        unsafe {
+            let func: Symbol<ZetDeFn> = self
+                .library
+                .get(b"__Z5ZetDei")
+                .map_err(|_| LibretroError::CoreNotLoaded)?;
+            Ok(func(cpu))
+        }
+    }
+
+    pub fn get_z80_hl(&self, cpu: i32) -> Result<i32, LibretroError> {
+        unsafe {
+            let func: Symbol<ZetHLFn> = self
+                .library
+                .get(b"__Z5ZetHLi")
+                .map_err(|_| LibretroError::CoreNotLoaded)?;
+            Ok(func(cpu))
+        }
+    }
+
+    pub fn get_z80_active(&self) -> Result<i32, LibretroError> {
+        unsafe {
+            let func: Symbol<ZetGetActiveFn> = self
+                .library
+                .get(b"__Z12ZetGetActivev")
+                .map_err(|_| LibretroError::CoreNotLoaded)?;
+            Ok(func())
+        }
+    }
+
     pub fn deinit(&self) -> Result<(), LibretroError> {
         unsafe {
             let func: Symbol<extern "C" fn()> = self
@@ -413,3 +535,39 @@ fn cstring_to_string(ptr: *const c_char) -> String {
         }
     }
 }
+
+// ============================================================================
+// M68000 CPU Debug API (from fbalpha2012)
+// ============================================================================
+
+#[repr(C)]
+pub enum SekRegister {
+    D0, D1, D2, D3, D4, D5, D6, D7,
+    A0, A1, A2, A3, A4, A5, A6, A7,
+    PC,
+    SR,
+    SP,
+    USP,
+    ISP,
+    MSP,
+    VBR,
+    SFC,
+    DFC,
+    CACR,
+    CAAR,
+}
+
+pub type SekDbgGetRegisterFn = extern "C" fn(SekRegister) -> u32;
+pub type SekDbgSetRegisterFn = extern "C" fn(SekRegister, u32) -> bool;
+pub type SekDbgGetCPUTypeFn = extern "C" fn() -> i32;
+pub type SekDbgGetPendingIRQFn = extern "C" fn() -> i32;
+
+// ============================================================================
+// Z80 CPU Debug API (from fbalpha2012)
+// ============================================================================
+
+pub type ZetGetPCFn = extern "C" fn(i32) -> i32;
+pub type ZetBcFn = extern "C" fn(i32) -> i32;
+pub type ZetDeFn = extern "C" fn(i32) -> i32;
+pub type ZetHLFn = extern "C" fn(i32) -> i32;
+pub type ZetGetActiveFn = extern "C" fn() -> i32;

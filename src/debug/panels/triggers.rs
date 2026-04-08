@@ -1,4 +1,4 @@
-use eframe::egui;
+use bevy_egui::egui;
 use std::sync::{Arc, Mutex};
 use crate::debug::DebugState;
 
@@ -58,7 +58,7 @@ impl Triggers {
         ui.horizontal(|ui| {
             ui.label("Frame #:");
             ui.add(egui::TextEdit::singleline(&mut self.frame_input).desired_width(100.0));
-            let cur = trigger_frame.map(|f| f.to_string()).unwrap_or_default();
+            let _cur = trigger_frame.map(|f| f.to_string()).unwrap_or_default();
             if ui.button("Set").clicked() {
                 if let Ok(n) = self.frame_input.trim().parse::<u64>() {
                     state.lock().unwrap().trigger_frame = Some(n);
