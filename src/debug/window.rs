@@ -98,20 +98,19 @@ impl eframe::App for DebugApp {
     }
 }
 
-/// Spawn the debug window in a background thread. Returns immediately.
-pub fn spawn(state: Arc<Mutex<DebugState>>) {
-    std::thread::spawn(move || {
-        let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_title("RustRetro Debugger")
-                .with_inner_size([1100.0, 700.0])
-                .with_min_inner_size([800.0, 500.0]),
-            ..Default::default()
-        };
-        let _ = eframe::run_native(
-            "RustRetro Debugger",
-            options,
-            Box::new(|cc| Ok(Box::new(DebugApp::new(state, cc)))),
-        );
-    });
+/// Run the debug window on the **calling thread** (must be main thread on macOS).
+/// Blocks until the user closes the debug window.
+pub fn run_main_thread(state: Arc<Mutex<DebugState>>) {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("RustRetro Debugger")
+            .with_inner_size([1100.0, 700.0])
+            .with_min_inner_size([800.0, 500.0]),
+        ..Default::default()
+    };
+    let _ = eframe::run_native(
+        "RustRetro Debugger",
+        options,
+        Box::new(|cc| Ok(Box::new(DebugApp::new(state, cc)))),
+    );
 }

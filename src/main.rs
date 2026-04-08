@@ -5,8 +5,9 @@ mod sdl_interface;
 
 use anyhow::Result;
 use clap::Parser;
-use frontend::Frontend;
+use debug::{DebugState, SharedDebugState};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 #[derive(Parser, Debug)]
 #[command(name = "RustRetro")]
@@ -39,12 +40,15 @@ struct Args {
     /// Disable audio output
     #[arg(long)]
     no_audio: bool,
+
+    /// Open debug window immediately on start
+    #[arg(long)]
+    debug: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Validate inputs
     if !std::path::Path::new(&args.core).exists() {
         anyhow::bail!("Core file not found: {}", args.core);
     }
@@ -54,26 +58,64 @@ fn main() -> Result<()> {
 
     eprintln!("RustRetro - Lightweight libretro Frontend");
     eprintln!("Core: {}", args.core);
-    eprintln!("ROM: {}", args.rom);
-    eprintln!("Save directory: {}", args.save_dir.display());
-    eprintln!("System directory: {}", args.system_dir.display());
-    eprintln!("Window scale: {}x", args.scale);
-    eprintln!("Audio: {}", if args.no_audio { "disabled" } else { "enabled" });
+    eprintln!("ROM:  {}", args.rom);
+    eprintln!("Press F12 in-game to open the debug window.");
     eprintln!();
 
-    let mut frontend = Frontend::new(
-        &args.core,
-        &args.rom,
-        args.save_dir,
-        args.system_dir,
-        args.scale,
-        args.fullscreen,
-        !args.no_audio,
-    )?;
+    // Shared state between emulation thread and debug window (main thread).
+    let debug_state: SharedDebugState = Arc::new(Mutex::new(DebugState::new()));
 
-    eprintln!("Starting emulation...\n");
-    frontend.run()?;
+    // Emulation runs in a background thread so the main thread can own the
+    // eframe event loop (macOS requires AppKit/NSApp on the main thread).
+    let emu_state = Arc::clone(&debug_state);
+    let core = args.core.clone();
+    let rom  = args.rom.clone();
+    let save_dir   = args.save_dir.clone();
+    let system_dir = args.system_dir.clone();
+    let scale      = args.scale;
+    let fullscreen = args.fullscreen;
+    let no_audio   = args.no_audio;
 
-    eprintln!("\nEmulation ended cleanly.");
+    let emu_thread = std::thread::spawn(move || {
+        let mut frontend = match frontend::Frontend::new(
+            &core, &rom, save_dir, system_dir, scale, fullscreen, !no_audio, emu_state,
+        ) {
+            Ok(f) => f,
+            Err(e) => { eprintln!("Frontend init error: {e}"); return; }
+        };
+        eprintln!("Starting emulation...");
+        if let Err(e) = frontend.run() {
+            eprintln!("Emulation error: {e}");
+        }
+        eprintln!("Emulation ended cleanly.");
+    });
+
+    // If --debug flag passed, open immediately; otherwise wait for F12 signal.
+    if args.debug {
+        debug_state.lock().unwrap().debug_open = true;
+    }
+
+    // Block main thread until debug window is requested, then run eframe.
+    // Poll in a tight loop until the emulation thread signals debug_open or exits.
+    loop {
+        // Check if emulation thread finished (user closed SDL window)
+        if emu_thread.is_finished() {
+            break;
+        }
+
+        let open = debug_state.lock().map(|s| s.debug_open).unwrap_or(false);
+        if open {
+            // eframe must run on the main thread on macOS
+            debug::window::run_main_thread(Arc::clone(&debug_state));
+            // After debug window closes, clear the flag so it can reopen
+            if let Ok(mut s) = debug_state.lock() {
+                s.debug_open = false;
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let _ = emu_thread.join();
     Ok(())
 }

@@ -1,5 +1,4 @@
 use crate::debug::{SharedDebugState, DebugState};
-use crate::debug::window as debug_window;
 use crate::libretro::*;
 use crate::sdl_interface::{Audio, Graphics, Input};
 use anyhow::{anyhow, Result};
@@ -35,13 +34,13 @@ impl Frontend {
         scale: u32,
         fullscreen: bool,
         enable_audio: bool,
+        debug_state: SharedDebugState,
     ) -> Result<Self> {
         let core = RetroCore::load(core_path)
             .map_err(|e| anyhow!("Failed to load core: {}", e))?;
 
         let sdl_context = sdl2::init().map_err(|e| anyhow!(e))?;
 
-        // Placeholder window — will be resized once AV info is known
         let graphics = Graphics::new(&sdl_context, 640, 480, scale, fullscreen)?;
 
         let audio = if enable_audio {
@@ -59,7 +58,6 @@ impl Frontend {
         eprintln!("Core: {} v{}", system_info.library_name, system_info.library_version);
         eprintln!("Valid extensions: {}", system_info.valid_extensions);
 
-        let debug_state = Arc::new(Mutex::new(DebugState::new()));
         let callback_context = Box::new(CallbackContext::new(save_dir, system_dir, Arc::clone(&debug_state)));
 
         let mut frontend = Frontend {
@@ -165,14 +163,10 @@ impl Frontend {
                 break;
             }
 
-            // F12: toggle debug window
+            // F12: signal main thread to open debug window
             if self.input.f12_pressed {
                 self.input.f12_pressed = false;
-                if !self.debug_spawned {
-                    debug_window::spawn(Arc::clone(&self.debug_state));
-                    self.debug_spawned = true;
-                }
-                // Toggle pause-on-open or just open; window manages itself
+                self.debug_spawned = true; // flag used for title hint
                 self.debug_state.lock().unwrap().debug_open = true;
             }
 
