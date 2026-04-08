@@ -12,10 +12,11 @@ use crate::debug::panels::{
     triggers::Triggers,
     cpu_state::CpuState,
     audio_controls::AudioControls,
+    disassembly::Disassembly,
 };
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab { FrameInspector, HexDump, TileViewer, InputMonitor, FrameLog, Triggers, CpuState, Audio }
+enum Tab { FrameInspector, HexDump, TileViewer, InputMonitor, FrameLog, Triggers, CpuState, Audio, Disasm }
 
 pub struct DebugApp {
     state: Arc<Mutex<DebugState>>,
@@ -69,6 +70,7 @@ impl DebugApp {
                 ui.selectable_value(&mut self.active_tab, Tab::TileViewer,     "🧩 Tiles");
                 ui.selectable_value(&mut self.active_tab, Tab::InputMonitor,   "🕹 Input");
                 ui.selectable_value(&mut self.active_tab, Tab::CpuState,       "🔧 CPU");
+                ui.selectable_value(&mut self.active_tab, Tab::Disasm,         "📜 Disasm");
                 ui.selectable_value(&mut self.active_tab, Tab::Audio,          "🔊 Audio");
                 ui.selectable_value(&mut self.active_tab, Tab::FrameLog,       "📜 Log");
                 ui.selectable_value(&mut self.active_tab, Tab::Triggers,       "⏸ Triggers");
@@ -92,6 +94,13 @@ impl DebugApp {
                 Tab::CpuState       => self.cpu_state.show(ui, &self.state),
                 Tab::FrameLog       => self.frame_log.show(ui, &self.state),
                 Tab::Triggers       => self.triggers.show(ui, &self.state),
+                Tab::Disasm => {
+                    if let Ok(ds) = self.state.lock() {
+                        Disassembly::show(ui, &ds);
+                    } else {
+                        ui.label("Error: Could not acquire debug state lock");
+                    }
+                }
                 Tab::Audio => {
                     if let Some(ref audio_ref) = self.audio {
                         if let Ok(mut audio) = audio_ref.lock() {

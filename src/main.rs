@@ -1,4 +1,6 @@
 mod audio;
+mod capstone_test;
+mod phase2_test;
 mod debug;
 mod frontend;
 mod libretro;
@@ -28,6 +30,8 @@ struct Args {
     #[arg(long, value_name = "FACTOR", default_value = "3")] scale: u32,
     #[arg(long)] no_audio: bool,
     #[arg(long)] debug: bool,
+    #[arg(long)] test_capstone: bool,
+    #[arg(long)] test_phase2: bool,
 }
 
 // ─── Bevy resources ──────────────────────────────────────────────────────────
@@ -54,6 +58,18 @@ struct AudioRes(AudioOutput);
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Run Capstone test if requested
+    if args.test_capstone {
+        capstone_test::run_capstone_tests();
+        return Ok(());
+    }
+
+    // Run Phase 2 test if requested
+    if args.test_phase2 {
+        phase2_test::run_phase2_tests();
+        return Ok(());
+    }
 
     if !std::path::Path::new(&args.core).exists() { anyhow::bail!("Core not found: {}", args.core); }
     if !std::path::Path::new(&args.rom).exists()  { anyhow::bail!("ROM not found: {}", args.rom); }

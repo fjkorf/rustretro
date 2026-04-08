@@ -13,6 +13,7 @@ bevy = "0.15"
 bevy_egui = "0.33"
 cpal = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }
+capstone = "0.12"
 
 [profile.release]
 opt-level = 3
