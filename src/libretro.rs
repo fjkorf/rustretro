@@ -448,6 +448,20 @@ impl RetroCore {
         }
     }
 
+    /// Read `count` bytes from M68K address space starting at `addr` using
+    /// SekFetchByte (instruction fetch — no I/O side effects).
+    /// Returns an empty Vec if the symbol is unavailable (non-fbalpha2012 core).
+    pub fn read_m68k_code(&self, addr: u32, count: usize) -> Vec<u8> {
+        unsafe {
+            match self.library.get::<Symbol<SekFetchByteFn>>(b"_Z12SekFetchBytej") {
+                Ok(fetch) => (0..count as u32)
+                    .map(|i| fetch(addr.wrapping_add(i)))
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+    }
+
     pub fn get_z80_pc(&self, cpu: i32) -> Result<i32, LibretroError> {
         unsafe {
             let func: Symbol<ZetGetPCFn> = self
@@ -565,6 +579,7 @@ pub type SekDbgGetRegisterFn = extern "C" fn(SekRegister) -> u32;
 pub type SekDbgSetRegisterFn = extern "C" fn(SekRegister, u32) -> bool;
 pub type SekDbgGetCPUTypeFn = extern "C" fn() -> i32;
 pub type SekDbgGetPendingIRQFn = extern "C" fn() -> i32;
+pub type SekFetchByteFn = extern "C" fn(u32) -> u8;
 
 // ============================================================================
 // Z80 CPU Debug API (from fbalpha2012)

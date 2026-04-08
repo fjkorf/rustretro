@@ -234,11 +234,20 @@ impl Frontend {
                 Err(_) => {}
             }
             
+            // Fetch code bytes at PC for disassembly panel (256 bytes via SekFetchByte)
+            if ds.m68k_pc > 0 {
+                let code = self.core.read_m68k_code(ds.m68k_pc, 256);
+                if !code.is_empty() {
+                    ds.m68k_code_bytes = code;
+                    ds.m68k_code_start = ds.m68k_pc;
+                }
+            }
+
             if self.frame_count % 300 == 0 {
                 if any_success {
                     eprintln!("[CPU] ✓ CPU state captured (M68K PC=${:06X})", ds.m68k_pc);
                 } else {
-                    eprintln!("[CPU] ✗ No CPU state data available (possible issue with debug API)");
+                    eprintln!("[CPU] ✗ No CPU state data available");
                 }
             }
         } else if self.frame_count % 300 == 0 {

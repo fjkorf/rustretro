@@ -82,6 +82,13 @@ pub struct DebugState {
     /// Accessible memory regions (from SET_MEMORY_MAPS callback)
     pub memory_regions: Vec<MemoryRegion>,
 
+    // --- M68K code bytes for disassembly ---
+    /// Raw bytes fetched from M68K address space starting at `m68k_code_start`.
+    /// Populated each frame via SekFetchByte when available; empty otherwise.
+    pub m68k_code_bytes: Vec<u8>,
+    /// Guest address of the first byte in `m68k_code_bytes`.
+    pub m68k_code_start: u32,
+
     // --- M68K CPU State ---
     pub m68k_d_regs: [u32; 8],     // D0-D7
     pub m68k_a_regs: [u32; 8],     // A0-A7
@@ -135,6 +142,8 @@ impl DebugState {
             fb_rgba: Vec::new(),
             fb_generation: 0,
             memory_regions: Vec::new(),
+            m68k_code_bytes: Vec::new(),
+            m68k_code_start: 0,
             m68k_d_regs: [0; 8],
             m68k_a_regs: [0; 8],
             m68k_pc: 0,

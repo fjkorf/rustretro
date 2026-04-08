@@ -11,13 +11,11 @@ impl Disassembly {
             ui.heading("📜 Disassembly");
             ui.separator();
 
-            // Display current M68K PC
             ui.horizontal(|ui| {
                 ui.label("M68K PC:");
                 ui.monospace(format!("0x{:06X}", debug_state.m68k_pc));
             });
 
-            // Display Z80 PC if available
             if debug_state.z80_pc > 0 {
                 ui.horizontal(|ui| {
                     ui.label("Z80 PC:");
@@ -27,13 +25,10 @@ impl Disassembly {
 
             ui.separator();
 
-            // Try to disassemble from current PC
             match Self::disassemble_from_pc(debug_state) {
                 Ok(disasm_text) => {
                     ui.label("Current instruction and context:");
                     ui.separator();
-                    
-                    // Display disassembly in a monospace font within a scrollable area
                     egui::ScrollArea::vertical()
                         .max_height(300.0)
                         .show(ui, |ui| {
@@ -42,106 +37,86 @@ impl Disassembly {
                 }
                 Err(err) => {
                     ui.label(egui::RichText::new(format!("⚠️ {}", err)).color(egui::Color32::YELLOW));
-                    
-                    // Show available memory regions for debugging
-                    ui.separator();
-                    ui.label(egui::RichText::new("Available Memory Regions:").color(egui::Color32::LIGHT_GRAY));
-                    if debug_state.memory_regions.is_empty() {
-                        ui.label(egui::RichText::new("  (No memory regions set)").italics().color(egui::Color32::DARK_GRAY));
-                    } else {
-                        for region in &debug_state.memory_regions {
-                            ui.label(format!(
-                                "  {}: 0x{:06X}—0x{:06X} ({})",
-                                region.name,
-                                region.addr_start,
-                                region.addr_end,
-                                region.region_type()
-                            ));
-                        }
-                    }
                 }
             }
 
             ui.separator();
-            ui.label("(This shows ±10 instructions around current PC)");
+            ui.label("(Shows ±10 instructions around current PC)");
         });
     }
 
-    /// Disassemble 10 instructions before and after current PC.
     fn disassemble_from_pc(debug_state: &DebugState) -> Result<String, String> {
-        let pc = debug_state.m68k_pc as usize;
+        let pc = debug_state.m68k_pc;
 
-        // Find memory region containing PC
-        let region = debug_state
-            .memory_regions
-            .iter()
-            .find(|r| pc >= r.addr_start && pc <= r.addr_end)
-            .ok_or_else(|| "PC outside all memory regions".to_string())?;
-
-        // Get host pointer for PC
-        let host_ptr = region
-            .host_ptr_for_addr(pc)
-            .ok_or_else(|| "Cannot translate PC address".to_string())?;
-
-        // Read a buffer around PC (±10 instructions ≈ up to ~80 bytes)
-        let read_size = 256; // Generous buffer
-        let bytes = unsafe {
-            std::slice::from_raw_parts(host_ptr as *const u8, read_size)
+        // Primary path: use pre-fetched code bytes from SekFetchByte (fbalpha2012)
+        let bytes: &[u8] = if !debug_state.m68k_code_bytes.is_empty()
+            && debug_state.m68k_code_start == pc
+        {
+            &debug_state.m68k_code_bytes
+        } else if !debug_state.memory_regions.is_empty() {
+            // Fallback: memory_regions from SET_MEMORY_MAPS (other cores)
+            let region = debug_state
+                .memory_regions
+                .iter()
+                .find(|r| pc as usize >= r.addr_start && pc as usize <= r.addr_end)
+                .ok_or_else(|| format!("PC 0x{:06X} outside all memory regions", pc))?;
+            let host_ptr = region
+                .host_ptr_for_addr(pc as usize)
+                .ok_or_else(|| "Cannot translate PC address".to_string())?;
+            return Self::disassemble_bytes(
+                unsafe { std::slice::from_raw_parts(host_ptr as *const u8, 256) },
+                pc,
+            );
+        } else {
+            return Err(
+                "No code bytes available — core does not expose memory via SekFetchByte or SET_MEMORY_MAPS".to_string()
+            );
         };
 
-        // Create Capstone disassembler
+        Self::disassemble_bytes(bytes, pc)
+    }
+
+    fn disassemble_bytes(bytes: &[u8], pc: u32) -> Result<String, String> {
         let cs = Capstone::new()
             .m68k()
             .mode(capstone::arch::m68k::ArchMode::M68k020)
             .build()
             .map_err(|e| format!("Capstone error: {:?}", e))?;
 
-        // Disassemble from current PC
         let insns = cs
             .disasm_all(bytes, pc as u64)
             .map_err(|e| format!("Disassembly error: {:?}", e))?;
 
-        // Find current instruction and build context
         let mut output = String::new();
         let mut found_pc = false;
-        let mut insn_count = 0;
+        let mut shown_after = 0;
 
         for insn in insns.iter() {
-            let insn_addr = insn.address() as usize;
+            let insn_addr = insn.address() as u32;
             let is_current = insn_addr == pc;
 
             if is_current {
                 found_pc = true;
             }
 
-            // Show ±10 instructions around PC
-            if found_pc && insn_count >= 10 {
-                break;
-            }
-            if !found_pc && insn_count >= 10 {
-                continue;
+            if found_pc {
+                if shown_after >= 12 {
+                    break;
+                }
+                shown_after += 1;
             }
 
             let mnem = insn.mnemonic().unwrap_or("??");
             let ops = insn.op_str().unwrap_or("");
             let marker = if is_current { "→ " } else { "  " };
-
-            output.push_str(&format!(
-                "{}{:06X}: {:<12} {}\n",
-                marker, insn_addr, mnem, ops
-            ));
-
-            insn_count += 1;
+            output.push_str(&format!("{}{:06X}: {:<12} {}\n", marker, insn_addr, mnem, ops));
         }
 
         if !found_pc {
-            return Err("PC not found in disassembly".to_string());
-        }
-
-        if output.is_empty() {
-            return Err("No instructions disassembled".to_string());
+            return Err(format!("PC 0x{:06X} not found in disassembled output", pc));
         }
 
         Ok(output)
     }
 }
+
