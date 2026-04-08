@@ -6,10 +6,13 @@ type SampleBuf = Arc<Mutex<Vec<i16>>>;
 
 /// Audio output resource — `Send + Sync` so it can be a Bevy `Resource`.
 /// The cpal `Stream` lives on a background thread; we communicate via the buffer.
+#[derive(Clone)]
 pub struct AudioOutput {
     buf: SampleBuf,
     pub sample_rate: f64,
     pub enabled: bool,
+    pub volume: f32,
+    pub muted: bool,
 }
 
 // The stream handle stays alive via the background thread; AudioOutput itself is safe to send.
@@ -27,19 +30,42 @@ impl AudioOutput {
             sample_rate = 44100.0;
         }
 
-        AudioOutput { buf, sample_rate, enabled }
+        AudioOutput { buf, sample_rate, enabled, volume: 1.0, muted: false }
+    }
+
+    pub fn set_volume(&mut self, vol: f32) {
+        self.volume = vol.max(0.0).min(1.0);
+    }
+
+    pub fn set_mute(&mut self, mute: bool) {
+        self.muted = mute;
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
+    pub fn get_volume(&self) -> f32 {
+        self.volume
     }
 
     /// Queue raw stereo i16 samples for playback.
     pub fn queue(&self, samples: &[i16]) {
-        if !self.enabled || samples.is_empty() { return; }
+        if !self.enabled || samples.is_empty() || self.muted { return; }
         // Don't let the buffer grow unbounded — drop oldest if we're way behind.
         let mut b = self.buf.lock().unwrap();
         let blen = b.len();
         if blen > 48000 * 2 { // ~0.5 s of stereo @ 48 kHz
             b.drain(0..blen / 2);
         }
-        b.extend_from_slice(samples);
+        
+        if self.volume < 0.99 {
+            let mut scaled = samples.to_vec();
+            apply_volume(&mut scaled, self.volume);
+            b.extend_from_slice(&scaled);
+        } else {
+            b.extend_from_slice(samples);
+        }
     }
 
     fn start_stream(buf: SampleBuf) -> f64 {
@@ -102,6 +128,14 @@ fn drain_i16(out: &mut [i16], buf: &SampleBuf, channels: usize) {
         } else {
             for s in frame.iter_mut() { *s = 0; }
         }
+    }
+}
+
+pub fn apply_volume(samples: &mut [i16], volume: f32) {
+    if volume >= 0.99 { return; }
+    for sample in samples.iter_mut() {
+        let scaled = (*sample as f32) * volume;
+        *sample = scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
     }
 }
 

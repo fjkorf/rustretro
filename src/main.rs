@@ -250,8 +250,10 @@ fn queue_audio(mut emu: NonSendMut<Emu>, audio: Res<AudioRes>) {
 fn show_debug(
     mut ctx: EguiContexts,
     debug_state: Res<DebugStateRes>,
+    audio: Res<AudioRes>,
     mut overlay: ResMut<DebugOverlay>,
 ) {
+    overlay.0.set_audio(Arc::new(Mutex::new(audio.0.clone())));
     let open = debug_state.0.lock().map(|s| s.debug_open).unwrap_or(false);
     if open { overlay.0.show(ctx.ctx_mut()); }
 }

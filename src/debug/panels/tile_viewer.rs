@@ -96,8 +96,11 @@ impl TileViewer {
             let available = ui.available_width();
             let cols = ((available / (tile_px + padding)).floor() as usize).max(1);
 
-            let mut col = 0;
-            ui.horizontal_wrapped(|ui| {
+            let grid = egui::Grid::new("tile_grid")
+                .spacing([padding, padding]);
+
+            grid.show(ui, |ui| {
+                let mut col = 0;
                 for (idx, tile) in self.tiles.iter().enumerate() {
                     let is_blank = tile.pixels.iter().all(|p| *p == egui::Color32::BLACK);
                     if self.hide_blank && is_blank { continue; }
@@ -137,7 +140,10 @@ impl TileViewer {
                     }
 
                     col += 1;
-                    if col >= cols { col = 0; }
+                    if col >= cols {
+                        col = 0;
+                        ui.end_row();
+                    }
                 }
             });
         });

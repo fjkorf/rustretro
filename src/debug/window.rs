@@ -1,6 +1,7 @@
 use bevy_egui::egui;
 use std::sync::{Arc, Mutex};
 
+use crate::audio::AudioOutput;
 use crate::debug::DebugState;
 use crate::debug::panels::{
     frame_inspector::FrameInspector,
@@ -10,13 +11,15 @@ use crate::debug::panels::{
     frame_log::FrameLog,
     triggers::Triggers,
     cpu_state::CpuState,
+    audio_controls::AudioControls,
 };
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab { FrameInspector, HexDump, TileViewer, InputMonitor, FrameLog, Triggers, CpuState }
+enum Tab { FrameInspector, HexDump, TileViewer, InputMonitor, FrameLog, Triggers, CpuState, Audio }
 
 pub struct DebugApp {
     state: Arc<Mutex<DebugState>>,
+    audio: Option<Arc<Mutex<AudioOutput>>>,
     active_tab: Tab,
     frame_inspector: FrameInspector,
     hex_dump: HexDump,
@@ -25,12 +28,14 @@ pub struct DebugApp {
     frame_log: FrameLog,
     triggers: Triggers,
     cpu_state: CpuState,
+    audio_controls: AudioControls,
 }
 
 impl DebugApp {
     pub fn new(state: Arc<Mutex<DebugState>>) -> Self {
         DebugApp {
             state,
+            audio: None,
             active_tab: Tab::FrameInspector,
             frame_inspector: FrameInspector::new(),
             hex_dump: HexDump::new(),
@@ -39,7 +44,12 @@ impl DebugApp {
             frame_log: FrameLog::new(),
             triggers: Triggers::new(),
             cpu_state: CpuState::new(),
+            audio_controls: AudioControls,
         }
+    }
+
+    pub fn set_audio(&mut self, audio: Arc<Mutex<AudioOutput>>) {
+        self.audio = Some(audio);
     }
 
     /// Render the debug overlay into the given egui context.
@@ -59,6 +69,7 @@ impl DebugApp {
                 ui.selectable_value(&mut self.active_tab, Tab::TileViewer,     "🧩 Tiles");
                 ui.selectable_value(&mut self.active_tab, Tab::InputMonitor,   "🕹 Input");
                 ui.selectable_value(&mut self.active_tab, Tab::CpuState,       "🔧 CPU");
+                ui.selectable_value(&mut self.active_tab, Tab::Audio,          "🔊 Audio");
                 ui.selectable_value(&mut self.active_tab, Tab::FrameLog,       "📜 Log");
                 ui.selectable_value(&mut self.active_tab, Tab::Triggers,       "⏸ Triggers");
 
@@ -81,6 +92,17 @@ impl DebugApp {
                 Tab::CpuState       => self.cpu_state.show(ui, &self.state),
                 Tab::FrameLog       => self.frame_log.show(ui, &self.state),
                 Tab::Triggers       => self.triggers.show(ui, &self.state),
+                Tab::Audio => {
+                    if let Some(ref audio_ref) = self.audio {
+                        if let Ok(mut audio) = audio_ref.lock() {
+                            AudioControls::show(ui, &mut audio);
+                        } else {
+                            ui.label("Error: Could not acquire audio lock");
+                        }
+                    } else {
+                        ui.label("Audio not available");
+                    }
+                }
             }
         });
     }

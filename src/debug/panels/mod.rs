@@ -5,4 +5,5 @@ pub mod tile_viewer;
 pub mod frame_log;
 pub mod triggers;
 pub mod cpu_state;
+pub mod audio_controls;
 
