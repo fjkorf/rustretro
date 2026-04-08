@@ -8,16 +8,16 @@ impl CpuState {
     pub fn new() -> Self { CpuState }
 
     pub fn show(&mut self, ui: &mut egui::Ui, state: &Arc<Mutex<DebugState>>) {
-        let (m68k_pc, m68k_sr, m68k_d, m68k_a, z80_pc, z80_bc, z80_de, z80_hl) = {
+        let (m68k_pc, m68k_sr, m68k_d, m68k_a, z80_pc, z80_bc, z80_de, z80_hl, frame_count) = {
             let s = state.lock().unwrap();
             (s.m68k_pc, s.m68k_sr, s.m68k_d_regs, s.m68k_a_regs, 
-             s.z80_pc, s.z80_bc, s.z80_de, s.z80_hl)
+             s.z80_pc, s.z80_bc, s.z80_de, s.z80_hl, s.frame_count)
         };
 
         // M68K Section
         ui.horizontal(|ui| {
             ui.heading("🟦 M68000");
-            ui.monospace(format!("PC: ${:06X}  SR: ${:04X}", m68k_pc, m68k_sr));
+            ui.monospace(format!("PC: ${:06X}  SR: ${:04X}  [f:{}]", m68k_pc, m68k_sr, frame_count));
         });
 
         // Data registers

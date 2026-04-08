@@ -134,6 +134,8 @@ impl Frontend {
     /// Capture M68K and Z80 CPU state from the core (fbalpha2012-specific).
     fn capture_cpu_state(&self) {
         if let Ok(mut ds) = self.debug_state.try_lock() {
+            let mut any_success = false;
+            
             // Try to read M68K registers (D0-D7)
             for i in 0..8 {
                 let reg = match i {
@@ -141,8 +143,16 @@ impl Frontend {
                     4 => SekRegister::D4, 5 => SekRegister::D5, 6 => SekRegister::D6, 7 => SekRegister::D7,
                     _ => continue,
                 };
-                if let Ok(val) = self.core.get_m68k_register(reg) {
-                    ds.m68k_d_regs[i as usize] = val;
+                match self.core.get_m68k_register(reg) {
+                    Ok(val) => {
+                        ds.m68k_d_regs[i as usize] = val;
+                        any_success = true;
+                    }
+                    Err(e) => {
+                        if i == 0 && self.frame_count % 300 == 0 {
+                            eprintln!("[CPU] M68K D{} read failed: {}", i, e);
+                        }
+                    }
                 }
             }
             
@@ -153,32 +163,86 @@ impl Frontend {
                     4 => SekRegister::A4, 5 => SekRegister::A5, 6 => SekRegister::A6, 7 => SekRegister::A7,
                     _ => continue,
                 };
-                if let Ok(val) = self.core.get_m68k_register(reg) {
-                    ds.m68k_a_regs[i as usize] = val;
+                match self.core.get_m68k_register(reg) {
+                    Ok(val) => {
+                        ds.m68k_a_regs[i as usize] = val;
+                        any_success = true;
+                    }
+                    Err(e) => {
+                        if i == 0 && self.frame_count % 300 == 0 {
+                            eprintln!("[CPU] M68K A{} read failed: {}", i, e);
+                        }
+                    }
                 }
             }
             
             // PC and SR
-            if let Ok(pc) = self.core.get_m68k_register(SekRegister::PC) {
-                ds.m68k_pc = pc;
+            match self.core.get_m68k_register(SekRegister::PC) {
+                Ok(pc) => {
+                    ds.m68k_pc = pc;
+                    any_success = true;
+                }
+                Err(e) => {
+                    if self.frame_count % 300 == 0 {
+                        eprintln!("[CPU] M68K PC read failed: {}", e);
+                    }
+                }
             }
-            if let Ok(sr) = self.core.get_m68k_register(SekRegister::SR) {
-                ds.m68k_sr = sr;
+            match self.core.get_m68k_register(SekRegister::SR) {
+                Ok(sr) => {
+                    ds.m68k_sr = sr;
+                    any_success = true;
+                }
+                Err(e) => {
+                    if self.frame_count % 300 == 0 {
+                        eprintln!("[CPU] M68K SR read failed: {}", e);
+                    }
+                }
             }
 
             // Try to read Z80 registers (need to be careful about which CPU)
-            if let Ok(pc) = self.core.get_z80_pc(0) {
-                ds.z80_pc = (pc & 0xFFFF) as u16;
+            match self.core.get_z80_pc(0) {
+                Ok(pc) => {
+                    ds.z80_pc = (pc & 0xFFFF) as u16;
+                    any_success = true;
+                }
+                Err(e) => {
+                    if self.frame_count % 300 == 0 {
+                        eprintln!("[CPU] Z80 PC read failed: {}", e);
+                    }
+                }
             }
-            if let Ok(bc) = self.core.get_z80_bc(0) {
-                ds.z80_bc = (bc & 0xFFFF) as u16;
+            match self.core.get_z80_bc(0) {
+                Ok(bc) => {
+                    ds.z80_bc = (bc & 0xFFFF) as u16;
+                    any_success = true;
+                }
+                Err(_) => {}
             }
-            if let Ok(de) = self.core.get_z80_de(0) {
-                ds.z80_de = (de & 0xFFFF) as u16;
+            match self.core.get_z80_de(0) {
+                Ok(de) => {
+                    ds.z80_de = (de & 0xFFFF) as u16;
+                    any_success = true;
+                }
+                Err(_) => {}
             }
-            if let Ok(hl) = self.core.get_z80_hl(0) {
-                ds.z80_hl = (hl & 0xFFFF) as u16;
+            match self.core.get_z80_hl(0) {
+                Ok(hl) => {
+                    ds.z80_hl = (hl & 0xFFFF) as u16;
+                    any_success = true;
+                }
+                Err(_) => {}
             }
+            
+            if self.frame_count % 300 == 0 {
+                if any_success {
+                    eprintln!("[CPU] ✓ CPU state captured (M68K PC=${:06X})", ds.m68k_pc);
+                } else {
+                    eprintln!("[CPU] ✗ No CPU state data available (possible issue with debug API)");
+                }
+            }
+        } else if self.frame_count % 300 == 0 {
+            eprintln!("[CPU] Failed to acquire debug_state lock");
         }
     }
 

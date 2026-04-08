@@ -422,7 +422,7 @@ impl RetroCore {
         unsafe {
             let func: Symbol<SekDbgSetRegisterFn> = self
                 .library
-                .get(b"_Z17SekDbgSetRegister11SekRegisterj")
+                .get(b"___Z17SekDbgSetRegister11SekRegisterj")
                 .map_err(|_| LibretroError::CoreNotLoaded)?;
             Ok(func(reg, value))
         }
@@ -432,7 +432,7 @@ impl RetroCore {
         unsafe {
             let func: Symbol<SekDbgGetCPUTypeFn> = self
                 .library
-                .get(b"_Z16SekDbgGetCPUTypev")
+                .get(b"___Z16SekDbgGetCPUTypev")
                 .map_err(|_| LibretroError::CoreNotLoaded)?;
             Ok(func())
         }
@@ -442,7 +442,7 @@ impl RetroCore {
         unsafe {
             let func: Symbol<SekDbgGetPendingIRQFn> = self
                 .library
-                .get(b"_Z19SekDbgGetPendingIRQv")
+                .get(b"___Z19SekDbgGetPendingIRQv")
                 .map_err(|_| LibretroError::CoreNotLoaded)?;
             Ok(func())
         }
@@ -452,7 +452,7 @@ impl RetroCore {
         unsafe {
             let func: Symbol<ZetGetPCFn> = self
                 .library
-                .get(b"_Z8ZetGetPCi")
+                .get(b"___Z8ZetGetPCi")
                 .map_err(|_| LibretroError::CoreNotLoaded)?;
             Ok(func(cpu))
         }
@@ -462,7 +462,7 @@ impl RetroCore {
         unsafe {
             let func: Symbol<ZetBcFn> = self
                 .library
-                .get(b"_Z5ZetBci")
+                .get(b"___Z5ZetBci")
                 .map_err(|_| LibretroError::CoreNotLoaded)?;
             Ok(func(cpu))
         }
@@ -472,7 +472,7 @@ impl RetroCore {
         unsafe {
             let func: Symbol<ZetDeFn> = self
                 .library
-                .get(b"_Z5ZetDei")
+                .get(b"___Z5ZetDei")
                 .map_err(|_| LibretroError::CoreNotLoaded)?;
             Ok(func(cpu))
         }
@@ -482,7 +482,7 @@ impl RetroCore {
         unsafe {
             let func: Symbol<ZetHLFn> = self
                 .library
-                .get(b"_Z5ZetHLi")
+                .get(b"___Z5ZetHLi")
                 .map_err(|_| LibretroError::CoreNotLoaded)?;
             Ok(func(cpu))
         }
@@ -492,7 +492,7 @@ impl RetroCore {
         unsafe {
             let func: Symbol<ZetGetActiveFn> = self
                 .library
-                .get(b"_Z12ZetGetActivev")
+                .get(b"___Z12ZetGetActivev")
                 .map_err(|_| LibretroError::CoreNotLoaded)?;
             Ok(func())
         }
