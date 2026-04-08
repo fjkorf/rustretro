@@ -17,6 +17,14 @@ impl Disassembly {
                 ui.monospace(format!("0x{:06X}", debug_state.m68k_pc));
             });
 
+            // Display Z80 PC if available
+            if debug_state.z80_pc > 0 {
+                ui.horizontal(|ui| {
+                    ui.label("Z80 PC:");
+                    ui.monospace(format!("0x{:04X}", debug_state.z80_pc));
+                });
+            }
+
             ui.separator();
 
             // Try to disassemble from current PC
@@ -34,6 +42,23 @@ impl Disassembly {
                 }
                 Err(err) => {
                     ui.label(egui::RichText::new(format!("⚠️ {}", err)).color(egui::Color32::YELLOW));
+                    
+                    // Show available memory regions for debugging
+                    ui.separator();
+                    ui.label(egui::RichText::new("Available Memory Regions:").color(egui::Color32::LIGHT_GRAY));
+                    if debug_state.memory_regions.is_empty() {
+                        ui.label(egui::RichText::new("  (No memory regions set)").italics().color(egui::Color32::DARK_GRAY));
+                    } else {
+                        for region in &debug_state.memory_regions {
+                            ui.label(format!(
+                                "  {}: 0x{:06X}—0x{:06X} ({})",
+                                region.name,
+                                region.addr_start,
+                                region.addr_end,
+                                region.region_type()
+                            ));
+                        }
+                    }
                 }
             }
 
