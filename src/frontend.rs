@@ -135,7 +135,12 @@ impl Frontend {
     fn capture_cpu_state(&self) {
         if let Ok(mut ds) = self.debug_state.try_lock() {
             let mut any_success = false;
-            
+
+            // Save previous register values for delta highlighting before overwriting
+            ds.prev_m68k_d_regs = ds.m68k_d_regs;
+            ds.prev_m68k_a_regs = ds.m68k_a_regs;
+            ds.prev_m68k_pc = ds.m68k_pc;
+
             // Try to read M68K registers (D0-D7)
             for i in 0..8 {
                 let reg = match i {
@@ -243,12 +248,25 @@ impl Frontend {
                 }
             }
 
-            if self.frame_count % 300 == 0 {
-                if any_success {
-                    eprintln!("[CPU] ✓ CPU state captured (M68K PC=${:06X})", ds.m68k_pc);
-                } else {
-                    eprintln!("[CPU] ✗ No CPU state data available");
+            // Check breakpoints and run-to-addr
+            let pc = ds.m68k_pc;
+            if !ds.paused {
+                if let Some(target) = ds.run_to_addr {
+                    if pc == target {
+                        ds.paused = true;
+                        ds.run_to_addr = None;
+                        ds.log(format!("⏸ Run-to reached ${:06X}", pc));
+                    }
                 }
+                if !ds.paused && ds.breakpoints.contains(&pc) {
+                    ds.paused = true;
+                    ds.hit_breakpoint = Some(pc);
+                    ds.log(format!("🔴 Breakpoint hit at ${:06X}", pc));
+                }
+            }
+
+            if self.frame_count % 300 == 0 && any_success {
+                eprintln!("[CPU] ✓ CPU state captured (M68K PC=${:06X})", ds.m68k_pc);
             }
         } else if self.frame_count % 300 == 0 {
             eprintln!("[CPU] Failed to acquire debug_state lock");

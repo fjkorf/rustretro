@@ -95,6 +95,11 @@ pub struct DebugState {
     pub m68k_pc: u32,              // Program Counter
     pub m68k_sr: u32,              // Status Register
 
+    /// Previous-frame register values for delta highlighting.
+    pub prev_m68k_d_regs: [u32; 8],
+    pub prev_m68k_a_regs: [u32; 8],
+    pub prev_m68k_pc: u32,
+
     // --- Z80 CPU State ---
     pub z80_pc: u16,               // Program Counter
     pub z80_bc: u16,               // BC register pair
@@ -126,6 +131,14 @@ pub struct DebugState {
     pub paused: bool,
     pub step_one: bool,
 
+    // --- Breakpoints ---
+    /// List of M68K PC addresses that will pause execution when hit.
+    pub breakpoints: Vec<u32>,
+    /// Set to Some(addr) when execution paused due to a breakpoint.
+    pub hit_breakpoint: Option<u32>,
+    /// When Some(addr), run until PC reaches that address then pause.
+    pub run_to_addr: Option<u32>,
+
     // --- Triggers ---
     pub trigger_frame: Option<u64>,
     pub trigger_pixel: Option<(u32, u32)>,
@@ -148,6 +161,9 @@ impl DebugState {
             m68k_a_regs: [0; 8],
             m68k_pc: 0,
             m68k_sr: 0,
+            prev_m68k_d_regs: [0; 8],
+            prev_m68k_a_regs: [0; 8],
+            prev_m68k_pc: 0,
             z80_pc: 0,
             z80_bc: 0,
             z80_de: 0,
@@ -164,6 +180,9 @@ impl DebugState {
             debug_open: false,
             paused: false,
             step_one: false,
+            breakpoints: Vec::new(),
+            hit_breakpoint: None,
+            run_to_addr: None,
             trigger_frame: None,
             trigger_pixel: None,
         }

@@ -95,8 +95,8 @@ impl DebugApp {
                 Tab::FrameLog       => self.frame_log.show(ui, &self.state),
                 Tab::Triggers       => self.triggers.show(ui, &self.state),
                 Tab::Disasm => {
-                    if let Ok(ds) = self.state.lock() {
-                        Disassembly::show(ui, &ds);
+                    if let Ok(mut ds) = self.state.lock() {
+                        Disassembly::show(ui, &mut ds);
                     } else {
                         ui.label("Error: Could not acquire debug state lock");
                     }
