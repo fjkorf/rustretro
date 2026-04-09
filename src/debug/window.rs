@@ -13,10 +13,11 @@ use crate::debug::panels::{
     cpu_state::CpuState,
     audio_controls::AudioControls,
     disassembly::Disassembly,
+    regions::RegionsPanel,
 };
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab { FrameInspector, HexDump, TileViewer, InputMonitor, FrameLog, Triggers, CpuState, Audio, Disasm }
+enum Tab { FrameInspector, HexDump, TileViewer, InputMonitor, FrameLog, Triggers, CpuState, Audio, Disasm, Regions }
 
 pub struct DebugApp {
     state: Arc<Mutex<DebugState>>,
@@ -30,6 +31,7 @@ pub struct DebugApp {
     triggers: Triggers,
     cpu_state: CpuState,
     audio_controls: AudioControls,
+    regions_panel: RegionsPanel,
 }
 
 impl DebugApp {
@@ -46,6 +48,7 @@ impl DebugApp {
             triggers: Triggers::new(),
             cpu_state: CpuState::new(),
             audio_controls: AudioControls,
+            regions_panel: RegionsPanel::new(),
         }
     }
 
@@ -74,6 +77,7 @@ impl DebugApp {
                 ui.selectable_value(&mut self.active_tab, Tab::Audio,          "🔊 Audio");
                 ui.selectable_value(&mut self.active_tab, Tab::FrameLog,       "📜 Log");
                 ui.selectable_value(&mut self.active_tab, Tab::Triggers,       "⏸ Triggers");
+                ui.selectable_value(&mut self.active_tab, Tab::Regions,        "🗺 Regions");
 
                 if let Some((fc, vf, vr, fps, w, h, fmt, paused)) = state_snapshot {
                     ui.separator();
@@ -97,6 +101,13 @@ impl DebugApp {
                 Tab::Disasm => {
                     if let Ok(mut ds) = self.state.lock() {
                         Disassembly::show(ui, &mut ds);
+                    } else {
+                        ui.label("Error: Could not acquire debug state lock");
+                    }
+                }
+                Tab::Regions => {
+                    if let Ok(mut ds) = self.state.lock() {
+                        self.regions_panel.show(ui, ctx, &mut ds);
                     } else {
                         ui.label("Error: Could not acquire debug state lock");
                     }

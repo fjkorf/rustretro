@@ -1,4 +1,4 @@
-use crate::debug::SharedDebugState;
+use crate::debug::{Bookmark, SharedDebugState};
 use crate::libretro::*;
 use anyhow::{anyhow, Result};
 use std::ffi::{CString, c_uint, c_void};
@@ -185,6 +185,7 @@ impl Frontend {
             match self.core.get_m68k_register(SekRegister::PC) {
                 Ok(pc) => {
                     ds.m68k_pc = pc;
+                    *ds.pc_heatmap.entry(pc).or_insert(0) += 1;
                     any_success = true;
                 }
                 Err(e) => {
@@ -273,6 +274,27 @@ impl Frontend {
         }
     }
 
+    /// If the UI requested a bookmark, capture one now and clear the flag.
+    fn maybe_capture_bookmark(&self) {
+        let needs_bookmark = self.debug_state.try_lock()
+            .map(|ds| ds.create_bookmark)
+            .unwrap_or(false);
+
+        if !needs_bookmark { return; }
+
+        if let Ok(mut ds) = self.debug_state.try_lock() {
+            ds.create_bookmark = false;
+            let frame = ds.frame_count;
+            let pc    = ds.m68k_pc;
+            let d     = ds.m68k_d_regs;
+            let a     = ds.m68k_a_regs;
+            let thumb = downsample_thumbnail(&ds.fb_rgba, ds.fb_width, ds.fb_height, 64, 48);
+            let label = format!("Frame {}", frame);
+            ds.bookmarks.push(Bookmark { label, frame, m68k_pc: pc, m68k_d_regs: d, m68k_a_regs: a, thumbnail: thumb, notes: String::new() });
+            ds.log(format!("📌 Bookmark created at frame {} PC=${:06X}", frame, pc));
+        }
+    }
+
     /// Run exactly one emulation frame. Returns true if a new video frame was produced.
     pub fn run_frame(&mut self) -> Result<bool> {
         // --- Check pause / triggers ---
@@ -329,6 +351,9 @@ impl Frontend {
 
         // --- Capture CPU state (fbalpha2012 debug API) ---
         self.capture_cpu_state();
+
+        // --- Capture bookmark if requested ---
+        self.maybe_capture_bookmark();
 
         // --- Apply pending AV info change ---
         if let Some(new_info) = self.callback_context.pending_av_info.take() {
@@ -666,4 +691,23 @@ extern "C" fn static_audio_batch_callback(data: *const i16, frames: usize) -> us
     let ctx_ptr = CALLBACK_CONTEXT.load(Ordering::SeqCst);
     if ctx_ptr.is_null() { return frames; }
     unsafe { (*ctx_ptr).audio_batch_callback(data, frames) }
+}
+
+/// Downsample an RGBA framebuffer (w×h) to (out_w×out_h) using nearest-neighbor.
+/// Returns empty Vec if source is empty or dimensions are zero.
+fn downsample_thumbnail(rgba: &[u8], w: u32, h: u32, out_w: u32, out_h: u32) -> Vec<u8> {
+    if rgba.is_empty() || w == 0 || h == 0 { return Vec::new(); }
+    let mut out = vec![0u8; (out_w * out_h * 4) as usize];
+    for oy in 0..out_h {
+        let sy = (oy * h / out_h) as usize;
+        for ox in 0..out_w {
+            let sx = (ox * w / out_w) as usize;
+            let src_idx = (sy * w as usize + sx) * 4;
+            let dst_idx = (oy as usize * out_w as usize + ox as usize) * 4;
+            if src_idx + 3 < rgba.len() {
+                out[dst_idx..dst_idx+4].copy_from_slice(&rgba[src_idx..src_idx+4]);
+            }
+        }
+    }
+    out
 }

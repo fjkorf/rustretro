@@ -181,6 +181,10 @@ fn read_input(
         let mut ds = debug_state.0.lock().unwrap();
         ds.paused = !ds.paused;
     }
+    if keys.just_pressed(KeyB) {
+        let mut ds = debug_state.0.lock().unwrap();
+        ds.create_bookmark = true;
+    }
 }
 
 // ─── Emulation ───────────────────────────────────────────────────────────────

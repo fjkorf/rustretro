@@ -7,3 +7,4 @@ pub mod triggers;
 pub mod cpu_state;
 pub mod audio_controls;
 pub mod disassembly;
+pub mod regions;

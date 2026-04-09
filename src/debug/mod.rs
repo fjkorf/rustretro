@@ -1,10 +1,34 @@
 pub mod panels;
 pub mod window;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 pub type SharedDebugState = Arc<Mutex<DebugState>>;
+
+/// A user-created snapshot of machine state at a named moment (e.g. "Title Screen", "Level 2").
+#[derive(Clone)]
+pub struct Bookmark {
+    pub label: String,
+    pub frame: u64,
+    pub m68k_pc: u32,
+    pub m68k_d_regs: [u32; 8],
+    pub m68k_a_regs: [u32; 8],
+    /// 64×48 RGBA thumbnail (downsampled framebuffer), may be empty.
+    pub thumbnail: Vec<u8>,
+    pub notes: String,
+}
+
+/// A user-labeled range of M68K code addresses (e.g. "game_loop", "sound_driver").
+#[derive(Clone)]
+pub struct CodeRegion {
+    pub label: String,
+    pub addr_start: u32,
+    pub addr_end: u32,
+    /// RGB display color for this region.
+    pub color: [u8; 3],
+    pub notes: String,
+}
 
 /// Memory region descriptor (from libretro SET_MEMORY_MAPS callback)
 #[derive(Clone)]
@@ -142,6 +166,16 @@ pub struct DebugState {
     // --- Triggers ---
     pub trigger_frame: Option<u64>,
     pub trigger_pixel: Option<(u32, u32)>,
+
+    // --- Region Discovery ---
+    /// Accumulated PC visit counts (address → frame count). Grows every frame automatically.
+    pub pc_heatmap: HashMap<u32, u64>,
+    /// User-created game state bookmarks (press B or click Bookmark button).
+    pub bookmarks: Vec<Bookmark>,
+    /// User-labeled M68K address ranges shown inline in the disassembly panel.
+    pub code_regions: Vec<CodeRegion>,
+    /// Signal from UI or keyboard: capture a bookmark on the next emulation frame.
+    pub create_bookmark: bool,
 }
 
 impl DebugState {
@@ -185,6 +219,10 @@ impl DebugState {
             run_to_addr: None,
             trigger_frame: None,
             trigger_pixel: None,
+            pc_heatmap: HashMap::new(),
+            bookmarks: Vec::new(),
+            code_regions: Vec::new(),
+            create_bookmark: false,
         }
     }
 
