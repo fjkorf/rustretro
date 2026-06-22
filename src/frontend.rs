@@ -254,7 +254,14 @@ impl Frontend {
                 }
                 Err(_) => {}
             }
-            
+
+            // Populate VDP registers when a source becomes available.
+            // (Currently a no-op: Genesis VDP regs are write-only and not exposed
+            // by the loaded cores — see debug/vdp_source.rs for the dead-end and routes.)
+            if let Some(vdp) = crate::debug::vdp_source::read_vdp_regs(&ds.memory_regions) {
+                ds.vdp_regs = vdp;
+            }
+
             // Fetch code bytes at PC for disassembly panel (256 bytes via SekFetchByte)
             if ds.m68k_pc > 0 {
                 let code = self.core.read_m68k_code(ds.m68k_pc, 256);
@@ -285,6 +292,7 @@ impl Frontend {
             // Collect ops first so we don't borrow ds.watches while calling
             // ds.read_addr / ds.write_addr (which borrow ds immutably).
             let mut freeze_writes: Vec<(usize, usize, u32)> = Vec::new();
+            let mut change_events: Vec<crate::debug::ChangeEvent> = Vec::new();
             {
                 let watch_params: Vec<(usize, usize, bool, Option<u32>)> = ds.watches.iter()
                     .map(|w| (w.addr, w.format.byte_len(), w.frozen, w.frozen_value))
@@ -305,10 +313,37 @@ impl Frontend {
                     }
                     updates.push((current, new_frozen_value));
                 }
+                // Detect frame-granular value changes for tracked watches. We
+                // collect events here (while iterating ds.watches mutably) and
+                // push them after the loop, since push_change needs &mut self.
+                // PC for this frame was already captured into ds.m68k_pc above.
+                let frame = ds.frame_count;
+                let pc = ds.m68k_pc;
                 for (w, (current, new_frozen_value)) in ds.watches.iter_mut().zip(updates) {
+                    if w.track_changes {
+                        if let Some(cur) = current {
+                            if crate::debug::detect_change(w.prev_value, cur) {
+                                let old = w.prev_value.unwrap_or(cur);
+                                change_events.push(crate::debug::ChangeEvent {
+                                    frame,
+                                    addr: w.addr,
+                                    old,
+                                    new: cur,
+                                    pc,
+                                });
+                            }
+                            w.prev_value = current;
+                        }
+                    } else {
+                        // Reset edge state so re-enabling tracking starts fresh.
+                        w.prev_value = None;
+                    }
                     w.current = current;
                     w.frozen_value = new_frozen_value;
                 }
+            }
+            for ev in change_events {
+                ds.push_change(ev);
             }
             for (addr, len, value) in freeze_writes {
                 ds.write_addr(addr, len, value);

@@ -327,7 +327,9 @@ impl RamSearchPanel {
                 format: size.watch_format(hex),
                 frozen: false,
                 frozen_value: None,
+                track_changes: false,
                 current: value,
+                prev_value: None,
             });
         }
     }

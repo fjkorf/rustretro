@@ -15,10 +15,16 @@
 //! memory.read_u16_be(addr)          -> integer
 //! memory.read_u32_be(addr)          -> integer
 //! memory.read_s16_be(addr)          -> integer (signed)
+//! memory.read_u16_le(addr)          -> integer  (little-endian)
+//! memory.read_u32_le(addr)          -> integer  (little-endian)
 //! gui.drawBox(x1,y1,x2,y2, fill, line)
 //! gui.drawText(x,y, str [, color])
+//! gui.drawLine(x1,y1,x2,y2, color)
+//! gui.drawPixel(x,y, color)
 //! event.onframeend(function)
 //! console.log(str)
+//! emu.framecount()                  -> integer
+//! _RUSTRETRO_API                    = 1  (version sentinel)
 //! ```
 //! Colors are packed RGBA u32: `0xRRGGBBAA`.
 
@@ -46,6 +52,20 @@ pub enum DrawCmd {
         x: i32,
         y: i32,
         s: String,
+        color: u32,
+    },
+    /// A straight line from (x1,y1) to (x2,y2). `color` is packed `0xRRGGBBAA`.
+    Line {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        color: u32,
+    },
+    /// A single pixel at (x,y). `color` is packed `0xRRGGBBAA`.
+    Pixel {
+        x: i32,
+        y: i32,
         color: u32,
     },
 }
@@ -161,6 +181,30 @@ impl LuaEngine {
             memory.set("read_s16_be", f)?;
         }
 
+        // read_u16_le(addr) -> integer  (little-endian: byte[addr] is low byte)
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, addr: u32| -> mlua::Result<u32> {
+                let lo = read1(&dbg, addr)? as u32;
+                let hi = read1(&dbg, addr.wrapping_add(1))? as u32;
+                Ok((hi << 8) | lo)
+            })?;
+            memory.set("read_u16_le", f)?;
+        }
+
+        // read_u32_le(addr) -> integer  (little-endian)
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, addr: u32| -> mlua::Result<u32> {
+                let b0 = read1(&dbg, addr)? as u32;
+                let b1 = read1(&dbg, addr.wrapping_add(1))? as u32;
+                let b2 = read1(&dbg, addr.wrapping_add(2))? as u32;
+                let b3 = read1(&dbg, addr.wrapping_add(3))? as u32;
+                Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+            })?;
+            memory.set("read_u32_le", f)?;
+        }
+
         globals.set("memory", memory)?;
 
         // ── gui.* ─────────────────────────────────────────────────────────────
@@ -203,6 +247,30 @@ impl LuaEngine {
             gui.set("drawText", f)?;
         }
 
+        // drawLine(x1,y1,x2,y2, color)
+        {
+            let buf = Rc::clone(draw_cmds);
+            let f = lua.create_function(
+                move |_, (x1, y1, x2, y2, color): (i32, i32, i32, i32, u32)| {
+                    buf.borrow_mut().push(DrawCmd::Line { x1, y1, x2, y2, color });
+                    Ok(())
+                },
+            )?;
+            gui.set("drawLine", f)?;
+        }
+
+        // drawPixel(x, y, color)
+        {
+            let buf = Rc::clone(draw_cmds);
+            let f = lua.create_function(
+                move |_, (x, y, color): (i32, i32, u32)| {
+                    buf.borrow_mut().push(DrawCmd::Pixel { x, y, color });
+                    Ok(())
+                },
+            )?;
+            gui.set("drawPixel", f)?;
+        }
+
         globals.set("gui", gui)?;
 
         // ── event.* ───────────────────────────────────────────────────────────
@@ -235,6 +303,25 @@ impl LuaEngine {
         }
         globals.set("console", console)?;
 
+        // ── emu.* ─────────────────────────────────────────────────────────────
+        let emu = lua.create_table()?;
+
+        // framecount() -> integer  (returns DebugState.frame_count)
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<u64> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(ds.frame_count)
+            })?;
+            emu.set("framecount", f)?;
+        }
+
+        globals.set("emu", emu)?;
+
+        // ── version sentinel ──────────────────────────────────────────────────
+        // Scripts can check `if _RUSTRETRO_API >= 1 then … end` to feature-detect.
+        globals.set("_RUSTRETRO_API", 1u32)?;
+
         Ok(())
     }
 
@@ -252,8 +339,7 @@ impl LuaEngine {
 
     /// Re-create a fresh VM, discarding all registered callbacks and draw state,
     /// then reload `src_or_path`. Use this to hot-reload a script.
-    /// (Staged API: not yet wired to a UI button / keybind.)
-    #[allow(dead_code)]
+    /// Called by the script panel's "Reload" and "Clear VM" buttons.
     pub fn reload(&mut self, src_or_path: &str) -> mlua::Result<()> {
         let fresh = LuaEngine::new(SharedDebugState::clone(&self.debug))?;
         *self = fresh;
@@ -301,6 +387,12 @@ impl LuaEngine {
     #[allow(dead_code)]
     pub fn clear_draw_cmds(&self) {
         self.draw_cmds.borrow_mut().clear();
+    }
+
+    /// Return the number of registered `event.onframeend` callbacks.
+    /// Used by the script panel to show registration status.
+    pub fn callback_count(&self) -> usize {
+        self.frame_callbacks.borrow().len()
     }
 
     fn log_error(&self, msg: &str) {
@@ -372,6 +464,18 @@ pub fn composite_into_rgba(cmds: &[DrawCmd], rgba: &mut [u8], width: u32, height
             DrawCmd::Text { x, y, ref s, color } => {
                 draw_text(rgba, w, h, x, y, s, color);
             }
+            DrawCmd::Line { x1, y1, x2, y2, color } => {
+                let (r, g, b, a) = unpack(color);
+                if a > 0 {
+                    draw_line(rgba, w, h, x1, y1, x2, y2, r, g, b, a);
+                }
+            }
+            DrawCmd::Pixel { x, y, color } => {
+                let (r, g, b, a) = unpack(color);
+                if a > 0 {
+                    blend_clamped(rgba, w, h, x, y, r, g, b, a);
+                }
+            }
         }
     }
 }
@@ -411,6 +515,34 @@ fn blend_clamped(rgba: &mut [u8], w: i32, h: i32, px: i32, py: i32, sr: u8, sg: 
         return;
     }
     blend_px(rgba, w, px, py, sr, sg, sb, sa);
+}
+
+/// Bresenham integer line rasteriser. Draws all pixels from (x1,y1) to (x2,y2)
+/// inclusive, alpha-blending each. Out-of-bounds pixels are silently clipped.
+fn draw_line(rgba: &mut [u8], w: i32, h: i32, x1: i32, y1: i32, x2: i32, y2: i32, r: u8, g: u8, b: u8, a: u8) {
+    let mut x = x1;
+    let mut y = y1;
+    let dx = (x2 - x1).abs();
+    let dy = (y2 - y1).abs();
+    let sx: i32 = if x1 < x2 { 1 } else { -1 };
+    let sy: i32 = if y1 < y2 { 1 } else { -1 };
+    let mut err = dx - dy;
+
+    loop {
+        blend_clamped(rgba, w, h, x, y, r, g, b, a);
+        if x == x2 && y == y2 {
+            break;
+        }
+        let e2 = err * 2;
+        if e2 > -dy {
+            err -= dy;
+            x += sx;
+        }
+        if e2 < dx {
+            err += dx;
+            y += sy;
+        }
+    }
 }
 
 /// Minimal blocky text renderer: draws each character as a small filled 3×5 dot

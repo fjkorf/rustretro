@@ -14,6 +14,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy_egui::{EguiContexts, EguiPlugin};
 use clap::Parser;
 use debug::{DebugState, SharedDebugState};
+use debug::panels::script_panel::ScriptPanel;
 use frontend::Frontend;
 use lua_engine::LuaEngine;
 use std::path::PathBuf;
@@ -137,8 +138,9 @@ fn main() -> Result<()> {
         .insert_resource(WindowScale(args.scale))
         .insert_resource(DebugOverlay(debug::window::DebugApp::new(debug_state)))
         .insert_non_send_resource(LuaRes(lua_engine))
+        .insert_resource(ScriptPanel::new())
         .add_systems(Startup, setup)
-        .add_systems(Update, (read_input, run_emulation, run_scripts, sync_video, queue_audio, show_debug, update_title).chain())
+        .add_systems(Update, (read_input, run_emulation, run_scripts, sync_video, queue_audio, show_debug, show_script_panel, update_title).chain())
         .run();
 
     Ok(())
@@ -180,6 +182,7 @@ fn read_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut emu: NonSendMut<Emu>,
     debug_state: Res<DebugStateRes>,
+    mut script_panel: ResMut<ScriptPanel>,
 ) {
     use KeyCode::*;
     emu.0.set_input([
@@ -208,6 +211,9 @@ fn read_input(
         let mut ds = debug_state.0.lock().unwrap();
         ds.create_bookmark = true;
     }
+    if keys.just_pressed(F10) {
+        script_panel.open = !script_panel.open;
+    }
 }
 
 // ─── Emulation ───────────────────────────────────────────────────────────────
@@ -221,6 +227,18 @@ fn run_emulation(mut emu: NonSendMut<Emu>) {
 /// Run Lua per-frame callbacks and composite their draw commands into the fresh
 /// framebuffer. Sits BETWEEN run_emulation (which refreshes fb_rgba) and
 /// sync_video (which uploads it), so overlays never lag a frame.
+/// Render the Lua script panel (floating window). Separate from the tab-based
+/// DebugApp because LuaEngine is a !Send NonSend resource and can't thread
+/// through the Send DebugApp.
+fn show_script_panel(
+    mut ctx: EguiContexts,
+    mut lua: NonSendMut<LuaRes>,
+    mut panel: ResMut<ScriptPanel>,
+    debug_state: Res<DebugStateRes>,
+) {
+    panel.show(ctx.ctx_mut(), &mut lua.0, &debug_state.0);
+}
+
 fn run_scripts(lua: NonSend<LuaRes>, debug_state: Res<DebugStateRes>) {
     let _ = lua.0.run_frame_callbacks();
     let cmds = lua.0.take_draw_cmds();

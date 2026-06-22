@@ -1,5 +1,6 @@
 pub mod panels;
 pub mod window;
+pub mod vdp_source;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -172,9 +173,37 @@ pub struct Watch {
     pub format: WatchFormat,
     pub frozen: bool,
     pub frozen_value: Option<u32>,
+    /// When true, log every frame in which this watch's value changes, together
+    /// with the CPU PC executing that frame ("what changed this address?").
+    /// Frame-granular, not instruction-exact.
+    #[serde(default)]
+    pub track_changes: bool,
     /// Last raw little-endian value read from memory (for display). Not persisted.
     #[serde(skip)]
     pub current: Option<u32>,
+    /// Last value seen for change-detection edge tracking. Not persisted.
+    #[serde(skip)]
+    pub prev_value: Option<u32>,
+}
+
+/// One frame-granular value change recorded for a tracked watch: the value went
+/// from `old` to `new` during `frame`, while the M68K PC was `pc`. Because
+/// libretro has no per-access hook, this only pins the change to a frame, not to
+/// the exact instruction.
+#[derive(Clone)]
+pub struct ChangeEvent {
+    pub frame: u64,
+    pub addr: usize,
+    pub old: u32,
+    pub new: u32,
+    pub pc: u32,
+}
+
+/// True when `cur` differs from a known previous value. Used for per-frame
+/// change-detection on tracked watches; a `None` prev (first sighting) is not a
+/// change so we don't log a spurious event on the first frame.
+pub fn detect_change(prev: Option<u32>, cur: u32) -> bool {
+    matches!(prev, Some(p) if p != cur)
 }
 
 /// Memory region descriptor (from libretro SET_MEMORY_MAPS callback)
@@ -338,7 +367,12 @@ pub struct DebugState {
     pub watches: Vec<Watch>,
     /// Iterative RAM-search state (cheat-engine-style value narrowing).
     pub ram_search: RamSearch,
+    /// Rolling log of value changes for tracked watches (capped, newest at back).
+    pub change_log: VecDeque<ChangeEvent>,
 }
+
+/// Maximum number of change events retained in `change_log`.
+const CHANGE_LOG_CAP: usize = 200;
 
 impl DebugState {
     pub fn new() -> Self {
@@ -390,7 +424,16 @@ impl DebugState {
             sidecar_path: None,
             watches: Vec::new(),
             ram_search: RamSearch::new(),
+            change_log: VecDeque::new(),
         }
+    }
+
+    /// Push a change event to the rolling log, capping at `CHANGE_LOG_CAP`.
+    pub fn push_change(&mut self, ev: ChangeEvent) {
+        if self.change_log.len() >= CHANGE_LOG_CAP {
+            self.change_log.pop_front();
+        }
+        self.change_log.push_back(ev);
     }
 
     /// Read up to 4 bytes from the emulated address space, returning them as a
@@ -661,5 +704,16 @@ mod tests {
         assert!(compare_passes(15, 10, SearchCompare::DifferentBy(5), false, 8));
         assert!(compare_passes(10, 15, SearchCompare::DifferentBy(5), false, 8));
         assert!(!compare_passes(10, 15, SearchCompare::DifferentBy(4), false, 8));
+    }
+
+    #[test]
+    fn detect_change_edge_logic() {
+        // First sighting (no prior value) is never a change.
+        assert!(!detect_change(None, 42));
+        // Same value held across frames is not a change.
+        assert!(!detect_change(Some(42), 42));
+        // A differing value is a change.
+        assert!(detect_change(Some(42), 43));
+        assert!(detect_change(Some(0), 1));
     }
 }
