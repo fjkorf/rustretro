@@ -343,8 +343,15 @@ fn show_debug(
     debug_state: Res<DebugStateRes>,
     audio: Res<AudioRes>,
     mut overlay: ResMut<DebugOverlay>,
+    mut audio_wired: Local<bool>,
 ) {
-    overlay.0.set_audio(Arc::new(Mutex::new(audio.0.clone())));
+    // Wire the audio panel exactly once. `AudioOutput` now shares volume/mute via
+    // `Arc<Atomic*>`, so this clone observes (and mutates) the same state the player
+    // uses. Running it every frame would churn a fresh mutex each frame, so guard it.
+    if !*audio_wired {
+        overlay.0.set_audio(Arc::new(Mutex::new(audio.0.clone())));
+        *audio_wired = true;
+    }
     let open = debug_state.0.lock().map(|s| s.debug_open).unwrap_or(false);
     if open { overlay.0.show(ctx.ctx_mut()); }
 }
