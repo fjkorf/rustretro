@@ -27,16 +27,23 @@ dynamically load any libretro core and wire its C callbacks into a Bevy app.
   64×48 thumbnails, watch a PC heatmap discover the code for you; everything persists to a
   `<rom>.regions.json` sidecar next to your saves.
 
-## The war story
+## How it works
 
-For a while, MAME cores crashed on load while Nestopia ran fine — and the investigation
-(committed in this repo as it happened, `MAME_FFI_INVESTIGATION.md` →
-`FINAL_MAME_REPORT.md`) found a great bug: **nearly every libretro environment-callback
-constant in my FFI layer was wrong.** I'd numbered them sequentially; the spec doesn't.
-Exactly one constant (`GET_SYSTEM_DIRECTORY = 9`) was right by coincidence, and Nestopia is
-lenient enough to limp along on that alone. MAME is not. Fixing the constants against
-`libretro.h` brought the arcade cores fully to life — a tidy lesson in how a forgiving peer
-can hide a broken protocol.
+Rust 2021, built on [Bevy](https://bevyengine.org/) (window/rendering) with `bevy_egui` for the
+debug UI, [cpal](https://github.com/RustAudio/cpal) for audio, `libloading` for the core FFI,
+and [Capstone](https://www.capstone-engine.org/) for M68K disassembly (~0.5 ms/frame). A few
+choices shape everything:
+
+- **The emulator runs on Bevy's main thread as a `NonSend` resource** — libretro cores expect
+  synchronous, single-threaded execution, and windowing/audio setup must be on the main thread.
+- **A static `AtomicPtr` bridges Rust ↔ C callbacks** — cores call C function pointers, which
+  can't carry closure state, so free `extern "C"` trampolines recover their instance from a
+  pointer set once at startup. It's race-free because `retro_run()` is synchronous.
+- **Live state lives behind `Arc<Mutex<DebugState>>`** — the emulation systems write it; the
+  egui overlay reads it. Audio is the one truly concurrent piece, on its own cpal thread.
+
+Full deep-dive with diagrams in [ARCHITECTURE.md](ARCHITECTURE.md); libretro gotchas in
+[DEBUGGING.md](DEBUGGING.md); where it's headed in [ROADMAP.md](ROADMAP.md).
 
 ## Build & run
 
@@ -63,19 +70,13 @@ cargo run --release -- --core ./mame2003_plus_libretro.dylib --rom ./game.zip --
 
 Input: arrows → D-pad, Z/X/A/S → B/A/Y/X, Q/W → L/R, Enter → Start, Shift → Select.
 
-## Stack
-
-Rust 2021 · [Bevy](https://bevyengine.org/) (window/rendering) · `bevy_egui` (debug UI) ·
-[cpal](https://github.com/RustAudio/cpal) (audio) · `libloading` (core FFI) ·
-[Capstone](https://www.capstone-engine.org/) (M68K disassembly, ~0.5 ms/frame) ·
-`clap` · `serde`. Architecture deep-dive in [ARCHITECTURE.md](ARCHITECTURE.md).
-
 ## Honest limits
 
-`RETRO_ENVIRONMENT_GET_VARIABLE` isn't implemented (cores needing options may misbehave),
-only controller port 0 is wired, and there are no save states, rewind, or cheats. It's a
-debugging instrument first, a daily-driver emulator second.
+`RETRO_ENVIRONMENT_GET_VARIABLE` isn't implemented (cores needing options may misbehave), only
+controller port 0 is wired, and there are no save states, rewind, or cheats. It's a debugging
+instrument first, a daily-driver emulator second.
 
 ---
 
 — Frank Korf · [fkorf.com](https://fkorf.com)
+</content>

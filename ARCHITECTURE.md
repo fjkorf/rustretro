@@ -1,270 +1,403 @@
-# RustRetro Architecture & Implementation Details
+# RustRetro — Architecture
 
 ## Overview
 
-RustRetro is a lightweight libretro frontend composed of ~900 lines of Rust code across 4 modules. It uses dynamic library loading to work with any libretro core without recompilation.
+RustRetro is a libretro frontend built with Bevy (rendering/window), bevy_egui (debug UI), cpal
+(audio), and Capstone (disassembly). The emulation loop runs on the main thread as a Bevy
+`NonSend` resource to satisfy OS and libretro threading requirements.
 
-## Module Breakdown
+**Source breakdown (~4,100 lines total):**
 
-### 1. `main.rs` (78 lines)
-**Purpose**: CLI interface using `clap` for argument parsing
+| Path | Lines | Role |
+|------|-------|------|
+| `src/main.rs` | 294 | CLI, Bevy app setup, video/audio/debug systems |
+| `src/frontend.rs` | 792 | `Frontend`, libretro callbacks, `retro_run` loop |
+| `src/libretro.rs` | 592 | FFI bindings, `RetroCore` dynamic loader |
+| `src/audio.rs` | 156 | `AudioOutput` — cpal stream + ring buffer |
+| `src/debug/mod.rs` | 313 | `DebugState`, `MemoryRegion`, `Bookmark`, `CodeRegion` |
+| `src/debug/window.rs` | 131 | `DebugApp` — tab bar, panel dispatch |
+| `src/debug/panels/` | ~1,180 | 9 egui panels (see below) |
 
-**Key Components**:
-- `Args` struct with `clap` derive macros
-- Command-line argument parsing with defaults
-- Input validation (core and ROM file existence checks)
-- Startup logging
+---
 
-**Arguments Supported**:
+## Architecture at a Glance
+
+Three views of the same system: what the pieces are, what one frame does, and how the
+Rust↔C callback bridge works.
+
+### Component structure
+
+The Bevy app owns everything. `run_emulation` drives `Frontend`, which talks to the
+dynamically-loaded core through the FFI layer. Three outputs leave the app — video, audio,
+and debug data — and the shared `DebugState` (amber) is the hub linking live emulation to the
+inspection UI.
+
+```mermaid
+graph TB
+    CLI["clap CLI args<br/>--core --rom --debug ..."] --> MAIN
+
+    subgraph BevyApp["Bevy App (main thread)"]
+        MAIN["main.rs<br/>app setup + systems"]
+        subgraph Systems["Update systems (chained, every frame)"]
+            RI[read_input] --> RE[run_emulation] --> SV[sync_video] --> QA[queue_audio] --> SD[show_debug] --> UT[update_title]
+        end
+        subgraph Resources["Bevy resources"]
+            EMU["Emu (NonSend)<br/>= Frontend"]
+            GT["GameTexture<br/>Handle&lt;Image&gt;"]
+            AR["AudioRes<br/>= AudioOutput"]
+            DSR["DebugStateRes<br/>Arc&lt;Mutex&lt;DebugState&gt;&gt;"]
+            DO["DebugOverlay<br/>= DebugApp"]
+        end
+    end
+
+    EMU --> FE["frontend.rs<br/>Frontend + CallbackContext"]
+    FE -->|"static AtomicPtr<br/>+ extern C trampolines"| LR["libretro.rs<br/>RetroCore FFI loader"]
+    LR -->|"libloading dlopen"| CORE[["libretro core<br/>.dylib / .so / .dll"]]
+
+    FE -. writes .-> DSR
+    AR --> CPAL[["cpal stream<br/>(separate OS thread)"]]
+    DO -->|reads| DSR
+    DO --> PANELS["debug/panels/*<br/>10 egui panels"]
+    SV --> GT --> GPU[["Bevy renderer → window"]]
+
+    style CORE fill:#4a2,color:#fff
+    style CPAL fill:#a24,color:#fff
+    style GPU fill:#24a,color:#fff
+    style DSR fill:#a82,color:#fff
 ```
---core <PATH>          (required) Path to libretro core .so/.dll/.dylib
---rom <PATH>           (required) Path to ROM/content file
---fullscreen           (flag) Enable fullscreen mode
---save-dir <PATH>      (opt) Save file directory, default: .
---system-dir <PATH>    (opt) BIOS directory, default: .
---scale <FACTOR>       (opt) Window scale (1-10), default: 3
---no-audio             (flag) Disable audio output
+
+### One frame, end to end
+
+Each Bevy tick is a strict chain. Input is gathered first, then `core.run()` executes exactly
+one frame — firing its C callbacks *synchronously* back into the Frontend, which is why no
+locking is needed during the run. The Frontend snapshots CPU/video state into `DebugState`;
+only afterward do the later systems convert the framebuffer, hand samples to the audio thread,
+and let the overlay render from the now-updated state.
+
+```mermaid
+sequenceDiagram
+    participant K as Keyboard
+    participant BV as Bevy scheduler
+    participant FE as Frontend
+    participant CORE as libretro core
+    participant DS as DebugState<br/>(Arc-Mutex)
+    participant GPU as Window
+    participant AU as cpal thread
+
+    Note over BV: Update tick (chained systems)
+    K->>BV: read_input → [bool;12] buttons
+    BV->>FE: run_emulation → run_frame()
+    activate FE
+    FE->>FE: check breakpoints / run-to / pause
+    FE->>CORE: core.run()
+    activate CORE
+    CORE-->>FE: video_callback(framebuffer)
+    CORE-->>FE: audio_batch_callback(samples)
+    CORE-->>FE: input_state_callback() → buttons
+    deactivate CORE
+    FE->>DS: write PC, regs, heatmap, framebuffer
+    FE->>FE: capture bookmark / save sidecar if signaled
+    deactivate FE
+    BV->>GPU: sync_video → to_rgba8() → GameTexture
+    BV->>AU: queue_audio → drain ring buffer
+    BV->>DS: show_debug → DebugApp reads & renders panels
+    BV->>GPU: update_title (every 60 frames)
 ```
 
-### 2. `libretro.rs` (281 lines)
-**Purpose**: FFI bindings to libretro cores and core management
+### The FFI callback bridge
 
-**Key Types**:
-- `RetroCore`: Represents a loaded libretro core
-  - Methods: `load()`, `get_system_info()`, `set_callbacks()`, `init()`, `load_game()`, `run()`, `unload_game()`, `deinit()`
-  
-- `RetroSystemInfo`: Core metadata (name, version, extensions, fullpath requirement)
-- `RetroGameInfo`: Game file information (path, data)
-- `RetroSystemAVInfo`: Video/audio configuration (dimensions, aspect ratio, FPS, sample rate)
+libretro cores call C function pointers, which can't carry Rust closure state. The fix:
+free-standing `extern "C"` trampolines that recover the instance by reading a static
+`AtomicPtr<CallbackContext>` set once at startup. Safe because `retro_run()` is synchronous
+and single-threaded, so the callbacks never race.
 
-**Callback Types**:
-- `RetroEnvironmentFn`: Core query callback (pixel format, directories, etc.)
-- `RetroVideoRefreshFn`: Framebuffer delivery callback
-- `RetroAudioSampleFn`: Audio sample callback  
-- `RetroAudioSampleBatchFn`: Batch audio samples callback
-- `RetroInputPollFn`: Input polling callback
-- `RetroInputStateFn`: Button state query callback
+```
+   Rust side                          static bridge                  C side (core)
+ ┌────────────────┐                                              ┌──────────────────┐
+ │ Frontend::new()│                                              │  retro_run()     │
+ │  boxes a       │   write once at startup                      │                  │
+ │  CallbackContext├──────────────┐                              │  needs to call   │
+ └────────────────┘               │                              │  back into us... │
+                                   ▼                              └────────┬─────────┘
+                  ┌───────────────────────────────────┐                   │ calls C fn ptr
+                  │ static CALLBACK_CONTEXT:           │                   │
+                  │   AtomicPtr<CallbackContext>       │                   ▼
+                  └───────────────────────────────────┘          ┌──────────────────────┐
+                                   ▲                              │ extern "C"           │
+                                   │ load(SeqCst)                 │ static_video_callback│
+                                   └──────────────────────────────┤ (a free function,    │
+                                          deref → (*ptr).method() │  not a closure)      │
+                                                                  └──────────────────────┘
+```
 
-**Constants**:
-- Environment callback command IDs
-- Pixel format definitions (XRGB8888)
-- Input device IDs and button mappings
+---
 
-**Implementation Notes**:
-- Uses `libloading` for dynamic library loading
-- Wraps C types (`c_char`, `c_void`) for FFI
-- Converts C strings to Rust strings safely
-- Error handling with `thiserror::Error` enum
+## Module Details
 
-### 3. `sdl_interface.rs` (188 lines)
-**Purpose**: SDL2 abstraction for graphics, audio, and input
+### `main.rs`
 
-**Key Structures**:
+Entry point and Bevy app configuration.
 
-**Graphics**:
-- Minimal stub implementation (window creation verified)
-- Method: `new()` creates SDL window
-- Method: `render_frame()` for texture updates (not fully rendering)
-- Method: `set_dimensions()` for resize handling
+**CLI** (`clap` derive):
+```
+--core <PATH>       (required) libretro core .dylib/.so/.dll
+--rom <PATH>        (required) ROM or content file
+--scale <N>         Window scale factor (default: 3)
+--save-dir <PATH>   SRAM/save-state directory (default: .)
+--system-dir <PATH> BIOS directory (default: .)
+--fullscreen        Fullscreen mode
+--no-audio          Disable audio
+--debug             Open debug overlay on startup
+```
 
-**Audio**:
-- `Audio` struct wraps SDL2 audio device
-- Method: `new()` initializes audio context
-- Method: `queue_sample()` queues audio samples
-- Method: `process_queue()` processes pending samples
-- Uses `AudioCallback` trait for SDL2 integration
+**Bevy resources:**
+- `Emu` (`NonSend`) — wraps `Frontend`; keeps `retro_run()` on the main thread
+- `GameTexture` — `Handle<Image>` for the framebuffer sprite
+- `WindowScale` — integer scale factor
+- `AudioRes` — `AudioOutput` resource
+- `DebugStateRes` — `Arc<Mutex<DebugState>>` shared with the debug overlay
+- `DebugOverlay` — `DebugApp` instance
 
-**Input**:
-- `Input` struct maintains button state array [bool; 12]
-- Maps SDL2 keycodes to SNES-style buttons:
-  - Arrow Keys → D-Pad
-  - ZXAS → BYXA buttons
-  - Q/W → L/R buttons
-  - Enter → Start
-  - Shift → Select
-- Methods: `handle_event()`, `get_button_state()`
+**Bevy systems (run every frame, chained in this order):**
+- `read_input` — polls the keyboard into the `[bool; 12]` button state; F12 toggles the
+  overlay, Space pauses, B captures a bookmark
+- `run_emulation` — calls `frontend.run_frame()` (which internally handles frame-step and
+  breakpoints before calling `core.run()`)
+- `sync_video` — converts framebuffer to RGBA, uploads to `GameTexture`
+- `queue_audio` — drains audio samples from `Frontend` into `AudioOutput`
+- `show_debug` — renders egui debug overlay when `debug_open`
+- `update_title` — updates window title with frame count, resolution, FPS (every 60 frames)
 
-**Tests**: Basic input initialization test included
+**Pixel format conversion (`to_rgba8`):**
 
-### 4. `frontend.rs` (321 lines)
-**Purpose**: Main frontend logic, callback system, and main loop
+Handles all three libretro pixel formats inline before uploading to the Bevy texture:
+- `0` = 0RGB1555 (5 bits per channel)
+- `1` = XRGB8888 (memory layout: B, G, R, X)
+- `2` = RGB565
 
-**Key Structures**:
+---
 
-**Frontend**:
-- Owns: `RetroCore`, `Graphics`, `Audio`, `Input`
-- Owns: `CallbackContext` with frame/audio/input data
-- Methods:
-  - `new()`: Initializes core, loads game, sets up callbacks
-  - `setup_callbacks()`: Registers static callback functions
-  - `run()`: Main event loop with frame timing
+### `libretro.rs`
 
-**CallbackContext**:
-- Public fields for callback access
-- Methods (private):
-  - `environment_callback()`: Handles core environment queries
-  - `video_callback()`: Stores framebuffer data
-  - `audio_callback()`: Queues audio samples
-  - `input_poll_callback()`: SDL2 event polling trigger
-  - `input_state_callback()`: Returns button states
+All FFI bindings to libretro cores.
 
-**Static Callback Functions**:
-- `static_environment_callback()`
-- `static_video_callback()`
-- `static_input_poll_callback()`
-- `static_input_state_callback()`
-- `static_audio_callback()`
+**`RetroCore`** — represents a loaded core:
+- `load(path)` — opens `.dylib` with `libloading`, resolves all `retro_*` symbols
+- `get_system_info()` → `RetroSystemInfo`
+- `set_callbacks(env, video, audio, audio_batch, input_poll, input_state)`
+- `init()`, `load_game(info)`, `run()`, `unload_game()`, `deinit()`
 
-These functions use an atomic pointer to access the callback context without capturing variables.
+**Key types:**
+- `RetroSystemInfo` — library name, version, valid extensions, `need_fullpath`
+- `RetroGameInfo` — path + byte slice for ROM data
+- `RetroSystemAVInfo` — geometry (width, height, aspect), timing (fps, sample_rate)
+- `RetroMemoryMap` / `RetroMemoryDescriptor` — memory region descriptors from `SET_MEMORY_MAPS`
 
-**Global State**:
+**Environment command constants** (subset):
+```
+SET_PIXEL_FORMAT         = 10
+GET_SYSTEM_DIRECTORY     = 9
+GET_SAVE_DIRECTORY       = 31
+SET_SYSTEM_AV_INFO       = 32
+SET_MEMORY_MAPS          = 36
+GET_VARIABLE             = 15  (not implemented — returns false)
+```
+
+**Error type** (`LibretroError`):
+- `LoadFailed(String)` — `.dylib` could not be opened or symbol missing
+- `ApiVersionMismatch` — core returns version ≠ 1
+- `CoreNotLoaded` — called before `load()`
+- `GameLoadFailed` — `retro_load_game` returned false
+
+---
+
+### `frontend.rs`
+
+Owns the loaded core and all callback state.
+
+**`Frontend` struct:**
+- `core: RetroCore`
+- `callback_context: Box<CallbackContext>` — heap-pinned; pointer stored in static
+- `av_info: Option<RetroSystemAVInfo>`
+- `frame_count: u64`
+- `debug_state: SharedDebugState`
+- `sidecar_path: Option<PathBuf>`
+
+**`CallbackContext`** — state accessed by libretro C callbacks:
+- Save/system directory paths
+- Framebuffer bytes, dimensions, pixel format
+- Audio sample queue
+- Input button states (`[bool; 12]`)
+- Reference to `SharedDebugState` (for breakpoints, memory maps, CPU regs, etc.)
+
+**Callback wiring pattern:**
+
+Libretro cores call C function pointers — closures cannot be used because they can't be coerced
+to `extern "C" fn`. The solution is a static atomic pointer:
+
 ```rust
 static CALLBACK_CONTEXT: AtomicPtr<CallbackContext> = AtomicPtr::new(std::ptr::null_mut());
-```
 
-This allows C callbacks to access Rust state through a thin FFI layer.
-
-## Data Flow
-
-```
-User starts program
-        ↓
-[main.rs] Parse CLI arguments
-        ↓
-[frontend.rs] Create Frontend
-        ├→ [libretro.rs] Load core .so file
-        ├→ [sdl_interface.rs] Create SDL window
-        └→ Set up callbacks and initialize core
-        ↓
-[main.rs] Call frontend.run()
-        ↓
-[frontend.rs] Main loop (SDL event pump)
-   ├→ Poll SDL events (keyboard input)
-   ├→ Store button states in CallbackContext
-   ├→ Call core.run()
-   │   └→ Core executes C functions
-   │       ├→ Video callback: data → framebuffer
-   │       ├→ Audio callback: samples → queue
-   │       └→ Input callback: query button states
-   ├→ Process audio queue
-   ├→ Limit frame rate
-   └→ Repeat or exit on Quit event
-        ↓
-Clean up: unload_game(), deinit(), close SDL
-```
-
-## Callback Mechanism
-
-### Why Static Callbacks?
-
-Libretro cores are C code that call function pointers. These pointers must be C function pointers (`extern "C"`), not Rust closures. Closures can't be function pointers if they capture state.
-
-### Solution: Atomic Pointer Pattern
-
-```rust
-static CALLBACK_CONTEXT: AtomicPtr<CallbackContext> = ...;
-
-extern "C" fn static_video_callback(data: *const c_void, ...) {
+extern "C" fn static_video_callback(data: *const c_void, width: c_uint, height: c_uint, pitch: usize) {
     unsafe {
-        let ctx_ptr = CALLBACK_CONTEXT.load(Ordering::SeqCst);
-        if !ctx_ptr.is_null() {
-            (*ctx_ptr).video_callback(data, ...);
-        }
+        let ptr = CALLBACK_CONTEXT.load(Ordering::SeqCst);
+        if !ptr.is_null() { (*ptr).video_callback(data, width, height, pitch); }
     }
 }
 ```
 
-1. Store context pointer in static atomic
-2. In static callback, load pointer with atomic operation
-3. Cast pointer back to Rust struct and call methods
-4. Thread-safe due to atomic operations
+The `CallbackContext` pointer is written once during `Frontend::new()` and remains valid for the
+lifetime of the program.
 
-### Environment Callbacks
+**Environment callback handles:**
+- `SET_PIXEL_FORMAT` — stores format, accepts XRGB8888 and RGB565
+- `GET_SYSTEM_DIRECTORY` / `GET_SAVE_DIRECTORY` — returns configured paths
+- `SET_SYSTEM_AV_INFO` — stores FPS and sample rate
+- `SET_MEMORY_MAPS` — copies memory region descriptors into `DebugState`
+- `GET_VARIABLE` — returns false (core options not implemented)
 
-Handles core queries:
-- `SET_PIXEL_FORMAT`: Confirms XRGB8888 format
-- `GET_SYSTEM_DIRECTORY`: Returns path for BIOS files
-- `GET_SAVE_DIRECTORY`: Returns path for save files
-- `SET_SYSTEM_AV_INFO`: Core provides FPS/sample rate
-- `GET_VARIABLE`: Core options (not implemented)
+**Frame loop** (`run_frame()`, called by the Bevy `run_emulation` system):
+1. Check breakpoints / run-to address
+2. Call `core.run()` — core executes one frame, fires callbacks
+3. Update `DebugState` with CPU registers, PC heatmap, framebuffer
+4. Handle bookmark capture if signaled
+5. Handle sidecar save if signaled
 
-## Dependencies & Versions
+---
 
-```toml
-clap = "4.5"          # CLI argument parsing
-sdl2 = "0.36"         # Graphics/audio/input
-libloading = "0.8"    # Dynamic library loading
-thiserror = "1.0"     # Custom error types
-anyhow = "1.0"        # Error handling
-parking_lot = "0.12"  # Efficient synchronization
+### `audio.rs`
+
+**`AudioOutput`:**
+- Spawns a cpal output stream on construction (unless `--no-audio`)
+- Shared `Arc<Mutex<Vec<i16>>>` ring buffer between emulation thread and cpal callback
+- `queue(&[i16])` — appends samples from the libretro audio callback
+- `volume`, `muted` — applied by cpal callback at drain time
+- `Clone` — allows Bevy resource and debug overlay to share the same instance
+
+---
+
+### `debug/` — Debug Overlay
+
+#### `debug/mod.rs` — Shared State
+
+**`DebugState`** — all data shared between emulation and debug UI:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `framebuffer` / `fb_rgba` | `Vec<u8>` | Raw and decoded framebuffer |
+| `memory_regions` | `Vec<MemoryRegion>` | From libretro `SET_MEMORY_MAPS` |
+| `m68k_*` / `z80_*` | various | CPU register state |
+| `pc_heatmap` | `HashMap<u32, u64>` | Address → visit count |
+| `bookmarks` | `Vec<Bookmark>` | User-captured state snapshots |
+| `code_regions` | `Vec<CodeRegion>` | User-labeled address ranges |
+| `breakpoints` | `Vec<u32>` | M68K PC breakpoints (max 8) |
+| `paused` / `step_one` | `bool` | Execution control flags |
+| `event_log` | `VecDeque<String>` | Rolling event log (500 entries) |
+
+**`MemoryRegion`** — libretro memory descriptor:
+- `addr_start`, `addr_end`, `ptr`, `offset`, `disconnect` — for address translation
+- `region_type()` → `"ROM" | "RAM" | "VRAM" | "SRAM" | "Unmapped"`
+- `host_ptr_for_addr(emu_addr)` — safe address translation using the libretro formula
+
+**`Bookmark`** — serializable state snapshot:
+- M68K register set, frame number, PC, 64×48 RGBA thumbnail, editable label + notes
+
+**`CodeRegion`** — serializable address range:
+- `addr_start`, `addr_end`, `label`, RGB `color`, `notes`
+
+#### `debug/window.rs` — Tab Dispatcher
+
+`DebugApp` renders the egui top bar and dispatches to each panel:
+
 ```
+🖼 Frame | 📋 Hex | 🧩 Tiles | 🕹 Input | 🔧 CPU | 📜 Disasm | 🔊 Audio | 📜 Log | ⏸ Triggers | 🗺 Regions
+```
+
+#### `debug/panels/` — Individual Panels
+
+| File | Panel | Key Features |
+|------|-------|-------------|
+| `frame_inspector.rs` | 🖼 Frame | Live framebuffer, pixel inspector, zoom |
+| `hex_dump.rs` | 📋 Hex | Hex+ASCII dump of any memory region |
+| `tile_viewer.rs` | 🧩 Tiles | 8×8 VRAM tile browser |
+| `input_monitor.rs` | 🕹 Input | Button state + 120-frame input history |
+| `cpu_state.rs` | 🔧 CPU | M68K D0–D7, A0–A7, PC, SR; Z80 regs; delta highlights |
+| `disassembly.rs` | 📜 Disasm | Capstone M68K; ±10 instr window; breakpoints; run-to; label-range |
+| `audio_controls.rs` | 🔊 Audio | Volume, mute, sample rate display |
+| `frame_log.rs` | 📜 Log | Scrollable event log with filter |
+| `triggers.rs` | ⏸ Triggers | Frame-count and pixel-value pause triggers |
+| `regions.rs` | 🗺 Regions | Bookmarks, PC heatmap, code region manager |
+
+---
+
+## Data Flow
+
+```
+CLI args parsed by clap
+        │
+        ▼
+Bevy App starts
+        │
+        ├─ NonSend: Frontend::new()
+        │     ├─ RetroCore::load(core_path)      [libretro.rs]
+        │     ├─ CallbackContext::new(...)
+        │     ├─ core.set_callbacks(statics)
+        │     ├─ core.init()
+        │     └─ core.load_game(rom_path)
+        │
+        └─ Resources: GameTexture, AudioRes, DebugStateRes, DebugOverlay
+                │
+                ▼
+        Bevy schedule (every frame)
+                │
+                ├─ run_emulation → frontend.run_frame()
+                │     └─ core.run()
+                │           ├─ video_callback → DebugState.update_frame()
+                │           ├─ audio_callback → AudioOutput.queue()
+                │           └─ input_state_callback ← input [bool;12]
+                │
+                ├─ sync_video
+                │     └─ to_rgba8(framebuffer) → GameTexture (Bevy Image)
+                │
+                ├─ queue_audio
+                │     └─ frontend.drain_audio() → AudioOutput.queue()
+                │
+                └─ show_debug (when debug_open)
+                      └─ DebugApp::show(egui_ctx)
+```
+
+---
+
+## Callback Threading Model
+
+`retro_run()` is called from the Bevy main thread (via `NonSend`). All libretro callbacks fire
+synchronously within that call, so there is no concurrent access to `CallbackContext`.
+
+`DebugState` is behind `Arc<Mutex<>>` because the Bevy `show_debug` system (also on main thread)
+reads it between frames. The lock is briefly held during each system that accesses it.
+
+`AudioOutput` uses a separate `Arc<Mutex<Vec<i16>>>` ring buffer. The cpal stream runs on its own
+OS thread and holds this lock only to drain samples, keeping audio latency low.
+
+---
 
 ## Error Handling
 
-**Custom Error Type** (`LibretroError`):
-- `LoadFailed(String)` - Core loading failure
-- `ApiVersionMismatch` - Incompatible core version
-- `CoreNotLoaded` - Function called before load
-- `GameLoadFailed` - ROM couldn't be loaded
+- `anyhow::Result` used throughout for flexible propagation
+- `LibretroError` (thiserror) for typed core-loading failures
+- All `unsafe` blocks are isolated to FFI call sites in `libretro.rs` and the static callback
+  functions in `frontend.rs`
 
-**Fallback**: Uses `anyhow::Result` for other errors (file I/O, SDL2)
+---
 
 ## Known Limitations
 
-### Not Implemented Yet
-- ❌ **Video Rendering**: Framebuffer captured but not rendered to SDL texture
-- ❌ **Audio Playback**: Callback registered but samples not played
-- ❌ **Save States**: Infrastructure present but file I/O not done
-- ❌ **Core Options**: Env callback returns false for variable queries
-- ❌ **Multi-controller**: Only supports port 0
-- ❌ **Cheats/Rewind**: No support yet
+- `RETRO_ENVIRONMENT_GET_VARIABLE` returns false — cores requiring options may behave incorrectly
+- Single joypad only (port 0)
+- Save state serialization not implemented (directories are passed to cores)
+- No disc / multi-file content support
+- No rewind or cheat code support
 
-### Design Limitations
-- Single-threaded (core execution blocks main loop)
-- No frame skip or performance throttling
-- No screen capture or recording
-- No disc/multi-file content
-
-## Performance Characteristics
-
-- **Binary Size**: ~800KB release build
-- **Memory Usage**: Minimal (core-dependent)
-- **CPU Usage**: Depends on core/game, frame rate limiting included
-- **Latency**: Minimal (directly calls core each frame)
-
-## Testing
-
-Current test coverage:
-- `Input` button state initialization
-
-Future tests needed:
-- Core loading and unloading
-- Callback system integration
-- SDL2 event handling
-- Frame rate limiting accuracy
-
-## Extension Points
-
-To enhance the frontend:
-
-1. **Video**: Implement SDL2 texture rendering in `Graphics::render_frame()`
-2. **Audio**: Integrate SDL audio queue with callback samples
-3. **Options**: Implement `RETRO_ENVIRONMENT_GET_VARIABLE` for core options
-4. **Save States**: Add serialization to disk
-5. **Rewind**: Buffer frames in ring buffer
-6. **Controllers**: Support multiple ports with device selection
-
-## Code Style
-
-- Error handling via `Result` types
-- Minimal unsafe (only in FFI boundaries)
-- Clear separation of concerns (modules)
-- Documentation on public APIs
-- Direct style (no unnecessary abstractions)
-
-## Compile-Time Guarantees
-
-- Type-safe FFI with `extern "C"`
-- Memory-safe callback system (via static dispatch)
-- No unsafe iterator or unwrap() in hot paths
-- Safe string conversions from C
+> **Note:** MAME 2003-Plus previously crashed in `retro_load_game`; this was the wrong
+> environment-callback constants in the FFI layer, now fixed (see [DEBUGGING.md](DEBUGGING.md)).
+> MAME cores load once the correct `--system-dir` BIOS layout is provided.

@@ -1,1 +1,21 @@
 /target
+
+# Editor / backup files
+*.bak
+*~
+
+# Emulator content & cores (don't commit ROMs, BIOS, or core libraries)
+*.dylib
+*.so
+*.dll
+*.nes
+*.zip
+*.bin
+*.md5
+
+# Per-run sidecars and machine-local state
+*.regions.json
+*.srm
+*.nv
+nvram/
+cfg/
