@@ -15,6 +15,7 @@ pub struct Frontend {
     _game_path_cstring: Option<CString>,
     pub frame_count: u64,
     debug_state: SharedDebugState,
+    sidecar_path: Option<std::path::PathBuf>,
 }
 
 impl Frontend {
@@ -35,7 +36,12 @@ impl Frontend {
         eprintln!("Core: {} v{}", system_info.library_name, system_info.library_version);
         eprintln!("Valid extensions: {}", system_info.valid_extensions);
 
-        let callback_context = Box::new(CallbackContext::new(save_dir, system_dir, Arc::clone(&debug_state)));
+        let callback_context = Box::new(CallbackContext::new(save_dir.clone(), system_dir, Arc::clone(&debug_state)));
+
+        // Derive sidecar path: <save_dir>/<rom_stem>.regions.json
+        let sidecar_path = std::path::Path::new(rom_path)
+            .file_stem()
+            .map(|stem| save_dir.join(format!("{}.regions.json", stem.to_string_lossy())));
 
         let mut frontend = Frontend {
             core,
@@ -43,8 +49,17 @@ impl Frontend {
             callback_context,
             _game_path_cstring: None,
             frame_count: 0,
-            debug_state,
+            debug_state: Arc::clone(&debug_state),
+            sidecar_path: sidecar_path.clone(),
         };
+
+        // Store sidecar path in debug state and try to load existing data
+        if let Ok(mut ds) = debug_state.lock() {
+            ds.sidecar_path = sidecar_path.clone();
+        }
+        if let Some(ref path) = sidecar_path {
+            load_regions_sidecar(path, &debug_state);
+        }
 
         frontend.setup_callbacks()?;
         frontend
@@ -355,6 +370,16 @@ impl Frontend {
         // --- Capture bookmark if requested ---
         self.maybe_capture_bookmark();
 
+        // --- Save regions sidecar if requested ---
+        let needs_save = self.debug_state.try_lock()
+            .map(|mut ds| { let v = ds.save_regions; ds.save_regions = false; v })
+            .unwrap_or(false);
+        if needs_save {
+            if let Some(ref path) = self.sidecar_path {
+                save_regions_sidecar(path, &self.debug_state);
+            }
+        }
+
         // --- Apply pending AV info change ---
         if let Some(new_info) = self.callback_context.pending_av_info.take() {
             let av = new_info.to_rust();
@@ -396,6 +421,10 @@ impl Frontend {
     }
 
     pub fn shutdown(&self) {
+        // Save regions sidecar before shutting down
+        if let Some(ref path) = self.sidecar_path {
+            save_regions_sidecar(path, &self.debug_state);
+        }
         let _ = self.core.unload_game();
         let _ = self.core.deinit();
     }
@@ -710,4 +739,54 @@ fn downsample_thumbnail(rgba: &[u8], w: u32, h: u32, out_w: u32, out_h: u32) -> 
         }
     }
     out
+}
+
+/// Sidecar file format — bookmarks and code regions for one ROM.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RegionsSidecar {
+    bookmarks: Vec<crate::debug::Bookmark>,
+    code_regions: Vec<crate::debug::CodeRegion>,
+}
+
+/// Load a regions sidecar file into debug state. Silently ignores missing files.
+fn load_regions_sidecar(path: &std::path::Path, debug_state: &SharedDebugState) {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(_) => return, // file doesn't exist yet — that's fine
+    };
+    match serde_json::from_str::<RegionsSidecar>(&data) {
+        Ok(sidecar) => {
+            if let Ok(mut ds) = debug_state.lock() {
+                let bm_count  = sidecar.bookmarks.len();
+                let reg_count = sidecar.code_regions.len();
+                ds.bookmarks    = sidecar.bookmarks;
+                ds.code_regions = sidecar.code_regions;
+                ds.log(format!("📂 Loaded {} bookmark(s) and {} region(s) from {}", bm_count, reg_count, path.display()));
+            }
+        }
+        Err(e) => eprintln!("[Regions] Failed to parse sidecar {}: {}", path.display(), e),
+    }
+}
+
+/// Save bookmarks and code regions to a JSON sidecar file (atomic write via .tmp).
+fn save_regions_sidecar(path: &std::path::Path, debug_state: &SharedDebugState) {
+    let (bookmarks, code_regions) = match debug_state.lock() {
+        Ok(ds) => (ds.bookmarks.clone(), ds.code_regions.clone()),
+        Err(_) => return,
+    };
+    let sidecar = RegionsSidecar { bookmarks, code_regions };
+    let json = match serde_json::to_string_pretty(&sidecar) {
+        Ok(j) => j,
+        Err(e) => { eprintln!("[Regions] Serialization failed: {}", e); return; }
+    };
+    let tmp = path.with_extension("regions.json.tmp");
+    if std::fs::write(&tmp, &json).is_ok() {
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            eprintln!("[Regions] Failed to rename sidecar: {}", e);
+        } else if let Ok(mut ds) = debug_state.lock() {
+            ds.log(format!("💾 Saved regions to {}", path.display()));
+        }
+    } else {
+        eprintln!("[Regions] Failed to write sidecar to {}", tmp.display());
+    }
 }

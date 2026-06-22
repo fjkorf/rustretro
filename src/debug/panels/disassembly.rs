@@ -1,11 +1,18 @@
 use bevy_egui::egui;
 use capstone::prelude::*;
-use crate::debug::DebugState;
+use crate::debug::{CodeRegion, DebugState};
 
-pub struct Disassembly;
+pub struct Disassembly {
+    /// Pending "label range" form: (start_addr, end_addr_input, label_text, color_rgb)
+    pending_label: Option<(u32, String, String, [f32; 3])>,
+}
 
 impl Disassembly {
-    pub fn show(ui: &mut egui::Ui, debug_state: &mut DebugState) {
+    pub fn new() -> Self {
+        Disassembly { pending_label: None }
+    }
+
+    pub fn show(&mut self, ui: &mut egui::Ui, debug_state: &mut DebugState) {
         ui.vertical(|ui| {
             ui.heading("📜 Disassembly");
             ui.separator();
@@ -54,13 +61,34 @@ impl Disassembly {
                 Ok(insns) => {
                     let pc = debug_state.m68k_pc;
                     let breakpoints = debug_state.breakpoints.clone();
+                    let code_regions = debug_state.code_regions.clone();
                     let mut toggle_bp: Option<u32> = None;
                     let mut run_to: Option<u32> = None;
+                    let mut label_addr: Option<u32> = None;
 
-                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                         for (addr, text) in &insns {
+                            // Region header — show banner when this address starts a labeled region
+                            for region in &code_regions {
+                                if *addr >= region.addr_start && *addr <= region.addr_end {
+                                    if *addr == region.addr_start {
+                                        let c = region.color;
+                                        let color = egui::Color32::from_rgb(c[0], c[1], c[2]);
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new(format!("▼ {}", region.label))
+                                                .strong().color(color).small());
+                                        });
+                                    }
+                                }
+                            }
+
                             let is_current = *addr == pc;
                             let has_bp = breakpoints.contains(addr);
+
+                            // Determine tint from any enclosing region
+                            let region_color = code_regions.iter()
+                                .find(|r| *addr >= r.addr_start && *addr <= r.addr_end)
+                                .map(|r| egui::Color32::from_rgba_unmultiplied(r.color[0], r.color[1], r.color[2], 40));
 
                             ui.horizontal(|ui| {
                                 let dot = if has_bp { "🔴" } else { "⚫" };
@@ -72,11 +100,31 @@ impl Disassembly {
                                     egui::Color32::from_rgb(100, 220, 100)
                                 } else if has_bp {
                                     egui::Color32::from_rgb(255, 100, 100)
+                                } else if let Some(rc) = region_color {
+                                    // blend region tint with light gray
+                                    egui::Color32::from_rgb(
+                                        180u8.saturating_add(rc.r() / 4),
+                                        180u8.saturating_add(rc.g() / 4),
+                                        180u8.saturating_add(rc.b() / 4),
+                                    )
                                 } else {
                                     egui::Color32::LIGHT_GRAY
                                 };
                                 let resp = ui.label(egui::RichText::new(text).monospace().color(color));
-                                if resp.secondary_clicked() { run_to = Some(*addr); }
+                                if resp.secondary_clicked() {
+                                    // Right-click: show context menu
+                                    run_to = Some(*addr);
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui.button("▶ Run to here").clicked() {
+                                        run_to = Some(*addr);
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("🏷 Label range starting here…").clicked() {
+                                        label_addr = Some(*addr);
+                                        ui.close_menu();
+                                    }
+                                });
                             });
                         }
                     });
@@ -91,6 +139,14 @@ impl Disassembly {
                     if let Some(addr) = run_to {
                         debug_state.run_to_addr = Some(addr);
                         debug_state.paused = false;
+                    }
+                    if let Some(addr) = label_addr {
+                        self.pending_label = Some((
+                            addr,
+                            format!("{:06X}", addr.saturating_add(31)),
+                            String::new(),
+                            [0.0, 0.8, 0.4],
+                        ));
                     }
 
                     if !debug_state.breakpoints.is_empty() {
@@ -109,8 +165,59 @@ impl Disassembly {
                 }
             }
 
+            // ── Inline label-range form ──────────────────────────────────────
+            // Decisions are collected into locals so we can clear `self.pending_label`
+            // after the mutable borrow from the form bindings has ended.
+            let mut new_region: Option<CodeRegion> = None;
+            let mut close_form = false;
+            if let Some((start, end_str, label_text, color)) = self.pending_label.as_mut() {
+                let start = *start;
+                ui.separator();
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new("🏷 Label Address Range").strong());
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Start: ${:06X}", start));
+                        ui.label("  End:");
+                        ui.add(egui::TextEdit::singleline(end_str).desired_width(80.0).hint_text("hex addr"));
+                        ui.label("  Label:");
+                        ui.add(egui::TextEdit::singleline(label_text).desired_width(150.0).hint_text("e.g. game_loop"));
+                        ui.label("Color:");
+                        ui.color_edit_button_rgb(color);
+                    });
+                    ui.horizontal(|ui| {
+                        let can_add = !label_text.is_empty();
+                        if ui.add_enabled(can_add, egui::Button::new("✅ Add Region")).clicked() {
+                            let end_addr = u32::from_str_radix(end_str.trim_start_matches("0x"), 16)
+                                .unwrap_or(start.saturating_add(31));
+                            let c = [
+                                (color[0] * 255.0) as u8,
+                                (color[1] * 255.0) as u8,
+                                (color[2] * 255.0) as u8,
+                            ];
+                            new_region = Some(CodeRegion {
+                                label: label_text.clone(),
+                                addr_start: start,
+                                addr_end: end_addr,
+                                color: c,
+                                notes: String::new(),
+                            });
+                            close_form = true;
+                        }
+                        if ui.button("❌ Cancel").clicked() {
+                            close_form = true;
+                        }
+                    });
+                });
+            }
+            if let Some(region) = new_region {
+                debug_state.code_regions.push(region);
+            }
+            if close_form {
+                self.pending_label = None;
+            }
+
             ui.separator();
-            ui.label(egui::RichText::new("Click ⚫ to set BP  ·  Right-click instruction → Run to address")
+            ui.label(egui::RichText::new("Click ⚫ to set BP  ·  Right-click → Run to / Label range")
                 .small().color(egui::Color32::DARK_GRAY));
         });
     }

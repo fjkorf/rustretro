@@ -31,6 +31,7 @@ pub struct DebugApp {
     triggers: Triggers,
     cpu_state: CpuState,
     audio_controls: AudioControls,
+    disassembly: Disassembly,
     regions_panel: RegionsPanel,
 }
 
@@ -48,6 +49,7 @@ impl DebugApp {
             triggers: Triggers::new(),
             cpu_state: CpuState::new(),
             audio_controls: AudioControls,
+            disassembly: Disassembly::new(),
             regions_panel: RegionsPanel::new(),
         }
     }
@@ -100,7 +102,7 @@ impl DebugApp {
                 Tab::Triggers       => self.triggers.show(ui, &self.state),
                 Tab::Disasm => {
                     if let Ok(mut ds) = self.state.lock() {
-                        Disassembly::show(ui, &mut ds);
+                        self.disassembly.show(ui, &mut ds);
                     } else {
                         ui.label("Error: Could not acquire debug state lock");
                     }

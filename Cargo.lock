@@ -4703,6 +4703,8 @@ dependencies = [
  "image",
  "libloading",
  "memoffset",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

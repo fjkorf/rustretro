@@ -7,20 +7,21 @@ use std::sync::{Arc, Mutex};
 pub type SharedDebugState = Arc<Mutex<DebugState>>;
 
 /// A user-created snapshot of machine state at a named moment (e.g. "Title Screen", "Level 2").
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Bookmark {
     pub label: String,
     pub frame: u64,
     pub m68k_pc: u32,
     pub m68k_d_regs: [u32; 8],
     pub m68k_a_regs: [u32; 8],
-    /// 64×48 RGBA thumbnail (downsampled framebuffer), may be empty.
+    /// 64×48 RGBA thumbnail. Not persisted (regenerated during play).
+    #[serde(skip)]
     pub thumbnail: Vec<u8>,
     pub notes: String,
 }
 
 /// A user-labeled range of M68K code addresses (e.g. "game_loop", "sound_driver").
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct CodeRegion {
     pub label: String,
     pub addr_start: u32,
@@ -176,6 +177,10 @@ pub struct DebugState {
     pub code_regions: Vec<CodeRegion>,
     /// Signal from UI or keyboard: capture a bookmark on the next emulation frame.
     pub create_bookmark: bool,
+    /// Signal from UI: write regions sidecar to disk on the next emulation frame.
+    pub save_regions: bool,
+    /// Path of the regions sidecar file (set by Frontend on startup).
+    pub sidecar_path: Option<std::path::PathBuf>,
 }
 
 impl DebugState {
@@ -223,6 +228,8 @@ impl DebugState {
             bookmarks: Vec::new(),
             code_regions: Vec::new(),
             create_bookmark: false,
+            save_regions: false,
+            sidecar_path: None,
         }
     }
 

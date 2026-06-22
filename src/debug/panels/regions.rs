@@ -26,13 +26,25 @@ impl RegionsPanel {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, ds: &mut DebugState) {
-        // ── Bookmark button (also usable without keyboard) ──────────────────
+        // ── Toolbar ─────────────────────────────────────────────────────────
         ui.horizontal(|ui| {
             if ui.button("📌 Bookmark now  [B]").clicked() {
                 ds.create_bookmark = true;
             }
-            ui.label(format!("{} bookmarks  |  {} heatmap entries  |  {} labeled regions",
-                ds.bookmarks.len(), ds.pc_heatmap.len(), ds.code_regions.len()));
+            ui.separator();
+            if ui.button("💾 Save").on_hover_text("Save bookmarks and regions to sidecar JSON").clicked() {
+                ds.save_regions = true;
+            }
+            if let Some(ref path) = ds.sidecar_path {
+                ui.label(egui::RichText::new(format!("→ {}", path.display()))
+                    .small().color(egui::Color32::DARK_GRAY));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(format!(
+                    "{} bookmarks  ·  {} heatmap entries  ·  {} regions",
+                    ds.bookmarks.len(), ds.pc_heatmap.len(), ds.code_regions.len()))
+                    .small().color(egui::Color32::GRAY));
+            });
         });
         ui.separator();
 
