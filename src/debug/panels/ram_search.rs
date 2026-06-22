@@ -289,12 +289,15 @@ impl RamSearchPanel {
             .collect();
 
         let mut to_watch: Option<usize> = None;
+        // Collect goto target into a local to avoid a second mut-borrow of state
+        // while rows (which borrows state) is still alive.
+        let mut goto_addr: Option<u32> = None;
 
         ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
                 egui::Grid::new("ram_search_results")
-                    .num_columns(3)
+                    .num_columns(4)
                     .spacing([12.0, 2.0])
                     .striped(true)
                     .show(ui, |ui| {
@@ -314,6 +317,15 @@ impl RamSearchPanel {
                             if ui.button("+Watch").clicked() {
                                 to_watch = Some(*addr);
                             }
+
+                            // Navigate — jump Disasm/Hex to this candidate address.
+                            if ui.small_button("→")
+                                .on_hover_text("Navigate Disasm/Hex to this address")
+                                .clicked()
+                            {
+                                goto_addr = Some(*addr as u32);
+                            }
+
                             ui.end_row();
                         }
                     });
@@ -331,6 +343,10 @@ impl RamSearchPanel {
                 current: value,
                 prev_value: None,
             });
+        }
+        // Apply goto after the rows borrow of state has ended.
+        if let Some(addr) = goto_addr {
+            state.goto(addr);
         }
     }
 }

@@ -57,7 +57,11 @@ impl Disassembly {
 
             ui.separator();
 
-            match Self::decode_instructions(debug_state) {
+            // Prefer pending_focus over PC when the navigator has a target this frame.
+            // Do NOT clear pending_focus here — the dispatcher owns that.
+            let focus_addr: u32 = debug_state.nav.pending_focus.unwrap_or(debug_state.m68k_pc);
+
+            match Self::decode_instructions_at(debug_state, focus_addr) {
                 Ok(insns) => {
                     let pc = debug_state.m68k_pc;
                     let breakpoints = debug_state.breakpoints.clone();
@@ -222,30 +226,45 @@ impl Disassembly {
         });
     }
 
-    fn decode_instructions(debug_state: &DebugState) -> Result<Vec<(u32, String)>, String> {
+    /// Decode instructions starting from `focus_addr` (which may differ from PC when the
+    /// navigation cursor has been set by another panel via `goto`).
+    fn decode_instructions_at(debug_state: &DebugState, focus_addr: u32) -> Result<Vec<(u32, String)>, String> {
         let pc = debug_state.m68k_pc;
+        // If cached bytes cover the focus address, use them.
         let bytes: &[u8] = if !debug_state.m68k_code_bytes.is_empty()
-            && debug_state.m68k_code_start == pc
+            && debug_state.m68k_code_start == focus_addr
         {
             &debug_state.m68k_code_bytes
         } else if !debug_state.memory_regions.is_empty() {
             let region = debug_state
                 .memory_regions
                 .iter()
-                .find(|r| pc as usize >= r.addr_start && pc as usize <= r.addr_end)
-                .ok_or_else(|| format!("PC ${:06X} outside all memory regions", pc))?;
+                .find(|r| focus_addr as usize >= r.addr_start && focus_addr as usize <= r.addr_end)
+                .ok_or_else(|| format!("Address ${:06X} outside all memory regions", focus_addr))?;
             let host_ptr = region
-                .host_ptr_for_addr(pc as usize)
-                .ok_or_else(|| "Cannot translate PC address".to_string())?;
-            return Self::decode_bytes(
-                unsafe { std::slice::from_raw_parts(host_ptr as *const u8, 256) }, pc);
+                .host_ptr_for_addr(focus_addr as usize)
+                .ok_or_else(|| "Cannot translate focus address".to_string())?;
+            return Self::decode_bytes_at(
+                unsafe { std::slice::from_raw_parts(host_ptr as *const u8, 256) },
+                focus_addr,
+                pc,
+            );
         } else {
             return Err("No code bytes — core does not expose memory via SekFetchByte or SET_MEMORY_MAPS".to_string());
         };
-        Self::decode_bytes(bytes, pc)
+        Self::decode_bytes_at(bytes, focus_addr, pc)
     }
 
-    fn decode_bytes(bytes: &[u8], pc: u32) -> Result<Vec<(u32, String)>, String> {
+    /// Legacy entry point retained for any callers that relied on PC-only decoding.
+    #[allow(dead_code)]
+    fn decode_instructions(debug_state: &DebugState) -> Result<Vec<(u32, String)>, String> {
+        Self::decode_instructions_at(debug_state, debug_state.m68k_pc)
+    }
+
+    /// Decode bytes starting at `start_addr`; mark `real_pc` with the "→" arrow.
+    /// `start_addr` may equal `real_pc` (normal case) or differ when the
+    /// navigation cursor has jumped elsewhere.
+    fn decode_bytes_at(bytes: &[u8], start_addr: u32, real_pc: u32) -> Result<Vec<(u32, String)>, String> {
         let cs = Capstone::new()
             .m68k()
             .mode(capstone::arch::m68k::ArchMode::M68k020)
@@ -253,29 +272,29 @@ impl Disassembly {
             .map_err(|e| format!("Capstone error: {:?}", e))?;
 
         let insns = cs
-            .disasm_all(bytes, pc as u64)
+            .disasm_all(bytes, start_addr as u64)
             .map_err(|e| format!("Disassembly error: {:?}", e))?;
 
         let mut result = Vec::new();
-        let mut found_pc = false;
-        let mut shown_after = 0;
 
-        for insn in insns.iter() {
+        for (shown, insn) in insns.iter().enumerate() {
+            if shown >= 14 { break; }
             let addr = insn.address() as u32;
-            if addr == pc { found_pc = true; }
-            if found_pc {
-                if shown_after >= 14 { break; }
-                shown_after += 1;
-            }
             let mnem = insn.mnemonic().unwrap_or("??");
             let ops  = insn.op_str().unwrap_or("");
-            let marker = if addr == pc { "→ " } else { "  " };
+            let marker = if addr == real_pc { "→ " } else { "  " };
             result.push((addr, format!("{}{:06X}:  {:<10} {}", marker, addr, mnem, ops)));
         }
 
-        if !found_pc {
-            return Err(format!("PC ${:06X} not found in decoded output", pc));
+        if result.is_empty() {
+            return Err(format!("No instructions decoded at ${:06X}", start_addr));
         }
         Ok(result)
+    }
+
+    /// Legacy byte-decoding entry point (PC == start address).
+    #[allow(dead_code)]
+    fn decode_bytes(bytes: &[u8], pc: u32) -> Result<Vec<(u32, String)>, String> {
+        Self::decode_bytes_at(bytes, pc, pc)
     }
 }

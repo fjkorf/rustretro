@@ -208,15 +208,19 @@ impl RegionsPanel {
 
         ui.label(format!("Top {} addresses (of {} unique):", entries.len(), ds.pc_heatmap.len()));
 
+        // Collect a goto target into a local to avoid borrowing ds during the grid loop.
+        let mut goto_addr: Option<u32> = None;
+
         ScrollArea::vertical().max_height(250.0).id_salt("heatmap_scroll").show(ui, |ui| {
             egui::Grid::new("heatmap_grid")
-                .num_columns(3)
+                .num_columns(4)
                 .striped(true)
                 .spacing([8.0, 2.0])
                 .show(ui, |ui| {
                     ui.label(RichText::new("Address").strong());
                     ui.label(RichText::new("Visits").strong());
                     ui.label(RichText::new("Heat").strong());
+                    ui.label(RichText::new("").strong());
                     ui.end_row();
 
                     for (addr, count) in &entries {
@@ -237,10 +241,20 @@ impl RegionsPanel {
                         ui.painter().rect_filled(
                             egui::Rect::from_min_size(rect.min, egui::vec2(bar_width, 12.0)),
                             2.0, color);
+
+                        // Navigation button — jump Disasm/Hex to this address.
+                        if ui.small_button("→").on_hover_text("Navigate Disasm/Hex to this address").clicked() {
+                            goto_addr = Some(*addr);
+                        }
                         ui.end_row();
                     }
                 });
         });
+
+        // Apply goto after the borrow of ds.pc_heatmap has ended.
+        if let Some(addr) = goto_addr {
+            ds.goto(addr);
+        }
     }
 
     // ── Code Regions ─────────────────────────────────────────────────────────
@@ -253,15 +267,18 @@ impl RegionsPanel {
         }
 
         let mut delete_idx: Option<usize> = None;
+        // Collect goto target into a local to avoid borrowing ds.code_regions during the grid loop.
+        let mut goto_addr: Option<u32> = None;
 
         ScrollArea::vertical().max_height(200.0).id_salt("regions_scroll").show(ui, |ui| {
             egui::Grid::new("regions_grid")
-                .num_columns(4)
+                .num_columns(5)
                 .striped(true)
                 .show(ui, |ui| {
                     ui.label(RichText::new("Label").strong());
                     ui.label(RichText::new("Start").strong());
                     ui.label(RichText::new("End").strong());
+                    ui.label(RichText::new("").strong());
                     ui.label(RichText::new("").strong());
                     ui.end_row();
 
@@ -269,8 +286,18 @@ impl RegionsPanel {
                         let c = region.color;
                         let color = Color32::from_rgb(c[0], c[1], c[2]);
                         ui.label(RichText::new(&region.label).color(color).strong());
-                        ui.label(RichText::new(format!("${:06X}", region.addr_start)).monospace());
+
+                        // Clickable start address — navigates to region start.
+                        if ui.small_button(
+                            RichText::new(format!("${:06X}", region.addr_start)).monospace()
+                        ).on_hover_text("Navigate Disasm/Hex to region start").clicked() {
+                            goto_addr = Some(region.addr_start);
+                        }
+
                         ui.label(RichText::new(format!("${:06X}", region.addr_end)).monospace());
+                        if ui.small_button("→").on_hover_text("Navigate to region start").clicked() {
+                            goto_addr = Some(region.addr_start);
+                        }
                         if ui.small_button("🗑").clicked() { delete_idx = Some(i); }
                         ui.end_row();
                     }
@@ -278,5 +305,9 @@ impl RegionsPanel {
         });
 
         if let Some(i) = delete_idx { ds.code_regions.remove(i); }
+        // Apply goto after the borrow of ds.code_regions has ended.
+        if let Some(addr) = goto_addr {
+            ds.goto(addr);
+        }
     }
 }

@@ -74,10 +74,13 @@ impl WatchPanel {
             }
 
             let mut remove_idx: Option<usize> = None;
+            // Collect goto target into a local to avoid a second mut-borrow of state
+            // while iterating over state.watches.
+            let mut goto_addr: Option<u32> = None;
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 egui::Grid::new("watch_grid")
-                    .num_columns(6)
+                    .num_columns(7)
                     .spacing([12.0, 4.0])
                     .striped(true)
                     .show(ui, |ui| {
@@ -92,7 +95,8 @@ impl WatchPanel {
                                  running that frame. Frame-granular: the actual \
                                  write happened sometime during that frame, not \
                                  necessarily at this exact instruction.");
-                        ui.label(egui::RichText::new("").strong());
+                        ui.label(egui::RichText::new("").strong()); // goto
+                        ui.label(egui::RichText::new("").strong()); // remove
                         ui.end_row();
 
                         for (i, watch) in state.watches.iter_mut().enumerate() {
@@ -120,6 +124,14 @@ impl WatchPanel {
                             // Track-changes checkbox
                             ui.checkbox(&mut watch.track_changes, "");
 
+                            // Navigate — jump Disasm/Hex to this watch address.
+                            if ui.small_button("→")
+                                .on_hover_text("Navigate Disasm/Hex to this address")
+                                .clicked()
+                            {
+                                goto_addr = Some(watch.addr as u32);
+                            }
+
                             // Remove
                             if ui.small_button("✕").clicked() {
                                 remove_idx = Some(i);
@@ -132,6 +144,10 @@ impl WatchPanel {
 
             if let Some(i) = remove_idx {
                 state.watches.remove(i);
+            }
+            // Apply goto after the iter_mut borrow of state.watches has ended.
+            if let Some(addr) = goto_addr {
+                state.goto(addr);
             }
 
             ui.separator();

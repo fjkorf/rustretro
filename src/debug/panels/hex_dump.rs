@@ -28,10 +28,34 @@ impl HexDump {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, state: &Arc<Mutex<DebugState>>) {
-        let (regions, current_fb) = {
+        let (regions, current_fb, nav_focus) = {
             let s = state.lock().unwrap();
-            (s.memory_regions.clone(), (s.framebuffer.clone(), s.fb_width, s.fb_height))
+            (
+                s.memory_regions.clone(),
+                (s.framebuffer.clone(), s.fb_width, s.fb_height),
+                s.nav.pending_focus,
+            )
         };
+
+        // Apply navigation cursor: scroll to the focused address and, if it
+        // falls within a known region, switch to that region automatically.
+        // Do NOT clear pending_focus — the dispatcher owns that.
+        if let Some(focus) = nav_focus {
+            let focus_usize = focus as usize;
+            // Find the region that contains this address and switch to it.
+            if let Some(region_idx) = regions.iter().position(|r| {
+                focus_usize >= r.addr_start && focus_usize <= r.addr_end
+            }) {
+                self.current_region_idx = region_idx;
+                // Row the byte lives in, relative to the region start.
+                let region = &regions[region_idx];
+                let offset = focus_usize.saturating_sub(region.addr_start);
+                self.scroll_to = Some(offset / 16);
+            } else {
+                // Address not in any named region — scroll by raw offset.
+                self.scroll_to = Some(focus_usize / 16);
+            }
+        }
 
         // Clamp region index
         if self.current_region_idx >= regions.len() {
@@ -137,9 +161,14 @@ impl HexDump {
         let num_rows = buf_to_display.len().div_ceil(bytes_per_row);
         let row_height = 16.0;
 
-        egui::ScrollArea::vertical()
-            .auto_shrink(false)
-            .show_rows(ui, row_height, num_rows, |ui, row_range| {
+        // Consume the scroll_to target: set the vertical offset so the requested
+        // row is visible, then clear it so it only fires once.
+        let mut scroll_area = egui::ScrollArea::vertical().auto_shrink(false);
+        if let Some(target_row) = self.scroll_to.take() {
+            let target_row = target_row.min(num_rows.saturating_sub(1));
+            scroll_area = scroll_area.vertical_scroll_offset(target_row as f32 * row_height);
+        }
+        scroll_area.show_rows(ui, row_height, num_rows, |ui, row_range| {
                 egui::Grid::new("hex_grid")
                     .num_columns(3)
                     .spacing([8.0, 2.0])

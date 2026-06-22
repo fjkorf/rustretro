@@ -27,6 +27,8 @@ pub struct DebugApp {
     state: Arc<Mutex<DebugState>>,
     audio: Option<Arc<Mutex<AudioOutput>>>,
     active_tab: Tab,
+    /// Hex address buffer backing the toolbar "Go to:" field.
+    goto_input: String,
     frame_inspector: FrameInspector,
     hex_dump: HexDump,
     input_monitor: InputMonitor,
@@ -49,6 +51,7 @@ impl DebugApp {
             state,
             audio: None,
             active_tab: Tab::FrameInspector,
+            goto_input: String::new(),
             frame_inspector: FrameInspector::new(),
             hex_dump: HexDump::new(),
             input_monitor: InputMonitor::new(),
@@ -78,23 +81,107 @@ impl DebugApp {
             s.fps, s.fb_width, s.fb_height, s.fb_fmt, s.paused,
         ));
 
-        egui::TopBottomPanel::top("debug_tab_bar").show(ctx, |ui| {
+        // --- Persistent global toolbar (always visible regardless of active tab) ---
+        egui::TopBottomPanel::top("debug_toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                if let Ok(mut ds) = self.state.lock() {
+                    // Back / Forward history navigation.
+                    let can_back = ds.can_go_back();
+                    let can_fwd = ds.can_go_forward();
+                    if ui.add_enabled(can_back, egui::Button::new("◀ Back")).clicked() {
+                        ds.nav_back();
+                    }
+                    if ui.add_enabled(can_fwd, egui::Button::new("▶ Fwd")).clicked() {
+                        ds.nav_forward();
+                    }
+
+                    ui.separator();
+
+                    // Run / Pause toggle.
+                    let (run_lbl, run_col) = if ds.paused {
+                        ("▶ Run", egui::Color32::GREEN)
+                    } else {
+                        ("⏸ Pause", egui::Color32::YELLOW)
+                    };
+                    if ui.button(egui::RichText::new(run_lbl).color(run_col)).clicked() {
+                        ds.paused = !ds.paused;
+                    }
+                    if ui.button("⏭ Step").clicked() {
+                        ds.step_one = true;
+                    }
+                    // Frame-step: advances one instruction for now (same as Step until a
+                    // true run-to-next-frame mechanism exists).
+                    if ui.button("⏯ Step Frame").clicked() {
+                        ds.step_one = true;
+                    }
+
+                    ui.separator();
+
+                    // Go-to-address (hex). Enter in the field or the Go button both jump.
+                    ui.label("Go to:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.goto_input)
+                            .desired_width(80.0)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("hex"),
+                    );
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Go").clicked() || enter {
+                        let txt = self.goto_input.trim().trim_start_matches('$').trim_start_matches("0x");
+                        if let Ok(addr) = u32::from_str_radix(txt, 16) {
+                            ds.goto(addr);
+                        }
+                    }
+
+                    ui.separator();
+
+                    // PC + current-location readout.
+                    let pc = ds.m68k_pc;
+                    let cur = ds.nav.current_address;
+                    ui.label(egui::RichText::new(format!("PC: ${pc:06X}")).monospace());
+                    if let Some(addr) = cur {
+                        ui.label(egui::RichText::new(format!("@ ${addr:06X}")).monospace());
+                    }
+                } else {
+                    ui.label("Error: Could not acquire debug state lock");
+                }
+            });
+        });
+
+        egui::TopBottomPanel::top("debug_tab_bar").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.heading("🎮 RustRetro Debugger");
                 ui.separator();
-                ui.selectable_value(&mut self.active_tab, Tab::FrameInspector, "🖼 Frame");
-                ui.selectable_value(&mut self.active_tab, Tab::HexDump,        "📋 Hex");
-                ui.selectable_value(&mut self.active_tab, Tab::TileViewer,     "🧩 Tiles");
-                ui.selectable_value(&mut self.active_tab, Tab::InputMonitor,   "🕹 Input");
+
+                // --- CPU group ---
+                ui.label(egui::RichText::new("CPU:").weak());
                 ui.selectable_value(&mut self.active_tab, Tab::CpuState,       "🔧 CPU");
                 ui.selectable_value(&mut self.active_tab, Tab::Disasm,         "📜 Disasm");
-                ui.selectable_value(&mut self.active_tab, Tab::Audio,          "🔊 Audio");
-                ui.selectable_value(&mut self.active_tab, Tab::FrameLog,       "📜 Log");
                 ui.selectable_value(&mut self.active_tab, Tab::Triggers,       "⏸ Triggers");
-                ui.selectable_value(&mut self.active_tab, Tab::Regions,        "🗺 Regions");
+                ui.selectable_value(&mut self.active_tab, Tab::FrameLog,       "🧾 Log");
+                ui.separator();
+
+                // --- MEM group ---
+                ui.label(egui::RichText::new("MEM:").weak());
+                ui.selectable_value(&mut self.active_tab, Tab::HexDump,        "📋 Hex");
                 ui.selectable_value(&mut self.active_tab, Tab::Watch,          "👁 Watch");
                 ui.selectable_value(&mut self.active_tab, Tab::RamSearch,      "🔍 Search");
+                ui.selectable_value(&mut self.active_tab, Tab::Regions,        "🗺 Regions");
+                ui.separator();
+
+                // --- GFX group ---
+                ui.label(egui::RichText::new("GFX:").weak());
+                ui.selectable_value(&mut self.active_tab, Tab::FrameInspector, "🖼 Frame");
+                ui.selectable_value(&mut self.active_tab, Tab::TileViewer,     "🧩 Tiles");
                 ui.selectable_value(&mut self.active_tab, Tab::VdpRegisters,   "📺 VDP");
+                ui.separator();
+
+                // --- IO group ---
+                ui.label(egui::RichText::new("IO:").weak());
+                ui.selectable_value(&mut self.active_tab, Tab::InputMonitor,   "🕹 Input");
+                ui.selectable_value(&mut self.active_tab, Tab::Audio,          "🔊 Audio");
+                ui.separator();
+
                 ui.selectable_value(&mut self.active_tab, Tab::Help,           "❓ Help");
 
                 if let Some((fc, vf, vr, fps, w, h, fmt, paused)) = state_snapshot {
@@ -165,5 +252,12 @@ impl DebugApp {
                 }
             }
         });
+
+        // pending_focus is a one-frame pulse: address-aware panels read it during this
+        // frame's CentralPanel render above, then we clear it here (after that closure
+        // returns) so it fires exactly once. Must run AFTER the central panel.
+        if let Ok(mut ds) = self.state.lock() {
+            ds.nav.pending_focus = None;
+        }
     }
 }

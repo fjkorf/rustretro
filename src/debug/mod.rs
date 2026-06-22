@@ -206,6 +206,34 @@ pub fn detect_change(prev: Option<u32>, cur: u32) -> bool {
     matches!(prev, Some(p) if p != cur)
 }
 
+/// Shared cross-panel navigation state: a single "current location" cursor plus a
+/// back/forward history stack.
+///
+/// ## Contract for address-aware panels
+/// Every frame, an address-aware panel (Disassembly, Hex, Regions, Watch, RamSearch)
+/// reads [`NavState::pending_focus`]. If it is `Some(addr)`, the panel scrolls/centers
+/// its view to `addr` for this frame. Panels MUST NOT clear `pending_focus` themselves;
+/// it is a one-frame pulse cleared centrally by the dispatcher AFTER all panels have
+/// rendered (see `DebugApp::show`, which sets `nav.pending_focus = None` once the
+/// CentralPanel closure returns). This guarantees every panel sees the same pulse for
+/// exactly one frame regardless of which tab is active.
+///
+/// To change the current location from anywhere, call [`DebugState::goto`] (THE entry
+/// point). Back/forward navigation is driven by the toolbar via [`DebugState::nav_back`]
+/// / [`DebugState::nav_forward`].
+#[derive(Default)]
+pub struct NavState {
+    /// The shared "current location" cursor (None until first `goto`).
+    pub current_address: Option<u32>,
+    /// Back/forward stack of visited addresses (oldest at front).
+    pub history: Vec<u32>,
+    /// Index into `history` of the current entry.
+    pub history_idx: usize,
+    /// Set whenever the address changes; address-aware panels consume it by reading
+    /// (the dispatcher clears it after the frame's panels have rendered).
+    pub pending_focus: Option<u32>,
+}
+
 /// Memory region descriptor (from libretro SET_MEMORY_MAPS callback)
 #[derive(Clone)]
 pub struct MemoryRegion {
@@ -369,6 +397,10 @@ pub struct DebugState {
     pub ram_search: RamSearch,
     /// Rolling log of value changes for tracked watches (capped, newest at back).
     pub change_log: VecDeque<ChangeEvent>,
+
+    // --- Navigation ---
+    /// Shared cross-panel navigation cursor + back/forward history.
+    pub nav: NavState,
 }
 
 /// Maximum number of change events retained in `change_log`.
@@ -425,7 +457,61 @@ impl DebugState {
             watches: Vec::new(),
             ram_search: RamSearch::new(),
             change_log: VecDeque::new(),
+            nav: NavState::default(),
         }
+    }
+
+    /// THE entry point other panels call to change the shared current location.
+    ///
+    /// Sets the cursor to `addr`, pushes it onto the back/forward history (truncating
+    /// any forward entries first, so a new jump from the middle of history discards the
+    /// "forward" branch), and arms `pending_focus` so address-aware panels scroll to it
+    /// on the next render.
+    pub fn goto(&mut self, addr: u32) {
+        self.nav.current_address = Some(addr);
+        // Truncate any forward entries before appending the new location.
+        if !self.nav.history.is_empty() && self.nav.history_idx + 1 < self.nav.history.len() {
+            self.nav.history.truncate(self.nav.history_idx + 1);
+        }
+        self.nav.history.push(addr);
+        self.nav.history_idx = self.nav.history.len() - 1;
+        self.nav.pending_focus = Some(addr);
+    }
+
+    /// Move one step back in history. Updates the cursor + `pending_focus` from the new
+    /// entry. Returns true if it moved.
+    pub fn nav_back(&mut self) -> bool {
+        if !self.can_go_back() {
+            return false;
+        }
+        self.nav.history_idx -= 1;
+        let addr = self.nav.history[self.nav.history_idx];
+        self.nav.current_address = Some(addr);
+        self.nav.pending_focus = Some(addr);
+        true
+    }
+
+    /// Move one step forward in history. Updates the cursor + `pending_focus` from the
+    /// new entry. Returns true if it moved.
+    pub fn nav_forward(&mut self) -> bool {
+        if !self.can_go_forward() {
+            return false;
+        }
+        self.nav.history_idx += 1;
+        let addr = self.nav.history[self.nav.history_idx];
+        self.nav.current_address = Some(addr);
+        self.nav.pending_focus = Some(addr);
+        true
+    }
+
+    /// True if there is an earlier entry in history to navigate back to.
+    pub fn can_go_back(&self) -> bool {
+        !self.nav.history.is_empty() && self.nav.history_idx > 0
+    }
+
+    /// True if there is a later entry in history to navigate forward to.
+    pub fn can_go_forward(&self) -> bool {
+        !self.nav.history.is_empty() && self.nav.history_idx + 1 < self.nav.history.len()
     }
 
     /// Push a change event to the rolling log, capping at `CHANGE_LOG_CAP`.
@@ -704,6 +790,45 @@ mod tests {
         assert!(compare_passes(15, 10, SearchCompare::DifferentBy(5), false, 8));
         assert!(compare_passes(10, 15, SearchCompare::DifferentBy(5), false, 8));
         assert!(!compare_passes(10, 15, SearchCompare::DifferentBy(4), false, 8));
+    }
+
+    #[test]
+    fn nav_history_back_forward_and_truncate() {
+        let mut ds = DebugState::new();
+        assert!(!ds.can_go_back());
+        assert!(!ds.can_go_forward());
+
+        // Push 3 addresses.
+        ds.goto(0x100);
+        ds.goto(0x200);
+        ds.goto(0x300);
+        assert_eq!(ds.nav.current_address, Some(0x300));
+        assert_eq!(ds.nav.history, vec![0x100, 0x200, 0x300]);
+        assert_eq!(ds.nav.history_idx, 2);
+        assert_eq!(ds.nav.pending_focus, Some(0x300));
+        assert!(ds.can_go_back());
+        assert!(!ds.can_go_forward());
+
+        // Back twice -> 0x100.
+        assert!(ds.nav_back());
+        assert_eq!(ds.nav.current_address, Some(0x200));
+        assert!(ds.nav_back());
+        assert_eq!(ds.nav.current_address, Some(0x100));
+        assert_eq!(ds.nav.pending_focus, Some(0x100));
+        assert!(!ds.can_go_back());
+        assert!(ds.can_go_forward());
+
+        // Forward once -> 0x200.
+        assert!(ds.nav_forward());
+        assert_eq!(ds.nav.current_address, Some(0x200));
+        assert_eq!(ds.nav.history_idx, 1);
+
+        // goto a 4th address from the middle truncates the forward branch (0x300).
+        ds.goto(0x400);
+        assert_eq!(ds.nav.history, vec![0x100, 0x200, 0x400]);
+        assert_eq!(ds.nav.history_idx, 2);
+        assert_eq!(ds.nav.current_address, Some(0x400));
+        assert!(!ds.can_go_forward());
     }
 
     #[test]
