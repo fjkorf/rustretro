@@ -6,21 +6,38 @@ where it serves that goal. Status reflects the codebase as of the current branch
 
 ## Done
 
+**Foundation**
 - Dynamic libretro core loading (`libloading`), correct env-callback constants
-- Bevy rendering for all three pixel formats; cpal audio
-- 10-panel egui debugger: frame inspector, hex, tiles, input, CPU state, disassembly,
-  audio, log, triggers, regions
+- Bevy rendering for all three pixel formats; cpal audio (volume/mute via shared atomics,
+  applied at drain time)
 - M68K disassembly via Capstone, sourced from `SekFetchByte` / `SET_MEMORY_MAPS`
 - Breakpoints, single-step, run-to-address, per-frame register deltas
 - PC heatmap, code-region labeling (inline from the Disasm panel), state bookmarks with
   thumbnails, persisted to a `<rom>.regions.json` sidecar
+
+**Reverse-engineering tooling (waves 1–6)**
+- **Watch panel** — pinned named addresses, live values, freeze/lock write-back, multiple
+  display formats
+- **RAM Search** — cheat-engine iterative narrowing (=, ≠, <, >, changed/unchanged/
+  increased/decreased/different-by; vs previous snapshot or specific value), "+Watch" handoff
+- **"What changed this address?"** — per-watch frame-granular change log (frame · old→new · PC)
+- **Hex dump** with changed-cell amber tint
+- **VDP register panel** — decodes Genesis VDP registers $00–$17 to plain-English bitfields
+  (decode-ready; live source not exposed by the cores — see `src/debug/vdp_source.rs`)
+- **Lua scripting** (`mlua`, sandboxed) — `memory.*`, `gui.draw*`, `event.onframeend`,
+  `console.log`, `emu.framecount`, drawn into the framebuffer pre-blit; in-UI script panel (F10)
+- **egui_dock workspace** — draggable/splittable multi-panel layout (14 surfaces visible at
+  once), persisted to `rustretro_layout.json`
+- **Persistent toolbar + linked navigation** — Back/Fwd history, Run/Pause/Step, Go-to-address,
+  PC readout; a shared address cursor (`goto`) drives Disasm + Hex from Regions/Watch/Search
 
 ## Near-term (next)
 
 - [ ] **Upgrade the egui/Bevy stack** — move from egui 0.31 / bevy 0.15 / bevy_egui 0.33 to
       egui 0.33 / bevy 0.18 / bevy_egui 0.39 (new `EguiPrimaryContextPass` schedule). Touches
       the sprite/image/render code; do it litui-free and get green first. **Prerequisite for
-      the litui integration below.**
+      the litui integration below.** Note: `egui_dock` is now adopted at 0.16 (egui 0.31); the
+      upgrade must bump it to the egui-0.33-compatible release in lockstep.
 - [ ] **`RETRO_ENVIRONMENT_GET_VARIABLE`** — real core-options support. Today it returns
       false, so cores needing options can misbehave. Highest-leverage correctness fix.
 - [ ] **Reconcile + verify MAME path** — confirm `retro_load_game` success across a couple of
@@ -35,14 +52,25 @@ where it serves that goal. Status reflects the codebase as of the current branch
 - [ ] **Z80 disassembly** — CPU panel already reads Z80 PC; extend the Disasm panel to Z80
       (second core in Genesis/arcade hardware).
 - [ ] **Multi-port input** — only joypad port 0 is wired; add port 1+ for 2-player titles.
-- [ ] **Memory watch / search** — find values, set watchpoints, track changes across frames
-      (a natural companion to the hex dump and heatmap).
-- [ ] **Save states** — wire `retro_serialize` / `retro_unserialize`; foundation for rewind.
+      Critical for fighting games (P2 inputs).
+- [x] ~~**Memory watch / search**~~ — shipped (Watch panel, RAM Search, change tracking).
+- [ ] **Save states** — wire `retro_serialize` / `retro_unserialize`; foundation for rewind,
+      and the backing for Lua `savestate.*` (stubbed out of the v1 API today).
 
 ## Later / exploratory
 
+- [ ] **Hitbox / hurtbox overlay** — read object-RAM box lists → translucent rects on the
+      framebuffer (the fighting-game differentiator). The Lua `gui.draw*` layer already supports
+      this for community scripts; a built-in per-game overlay is the next step.
+- [ ] **Frame meter** — per-frame phase strip (startup/active/recovery), one row per player,
+      for reading frame advantage at a glance.
+- [ ] **Instruction-level "what writes this address"** — today's change tracking is
+      frame-granular (no libretro per-access hook); true instruction-exact needs a core debug
+      interface or a trace-correlation pass.
+- [ ] **VDP register live source** — intercept M68K control-port writes to `$C00004/$C00006`
+      to populate the (already-built) VDP decoder panel.
 - [ ] **Rewind** (depends on save states)
-- [ ] **Cheat / patch support** (`retro_cheat_set`)
+- [ ] **Cheat / patch support** (`retro_cheat_set`) — the Watch freeze path is a partial start
 - [ ] **Symbol import/export** — load labels from a `.sym`/IDA/Ghidra map into code regions
 - [ ] **Trace logging** — record PC/register history to disk for offline analysis
 - [ ] **Disc / multi-file content** support

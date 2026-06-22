@@ -6,17 +6,20 @@ RustRetro is a libretro frontend built with Bevy (rendering/window), bevy_egui (
 (audio), and Capstone (disassembly). The emulation loop runs on the main thread as a Bevy
 `NonSend` resource to satisfy OS and libretro threading requirements.
 
-**Source breakdown (~4,100 lines total):**
+**Source breakdown (~7,400 lines total):**
 
 | Path | Lines | Role |
 |------|-------|------|
-| `src/main.rs` | 294 | CLI, Bevy app setup, video/audio/debug systems |
-| `src/frontend.rs` | 792 | `Frontend`, libretro callbacks, `retro_run` loop |
-| `src/libretro.rs` | 592 | FFI bindings, `RetroCore` dynamic loader |
-| `src/audio.rs` | 156 | `AudioOutput` — cpal stream + ring buffer |
-| `src/debug/mod.rs` | 313 | `DebugState`, `MemoryRegion`, `Bookmark`, `CodeRegion` |
-| `src/debug/window.rs` | 131 | `DebugApp` — tab bar, panel dispatch |
-| `src/debug/panels/` | ~1,180 | 9 egui panels (see below) |
+| `src/main.rs` | ~370 | CLI, Bevy app setup, video/audio/debug/script systems |
+| `src/frontend.rs` | ~860 | `Frontend`, libretro callbacks, `retro_run` loop, per-frame capture |
+| `src/libretro.rs` | ~590 | FFI bindings, `RetroCore` dynamic loader |
+| `src/audio.rs` | ~210 | `AudioOutput` — cpal stream + ring buffer; shared-atomic volume/mute |
+| `src/lua_engine.rs` | ~615 | `LuaEngine` (mlua, sandboxed): memory/gui/event/console API + compositor |
+| `src/debug/mod.rs` | ~845 | `DebugState`, `MemoryRegion`, `Watch`, `RamSearch`, `NavState`, `Bookmark`, `CodeRegion` |
+| `src/debug/window.rs` | ~150 | `DebugApp` — persistent toolbar + dock host |
+| `src/debug/dock.rs` | ~320 | `egui_dock` workspace: `Tab`, `Panels`, `TabViewer`, layout persistence |
+| `src/debug/vdp_source.rs` | ~90 | VDP register source probe (currently `None` — regs not exposed) |
+| `src/debug/panels/` | ~2,900 | egui panels (see below) |
 
 ---
 
@@ -305,28 +308,45 @@ lifetime of the program.
 **`CodeRegion`** — serializable address range:
 - `addr_start`, `addr_end`, `label`, RGB `color`, `notes`
 
-#### `debug/window.rs` — Tab Dispatcher
+#### `debug/window.rs` + `debug/dock.rs` — Toolbar + Docking Workspace
 
-`DebugApp` renders the egui top bar and dispatches to each panel:
+`DebugApp` renders a **persistent toolbar** (`TopBottomPanel "debug_toolbar"`) above an
+`egui_dock` **workspace** (`dock.rs`). The toolbar holds global controls independent of which
+panels are open:
 
 ```
-🖼 Frame | 📋 Hex | 🧩 Tiles | 🕹 Input | 🔧 CPU | 📜 Disasm | 🔊 Audio | 📜 Log | ⏸ Triggers | 🗺 Regions
+◀ Back  ▶ Fwd  |  ▶Run/⏸Pause  ⏭ Step  ⏯ Step Frame  |  Go to: $______  |  PC: $XXXXXX  |  💾 Save layout  ⟲ Reset
 ```
+
+The dock shows all 14 surfaces as draggable/splittable tabs — multiple visible at once
+(default: Disasm central, CPU/Watch/Regions right, the rest in a bottom tabbed strip). The
+layout serializes to `rustretro_layout.json`. A shared `NavState` cursor (`DebugState::goto`)
+links navigation: clicking an address in Regions/Watch/Search focuses Disasm + Hex via a
+one-frame `nav.pending_focus` pulse (cleared centrally after the dock renders).
+
+The Lua **script panel** is *not* a dock tab — it is a separate floating `egui::Window`
+(F10) driven by the `show_script_panel` Bevy system, because `LuaEngine` is `!Send`.
 
 #### `debug/panels/` — Individual Panels
 
 | File | Panel | Key Features |
 |------|-------|-------------|
 | `frame_inspector.rs` | 🖼 Frame | Live framebuffer, pixel inspector, zoom |
-| `hex_dump.rs` | 📋 Hex | Hex+ASCII dump of any memory region |
+| `hex_dump.rs` | 📋 Hex | Hex+ASCII dump of any region; changed-cell amber tint; nav-focus scroll |
 | `tile_viewer.rs` | 🧩 Tiles | 8×8 VRAM tile browser |
 | `input_monitor.rs` | 🕹 Input | Button state + 120-frame input history |
 | `cpu_state.rs` | 🔧 CPU | M68K D0–D7, A0–A7, PC, SR; Z80 regs; delta highlights |
-| `disassembly.rs` | 📜 Disasm | Capstone M68K; ±10 instr window; breakpoints; run-to; label-range |
-| `audio_controls.rs` | 🔊 Audio | Volume, mute, sample rate display |
-| `frame_log.rs` | 📜 Log | Scrollable event log with filter |
+| `disassembly.rs` | 📜 Disasm | Capstone M68K; breakpoints; run-to; label-range; nav-focus |
+| `audio_controls.rs` | 🔊 Audio | Volume, mute (shared atomics), sample rate display |
+| `frame_log.rs` | 🧾 Log | Scrollable event log with filter |
 | `triggers.rs` | ⏸ Triggers | Frame-count and pixel-value pause triggers |
-| `regions.rs` | 🗺 Regions | Bookmarks, PC heatmap, code region manager |
+| `regions.rs` | 🗺 Regions | Bookmarks, PC heatmap, code region manager; → goto |
+| `watch.rs` | 👁 Watch | Pinned addresses, live values, freeze/lock, change tracking; → goto |
+| `ram_search.rs` | 🔍 Search | Iterative cheat-engine narrowing; +Watch / → goto |
+| `vdp_registers.rs` | 📺 VDP | Genesis VDP $00–$17 bitfield decode (source not yet wired) |
+| `help.rs` | ❓ Help | Static keybinds / panels / about |
+| `script_panel.rs` | (F10 window) | Lua load/reload/status + API reference |
+| `hex_tint.rs` | (helper) | Changed-cell diff/color used by the hex dump |
 
 ---
 
@@ -394,9 +414,15 @@ OS thread and holds this lock only to drain samples, keeping audio latency low.
 
 - `RETRO_ENVIRONMENT_GET_VARIABLE` returns false — cores requiring options may behave incorrectly
 - Single joypad only (port 0)
-- Save state serialization not implemented (directories are passed to cores)
-- No disc / multi-file content support
-- No rewind or cheat code support
+- Save state serialization not implemented (directories are passed to cores). This also stubs
+  out the Lua `savestate.*` API and blocks rewind.
+- No disc / multi-file content support; no rewind
+- No full cheat-code engine, though the Watch panel's freeze/lock provides per-address value forcing
+- VDP registers are not exposed by the loaded cores (write-only hardware); the VDP panel decodes
+  but shows zeros until a control-port-write intercept is added (`src/debug/vdp_source.rs`)
+- "What changed this address?" is **frame-granular** (libretro exposes no per-access memory hook),
+  not instruction-exact
+- `egui_dock` is pinned to 0.16 (egui 0.31); the planned egui/Bevy upgrade must bump it in lockstep
 
 > **Note:** MAME 2003-Plus previously crashed in `retro_load_game`; this was the wrong
 > environment-callback constants in the FFI layer, now fixed (see [DEBUGGING.md](DEBUGGING.md)).

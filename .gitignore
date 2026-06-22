@@ -15,6 +15,7 @@
 
 # Per-run sidecars and machine-local state
 *.regions.json
+rustretro_layout.json
 *.srm
 *.nv
 nvram/
