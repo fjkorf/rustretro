@@ -11,6 +11,7 @@ anyhow = "1.0"
 memoffset = "0.9"
 bevy = "0.15"
 bevy_egui = "0.33"
+egui_dock = { version = "0.16", features = ["serde"] }
 cpal = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }
 capstone = "0.12"

@@ -1,5 +1,6 @@
 pub mod panels;
 pub mod window;
+pub mod dock;
 pub mod vdp_source;
 
 use std::collections::{HashMap, VecDeque};
