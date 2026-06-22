@@ -4,6 +4,7 @@ mod phase2_test;
 mod debug;
 mod frontend;
 mod libretro;
+mod lua_engine;
 
 use anyhow::Result;
 use audio::AudioOutput;
@@ -14,6 +15,7 @@ use bevy_egui::{EguiContexts, EguiPlugin};
 use clap::Parser;
 use debug::{DebugState, SharedDebugState};
 use frontend::Frontend;
+use lua_engine::LuaEngine;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -32,12 +34,17 @@ struct Args {
     #[arg(long)] debug: bool,
     #[arg(long)] test_capstone: bool,
     #[arg(long)] test_phase2: bool,
+    /// Optional Lua overlay script (loaded once at startup).
+    #[arg(long, value_name = "PATH")] script: Option<PathBuf>,
 }
 
 // ─── Bevy resources ──────────────────────────────────────────────────────────
 
 /// Emulation frontend — NonSend keeps retro_run() on the main thread.
 struct Emu(Frontend);
+
+/// Lua scripting engine — NonSend (mlua + Rc/RefCell are !Send), main-thread only.
+struct LuaRes(LuaEngine);
 
 #[derive(Resource)]
 struct GameTexture(Handle<Image>);
@@ -92,6 +99,21 @@ fn main() -> Result<()> {
 
     if args.debug { debug_state.lock().unwrap().debug_open = true; }
 
+    // Build the Lua scripting engine (main-thread NonSend resource). Load the
+    // optional --script once at startup. A failure to load logs but does not
+    // abort the emulator.
+    let mut lua_engine = LuaEngine::new(Arc::clone(&debug_state))
+        .map_err(|e| anyhow::anyhow!("failed to init Lua engine: {e}"))?;
+    if let Some(script_path) = &args.script {
+        match lua_engine.load_script(&script_path.to_string_lossy()) {
+            Ok(()) => eprintln!("Loaded Lua script: {}", script_path.display()),
+            Err(e) => {
+                eprintln!("Lua script load error ({}): {e}", script_path.display());
+                debug_state.lock().unwrap().log(format!("[lua] load error: {e}"));
+            }
+        }
+    }
+
     let fullscreen = if args.fullscreen {
         bevy::window::WindowMode::BorderlessFullscreen(MonitorSelection::Primary)
     } else {
@@ -114,8 +136,9 @@ fn main() -> Result<()> {
         .insert_resource(AudioRes(AudioOutput::new(!args.no_audio)))
         .insert_resource(WindowScale(args.scale))
         .insert_resource(DebugOverlay(debug::window::DebugApp::new(debug_state)))
+        .insert_non_send_resource(LuaRes(lua_engine))
         .add_systems(Startup, setup)
-        .add_systems(Update, (read_input, run_emulation, sync_video, queue_audio, show_debug, update_title).chain())
+        .add_systems(Update, (read_input, run_emulation, run_scripts, sync_video, queue_audio, show_debug, update_title).chain())
         .run();
 
     Ok(())
@@ -193,6 +216,23 @@ fn run_emulation(mut emu: NonSendMut<Emu>) {
     let _ = emu.0.run_frame();
 }
 
+// ─── Scripting ───────────────────────────────────────────────────────────────
+
+/// Run Lua per-frame callbacks and composite their draw commands into the fresh
+/// framebuffer. Sits BETWEEN run_emulation (which refreshes fb_rgba) and
+/// sync_video (which uploads it), so overlays never lag a frame.
+fn run_scripts(lua: NonSend<LuaRes>, debug_state: Res<DebugStateRes>) {
+    let _ = lua.0.run_frame_callbacks();
+    let cmds = lua.0.take_draw_cmds();
+    if cmds.is_empty() {
+        return;
+    }
+    if let Ok(mut ds) = debug_state.0.lock() {
+        let (w, h) = (ds.fb_width, ds.fb_height);
+        lua_engine::composite_into_rgba(&cmds, &mut ds.fb_rgba, w, h);
+    }
+}
+
 // ─── Video ───────────────────────────────────────────────────────────────────
 
 /// Convert any libretro pixel format → RGBA8 bytes (row-major, top-down).
@@ -233,10 +273,23 @@ fn sync_video(
     game_tex: Res<GameTexture>,
     mut images: ResMut<Assets<Image>>,
     scale: Res<WindowScale>,
+    debug_state: Res<DebugStateRes>,
     mut sprites: Query<&mut Sprite>,
 ) {
     let Some((fb, w, h, pitch, fmt)) = emu.0.framebuffer() else { return };
-    let rgba = to_rgba8(fb, w, h, pitch, fmt);
+    // Prefer the DebugState's RGBA framebuffer when it's fresh and matches the
+    // core dimensions: run_scripts has already composited Lua overlays onto it
+    // this frame. Fall back to decoding the raw core framebuffer otherwise.
+    let rgba = {
+        let composited = debug_state.0.lock().ok().and_then(|ds| {
+            if ds.fb_width == w && ds.fb_height == h && ds.fb_rgba.len() == (w * h * 4) as usize {
+                Some(ds.fb_rgba.clone())
+            } else {
+                None
+            }
+        });
+        composited.unwrap_or_else(|| to_rgba8(fb, w, h, pitch, fmt))
+    };
 
     if let Some(img) = images.get_mut(&game_tex.0) {
         if img.width() != w || img.height() != h {
