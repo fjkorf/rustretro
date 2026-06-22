@@ -17,6 +17,10 @@ where it serves that goal. Status reflects the codebase as of the current branch
 
 ## Near-term (next)
 
+- [ ] **Upgrade the egui/Bevy stack** — move from egui 0.31 / bevy 0.15 / bevy_egui 0.33 to
+      egui 0.33 / bevy 0.18 / bevy_egui 0.39 (new `EguiPrimaryContextPass` schedule). Touches
+      the sprite/image/render code; do it litui-free and get green first. **Prerequisite for
+      the litui integration below.**
 - [ ] **`RETRO_ENVIRONMENT_GET_VARIABLE`** — real core-options support. Today it returns
       false, so cores needing options can misbehave. Highest-leverage correctness fix.
 - [ ] **Reconcile + verify MAME path** — confirm `retro_load_game` success across a couple of
@@ -42,6 +46,60 @@ where it serves that goal. Status reflects the codebase as of the current branch
 - [ ] **Symbol import/export** — load labels from a `.sym`/IDA/Ghidra map into code regions
 - [ ] **Trace logging** — record PC/register history to disk for offline analysis
 - [ ] **Disc / multi-file content** support
+
+## litui integration — let a UI library own the chrome
+
+The plan: adopt [litui](https://github.com/fjkorf/litui) (Markdown → egui, compiled) to own
+RustRetro's **UI framework** (window frame, navigation, panel layout) and **all the rote,
+standard screens**, so hand-written code is reserved for the few panels that are the actual
+point of this project. litui's matching showcase/driver view lives in
+`../litui/knowledge/rustretro-showcase.md`.
+
+**Boundary principle.** The line is *not* "generic vs. retro-specific" — it's **shape**:
+
+> List / form / display surfaces → litui. Custom-painted, spatial surfaces → bespoke.
+
+A watch table or breakpoint manager is retro-specific *content* in a generic *shape*, so litui
+can own it. The frame inspector is generic content in a bespoke *shape*, so it stays
+hand-written. The truly bespoke core is the five **spatial** views below.
+
+**Panel / screen disposition:**
+
+| Surface | Owner | Notes |
+|---|---|---|
+| Window frame, tab/nav, layout | **litui** | `define_markdown_app!` shell; bespoke panels mount as `[custom]` slot pages |
+| Audio controls | **litui** | `[checkbox]` + `[slider]` + `[display]`, near 1:1 |
+| Event log | **litui** | maps to litui's `[log]` widget (`Vec<String>`) |
+| CPU state readout | **litui** | `foreach`/`[display]` table; delta color via `::$field` |
+| Help / about | **litui** | static markdown — first, free win |
+| Controls / keybinds | **litui** + hook | list in litui; key-capture is a small Rust callback |
+| File access (core/ROM/dirs) | **litui** + dialog | displays/recents in litui; "Browse" calls `rfd` |
+| Watch variables | **litui** + live sync | table in litui; values pushed from memory each frame |
+| Breakpoint manager | **litui** | list/enable/delete in litui; set-from-disasm stays bespoke |
+| Timing / perf | **litui** (mostly) | numbers/log in litui; live graph needs `egui_plot` or a slot |
+| Frame inspector, tile viewer, hex dump, disassembly, heatmap | **bespoke** | custom-painted spatial views — the crown jewels; keep them |
+
+**State model.** RustRetro's truth stays `Arc<Mutex<DebugState>>`; litui's generated `AppState`
+is a **pure projection**. One `sync(debug, app)` per frame: copy display values down
+(`populate_data` pattern), read widget outputs back up. This already matches how RustRetro
+works — `create_bookmark` / `save_regions` are "UI flips a bool, the run loop consumes it,"
+which *is* litui's event model. Keep `AppState` a dumb viewmodel; never let domain logic into it.
+
+**Sequencing.**
+
+1. Upgrade the egui/Bevy stack (see Near-term) — litui-free, get green.
+2. (litui side) Build the `[custom]` escape hatch — needed both for custom widgets *inside* a
+   page and for whole bespoke panels to live *as pages* in litui's nav. Critical-path unknown;
+   prototype before committing the migration.
+3. Move the shell to litui; bespoke panels become `[custom]` slot pages.
+4. Port the 3 easy panels (audio, log, CPU) with the sync layer.
+5. Build the new standard screens (help → controls → file access) as pure litui.
+6. Watch vars / breakpoint manager / timing once live-data sync is proven.
+
+**Risks.** Adopting litui couples RustRetro to litui's egui cadence (needs a litui min-version
+policy); the critical path runs through litui's unbuilt `[custom]` hatch; and the "little Rust"
+claim must stay measurable — keep the sync glue small and report the real ratio of
+litui-owned vs. bespoke surfaces. Don't litui-ify the spatial inspectors for purity's sake.
 
 ## Non-goals
 
