@@ -281,6 +281,39 @@ impl Frontend {
                 }
             }
 
+            // Update watches: read current values and apply freezes.
+            // Collect ops first so we don't borrow ds.watches while calling
+            // ds.read_addr / ds.write_addr (which borrow ds immutably).
+            let mut freeze_writes: Vec<(usize, usize, u32)> = Vec::new();
+            {
+                let watch_params: Vec<(usize, usize, bool, Option<u32>)> = ds.watches.iter()
+                    .map(|w| (w.addr, w.format.byte_len(), w.frozen, w.frozen_value))
+                    .collect();
+                let mut updates: Vec<(Option<u32>, Option<u32>)> = Vec::with_capacity(watch_params.len());
+                for (addr, len, frozen, frozen_value) in &watch_params {
+                    let current = ds.read_addr(*addr, *len);
+                    let mut new_frozen_value = *frozen_value;
+                    if *frozen {
+                        if new_frozen_value.is_none() {
+                            new_frozen_value = current;
+                        }
+                        if let Some(fv) = new_frozen_value {
+                            freeze_writes.push((*addr, *len, fv));
+                        }
+                    } else {
+                        new_frozen_value = None;
+                    }
+                    updates.push((current, new_frozen_value));
+                }
+                for (w, (current, new_frozen_value)) in ds.watches.iter_mut().zip(updates) {
+                    w.current = current;
+                    w.frozen_value = new_frozen_value;
+                }
+            }
+            for (addr, len, value) in freeze_writes {
+                ds.write_addr(addr, len, value);
+            }
+
             if self.frame_count % 300 == 0 && any_success {
                 eprintln!("[CPU] ✓ CPU state captured (M68K PC=${:06X})", ds.m68k_pc);
             }

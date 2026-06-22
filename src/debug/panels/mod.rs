@@ -8,3 +8,8 @@ pub mod cpu_state;
 pub mod audio_controls;
 pub mod disassembly;
 pub mod regions;
+pub mod watch;
+pub mod ram_search;
+pub mod vdp_registers;
+pub mod help;
+pub mod hex_tint;

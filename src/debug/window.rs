@@ -14,10 +14,14 @@ use crate::debug::panels::{
     audio_controls::AudioControls,
     disassembly::Disassembly,
     regions::RegionsPanel,
+    watch::WatchPanel,
+    ram_search::RamSearchPanel,
+    vdp_registers::VdpRegisters,
+    help::HelpPanel,
 };
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab { FrameInspector, HexDump, TileViewer, InputMonitor, FrameLog, Triggers, CpuState, Audio, Disasm, Regions }
+enum Tab { FrameInspector, HexDump, TileViewer, InputMonitor, FrameLog, Triggers, CpuState, Audio, Disasm, Regions, Watch, RamSearch, VdpRegisters, Help }
 
 pub struct DebugApp {
     state: Arc<Mutex<DebugState>>,
@@ -33,6 +37,10 @@ pub struct DebugApp {
     audio_controls: AudioControls,
     disassembly: Disassembly,
     regions_panel: RegionsPanel,
+    watch_panel: WatchPanel,
+    ram_search_panel: RamSearchPanel,
+    vdp_registers: VdpRegisters,
+    help_panel: HelpPanel,
 }
 
 impl DebugApp {
@@ -51,6 +59,10 @@ impl DebugApp {
             audio_controls: AudioControls,
             disassembly: Disassembly::new(),
             regions_panel: RegionsPanel::new(),
+            watch_panel: WatchPanel::new(),
+            ram_search_panel: RamSearchPanel::new(),
+            vdp_registers: VdpRegisters::new(),
+            help_panel: HelpPanel::new(),
         }
     }
 
@@ -80,6 +92,10 @@ impl DebugApp {
                 ui.selectable_value(&mut self.active_tab, Tab::FrameLog,       "📜 Log");
                 ui.selectable_value(&mut self.active_tab, Tab::Triggers,       "⏸ Triggers");
                 ui.selectable_value(&mut self.active_tab, Tab::Regions,        "🗺 Regions");
+                ui.selectable_value(&mut self.active_tab, Tab::Watch,          "👁 Watch");
+                ui.selectable_value(&mut self.active_tab, Tab::RamSearch,      "🔍 Search");
+                ui.selectable_value(&mut self.active_tab, Tab::VdpRegisters,   "📺 VDP");
+                ui.selectable_value(&mut self.active_tab, Tab::Help,           "❓ Help");
 
                 if let Some((fc, vf, vr, fps, w, h, fmt, paused)) = state_snapshot {
                     ui.separator();
@@ -114,6 +130,28 @@ impl DebugApp {
                         ui.label("Error: Could not acquire debug state lock");
                     }
                 }
+                Tab::Watch => {
+                    if let Ok(mut ds) = self.state.lock() {
+                        self.watch_panel.show(ui, &mut ds);
+                    } else {
+                        ui.label("Error: Could not acquire debug state lock");
+                    }
+                }
+                Tab::RamSearch => {
+                    if let Ok(mut ds) = self.state.lock() {
+                        self.ram_search_panel.show(ui, &mut ds);
+                    } else {
+                        ui.label("Error: Could not acquire debug state lock");
+                    }
+                }
+                Tab::VdpRegisters => {
+                    if let Ok(ds) = self.state.lock() {
+                        self.vdp_registers.show(ui, &ds.vdp_regs);
+                    } else {
+                        ui.label("Error: Could not acquire debug state lock");
+                    }
+                }
+                Tab::Help => self.help_panel.show(ui),
                 Tab::Audio => {
                     if let Some(ref audio_ref) = self.audio {
                         if let Ok(mut audio) = audio_ref.lock() {
