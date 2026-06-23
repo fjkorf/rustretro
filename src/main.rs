@@ -5,6 +5,7 @@ mod debug;
 mod frontend;
 mod libretro;
 mod lua_engine;
+mod mcp;
 
 use anyhow::Result;
 use audio::AudioOutput;
@@ -37,6 +38,10 @@ struct Args {
     #[arg(long)] test_phase2: bool,
     /// Optional Lua overlay script (loaded once at startup).
     #[arg(long, value_name = "PATH")] script: Option<PathBuf>,
+    /// Expose the running app to a Claude session via an MCP server (AI Wave 1).
+    #[arg(long)] mcp: bool,
+    /// TCP port for the MCP server (only used with --mcp).
+    #[arg(long, value_name = "N", default_value = "4000")] mcp_port: u16,
 }
 
 // ─── Bevy resources ──────────────────────────────────────────────────────────
@@ -115,6 +120,13 @@ fn main() -> Result<()> {
         }
     }
 
+    // AI Wave 1: optionally start the MCP server on its own thread. It holds a
+    // clone of the Arc<Mutex<DebugState>> and locks it briefly to read; it never
+    // touches the NonSend Emu/Lua resources. Absent --mcp, nothing changes.
+    if args.mcp {
+        mcp::spawn_mcp_server(Arc::clone(&debug_state), args.mcp_port);
+    }
+
     let fullscreen = if args.fullscreen {
         bevy::window::WindowMode::BorderlessFullscreen(MonitorSelection::Primary)
     } else {
@@ -140,7 +152,7 @@ fn main() -> Result<()> {
         .insert_non_send_resource(LuaRes(lua_engine))
         .insert_resource(ScriptPanel::new())
         .add_systems(Startup, setup)
-        .add_systems(Update, (read_input, run_emulation, run_scripts, sync_video, queue_audio, update_title).chain())
+        .add_systems(Update, (read_input, run_emulation, run_scripts, drain_lua_requests, sync_video, queue_audio, update_title).chain())
         .add_systems(EguiPrimaryContextPass, (show_debug, show_script_panel))
         .run();
 
@@ -239,6 +251,25 @@ fn show_script_panel(
 ) {
     if let Ok(ctx) = ctx.ctx_mut() {
         panel.show(ctx, &mut lua.0, &debug_state.0);
+    }
+}
+
+/// AI Wave 1: pick up a Lua script submitted by the MCP `run_lua` tool, run it
+/// on the main thread (where the NonSend LuaEngine lives), and write the result
+/// back for the MCP thread to poll. A no-op when no request is pending, so it's
+/// free when --mcp is absent. Errors are isolated to the result channel.
+fn drain_lua_requests(lua: NonSend<LuaRes>, debug_state: Res<DebugStateRes>) {
+    // Take the pending request under a brief lock.
+    let script = {
+        let Ok(mut ds) = debug_state.0.lock() else { return };
+        ds.pending_lua.take()
+    };
+    let Some(script) = script else { return };
+
+    let result = lua.0.eval_to_string(&script);
+
+    if let Ok(mut ds) = debug_state.0.lock() {
+        ds.pending_lua_result = Some(result);
     }
 }
 

@@ -19,6 +19,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 
+# --- AI Wave 1: MCP server (only active behind the `--mcp` flag) ---
+rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+axum = "0.8"
+
 [profile.release]
 opt-level = 3
 lto = true

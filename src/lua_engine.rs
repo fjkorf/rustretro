@@ -337,6 +337,35 @@ impl LuaEngine {
         self.lua.load(&src).set_name(name).exec()
     }
 
+    /// Execute an inline Lua chunk and return a textual result. Used by the MCP
+    /// `run_lua` bridge: the script runs in the same sandboxed VM as `--script`
+    /// (so `memory.*`, `gui.*`, `console.log`, `emu.*` are all available). If the
+    /// chunk evaluates to a value it is stringified; otherwise "ok" is returned.
+    /// Errors are returned as `Err(message)` rather than logged-and-swallowed so
+    /// the caller (and ultimately the AI) sees them.
+    pub fn eval_to_string(&self, src: &str) -> Result<String, String> {
+        // Try as an expression first (so `2+2` or `memory.read_u8(0xFF0000)`
+        // yields a value); fall back to running it as a statement chunk.
+        let as_expr = format!("return ({src})");
+        let result: mlua::Result<mlua::Value> = self
+            .lua
+            .load(&as_expr)
+            .set_name("<mcp-expr>")
+            .eval()
+            .or_else(|_| self.lua.load(src).set_name("<mcp>").eval());
+        match result {
+            Ok(mlua::Value::Nil) => Ok("ok".to_string()),
+            Ok(v) => match v {
+                mlua::Value::String(s) => Ok(s.to_string_lossy().to_string()),
+                mlua::Value::Integer(i) => Ok(i.to_string()),
+                mlua::Value::Number(n) => Ok(n.to_string()),
+                mlua::Value::Boolean(b) => Ok(b.to_string()),
+                other => Ok(format!("{other:?}")),
+            },
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// Re-create a fresh VM, discarding all registered callbacks and draw state,
     /// then reload `src_or_path`. Use this to hot-reload a script.
     /// Called by the script panel's "Reload" and "Clear VM" buttons.

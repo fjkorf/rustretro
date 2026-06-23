@@ -191,7 +191,7 @@ pub struct Watch {
 /// from `old` to `new` during `frame`, while the M68K PC was `pc`. Because
 /// libretro has no per-access hook, this only pins the change to a frame, not to
 /// the exact instruction.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 pub struct ChangeEvent {
     pub frame: u64,
     pub addr: usize,
@@ -222,7 +222,7 @@ pub fn detect_change(prev: Option<u32>, cur: u32) -> bool {
 /// To change the current location from anywhere, call [`DebugState::goto`] (THE entry
 /// point). Back/forward navigation is driven by the toolbar via [`DebugState::nav_back`]
 /// / [`DebugState::nav_forward`].
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct NavState {
     /// The shared "current location" cursor (None until first `goto`).
     pub current_address: Option<u32>,
@@ -402,6 +402,16 @@ pub struct DebugState {
     // --- Navigation ---
     /// Shared cross-panel navigation cursor + back/forward history.
     pub nav: NavState,
+
+    // --- AI Wave 1: deferred Lua bridge (MCP run_lua round-trip) ---
+    /// Lua source submitted by the MCP `run_lua` tool, waiting for the main
+    /// thread to execute it. The MCP thread sets this under lock; the Bevy
+    /// `drain_lua_requests` system (which owns the NonSend LuaEngine) picks it
+    /// up, runs it, and clears it back to `None`.
+    pub pending_lua: Option<String>,
+    /// Result of the most recently drained `pending_lua` request: `Ok(output)`
+    /// or `Err(message)`. The MCP thread polls this and clears it on read.
+    pub pending_lua_result: Option<Result<String, String>>,
 }
 
 /// Maximum number of change events retained in `change_log`.
@@ -459,6 +469,8 @@ impl DebugState {
             ram_search: RamSearch::new(),
             change_log: VecDeque::new(),
             nav: NavState::default(),
+            pending_lua: None,
+            pending_lua_result: None,
         }
     }
 
