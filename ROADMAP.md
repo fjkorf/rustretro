@@ -205,6 +205,43 @@ AI-discovered regions should write back into the ROM map as `::: region` blocks 
 `author: ai` / `confidence` provenance field, so they're distinguishable and reviewable — making
 the AI's findings **durable across sessions**, not just chat.
 
+### Convergent evidence — "ROM DNA" and the literate ROM
+
+The deeper goal isn't a single tool that answers a question — it's giving Claude **multiple
+independent lines of evidence that converge**, the way a real reverse-engineer (or a forensic
+analyst) works. No one method is authoritative; agreement between methods is. For *"which ROM
+holds the on-screen characters' sprite pieces,"* Claude can triangulate:
+
+- **Vision** — read `app://screen`, *see* the rendered characters, and reason about what's there.
+- **Content match (hex DNA)** — pull on-screen tile bytes from VRAM and `search_memory` them
+  across ROM (the AI Wave 2 `vram_to_rom` primitive). Each tile is a fingerprint; a cluster of
+  matches in one ROM span is a sprite-data block.
+- **Image recognition** — render candidate ROM regions *as* tiles (decode ROM bytes with the
+  system's pixel format) and visually compare the result to the on-screen character — the
+  inverse of content match, and it survives some transforms that byte-comparison can't.
+- **Structure** — major-region discovery: scan the ROM for the statistical signatures of code
+  vs. graphics vs. tables (entropy, byte-histogram, tile-ness), proposing "this 512 KB span
+  looks like packed sprite data." The PC heatmap + CDL-style code/data logging feed this.
+- **Execution** — which code touches which VRAM, when (the DMA/control-port intercept on the
+  roadmap), pinning the *loader* even when the data itself is compressed.
+
+This is the **"natural DNA" of a ROM**: a tile, a palette, a sound table, a routine each leave a
+recognizable signature, and the same character's sprites carry the same DNA in VRAM and in ROM.
+Claude's job is to *tinker* — try a method, corroborate with another, and when they agree, write
+the finding into the **literate ROM map** (`ROM_MAP_FORMAT.md`) as a confirmed region with its
+evidence and `confidence`. Over many sessions the map accretes into a documented genome of the
+ROM, co-authored by tool, human, and AI. The emulator, the live memory map, the ROM map, the
+Lua probes, and the MCP surface are all instruments serving that one literate-documentation
+end — which is exactly the surface area Claude is good at exploring.
+
+**What this implies for the build order** (folds into the sub-track above): the content-match
+primitive exists (Wave 2). The high-leverage additions are **(a) a ROM-region tile renderer**
+(decode a ROM span as tiles → PNG, so vision/image-recognition can compare it to the screen),
+**(b) major-region discovery** (entropy/histogram/tile-ness scan proposing graphics vs. code vs.
+data blocks), and **(c) the DMA/execution provenance** hook (shared with the VDP source work).
+Each is an independent evidence stream Claude can cross-check — none has to be perfect, because
+**convergence, not any single method, is what makes a finding confirmed.**
+
 ## Non-goals
 
 - Becoming a general-purpose, configure-everything emulator frontend (RetroArch exists).
