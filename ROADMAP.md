@@ -156,3 +156,50 @@ litui-ify the spatial inspectors for purity's sake.
 
 - Becoming a general-purpose, configure-everything emulator frontend (RetroArch exists).
   Features earn their place by making a game easier to *take apart*, not just to play.
+
+## AI-friendly interface — converse with Claude about the running app
+
+The goal: drive a RustRetro session from a Claude conversation — *"identify the ROM that holds
+the sprite pieces for the characters currently on screen,"* *"freeze player 2's health and label
+the routine that drains it"* — with Claude perceiving the live app and acting on it. This is a
+parallel track to the litui work, not a competitor: both read the same `Arc<Mutex<DebugState>>`
+hub. litui is the **human** UI surface; this is the **AI** surface.
+
+**Why we're already ~70% there.** `DebugState` already centralizes everything an AI would read
+(memory regions, M68K/Z80 registers, `fb_rgba`, `pc_heatmap`, `watches`, `change_log`,
+`code_regions`, `bookmarks`, `frame_count`), much of it already `serde`-serializable.
+`DebugState::read_addr`/`read_u8` already abstract guest-memory reads. The Lua engine is already
+a programmatic control surface. The `.regions.json` sidecar and `ROM_MAP_FORMAT.md` maps are
+already designed for tool+human co-authoring — AI becomes the third co-author.
+
+**The architecture: an MCP server over `DebugState`.** MCP is the protocol a Claude session
+already uses to talk to tools, so RustRetro exposes one. Claude connects and gets:
+- *Resources (perception):* `app://state` (serialized DebugState), `app://screen` (framebuffer
+  as PNG — gives Claude **vision** of the game for free), `app://memory/{region}/{addr}/{len}`,
+  `app://watches`, `app://regions`, `app://heatmap`, `app://change-log`, `app://rom-map`.
+- *Tools (action):* `pause`/`step`/`run_to`, `read_mem`/`write_mem`, `add_watch`/`freeze`,
+  `ram_search`, `set_breakpoint`, `bookmark`, `label_region`, and `run_lua(script)` — the
+  escape hatch that makes the Lua engine **Claude's hands** for exploratory probes.
+
+**The honest gap: perception, not action.** Acting (pause/step/read/write/watch/search) is
+nearly free — it's already `DebugState` methods. *Perceiving* is the new work, and the sprite
+query demands it in three steps: (1) what's on screen → **sprite/OAM decode** (no object-RAM
+model today); (2) which VRAM tiles those sprites use → sprite→tile mapping; (3) where those
+tiles came from in ROM → **VRAM→ROM provenance** (DMA source→dest logging — the genuinely new
+core capability, and it shares the VDP control-port-intercept work already roadmapped above).
+
+**Sequenced sub-track** (each a wave; sequencing against the litui waves TBD):
+
+| # | Capability | Effort | Notes |
+|---|---|---|---|
+| 1 | **MCP server over `DebugState`** — resources (state/screen/memory) + action tools | M | The whole interface; a working "talk to Claude about the app" loop. Screen-as-PNG = vision. |
+| 2 | **`run_lua` MCP tool** | S | Reuses the engine; Claude writes/runs probes. Huge leverage, tiny cost. |
+| 3 | **Sprite / OAM decode** — model active sprites + their VRAM tile refs | M | "What's on screen" structurally; also powers the roadmapped hitbox overlay. |
+| 4 | **VRAM→ROM provenance** — DMA source→dest logging | M–L | The new core capability the sprite query needs; shares the VDP `$C00004/$C00006` intercept. |
+| 5 | **Structured AI snapshot/event feed** — stable JSON the agent reads each turn | S | Grounded, repeatable conversations. |
+
+**Guardrails & decisions.** Ship **read-mostly first** (perception + suggestions); gate
+`write_mem`/`run_lua` behind a confirm-before-write mode, since a bad poke can crash the core.
+AI-discovered regions should write back into the ROM map as `::: region` blocks with an
+`author: ai` / `confidence` provenance field, so they're distinguishable and reviewable — making
+the AI's findings **durable across sessions**, not just chat.
