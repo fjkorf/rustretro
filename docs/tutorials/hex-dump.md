@@ -42,8 +42,8 @@ amber change-tinting is how you map a struct by watching it move.
 
 ## See also
 
-- [Watch & Freeze](watch-and-freeze.md) — pin a specific address out of the dump.
-- [Disassembly & Breakpoints](disassembly-and-breakpoints.md) — read code bytes by hand when a core hides the disassembly.
+- [Watch & Freeze](/docs/tutorials/watch-and-freeze.md) — pin a specific address out of the dump.
+- [Disassembly & Breakpoints](/docs/tutorials/disassembly-and-breakpoints.md) — read code bytes by hand when a core hides the disassembly.
 
 <!-- litui:live
 When litui is integrated, this page gains live embeds:

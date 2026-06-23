@@ -30,7 +30,7 @@ Open the **🗺 Regions** tab. It has three collapsible sections plus a toolbar.
 ## Label what you figure out
 
 4. When you've identified a hot range — say the game loop — label it. Either right-click
-   it in [Disassembly](disassembly-and-breakpoints.md) → **🏷 Label range starting
+   it in [Disassembly](/docs/tutorials/disassembly-and-breakpoints.md) → **🏷 Label range starting
    here…**, or manage existing labels in the **🏷 Code Regions** section here. Each
    region has a label, start/end, and color; click a start address or **→** to jump to
    it, **🗑** to delete it.
@@ -62,8 +62,8 @@ from scratch twice.
 
 ## See also
 
-- [Disassembly & Breakpoints](disassembly-and-breakpoints.md) — where regions are created and shown.
-- [CPU Registers](cpu-registers.md) — the live registers a bookmark captures a snapshot of.
+- [Disassembly & Breakpoints](/docs/tutorials/disassembly-and-breakpoints.md) — where regions are created and shown.
+- [CPU Registers](/docs/tutorials/cpu-registers.md) — the live registers a bookmark captures a snapshot of.
 
 <!-- litui:live
 When litui is integrated, this page gains live embeds:

@@ -23,7 +23,7 @@ These are two panels that pair naturally: **🖼 Frame** (the whole picture) and
 
 3. **Pick a pixel.** Hover over the image and the readout shows `(x,y) R:.. G:.. B:..`
    for the pixel under the cursor — exact game-pixel coordinates and color. This is how
-   you find the `(x,y)` to feed a [pixel trigger](input-and-triggers.md) or a Lua
+   you find the `(x,y)` to feed a [pixel trigger](/docs/tutorials/input-and-triggers.md) or a Lua
    `gui.drawPixel`.
 
 4. **💾 Save PNG** writes the current frame to `frame_NNNNNN.png` in the working
@@ -45,8 +45,8 @@ out of the live frame while you hunt for the RAM that drives it.
 
 ## See also
 
-- [Input & Triggers](input-and-triggers.md) — pause when a picked pixel changes.
-- [Lua Scripting](lua-scripting.md) — draw overlays in the same game-pixel space.
+- [Input & Triggers](/docs/tutorials/input-and-triggers.md) — pause when a picked pixel changes.
+- [Lua Scripting](/docs/tutorials/lua-scripting.md) — draw overlays in the same game-pixel space.
 
 <!-- litui:live
 When litui is integrated, this page gains live embeds:

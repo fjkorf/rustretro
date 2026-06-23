@@ -58,8 +58,8 @@ trust without a memory map.
 
 ## See also
 
-- [Watch & Freeze](watch-and-freeze.md) — what to do with the address you found.
-- [Tracking Changes](tracking-changes.md) — find the instruction that writes it.
+- [Watch & Freeze](/docs/tutorials/watch-and-freeze.md) — what to do with the address you found.
+- [Tracking Changes](/docs/tutorials/tracking-changes.md) — find the instruction that writes it.
 
 <!-- litui:live
 When litui is integrated, this page gains live embeds:

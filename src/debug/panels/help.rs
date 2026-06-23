@@ -18,6 +18,9 @@ impl HelpPanel {
             ui.monospace("F12          Toggle debug overlay");
             ui.monospace("Space        Pause / unpause emulation");
             ui.monospace("B            Capture bookmark");
+            ui.monospace("F8           Tutorials (Help → Tutorials)");
+            ui.monospace("F9           litui panels preview (CPU/Log/Audio)");
+            ui.monospace("F10          Lua script panel");
             ui.separator();
 
             ui.heading("Panels");
@@ -36,7 +39,7 @@ impl HelpPanel {
             ui.heading("Tutorials");
             ui.label("Task-oriented walkthroughs live in docs/tutorials/ (one per feature).");
             ui.label("Start with getting-started.md, then ram-search.md (find a health bar).");
-            ui.label("Authored as litui pages — they will mount here as a Help → Tutorials screen once litui is integrated.");
+            ui.label("Press F8 to open them in-app: each is a litui page rendered as a Help → Tutorials screen.");
             ui.separator();
 
             ui.heading("About");

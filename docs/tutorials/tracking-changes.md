@@ -14,8 +14,8 @@ that writes it.
 
 ## Steps
 
-1. Add the address as a watch (see [Watch & Freeze](watch-and-freeze.md)). For
-   example, watch your health address from the [RAM Search](ram-search.md) hunt.
+1. Add the address as a watch (see [Watch & Freeze](/docs/tutorials/watch-and-freeze.md)). For
+   example, watch your health address from the [RAM Search](/docs/tutorials/ram-search.md) hunt.
 
 2. In the **👁 Watch** grid, tick the **🔍 Track** checkbox on that row.
 
@@ -40,7 +40,7 @@ The logged **PC** is sampled *per frame*, not at the exact write. The actual sto
 happened *sometime during* that frame, not necessarily at that instruction. Treat the
 PC as a neighborhood to investigate, not a pin on the exact `MOVE`. To pin it down
 further, set a breakpoint nearby and single-step (see
-[Disassembly & Breakpoints](disassembly-and-breakpoints.md)).
+[Disassembly & Breakpoints](/docs/tutorials/disassembly-and-breakpoints.md)).
 
 ## Why it matters
 
@@ -50,8 +50,8 @@ tweak, a hitbox overlay, or a deeper RE.
 
 ## See also
 
-- [Disassembly & Breakpoints](disassembly-and-breakpoints.md) — pin the write with a breakpoint.
-- [RAM Search](ram-search.md) — how to find the address in the first place.
+- [Disassembly & Breakpoints](/docs/tutorials/disassembly-and-breakpoints.md) — pin the write with a breakpoint.
+- [RAM Search](/docs/tutorials/ram-search.md) — how to find the address in the first place.
 
 <!-- litui:live
 When litui is integrated, this page gains live embeds:

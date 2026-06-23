@@ -19,6 +19,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 
+# litui (Markdown -> egui). Pinned to a specific commit so RustRetro and litui
+# evolve independently — bump deliberately. The `[custom]` escape hatch (the
+# bespoke-panel-as-page mechanism) landed at this rev. egui 0.33 matches our stack.
+litui = { git = "https://github.com/fjkorf/litui.git", rev = "52847b93725911e833582d6c8b3d2dbe2eea4a07" }
+
 # --- AI Wave 1: MCP server (only active behind the `--mcp` flag) ---
 rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
