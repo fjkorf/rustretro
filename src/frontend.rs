@@ -77,6 +77,9 @@ impl Frontend {
             // cores like FBNeo, which the scaffold then leaves blank).
             ds.rom_system =
                 crate::debug::system_slug_from_library(&system_info.library_name).map(String::from);
+            // Keep the ROM path so the `rom_file` MCP source can re-read the cart
+            // (needed for need_fullpath cores, which never load the bytes here).
+            ds.rom_path = Some(std::path::PathBuf::from(rom_path));
         }
         if let Some(ref path) = sidecar_path {
             load_regions_sidecar(path, &debug_state);
@@ -102,6 +105,10 @@ impl Frontend {
             if let Ok(mut ds) = debug_state.lock() {
                 ds.rom_sha1 = Some(sha1);
                 ds.rom_size = Some(size);
+                // Retain the raw cart bytes for the `rom_file` MCP source (decodes
+                // CHR-ROM graphics etc. the core won't expose). Cheap for the small
+                // ROMs this path handles; need_fullpath cores skip it (empty here).
+                ds.rom_bytes = Some(rom_data.clone());
             }
         }
 
