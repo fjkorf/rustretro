@@ -83,6 +83,12 @@ standard screens**, so hand-written code is reserved for the few panels that are
 point of this project. litui's matching showcase/driver view lives in
 `../litui/knowledge/rustretro-showcase.md`.
 
+> **Repo ownership:** the litui library (`../litui`) is developed in its own dedicated
+> session/repo. RustRetro-side work treats litui as an **external dependency it consumes**, never
+> modifies — the `[custom]` escape-hatch GO (Wave B) and the parser-crate refactor land on the
+> litui side. RustRetro's litui Waves C–F begin once litui ships a version with `[custom]`; pin
+> that version then. Don't edit `../litui` from a RustRetro session.
+
 **Boundary principle.** The line is *not* "generic vs. retro-specific" — it's **shape**:
 
 > List / form / display surfaces → litui. Custom-painted, spatial surfaces → bespoke.
