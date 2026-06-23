@@ -441,6 +441,19 @@ pub struct DebugState {
     pub save_regions: bool,
     /// Path of the regions sidecar file (set by Frontend on startup).
     pub sidecar_path: Option<std::path::PathBuf>,
+    /// Path of the literate ROM-map Markdown file, `library/<slug>/<slug>.md`,
+    /// where `<slug>` is the ROM file stem (set by Frontend on startup). The MCP
+    /// `add_rom_map_region`/`get_rom_map` tools read/scaffold this file so an AI
+    /// RE session can persist confirmed findings across sessions (see
+    /// `ROM_MAP_FORMAT.md`). `None` until a ROM is loaded with a library path.
+    pub rom_map_path: Option<std::path::PathBuf>,
+    /// The ROM file stem (e.g. "mvsc"), used as the map slug and to seed the
+    /// scaffolded frontmatter `rom.name`. Set by Frontend on startup.
+    pub rom_name: Option<String>,
+    /// SHA-1 of the loaded ROM bytes (lowercase hex), used to seed the scaffolded
+    /// frontmatter `rom.sha1` identity key (§3). `None` for need_fullpath cores
+    /// where the bytes aren't read into memory.
+    pub rom_sha1: Option<String>,
 
     // --- Watches ---
     /// User-created memory watches (displayed in the Watch panel).
@@ -516,6 +529,9 @@ impl DebugState {
             create_bookmark: false,
             save_regions: false,
             sidecar_path: None,
+            rom_map_path: None,
+            rom_name: None,
+            rom_sha1: None,
             watches: Vec::new(),
             ram_search: RamSearch::new(),
             change_log: VecDeque::new(),
