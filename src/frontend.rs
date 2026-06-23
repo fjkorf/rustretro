@@ -73,6 +73,10 @@ impl Frontend {
             ds.sidecar_path = sidecar_path.clone();
             ds.rom_map_path = rom_map_path.clone();
             ds.rom_name = rom_stem.clone();
+            // Infer the ROM-map `system` slug from the core (None for multi-system
+            // cores like FBNeo, which the scaffold then leaves blank).
+            ds.rom_system =
+                crate::debug::system_slug_from_library(&system_info.library_name).map(String::from);
         }
         if let Some(ref path) = sidecar_path {
             load_regions_sidecar(path, &debug_state);

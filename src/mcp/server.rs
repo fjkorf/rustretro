@@ -1052,12 +1052,18 @@ impl RetroMcpServer {
         let note = note.unwrap_or(DEFAULT_REGION_NOTE);
 
         // Pull the map path + identity fields under a brief lock.
-        let (path, rom_name, rom_sha1, rom_size) = {
+        let (path, rom_name, rom_sha1, rom_size, rom_system) = {
             let ds = match self.debug.lock() {
                 Ok(g) => g,
                 Err(_) => return json!({ "error": "debug state lock poisoned" }),
             };
-            (ds.rom_map_path.clone(), ds.rom_name.clone(), ds.rom_sha1.clone(), ds.rom_size)
+            (
+                ds.rom_map_path.clone(),
+                ds.rom_name.clone(),
+                ds.rom_sha1.clone(),
+                ds.rom_size,
+                ds.rom_system.clone(),
+            )
         };
         let path = match path {
             Some(p) => p,
@@ -1081,7 +1087,12 @@ impl RetroMcpServer {
                         });
                     }
                 }
-                scaffold_rom_map(rom_name.as_deref(), rom_sha1.as_deref(), rom_size)
+                scaffold_rom_map(
+                    rom_name.as_deref(),
+                    rom_sha1.as_deref(),
+                    rom_size,
+                    rom_system.as_deref(),
+                )
             }
         };
 
@@ -1948,10 +1959,18 @@ fn normalize_addr(addr: &str) -> Result<String, String> {
 ///
 /// The `rom:` block keys are nested under `rom:` with a 2-space indent so the
 /// frontmatter parses as a valid YAML mapping (matching library/mvsc/mvsc.md).
-fn scaffold_rom_map(rom_name: Option<&str>, rom_sha1: Option<&str>, rom_size: Option<usize>) -> String {
+fn scaffold_rom_map(
+    rom_name: Option<&str>,
+    rom_sha1: Option<&str>,
+    rom_size: Option<usize>,
+    rom_system: Option<&str>,
+) -> String {
     let name = rom_name.unwrap_or("");
     let sha1 = rom_sha1.unwrap_or("");
     let size = rom_size.unwrap_or(0);
+    // Inferred from the core's library_name; "" when unknown (multi-system cores)
+    // — an honest blank a human can fill, matching the other empty-default fields.
+    let system = rom_system.unwrap_or("");
     // NOTE: a raw string (not `"…\n\"` line-continuations) is required here —
     // the `\<newline>` continuation form strips the leading whitespace of the
     // following line, which silently flattened the indented YAML keys (the
@@ -1962,7 +1981,7 @@ schema_version: 1
 
 rom:
   name: "{name}"
-  system: ""
+  system: "{system}"
   sha1: "{sha1}"
   crc32: ""
   size: {size}
@@ -2236,7 +2255,7 @@ Title tilemap, drawn by `title_draw`. DO NOT TOUCH THIS PROSE.\n\
 
     #[test]
     fn scaffold_has_frontmatter_and_empty_regions() {
-        let md = scaffold_rom_map(Some("mvsc"), Some("abc123"), Some(22699761));
+        let md = scaffold_rom_map(Some("mvsc"), Some("abc123"), Some(22699761), Some("cps2"));
         assert!(md.starts_with("---\nschema_version: 1"));
         // Identity fields are populated AND nested under `rom:` with a 2-space
         // indent so the frontmatter is a valid YAML mapping (not flat).
@@ -2244,8 +2263,8 @@ Title tilemap, drawn by `title_draw`. DO NOT TOUCH THIS PROSE.\n\
         assert!(md.contains("\n  name: \"mvsc\"\n"));
         assert!(md.contains("\n  sha1: \"abc123\"\n"));
         assert!(md.contains("\n  size: 22699761\n"));
-        // `system` is left empty (honest default), not the misleading "unknown".
-        assert!(md.contains("\n  system: \"\"\n"));
+        // `system` is populated when inferred (here "cps2"), never "unknown".
+        assert!(md.contains("\n  system: \"cps2\"\n"));
         assert!(!md.contains("system: unknown"));
         // Verify the frontmatter block is well-formed: every key line between the
         // opening `---` and closing `---` that sits under `rom:` is 2-space
@@ -2262,10 +2281,12 @@ Title tilemap, drawn by `title_draw`. DO NOT TOUCH THIS PROSE.\n\
         assert!(md.contains("## Regions"));
 
         // Missing identity falls back to empty strings / zero size, never "unknown".
-        let bare = scaffold_rom_map(None, None, None);
+        // A multi-system core (rom_system None) leaves `system` blank.
+        let bare = scaffold_rom_map(None, None, None, None);
         assert!(bare.contains("\n  name: \"\"\n"));
         assert!(bare.contains("\n  sha1: \"\"\n"));
         assert!(bare.contains("\n  size: 0\n"));
+        assert!(bare.contains("\n  system: \"\"\n"));
         assert!(!bare.contains("unknown"));
         // Round-trip: appending to a fresh scaffold yields a valid AI block.
         let out = append_region_block(

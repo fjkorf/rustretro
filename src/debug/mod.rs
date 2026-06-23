@@ -479,6 +479,11 @@ pub struct DebugState {
     /// Byte length of the loaded ROM, used to seed the scaffolded frontmatter
     /// `rom.size`. `None` for need_fullpath cores where the bytes aren't read.
     pub rom_size: Option<usize>,
+    /// The ROM-map `system` slug (e.g. "nes", "megadrive") inferred from the
+    /// loaded core's `library_name`. `None` when the core can't be confidently
+    /// mapped (e.g. multi-system FBNeo) — left blank rather than guessed wrong.
+    /// Seeds the scaffolded frontmatter `rom.system`. Set by Frontend on startup.
+    pub rom_system: Option<String>,
 
     // --- Watches ---
     /// User-created memory watches (displayed in the Watch panel).
@@ -558,6 +563,7 @@ impl DebugState {
             rom_name: None,
             rom_sha1: None,
             rom_size: None,
+            rom_system: None,
             watches: Vec::new(),
             ram_search: RamSearch::new(),
             change_log: VecDeque::new(),
@@ -851,9 +857,52 @@ pub fn decode_to_rgba(src: &[u8], width: u32, height: u32, pitch: usize, fmt: u3
     out
 }
 
+/// Infer the ROM-map `system` slug (ROM_MAP_FORMAT §3 controlled vocabulary:
+/// `nes` | `megadrive` | `cps2` | …) from a libretro core's `library_name`.
+///
+/// Only cores that map to exactly ONE system are recognized — single-system
+/// cores (fceumm/nestopia/mesen → nes; genesis_plus_gx/picodrive/blastem →
+/// megadrive). Multi-system cores like FBNeo/MAME run many systems, so their
+/// library name alone can't pin the system; those return `None` and the scaffold
+/// leaves `system` blank — an honest "human, fill this in" over a wrong guess.
+///
+/// Match is case-insensitive substring so version/branding suffixes don't break
+/// it (e.g. "Genesis Plus GX", "Nestopia UE").
+pub fn system_slug_from_library(library_name: &str) -> Option<&'static str> {
+    let n = library_name.to_ascii_lowercase();
+    let has = |needle: &str| n.contains(needle);
+
+    // NES.
+    if has("fceumm") || has("nestopia") || has("mesen") || has("quicknes") {
+        return Some("nes");
+    }
+    // Sega Mega Drive / Genesis.
+    if has("genesis plus") || has("genesis_plus") || has("picodrive") || has("blastem") {
+        return Some("megadrive");
+    }
+    // Multi-system arcade cores (FBNeo/FB Alpha/MAME) and anything else: the
+    // library name doesn't identify a single system — leave it for a human.
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_slug_maps_single_system_cores_only() {
+        // Single-system cores → confident slug (case/branding tolerant).
+        assert_eq!(system_slug_from_library("FCEUmm"), Some("nes"));
+        assert_eq!(system_slug_from_library("Nestopia UE"), Some("nes"));
+        assert_eq!(system_slug_from_library("Mesen"), Some("nes"));
+        assert_eq!(system_slug_from_library("Genesis Plus GX"), Some("megadrive"));
+        assert_eq!(system_slug_from_library("PicoDrive"), Some("megadrive"));
+        // Multi-system arcade cores → None (can't pin the system from the name).
+        assert_eq!(system_slug_from_library("FinalBurn Neo"), None);
+        assert_eq!(system_slug_from_library("FB Alpha 2012"), None);
+        assert_eq!(system_slug_from_library("MAME 2003"), None);
+        assert_eq!(system_slug_from_library(""), None);
+    }
 
     fn region(name: &str, start: usize, size: usize, ptr: usize) -> MemoryRegion {
         MemoryRegion {
