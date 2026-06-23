@@ -18,6 +18,7 @@
 //! set) are intentionally NOT implemented this wave.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,7 @@ use rmcp::service::RequestContext;
 use rmcp::RoleServer;
 use serde_json::{json, Map, Value};
 
-use crate::debug::SharedDebugState;
+use crate::debug::{SharedDebugState, Watch, WatchFormat};
 use crate::mcp::snapshot::{
     memory_capability, memory_map, parse_hex_bytes, read_region_bytes, rgba_to_png, search_bytes,
     top_heatmap, AiSnapshot,
@@ -59,17 +60,67 @@ const HEATMAP_TOP_N: usize = 64;
 /// region is declared but backed by no readable host memory (a virtual/garbage
 /// descriptor). Format: `"<prefix>:<region_name>"`.
 const REGION_UNBACKED: &str = "region-unbacked";
+/// Maximum number of M68K PC breakpoints, mirroring the UI cap in
+/// `debug/panels/disassembly.rs` so an MCP-set breakpoint behaves identically.
+const MAX_BREAKPOINTS: usize = 8;
 
 /// The MCP server handler. Cloneable (it's just an `Arc` inside) so the
 /// streamable-http service factory can mint a fresh handler per session.
+///
+/// ## Write gate
+/// `writes_enabled` is the session-level "writes armed" flag. The streamable-http
+/// factory mints a FRESH `RetroMcpServer` per MCP session (see `spawn_mcp_server`),
+/// so a field here is the correct home for the gate: it persists across tool calls
+/// for the lifetime of one session and is naturally isolated per session, while the
+/// shared `DebugState` stays a pure data boundary. It is an `Arc<AtomicBool>` so the
+/// `#[derive(Clone)]` (used by `call_tool`/`read_resource`, which clone `self`)
+/// shares one flag rather than copying it. Defaults to LOCKED (false).
 #[derive(Clone)]
 pub struct RetroMcpServer {
     debug: SharedDebugState,
+    writes_enabled: Arc<AtomicBool>,
 }
 
 impl RetroMcpServer {
     pub fn new(debug: SharedDebugState) -> Self {
-        RetroMcpServer { debug }
+        RetroMcpServer {
+            debug,
+            writes_enabled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    // ── write gate ─────────────────────────────────────────────────────────
+
+    /// Returns `Ok(())` when write tools are armed, `Err` with a refusal message
+    /// otherwise. Factored out so the gate logic is unit-testable without a live
+    /// MCP server (see tests).
+    fn check_writes_armed(&self) -> Result<(), &'static str> {
+        if self.writes_enabled.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err("writes are locked; call enable_writes first")
+        }
+    }
+
+    /// Arm the write tools for this session.
+    fn enable_writes(&self) -> Value {
+        self.writes_enabled.store(true, Ordering::SeqCst);
+        json!({
+            "ok": true,
+            "writes_enabled": true,
+            "message": "Write tools ARMED. write_memory/freeze/set_breakpoint/run_to are now \
+                        active. Call disable_writes to re-lock.",
+        })
+    }
+
+    /// Re-lock the write tools for this session.
+    fn disable_writes(&self) -> Value {
+        self.writes_enabled.store(false, Ordering::SeqCst);
+        json!({
+            "ok": true,
+            "writes_enabled": false,
+            "message": "Write tools LOCKED.",
+        })
     }
 
     // ── helpers ────────────────────────────────────────────────────────────
@@ -452,6 +503,180 @@ impl RetroMcpServer {
         }
     }
 
+    // ── gated write tools ──────────────────────────────────────────────────
+
+    /// `write_memory`: poke `len` little-endian bytes of `value` at guest `addr`
+    /// via the bounds-checked [`DebugState::write_addr`]. GATED: refuses unless
+    /// writes are armed. Returns an error (without writing) if `write_addr`
+    /// reports the target is read-only or unbacked.
+    fn write_memory(&self, addr: usize, len: usize, value: u32) -> Value {
+        if let Err(e) = self.check_writes_armed() {
+            return json!({ "error": e });
+        }
+        let len = len.clamp(1, 4);
+        let mut ds = match self.debug.lock() {
+            Ok(g) => g,
+            Err(_) => return json!({ "error": "debug state lock poisoned" }),
+        };
+        let region = ds
+            .memory_regions
+            .iter()
+            .find(|r| addr >= r.addr_start && addr <= r.addr_end)
+            .map(|r| r.name.clone());
+        let wrote = ds.write_addr(addr, len, value);
+        drop(ds);
+        if !wrote {
+            return json!({
+                "ok": false,
+                "addr": format!("0x{addr:X}"),
+                "region": region,
+                "error": "write refused: address is read-only or not backed by writable memory",
+            });
+        }
+        json!({
+            "ok": true,
+            "wrote": true,
+            "addr": format!("0x{addr:X}"),
+            "len": len,
+            "value": value,
+            "region": region,
+        })
+    }
+
+    /// `freeze`: add (or update) a frozen [`Watch`] at `addr`. With `value`, freeze
+    /// to that value; otherwise capture the current value. This matches the UI
+    /// freeze exactly: the run loop re-writes every watch with `frozen == true`
+    /// each frame, using `frozen_value` (capturing the current value when it is
+    /// `None`). GATED.
+    fn freeze(&self, addr: usize, format: WatchFormat, value: Option<u32>) -> Value {
+        if let Err(e) = self.check_writes_armed() {
+            return json!({ "error": e });
+        }
+        let mut ds = match self.debug.lock() {
+            Ok(g) => g,
+            Err(_) => return json!({ "error": "debug state lock poisoned" }),
+        };
+        // Determine the value to hold: explicit, else the current memory value.
+        let frozen_value = match value {
+            Some(v) => Some(v),
+            None => ds.read_addr(addr, format.byte_len()),
+        };
+        // Update an existing watch at this addr, or append a new one.
+        if let Some(w) = ds.watches.iter_mut().find(|w| w.addr == addr) {
+            w.format = format;
+            w.frozen = true;
+            w.frozen_value = frozen_value;
+        } else {
+            ds.watches.push(Watch {
+                addr,
+                label: format!("{addr:06X}"),
+                format,
+                frozen: true,
+                frozen_value,
+                track_changes: false,
+                current: None,
+                prev_value: None,
+            });
+        }
+        let watch = ds.watches.iter().find(|w| w.addr == addr).cloned();
+        drop(ds);
+        json!({ "ok": true, "watch": watch })
+    }
+
+    /// `unfreeze`: clear the freeze on the watch at `addr` (leaving the watch in
+    /// place, like un-checking the UI freeze box, which also clears
+    /// `frozen_value`). GATED. Returns whether a matching watch was found.
+    fn unfreeze(&self, addr: usize) -> Value {
+        if let Err(e) = self.check_writes_armed() {
+            return json!({ "error": e });
+        }
+        let mut ds = match self.debug.lock() {
+            Ok(g) => g,
+            Err(_) => return json!({ "error": "debug state lock poisoned" }),
+        };
+        let found = if let Some(w) = ds.watches.iter_mut().find(|w| w.addr == addr) {
+            w.frozen = false;
+            w.frozen_value = None;
+            true
+        } else {
+            false
+        };
+        drop(ds);
+        json!({ "ok": found, "addr": format!("0x{addr:X}"), "unfrozen": found })
+    }
+
+    /// `set_breakpoint`: add an M68K PC breakpoint (deduped, capped at
+    /// [`MAX_BREAKPOINTS`] to match the UI). GATED.
+    fn set_breakpoint(&self, addr: u32) -> Value {
+        if let Err(e) = self.check_writes_armed() {
+            return json!({ "error": e });
+        }
+        let mut ds = match self.debug.lock() {
+            Ok(g) => g,
+            Err(_) => return json!({ "error": "debug state lock poisoned" }),
+        };
+        if ds.breakpoints.contains(&addr) {
+            let list = ds.breakpoints.clone();
+            drop(ds);
+            return json!({ "ok": true, "added": false, "reason": "already set",
+                           "addr": format!("0x{addr:X}"), "breakpoints": fmt_addrs(&list) });
+        }
+        if ds.breakpoints.len() >= MAX_BREAKPOINTS {
+            let list = ds.breakpoints.clone();
+            drop(ds);
+            return json!({ "ok": false, "added": false,
+                           "error": format!("breakpoint limit reached (max {MAX_BREAKPOINTS})"),
+                           "breakpoints": fmt_addrs(&list) });
+        }
+        ds.breakpoints.push(addr);
+        let list = ds.breakpoints.clone();
+        drop(ds);
+        json!({ "ok": true, "added": true, "addr": format!("0x{addr:X}"),
+                "breakpoints": fmt_addrs(&list) })
+    }
+
+    /// `clear_breakpoint`: remove an M68K PC breakpoint. GATED.
+    fn clear_breakpoint(&self, addr: u32) -> Value {
+        if let Err(e) = self.check_writes_armed() {
+            return json!({ "error": e });
+        }
+        let mut ds = match self.debug.lock() {
+            Ok(g) => g,
+            Err(_) => return json!({ "error": "debug state lock poisoned" }),
+        };
+        let before = ds.breakpoints.len();
+        ds.breakpoints.retain(|&a| a != addr);
+        let removed = ds.breakpoints.len() != before;
+        let list = ds.breakpoints.clone();
+        drop(ds);
+        json!({ "ok": true, "removed": removed, "addr": format!("0x{addr:X}"),
+                "breakpoints": fmt_addrs(&list) })
+    }
+
+    /// `list_breakpoints`: report the current M68K PC breakpoints. Ungated (read).
+    fn list_breakpoints(&self) -> Value {
+        let list = match self.debug.lock() {
+            Ok(ds) => ds.breakpoints.clone(),
+            Err(_) => return json!({ "error": "debug state lock poisoned" }),
+        };
+        json!({ "breakpoints": fmt_addrs(&list), "count": list.len() })
+    }
+
+    /// `run_to`: arm a one-shot run-to-address; the run loop pauses when the M68K
+    /// PC reaches `addr`. GATED (it changes execution flow).
+    fn run_to(&self, addr: u32) -> Value {
+        if let Err(e) = self.check_writes_armed() {
+            return json!({ "error": e });
+        }
+        let mut ds = match self.debug.lock() {
+            Ok(g) => g,
+            Err(_) => return json!({ "error": "debug state lock poisoned" }),
+        };
+        ds.run_to_addr = Some(addr);
+        drop(ds);
+        json!({ "ok": true, "run_to_addr": format!("0x{addr:X}") })
+    }
+
     // ── tool catalog ───────────────────────────────────────────────────────
 
     /// Build the static tool list advertised to clients.
@@ -522,6 +747,43 @@ impl RetroMcpServer {
             });
             Arc::new(schema.as_object().unwrap().clone())
         };
+        // Schema for { addr, len, value } (write_memory).
+        let write_memory_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "addr":  { "type": "integer", "description": "Guest address to write" },
+                    "len":   { "type": "integer", "description": "Number of little-endian bytes (1..=4)" },
+                    "value": { "type": "integer", "description": "Value to write (little-endian, low `len` bytes used)" }
+                },
+                "required": ["addr", "len", "value"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+        // Schema for { addr, format, value? } (freeze).
+        let freeze_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "addr":   { "type": "integer", "description": "Guest address to freeze" },
+                    "format": { "type": "string", "description": "Watch format: u8, s8, u16_le, u16_be, u32_le, u32_be, hex8, hex16, hex32" },
+                    "value":  { "type": "integer", "description": "Optional value to freeze to; if omitted, the current value is captured" }
+                },
+                "required": ["addr", "format"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+        // Schema for { addr } (unfreeze / breakpoint ops / run_to).
+        let addr_only_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "addr": { "type": "integer", "description": "Guest address" }
+                },
+                "required": ["addr"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
 
         vec![
             Tool::new(
@@ -583,6 +845,64 @@ impl RetroMcpServer {
                 "run_lua",
                 "Run a Lua script in the app's sandboxed engine on the main thread and return its console output. Gated/deferred round-trip.",
                 run_lua_schema(),
+            ),
+            // ── write gate + gated write/action tools ──────────────────────
+            Tool::new(
+                "enable_writes",
+                "ARM the write tools for this session. Write tools (write_memory, freeze, \
+                 unfreeze, set_breakpoint, clear_breakpoint, run_to) are LOCKED by default and \
+                 refuse to act until you call this. This is the explicit confirm-before-write \
+                 step. Call disable_writes to re-lock. A bad write can crash the core.",
+                no_params(),
+            ),
+            Tool::new(
+                "disable_writes",
+                "Re-LOCK the write tools for this session (the default state).",
+                no_params(),
+            ),
+            Tool::new(
+                "write_memory",
+                "Poke up to 4 little-endian bytes into guest memory at `addr`. REQUIRES \
+                 enable_writes first (refused otherwise). Goes through the bounds-checked \
+                 write path; refuses (without writing) if the target is read-only or unbacked. \
+                 A bad write can crash the core.",
+                write_memory_schema(),
+            ),
+            Tool::new(
+                "freeze",
+                "Freeze a guest address to a value: adds/updates a watch with frozen=true so \
+                 the run loop re-writes it every frame (identical to the UI freeze checkbox). \
+                 With `value`, freezes to that value; otherwise captures the current value. \
+                 REQUIRES enable_writes first.",
+                freeze_schema(),
+            ),
+            Tool::new(
+                "unfreeze",
+                "Clear the freeze on the watch at `addr` (like un-checking the UI freeze box). \
+                 REQUIRES enable_writes first.",
+                addr_only_schema(),
+            ),
+            Tool::new(
+                "set_breakpoint",
+                "Add an M68K PC breakpoint (deduped; capped at 8 to match the UI). The run \
+                 loop pauses when the PC reaches it. REQUIRES enable_writes first.",
+                addr_only_schema(),
+            ),
+            Tool::new(
+                "clear_breakpoint",
+                "Remove an M68K PC breakpoint. REQUIRES enable_writes first.",
+                addr_only_schema(),
+            ),
+            Tool::new(
+                "list_breakpoints",
+                "List the current M68K PC breakpoints. Read-only (no enable_writes needed).",
+                no_params(),
+            ),
+            Tool::new(
+                "run_to",
+                "Arm a one-shot run-to-address: emulation runs until the M68K PC reaches \
+                 `addr`, then pauses. REQUIRES enable_writes first (it changes execution).",
+                addr_only_schema(),
             ),
         ]
     }
@@ -713,7 +1033,11 @@ impl ServerHandler for RetroMcpServer {
              (see examples/cps2_oam_probe.lua), read those tiles out of VRAM with read_region, \
              then vram_to_rom/search_memory to get ROM candidates. pause/resume/step control \
              execution. Sprite/OAM layout is game- and system-specific; there is no universal \
-             decoder."
+             decoder. WRITE GATE: the write/action tools (write_memory, freeze, unfreeze, \
+             set_breakpoint, clear_breakpoint, run_to) are LOCKED by default; call enable_writes \
+             to arm them for this session (and disable_writes to re-lock). A bad write can crash \
+             the core, so writes require this explicit confirm step. Read-only perception and \
+             pause/resume/step/list_breakpoints stay available without arming."
                 .to_string(),
         );
         info
@@ -833,6 +1157,75 @@ impl ServerHandler for RetroMcpServer {
                     let v = this.run_lua(script);
                     Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
                 }
+                // ── write gate ──────────────────────────────────────────────
+                "enable_writes" => Ok(CallToolResult::success(vec![Self::json_content(
+                    &this.enable_writes(),
+                )?])),
+                "disable_writes" => Ok(CallToolResult::success(vec![Self::json_content(
+                    &this.disable_writes(),
+                )?])),
+                // ── gated write/action tools ────────────────────────────────
+                "write_memory" => {
+                    let addr = get_u("addr").ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `addr`", None)
+                    })? as usize;
+                    let len = get_u("len").ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `len`", None)
+                    })? as usize;
+                    let value = get_u("value").ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `value`", None)
+                    })? as u32;
+                    let v = this.write_memory(addr, len, value);
+                    Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
+                }
+                "freeze" => {
+                    let addr = get_u("addr").ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `addr`", None)
+                    })? as usize;
+                    let fmt_str = args.get("format").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `format`", None)
+                    })?;
+                    let format = parse_watch_format(fmt_str).ok_or_else(|| {
+                        ErrorData::invalid_params(
+                            "`format` must be one of u8/s8/u16_le/u16_be/u32_le/u32_be/hex8/hex16/hex32",
+                            None,
+                        )
+                    })?;
+                    let value = get_u("value").map(|v| v as u32);
+                    let v = this.freeze(addr, format, value);
+                    Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
+                }
+                "unfreeze" => {
+                    let addr = get_u("addr").ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `addr`", None)
+                    })? as usize;
+                    let v = this.unfreeze(addr);
+                    Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
+                }
+                "set_breakpoint" => {
+                    let addr = get_u("addr").ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `addr`", None)
+                    })? as u32;
+                    let v = this.set_breakpoint(addr);
+                    Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
+                }
+                "clear_breakpoint" => {
+                    let addr = get_u("addr").ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `addr`", None)
+                    })? as u32;
+                    let v = this.clear_breakpoint(addr);
+                    Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
+                }
+                "list_breakpoints" => Ok(CallToolResult::success(vec![Self::json_content(
+                    &this.list_breakpoints(),
+                )?])),
+                "run_to" => {
+                    let addr = get_u("addr").ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `addr`", None)
+                    })? as u32;
+                    let v = this.run_to(addr);
+                    Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
+                }
                 other => Err(ErrorData::invalid_params(
                     format!("unknown tool: {other}"),
                     None,
@@ -894,9 +1287,35 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+/// Format a list of guest addresses as `0x`-prefixed hex strings for JSON output.
+fn fmt_addrs(addrs: &[u32]) -> Vec<String> {
+    addrs.iter().map(|a| format!("0x{a:X}")).collect()
+}
+
+/// Map a case-insensitive format string to a [`WatchFormat`]. Accepts the names
+/// of every `WatchFormat` variant plus a couple of friendly aliases. Used by the
+/// `freeze` tool so an MCP-created watch matches the formats the UI offers.
+fn parse_watch_format(s: &str) -> Option<WatchFormat> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "u8" => Some(WatchFormat::U8),
+        "s8" | "i8" => Some(WatchFormat::S8),
+        "u16" | "u16_le" | "u16le" => Some(WatchFormat::U16LE),
+        "u16_be" | "u16be" => Some(WatchFormat::U16BE),
+        "u32" | "u32_le" | "u32le" => Some(WatchFormat::U32LE),
+        "u32_be" | "u32be" => Some(WatchFormat::U32BE),
+        "hex8" | "hex_8" => Some(WatchFormat::Hex8),
+        "hex16" | "hex_16" => Some(WatchFormat::Hex16),
+        "hex32" | "hex_32" => Some(WatchFormat::Hex32),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::base64_encode;
+    use super::{parse_watch_format, RetroMcpServer};
+    use crate::debug::{DebugState, WatchFormat};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn base64_matches_known_vectors() {
@@ -907,5 +1326,57 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn parse_watch_format_maps_variants_and_aliases() {
+        assert_eq!(parse_watch_format("u8"), Some(WatchFormat::U8));
+        assert_eq!(parse_watch_format("S8"), Some(WatchFormat::S8));
+        assert_eq!(parse_watch_format("i8"), Some(WatchFormat::S8));
+        assert_eq!(parse_watch_format("u16"), Some(WatchFormat::U16LE));
+        assert_eq!(parse_watch_format("u16_le"), Some(WatchFormat::U16LE));
+        assert_eq!(parse_watch_format("U16BE"), Some(WatchFormat::U16BE));
+        assert_eq!(parse_watch_format("u32_le"), Some(WatchFormat::U32LE));
+        assert_eq!(parse_watch_format("u32be"), Some(WatchFormat::U32BE));
+        assert_eq!(parse_watch_format(" hex16 "), Some(WatchFormat::Hex16));
+        assert_eq!(parse_watch_format("hex32"), Some(WatchFormat::Hex32));
+        assert_eq!(parse_watch_format("nope"), None);
+    }
+
+    #[test]
+    fn write_gate_defaults_locked_and_arms() {
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        // Default: locked.
+        assert!(srv.check_writes_armed().is_err());
+        // Arm.
+        let _ = srv.enable_writes();
+        assert!(srv.check_writes_armed().is_ok());
+        // Re-lock.
+        let _ = srv.disable_writes();
+        assert!(srv.check_writes_armed().is_err());
+    }
+
+    #[test]
+    fn gated_write_refused_when_locked_and_allowed_when_armed() {
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+
+        // Locked: a write/action tool must refuse WITHOUT touching state.
+        let refused = srv.set_breakpoint(0x0400);
+        assert_eq!(
+            refused["error"].as_str(),
+            Some("writes are locked; call enable_writes first")
+        );
+        assert!(srv.debug.lock().unwrap().breakpoints.is_empty());
+
+        // run_to is likewise refused while locked.
+        let refused_rt = srv.run_to(0x1000);
+        assert!(refused_rt["error"].is_string());
+        assert!(srv.debug.lock().unwrap().run_to_addr.is_none());
+
+        // Arm, then the action succeeds and mutates state.
+        let _ = srv.enable_writes();
+        let ok = srv.set_breakpoint(0x0400);
+        assert_eq!(ok["added"], serde_json::json!(true));
+        assert!(srv.debug.lock().unwrap().breakpoints.contains(&0x0400));
     }
 }
