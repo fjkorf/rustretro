@@ -33,19 +33,11 @@ where it serves that goal. Status reflects the codebase as of the current branch
 
 ## Near-term (next)
 
-- [ ] **Upgrade the egui/Bevy stack** — move from egui 0.31 / bevy 0.15 / bevy_egui 0.33 to
-      egui 0.33 / bevy 0.18 / bevy_egui 0.39 (new `EguiPrimaryContextPass` schedule). Touches
-      the sprite/image/render code; do it litui-free and get green first. **Prerequisite for
-      the litui integration below.** Note: `egui_dock` is now adopted at 0.16 (egui 0.31); the
-      upgrade must bump it to the egui-0.33-compatible release in lockstep.
-- [ ] **`retro_get_memory_data` fallback** — the highest-leverage core-compat fix for the AI/RE
-      track. RustRetro only reads memory from `SET_MEMORY_MAPS`, but **many cores skip it** and
-      expose RAM only via `retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM)`. Verified live (see the
-      core-capability matrix below): fbalpha2012 (CPS2), Genesis Plus GX (Genesis/MK2), and FBNeo
-      all publish **0 regions** to RustRetro today, so their RAM is unreachable. Consuming
-      `get_memory_data` as a fallback synthesizes a System-RAM region for these cores — unlocking
-      Genesis and CPS2 work-RAM inspection. (Full VRAM/sprite-RAM/ROM still needs `SET_MEMORY_MAPS`
-      or a hardcoded region table.)
+- [x] ~~**Upgrade the egui/Bevy stack**~~ — SHIPPED: bevy 0.18.1 / bevy_egui 0.39.1 /
+      egui 0.33.3 / egui_dock 0.18 (single egui in the tree). Unblocked the litui integration.
+- [x] ~~**`retro_get_memory_data` fallback**~~ — SHIPPED & proven live (GPGX + Mortal Kombat II:
+      0 regions → 64 KB System RAM, 1169 nonzero bytes). Unlocks Genesis + CPS2 work-RAM. Full
+      VRAM/sprite/ROM still needs `SET_MEMORY_MAPS` or a hardcoded region table.
 - [ ] **`RETRO_ENVIRONMENT_GET_VARIABLE`** — real core-options support. Today it returns
       false, so cores needing options can misbehave. Highest-leverage correctness fix.
 - [ ] **Mesen NES core fails to load** — `genesis_plus_gx`/`fceumm` load fine, but the Mesen
