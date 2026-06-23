@@ -128,6 +128,85 @@ impl AiSnapshot {
     }
 }
 
+/// A full memory-map entry for the `app://memory-map` resource. Same data as
+/// [`RegionSummary`] but named for orientation use; kept distinct so the map
+/// resource can evolve independently of the state-snapshot summary.
+#[derive(Serialize, Clone)]
+pub struct MemoryMapEntry {
+    pub name: String,
+    /// "ROM" / "RAM" / "VRAM" / "SRAM" / "Unmapped".
+    pub kind: String,
+    pub addr_start: usize,
+    pub addr_end: usize,
+    pub size: usize,
+    pub readonly: bool,
+}
+
+/// Build the memory map: one [`MemoryMapEntry`] per mapped region, in order.
+pub fn memory_map(ds: &DebugState) -> Vec<MemoryMapEntry> {
+    ds.memory_regions
+        .iter()
+        .map(|r| MemoryMapEntry {
+            name: r.name.clone(),
+            kind: r.region_type().to_string(),
+            addr_start: r.addr_start,
+            addr_end: r.addr_end,
+            size: r.size,
+            readonly: r.is_readonly(),
+        })
+        .collect()
+}
+
+/// Find every occurrence of `needle` in `haystack`, returning the BYTE OFFSETS
+/// (relative to the start of `haystack`) of each match, capped at `max_hits`.
+///
+/// Pure and allocation-light so it can be unit-tested with synthetic buffers and
+/// run UNLOCKED by the MCP layer (which clones region bytes out under a brief
+/// lock, then scans here without holding the mutex). Returns an empty vec if the
+/// needle is empty or longer than the haystack.
+pub fn search_bytes(haystack: &[u8], needle: &[u8], max_hits: usize) -> Vec<usize> {
+    let mut hits = Vec::new();
+    if needle.is_empty() || needle.len() > haystack.len() || max_hits == 0 {
+        return hits;
+    }
+    let last = haystack.len() - needle.len();
+    let first = needle[0];
+    let mut i = 0;
+    while i <= last {
+        if haystack[i] == first && &haystack[i..i + needle.len()] == needle {
+            hits.push(i);
+            if hits.len() >= max_hits {
+                break;
+            }
+        }
+        i += 1;
+    }
+    hits
+}
+
+/// Parse a whitespace-or-comma-tolerant hex byte string (e.g. "DE AD BE EF",
+/// "deadbeef", "DE,AD,BE,EF") into a byte vector. Returns `None` on any
+/// non-hex-digit or an odd number of nibbles.
+pub fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ',' && *c != '_')
+        .collect();
+    if cleaned.is_empty() || cleaned.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(cleaned.len() / 2);
+    let bytes = cleaned.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
 /// One row of the PC heatmap, sorted hottest-first by the caller.
 #[derive(Serialize, Clone)]
 pub struct HeatmapEntry {
@@ -246,6 +325,79 @@ mod tests {
         // 3 bytes can't be a 1×1 RGBA pixel (needs 4).
         assert!(rgba_to_png(&[1, 2, 3], 1, 1).is_none());
         assert!(rgba_to_png(&[], 0, 0).is_none());
+    }
+
+    #[test]
+    fn search_bytes_finds_known_needle_offsets() {
+        // Haystack with the needle "BE EF" at offsets 2 and 7.
+        let hay = [0x00, 0x11, 0xBE, 0xEF, 0x22, 0x33, 0x44, 0xBE, 0xEF, 0x55];
+        let needle = [0xBEu8, 0xEF];
+        let hits = search_bytes(&hay, &needle, 16);
+        assert_eq!(hits, vec![2, 7]);
+    }
+
+    #[test]
+    fn search_bytes_respects_max_hits_and_edges() {
+        let hay = [0xAAu8, 0xAA, 0xAA, 0xAA];
+        // single-byte needle 0xAA appears at every offset; cap at 2.
+        assert_eq!(search_bytes(&hay, &[0xAA], 2), vec![0, 1]);
+        // needle longer than haystack -> no hits.
+        assert!(search_bytes(&[0x01, 0x02], &[0x01, 0x02, 0x03], 8).is_empty());
+        // empty needle -> no hits.
+        assert!(search_bytes(&hay, &[], 8).is_empty());
+        // needle at the very end of the haystack is found.
+        let hay2 = [0x00u8, 0x01, 0xCA, 0xFE];
+        assert_eq!(search_bytes(&hay2, &[0xCA, 0xFE], 8), vec![2]);
+    }
+
+    #[test]
+    fn parse_hex_bytes_tolerates_separators() {
+        assert_eq!(parse_hex_bytes("DEADBEEF").unwrap(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(parse_hex_bytes("DE AD BE EF").unwrap(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(parse_hex_bytes("de,ad").unwrap(), vec![0xDE, 0xAD]);
+        // Odd nibble count is rejected.
+        assert!(parse_hex_bytes("ABC").is_none());
+        // Non-hex char is rejected.
+        assert!(parse_hex_bytes("ZZ").is_none());
+        assert!(parse_hex_bytes("").is_none());
+    }
+
+    #[test]
+    fn memory_map_resolves_region_by_name_and_kind() {
+        let mut ds = DebugState::new();
+        ds.memory_regions.push(MemoryRegion {
+            name: "GFX ROM".to_string(),
+            addr_start: 0x10_0000,
+            addr_end: 0x1F_FFFF,
+            size: 0x10_0000,
+            flags: 1 << 0, // CONST -> ROM, readonly
+            ptr: 0,
+            offset: 0,
+            select: 0,
+            disconnect: 0,
+        });
+        ds.memory_regions.push(MemoryRegion {
+            name: "VRAM".to_string(),
+            addr_start: 0,
+            addr_end: 0xFFFF,
+            size: 0x1_0000,
+            flags: 1 << 4, // VIDEO_RAM -> VRAM
+            ptr: 0,
+            offset: 0,
+            select: 0,
+            disconnect: 0,
+        });
+        let map = memory_map(&ds);
+        assert_eq!(map.len(), 2);
+        // Region-name resolution: find "GFX ROM" and confirm its classification.
+        let rom = map.iter().find(|m| m.name == "GFX ROM").expect("GFX ROM present");
+        assert_eq!(rom.kind, "ROM");
+        assert!(rom.readonly);
+        assert_eq!(rom.addr_start, 0x10_0000);
+        assert_eq!(rom.addr_end, 0x1F_FFFF);
+        let vram = map.iter().find(|m| m.name == "VRAM").expect("VRAM present");
+        assert_eq!(vram.kind, "VRAM");
+        assert!(!vram.readonly);
     }
 
     #[test]
