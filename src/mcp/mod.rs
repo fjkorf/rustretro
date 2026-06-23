@@ -13,6 +13,7 @@
 //! keeps running on the main thread, oblivious — when `--mcp` is absent this
 //! module is never invoked and behavior is byte-for-byte identical.
 
+pub mod ines;
 pub mod server;
 pub mod snapshot;
 
