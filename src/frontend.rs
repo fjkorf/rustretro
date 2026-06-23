@@ -45,6 +45,18 @@ impl Frontend {
             .file_stem()
             .map(|stem| save_dir.join(format!("{}.regions.json", stem.to_string_lossy())));
 
+        // Derive the literate ROM-map path: library/<slug>/<slug>.md where the
+        // slug is the ROM file stem (e.g. "mvsc" from "mvsc.zip"). We use the
+        // project-root-relative `library/` directory (cwd-relative, matching how
+        // .regions.json / rustretro_layout.json are resolved). The MCP
+        // add_rom_map_region/get_rom_map tools read & scaffold this file.
+        let rom_stem = std::path::Path::new(rom_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string());
+        let rom_map_path = rom_stem
+            .as_ref()
+            .map(|slug| PathBuf::from("library").join(slug).join(format!("{slug}.md")));
+
         let mut frontend = Frontend {
             core,
             av_info: None,
@@ -59,6 +71,8 @@ impl Frontend {
         // Store sidecar path in debug state and try to load existing data
         if let Ok(mut ds) = debug_state.lock() {
             ds.sidecar_path = sidecar_path.clone();
+            ds.rom_map_path = rom_map_path.clone();
+            ds.rom_name = rom_stem.clone();
         }
         if let Some(ref path) = sidecar_path {
             load_regions_sidecar(path, &debug_state);
@@ -75,6 +89,15 @@ impl Frontend {
         } else {
             std::fs::read(rom_path).map_err(|e| anyhow!("Failed to read ROM: {}", e))?
         };
+
+        // Seed the ROM-map identity (frontmatter `rom.sha1`, §3) from the loaded
+        // bytes, when available. Skipped for need_fullpath cores (no bytes here).
+        if !rom_data.is_empty() {
+            let sha1 = sha1_hex(&rom_data);
+            if let Ok(mut ds) = debug_state.lock() {
+                ds.rom_sha1 = Some(sha1);
+            }
+        }
 
         let path_cstring = CString::new(rom_path).ok();
 
@@ -958,5 +981,85 @@ fn save_regions_sidecar(path: &std::path::Path, debug_state: &SharedDebugState) 
         }
     } else {
         eprintln!("[Regions] Failed to write sidecar to {}", tmp.display());
+    }
+}
+
+/// Compute the SHA-1 of `data` and return it as a lowercase hex string.
+///
+/// A small self-contained implementation (RFC 3174) so we can stamp the ROM-map
+/// frontmatter identity key (§3 of `ROM_MAP_FORMAT.md`) without pulling in a new
+/// crate dependency. ROMs are read once at load, so the cost is negligible.
+fn sha1_hex(data: &[u8]) -> String {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let ml = (data.len() as u64).wrapping_mul(8);
+
+    // Build the padded message: data || 0x80 || 0x00... || 64-bit big-endian length.
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&ml.to_be_bytes());
+
+    let mut w = [0u32; 80];
+    for chunk in msg.chunks_exact(64) {
+        for (i, word) in w.iter_mut().take(16).enumerate() {
+            *word = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &word) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let tmp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = tmp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+
+    let mut out = String::with_capacity(40);
+    for word in h {
+        out.push_str(&format!("{word:08x}"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod sha1_tests {
+    use super::sha1_hex;
+
+    #[test]
+    fn sha1_known_vectors() {
+        assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            sha1_hex(b"The quick brown fox jumps over the lazy dog"),
+            "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12"
+        );
     }
 }

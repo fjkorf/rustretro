@@ -64,6 +64,37 @@ const REGION_UNBACKED: &str = "region-unbacked";
 /// `debug/panels/disassembly.rs` so an MCP-set breakpoint behaves identically.
 const MAX_BREAKPOINTS: usize = 8;
 
+/// The controlled vocabulary of region `kind` values (ROM_MAP_FORMAT §5). The
+/// `add_rom_map_region` tool validates against this list so AI-authored regions
+/// stay queryable across the library.
+const ROM_MAP_KINDS: &[&str] = &[
+    // Code
+    "game_loop",
+    "subroutine",
+    "interrupt_handler",
+    "sound_driver",
+    // Graphics
+    "title_screen",
+    "background",
+    "tilemap",
+    "character_sprite",
+    "sprite_sheet",
+    "palette",
+    // Audio
+    "music_track",
+    "sfx_table",
+    // Data
+    "level_data",
+    "text_table",
+    "lookup_table",
+];
+
+/// The `confidence` vocabulary (ROM_MAP_FORMAT §4). Default is `likely`.
+const ROM_MAP_CONFIDENCES: &[&str] = &["confirmed", "likely", "guess"];
+
+/// Default human-zone stub prose for an AI-authored region when no note is given.
+const DEFAULT_REGION_NOTE: &str = "Discovered via MCP RE session.";
+
 /// The MCP server handler. Cloneable (it's just an `Arc` inside) so the
 /// streamable-http service factory can mint a fresh handler per session.
 ///
@@ -677,6 +708,147 @@ impl RetroMcpServer {
         json!({ "ok": true, "run_to_addr": format!("0x{addr:X}") })
     }
 
+    // ── ROM-map writeback (AI-authored region persistence) ──────────────────
+
+    /// `get_rom_map`: return the current literate ROM-map Markdown (read-only,
+    /// UNGATED) so the agent can review what's already recorded before adding to
+    /// it. Reports `exists: false` with the resolved path when no map exists yet.
+    fn get_rom_map(&self) -> Value {
+        let path = {
+            let ds = match self.debug.lock() {
+                Ok(g) => g,
+                Err(_) => return json!({ "error": "debug state lock poisoned" }),
+            };
+            ds.rom_map_path.clone()
+        };
+        let path = match path {
+            Some(p) => p,
+            None => {
+                return json!({
+                    "error": "no ROM map path (ROM not loaded with a library path)"
+                })
+            }
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(md) => json!({
+                "ok": true,
+                "exists": true,
+                "path": path.display().to_string(),
+                "markdown": md,
+            }),
+            Err(_) => json!({
+                "ok": true,
+                "exists": false,
+                "path": path.display().to_string(),
+                "markdown": Value::Null,
+                "note": "no map yet — add_rom_map_region will scaffold one",
+            }),
+        }
+    }
+
+    /// `add_rom_map_region`: persist a confirmed RE finding into the ROM's
+    /// literate Markdown map as an `author=ai` `::: region` block. GATED (it
+    /// mutates a file). Validates `kind`/`confidence` against the §5/§4 vocab,
+    /// scaffolds the map if missing (§9), assigns a collision-free `ai<n>` id,
+    /// appends the block into `## Regions` (never touching existing prose, §6),
+    /// and writes atomically (`.tmp` + rename).
+    fn add_rom_map_region(
+        &self,
+        kind: &str,
+        addr: &str,
+        label: Option<&str>,
+        confidence: Option<&str>,
+        note: Option<&str>,
+    ) -> Value {
+        if let Err(e) = self.check_writes_armed() {
+            return json!({ "error": e });
+        }
+
+        // Validate kind against the controlled vocabulary (§5).
+        if !ROM_MAP_KINDS.contains(&kind) {
+            return json!({
+                "error": format!("unknown kind '{kind}'"),
+                "valid_kinds": ROM_MAP_KINDS,
+            });
+        }
+
+        // Validate / default confidence (§4).
+        let confidence = confidence.unwrap_or("likely");
+        if !ROM_MAP_CONFIDENCES.contains(&confidence) {
+            return json!({
+                "error": format!("unknown confidence '{confidence}'"),
+                "valid_confidence": ROM_MAP_CONFIDENCES,
+            });
+        }
+
+        // Normalize/validate the addr token: "0xSTART-0xEND" or a single "0xADDR".
+        let addr = match normalize_addr(addr) {
+            Ok(a) => a,
+            Err(e) => return json!({ "error": e }),
+        };
+
+        let note = note.unwrap_or(DEFAULT_REGION_NOTE);
+
+        // Pull the map path + identity fields under a brief lock.
+        let (path, rom_name, rom_sha1) = {
+            let ds = match self.debug.lock() {
+                Ok(g) => g,
+                Err(_) => return json!({ "error": "debug state lock poisoned" }),
+            };
+            (ds.rom_map_path.clone(), ds.rom_name.clone(), ds.rom_sha1.clone())
+        };
+        let path = match path {
+            Some(p) => p,
+            None => {
+                return json!({
+                    "error": "no ROM map path (ROM not loaded with a library path)"
+                })
+            }
+        };
+
+        // Read the existing map, or scaffold a fresh one (§9) if absent. We never
+        // create the parent dir lazily inside the helper — do it here so a write
+        // error surfaces cleanly.
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(md) => md,
+            Err(_) => {
+                if let Some(parent) = path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        return json!({
+                            "error": format!("failed to create library dir: {e}")
+                        });
+                    }
+                }
+                scaffold_rom_map(rom_name.as_deref(), rom_sha1.as_deref())
+            }
+        };
+
+        // Assign a collision-free AI id and build the new content.
+        let id = next_ai_id(&existing);
+        let new_md =
+            append_region_block(&existing, &id, kind, &addr, label, confidence, "ai", note);
+
+        // Atomic write: <path>.tmp then rename over the original (§6).
+        let tmp = path.with_extension("md.tmp");
+        if let Err(e) = std::fs::write(&tmp, &new_md) {
+            return json!({ "error": format!("failed to write tmp map: {e}") });
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return json!({ "error": format!("failed to rename map into place: {e}") });
+        }
+
+        json!({
+            "ok": true,
+            "id": id,
+            "path": path.display().to_string(),
+            "kind": kind,
+            "addr": addr,
+            "confidence": confidence,
+            "author": "ai",
+        })
+    }
+
     // ── tool catalog ───────────────────────────────────────────────────────
 
     /// Build the static tool list advertised to clients.
@@ -770,6 +942,21 @@ impl RetroMcpServer {
                     "value":  { "type": "integer", "description": "Optional value to freeze to; if omitted, the current value is captured" }
                 },
                 "required": ["addr", "format"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+        // Schema for { kind, addr, label?, confidence?, note? } (add_rom_map_region).
+        let add_rom_map_region_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "description": "Controlled vocab (ROM_MAP_FORMAT §5): game_loop, subroutine, interrupt_handler, sound_driver, title_screen, background, tilemap, character_sprite, sprite_sheet, palette, music_track, sfx_table, level_data, text_table, lookup_table" },
+                    "addr": { "type": "string", "description": "Address: a single point \"0xADDR\" or a range \"0xSTART-0xEND\"" },
+                    "label": { "type": "string", "description": "Optional short human name for the region" },
+                    "confidence": { "type": "string", "description": "confirmed | likely | guess (default likely)" },
+                    "note": { "type": "string", "description": "Optional prose stub line (the human-owned zone); defaults to a generic note" }
+                },
+                "required": ["kind", "addr"]
             });
             Arc::new(schema.as_object().unwrap().clone())
         };
@@ -904,6 +1091,27 @@ impl RetroMcpServer {
                  `addr`, then pauses. REQUIRES enable_writes first (it changes execution).",
                 addr_only_schema(),
             ),
+            // ── ROM-map writeback (persist findings across sessions) ─────────
+            Tool::new(
+                "get_rom_map",
+                "Read-only: return the current literate ROM-map Markdown (frontmatter + \
+                 ## Regions) for the loaded ROM so you can review what's already recorded. \
+                 Reports exists=false (with the path) when no map has been scaffolded yet. \
+                 No enable_writes needed.",
+                no_params(),
+            ),
+            Tool::new(
+                "add_rom_map_region",
+                "Persist a CONFIRMED reverse-engineering finding into the ROM's literate \
+                 Markdown map as an `author=ai` `::: region` block, so it survives across \
+                 sessions instead of evaporating in chat. `kind` must be in the controlled \
+                 vocabulary (rejected otherwise, with the valid list); `addr` is \"0xADDR\" or \
+                 \"0xSTART-0xEND\"; `confidence` is confirmed|likely|guess (default likely). \
+                 Scaffolds the map (frontmatter + ## Regions) if none exists, assigns a unique \
+                 ai<n> id, and appends atomically — it NEVER rewrites existing human prose. \
+                 REQUIRES enable_writes first (it mutates a file).",
+                add_rom_map_region_schema(),
+            ),
         ]
     }
 
@@ -1037,7 +1245,13 @@ impl ServerHandler for RetroMcpServer {
              set_breakpoint, clear_breakpoint, run_to) are LOCKED by default; call enable_writes \
              to arm them for this session (and disable_writes to re-lock). A bad write can crash \
              the core, so writes require this explicit confirm step. Read-only perception and \
-             pause/resume/step/list_breakpoints stay available without arming."
+             pause/resume/step/list_breakpoints stay available without arming. PERSIST FINDINGS: \
+             once a region is CONFIRMED, durably record it in the ROM's literate Markdown map \
+             with add_rom_map_region (gated — it writes a file, so enable_writes first); it \
+             scaffolds the map if needed and appends an author=ai ::: region block without \
+             touching existing prose. Review the current map any time with get_rom_map \
+             (read-only). This is how findings survive across sessions instead of evaporating \
+             in chat."
                 .to_string(),
         );
         info
@@ -1226,6 +1440,23 @@ impl ServerHandler for RetroMcpServer {
                     let v = this.run_to(addr);
                     Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
                 }
+                // ── ROM-map writeback ───────────────────────────────────────
+                "get_rom_map" => Ok(CallToolResult::success(vec![Self::json_content(
+                    &this.get_rom_map(),
+                )?])),
+                "add_rom_map_region" => {
+                    let kind = args.get("kind").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `kind`", None)
+                    })?;
+                    let addr = args.get("addr").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `addr`", None)
+                    })?;
+                    let label = args.get("label").and_then(|v| v.as_str());
+                    let confidence = args.get("confidence").and_then(|v| v.as_str());
+                    let note = args.get("note").and_then(|v| v.as_str());
+                    let v = this.add_rom_map_region(kind, addr, label, confidence, note);
+                    Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
+                }
                 other => Err(ErrorData::invalid_params(
                     format!("unknown tool: {other}"),
                     None,
@@ -1310,9 +1541,169 @@ fn parse_watch_format(s: &str) -> Option<WatchFormat> {
     }
 }
 
+// ── ROM-map writeback helpers (pure, testable) ───────────────────────────────
+
+/// Validate and normalize an `addr` token to its canonical form. Accepts a
+/// single point `0xHHHH` or a range `0xSTART-0xEND`. Returns the normalized
+/// uppercase-hex string (e.g. `"0x024000-0x025FFF"`) or an error message.
+fn normalize_addr(addr: &str) -> Result<String, String> {
+    let s = addr.trim();
+    let parse_hex = |tok: &str| -> Result<u64, String> {
+        let t = tok.trim();
+        let body = t
+            .strip_prefix("0x")
+            .or_else(|| t.strip_prefix("0X"))
+            .ok_or_else(|| format!("addr token '{t}' must be hex with a 0x prefix"))?;
+        if body.is_empty() || !body.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("addr token '{t}' is not valid hex"));
+        }
+        u64::from_str_radix(body, 16).map_err(|_| format!("addr token '{t}' out of range"))
+    };
+
+    if let Some((lo, hi)) = s.split_once('-') {
+        let lo = parse_hex(lo)?;
+        let hi = parse_hex(hi)?;
+        if hi < lo {
+            return Err(format!("addr range end 0x{hi:X} is before start 0x{lo:X}"));
+        }
+        Ok(format!("0x{lo:06X}-0x{hi:06X}"))
+    } else {
+        let p = parse_hex(s)?;
+        Ok(format!("0x{p:06X}"))
+    }
+}
+
+/// Build a minimal scaffold map (ROM_MAP_FORMAT §9) for a ROM that has no map
+/// yet. Fills the identity fields we know (`rom.name`, `rom.sha1`) and leaves
+/// unknowns blank/sensible. Always includes an (empty) `## Regions` section so
+/// the first `append_region_block` has a home.
+fn scaffold_rom_map(rom_name: Option<&str>, rom_sha1: Option<&str>) -> String {
+    let name = rom_name.unwrap_or("unknown");
+    let sha1 = rom_sha1.unwrap_or("");
+    format!(
+        "---\n\
+schema_version: 1\n\
+\n\
+rom:\n\
+  name: \"{name}\"\n\
+  system: unknown\n\
+  sha1: \"{sha1}\"\n\
+  crc32: \"\"\n\
+  size: 0\n\
+\n\
+settings:\n\
+  scale: 3\n\
+  volume: 0.8\n\
+  muted: false\n\
+  breakpoints: []\n\
+  watches: []\n\
+\n\
+meta:\n\
+  genre: \"\"\n\
+  year: \"\"\n\
+  developer: \"\"\n\
+  progress: \"new\"\n\
+  tags: []\n\
+---\n\
+\n\
+# {name} — map\n\
+\n\
+## Overview\n\
+\n\
+_(notes go here)_\n\
+\n\
+## Regions\n\
+\n\
+_(region blocks accumulate here as you explore)_\n"
+    )
+}
+
+/// Scan `existing` for `id=ai<N>` fence attributes and return the next free
+/// `ai<N>` id (1-based, zero-padded to two digits like `ai01`). Avoids
+/// collisions with any existing `ai`-prefixed id, including human-renamed ones.
+fn next_ai_id(existing: &str) -> String {
+    let mut max = 0u32;
+    for line in existing.lines() {
+        let line = line.trim_start();
+        if !line.starts_with("::: region") {
+            continue;
+        }
+        for tok in line.split_whitespace() {
+            if let Some(val) = tok.strip_prefix("id=") {
+                if let Some(num) = val.strip_prefix("ai") {
+                    if let Ok(n) = num.parse::<u32>() {
+                        max = max.max(n);
+                    }
+                }
+            }
+        }
+    }
+    format!("ai{:02}", max + 1)
+}
+
+/// PURE: given the current map Markdown, append a new `::: region` block to the
+/// `## Regions` section and return the new content. Creates the `## Regions`
+/// section (at the end) if missing. NEVER rewrites existing fence lines or
+/// human prose (ROM_MAP_FORMAT §6) — it only appends. The opening fence carries
+/// the AI authorship marker `author=<author>` so the block is reviewable.
+#[allow(clippy::too_many_arguments)]
+fn append_region_block(
+    existing_md: &str,
+    id: &str,
+    kind: &str,
+    addr: &str,
+    label: Option<&str>,
+    confidence: &str,
+    author: &str,
+    note: &str,
+) -> String {
+    // Build the fence line. Order: kind, id, addr, author, confidence, [label].
+    let mut fence = format!(
+        "::: region kind={kind} id={id} addr={addr} author={author} confidence={confidence}"
+    );
+    if let Some(lbl) = label {
+        let lbl = lbl.trim();
+        if !lbl.is_empty() {
+            fence.push_str(&format!(" label=\"{}\"", lbl.replace('"', "'")));
+        }
+    }
+    // The block: fence, one prose stub line (human-owned), closing fence.
+    let block = format!("{fence}\n{note}\n:::\n");
+
+    // Locate the `## Regions` heading (a line that is exactly `## Regions`,
+    // ignoring trailing whitespace).
+    let has_regions = existing_md
+        .lines()
+        .any(|l| l.trim_end() == "## Regions");
+
+    if has_regions {
+        // Append the block at the very end of the file, after all existing
+        // content (which keeps every existing block + prose byte-for-byte).
+        let mut out = String::with_capacity(existing_md.len() + block.len() + 2);
+        out.push_str(existing_md);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&block);
+        out
+    } else {
+        // No Regions section — create one at the end, then append the block.
+        let mut out = String::with_capacity(existing_md.len() + block.len() + 32);
+        out.push_str(existing_md);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("\n## Regions\n\n");
+        out.push_str(&block);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::base64_encode;
+    use super::{append_region_block, next_ai_id, normalize_addr, scaffold_rom_map};
     use super::{parse_watch_format, RetroMcpServer};
     use crate::debug::{DebugState, WatchFormat};
     use std::sync::{Arc, Mutex};
@@ -1378,5 +1769,107 @@ mod tests {
         let ok = srv.set_breakpoint(0x0400);
         assert_eq!(ok["added"], serde_json::json!(true));
         assert!(srv.debug.lock().unwrap().breakpoints.contains(&0x0400));
+    }
+
+    // ── ROM-map writeback ───────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_addr_accepts_point_and_range() {
+        assert_eq!(normalize_addr("0x24000").unwrap(), "0x024000");
+        assert_eq!(
+            normalize_addr("0x024000-0x025FFF").unwrap(),
+            "0x024000-0x025FFF"
+        );
+        // case-insensitive prefix + hex; whitespace trimmed.
+        assert_eq!(normalize_addr(" 0XdeAD ").unwrap(), "0x00DEAD");
+        // errors
+        assert!(normalize_addr("24000").is_err()); // no 0x
+        assert!(normalize_addr("0xZZ").is_err()); // not hex
+        assert!(normalize_addr("0x200-0x100").is_err()); // end before start
+    }
+
+    #[test]
+    fn append_preserves_existing_blocks_and_prose_and_marks_ai() {
+        // A map WITH a ## Regions section containing a human block with prose.
+        let existing = "\
+---\nschema_version: 1\n---\n\n# Game — map\n\n## Regions\n\n\
+::: region kind=title_screen id=tt01 addr=0x024000-0x025FFF confidence=confirmed\n\
+Title tilemap, drawn by `title_draw`. DO NOT TOUCH THIS PROSE.\n\
+:::\n";
+
+        let out = append_region_block(
+            existing,
+            "ai01",
+            "subroutine",
+            "0x001000-0x0010FF",
+            Some("hp_update"),
+            "likely",
+            "ai",
+            "Found via heatmap + breakpoint.",
+        );
+
+        // Existing human block + its prose survive byte-for-byte.
+        assert!(out.contains(
+            "::: region kind=title_screen id=tt01 addr=0x024000-0x025FFF confidence=confirmed"
+        ));
+        assert!(out.contains("Title tilemap, drawn by `title_draw`. DO NOT TOUCH THIS PROSE."));
+        // New block is present, tagged author=ai, with the note as prose.
+        assert!(out.contains(
+            "::: region kind=subroutine id=ai01 addr=0x001000-0x0010FF author=ai confidence=likely label=\"hp_update\""
+        ));
+        assert!(out.contains("Found via heatmap + breakpoint."));
+        // The new block comes AFTER the existing one (no reordering).
+        let tt = out.find("id=tt01").unwrap();
+        let ai = out.find("id=ai01").unwrap();
+        assert!(ai > tt);
+    }
+
+    #[test]
+    fn append_creates_regions_section_when_missing() {
+        let existing = "---\nschema_version: 1\n---\n\n# Game — map\n\n## Overview\n\nNotes.\n";
+        let out = append_region_block(
+            existing, "ai01", "palette", "0x008000", None, "guess", "ai", "A palette table.",
+        );
+        // Overview prose preserved.
+        assert!(out.contains("## Overview"));
+        assert!(out.contains("Notes."));
+        // Regions section was created and holds the new block.
+        assert!(out.contains("## Regions"));
+        assert!(out.contains(
+            "::: region kind=palette id=ai01 addr=0x008000 author=ai confidence=guess"
+        ));
+        // No label attr when label is None.
+        assert!(!out.contains("label="));
+    }
+
+    #[test]
+    fn next_ai_id_avoids_collision() {
+        // Empty / no blocks → ai01.
+        assert_eq!(next_ai_id("nothing here"), "ai01");
+        // With an existing ai01, the next is ai02 (skips human tt01).
+        let md = "\
+## Regions\n\
+::: region kind=subroutine id=ai01 addr=0x1000 author=ai confidence=likely\nx\n:::\n\
+::: region kind=title_screen id=tt01 addr=0x2000 confidence=confirmed\ny\n:::\n";
+        assert_eq!(next_ai_id(md), "ai02");
+        // Highest wins even if non-contiguous.
+        let md2 = "::: region kind=palette id=ai05 addr=0x3000 author=ai\nz\n:::\n";
+        assert_eq!(next_ai_id(md2), "ai06");
+    }
+
+    #[test]
+    fn scaffold_has_frontmatter_and_empty_regions() {
+        let md = scaffold_rom_map(Some("mvsc"), Some("abc123"));
+        assert!(md.starts_with("---\nschema_version: 1"));
+        assert!(md.contains("name: \"mvsc\""));
+        assert!(md.contains("sha1: \"abc123\""));
+        assert!(md.contains("## Regions"));
+        // Round-trip: appending to a fresh scaffold yields a valid AI block.
+        let out = append_region_block(
+            &md, "ai01", "game_loop", "0x000400", None, "confirmed", "ai", "Main loop.",
+        );
+        assert!(out.contains(
+            "::: region kind=game_loop id=ai01 addr=0x000400 author=ai confidence=confirmed"
+        ));
     }
 }
