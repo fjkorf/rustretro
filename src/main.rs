@@ -9,9 +9,9 @@ mod lua_engine;
 use anyhow::Result;
 use audio::AudioOutput;
 use bevy::prelude::*;
-use bevy::render::render_asset::RenderAssetUsages;
+use bevy::asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy_egui::{EguiContexts, EguiPlugin};
+use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use clap::Parser;
 use debug::{DebugState, SharedDebugState};
 use debug::panels::script_panel::ScriptPanel;
@@ -95,8 +95,8 @@ fn main() -> Result<()> {
         Arc::clone(&debug_state),
     )?;
 
-    let w = (frontend.video_width().max(320) * args.scale) as f32;
-    let h = (frontend.video_height().max(240) * args.scale) as f32;
+    let w = frontend.video_width().max(320) * args.scale;
+    let h = frontend.video_height().max(240) * args.scale;
 
     if args.debug { debug_state.lock().unwrap().debug_open = true; }
 
@@ -131,7 +131,7 @@ fn main() -> Result<()> {
             }),
             ..default()
         }))
-        .add_plugins(EguiPlugin)
+        .add_plugins(EguiPlugin::default())
         .insert_non_send_resource(Emu(frontend))
         .insert_resource(DebugStateRes(debug_state.clone()))
         .insert_resource(AudioRes(AudioOutput::new(!args.no_audio)))
@@ -140,7 +140,8 @@ fn main() -> Result<()> {
         .insert_non_send_resource(LuaRes(lua_engine))
         .insert_resource(ScriptPanel::new())
         .add_systems(Startup, setup)
-        .add_systems(Update, (read_input, run_emulation, run_scripts, sync_video, queue_audio, show_debug, show_script_panel, update_title).chain())
+        .add_systems(Update, (read_input, run_emulation, run_scripts, sync_video, queue_audio, update_title).chain())
+        .add_systems(EguiPrimaryContextPass, (show_debug, show_script_panel))
         .run();
 
     Ok(())
@@ -236,7 +237,9 @@ fn show_script_panel(
     mut panel: ResMut<ScriptPanel>,
     debug_state: Res<DebugStateRes>,
 ) {
-    panel.show(ctx.ctx_mut(), &mut lua.0, &debug_state.0);
+    if let Ok(ctx) = ctx.ctx_mut() {
+        panel.show(ctx, &mut lua.0, &debug_state.0);
+    }
 }
 
 fn run_scripts(lua: NonSend<LuaRes>, debug_state: Res<DebugStateRes>) {
@@ -319,12 +322,14 @@ fn sync_video(
                 TextureFormat::Rgba8UnormSrgb,
                 RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
             );
-            if let Ok(mut sp) = sprites.get_single_mut() {
+            if let Ok(mut sp) = sprites.single_mut() {
                 sp.custom_size = Some(Vec2::new(w as f32 * s, h as f32 * s));
             }
         }
-        if img.data.len() == rgba.len() {
-            img.data.copy_from_slice(&rgba);
+        if let Some(data) = img.data.as_mut() {
+            if data.len() == rgba.len() {
+                data.copy_from_slice(&rgba);
+            }
         }
     }
 }
@@ -353,14 +358,18 @@ fn show_debug(
         *audio_wired = true;
     }
     let open = debug_state.0.lock().map(|s| s.debug_open).unwrap_or(false);
-    if open { overlay.0.show(ctx.ctx_mut()); }
+    if open {
+        if let Ok(ctx) = ctx.ctx_mut() {
+            overlay.0.show(ctx);
+        }
+    }
 }
 
 // ─── Window title ────────────────────────────────────────────────────────────
 
 fn update_title(emu: NonSend<Emu>, mut windows: Query<&mut Window>) {
     if emu.0.frame_count % 60 != 0 { return; }
-    if let Ok(mut win) = windows.get_single_mut() {
+    if let Ok(mut win) = windows.single_mut() {
         let fc  = emu.0.frame_count;
         let fps = emu.0.fps();
         win.title = match emu.0.framebuffer() {

@@ -174,6 +174,7 @@ fn slice_tiles(rgba: &[u8], width: usize, height: usize, tile_size: usize) -> Ve
             }
             tiles.push(egui::ColorImage {
                 size: [tile_size, tile_size],
+                source_size: egui::Vec2::new(tile_size as f32, tile_size as f32),
                 pixels,
             });
         }
