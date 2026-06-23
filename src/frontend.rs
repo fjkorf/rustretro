@@ -94,8 +94,10 @@ impl Frontend {
         // bytes, when available. Skipped for need_fullpath cores (no bytes here).
         if !rom_data.is_empty() {
             let sha1 = sha1_hex(&rom_data);
+            let size = rom_data.len();
             if let Ok(mut ds) = debug_state.lock() {
                 ds.rom_sha1 = Some(sha1);
+                ds.rom_size = Some(size);
             }
         }
 
