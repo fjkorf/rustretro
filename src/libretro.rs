@@ -52,6 +52,15 @@ pub const RETRO_MEMDESC_SYSTEM_RAM: u64 = 1 << 2;
 pub const RETRO_MEMDESC_SAVE_RAM: u64 = 1 << 3;
 pub const RETRO_MEMDESC_VIDEO_RAM: u64 = 1 << 4;
 
+// retro_get_memory_data / retro_get_memory_size id values (libretro.h
+// RETRO_MEMORY_*). Used by the SET_MEMORY_MAPS fallback: many cores
+// (fbalpha2012, Genesis Plus GX, FBNeo) never publish a memory map but DO
+// implement this simpler pointer+size interface for work RAM / VRAM.
+pub const RETRO_MEMORY_SAVE_RAM: u32 = 0;
+pub const RETRO_MEMORY_RTC: u32 = 1;
+pub const RETRO_MEMORY_SYSTEM_RAM: u32 = 2;
+pub const RETRO_MEMORY_VIDEO_RAM: u32 = 3;
+
 // Pixel format constants (retro_pixel_format enum values)
 pub const RETRO_PIXEL_FORMAT_0RGB1555: u32 = 0; // legacy default
 pub const RETRO_PIXEL_FORMAT_XRGB8888: u32 = 1;
@@ -512,6 +521,34 @@ impl RetroCore {
         }
     }
 
+    /// Resolve `retro_get_memory_data(id)` — returns a host pointer to the
+    /// requested memory block (e.g. system work RAM) owned by the core, or null
+    /// if the symbol is missing or the core has no such block.
+    ///
+    /// The returned pointer is NOT dereferenced here; callers store it (as
+    /// `usize`) in a `MemoryRegion` and read through the guarded
+    /// `safe_host_ptr` path.
+    pub fn get_memory_data(&self, id: u32) -> *mut std::ffi::c_void {
+        unsafe {
+            match self.library.get::<Symbol<RetroGetMemoryDataFn>>(b"retro_get_memory_data") {
+                Ok(func) => func(id as std::ffi::c_uint),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+    }
+
+    /// Resolve `retro_get_memory_size(id)` — returns the size in bytes of the
+    /// requested memory block, or 0 if the symbol is missing / the block is
+    /// unavailable.
+    pub fn get_memory_size(&self, id: u32) -> usize {
+        unsafe {
+            match self.library.get::<Symbol<RetroGetMemorySizeFn>>(b"retro_get_memory_size") {
+                Ok(func) => func(id as std::ffi::c_uint),
+                Err(_) => 0,
+            }
+        }
+    }
+
     pub fn deinit(&self) -> Result<(), LibretroError> {
         unsafe {
             let func: Symbol<extern "C" fn()> = self
@@ -580,6 +617,10 @@ pub type SekDbgSetRegisterFn = extern "C" fn(SekRegister, u32) -> bool;
 pub type SekDbgGetCPUTypeFn = extern "C" fn() -> i32;
 pub type SekDbgGetPendingIRQFn = extern "C" fn() -> i32;
 pub type SekFetchByteFn = extern "C" fn(u32) -> u8;
+
+// retro_get_memory_data(unsigned) -> void* ; retro_get_memory_size(unsigned) -> size_t
+pub type RetroGetMemoryDataFn = extern "C" fn(std::ffi::c_uint) -> *mut c_void;
+pub type RetroGetMemorySizeFn = extern "C" fn(std::ffi::c_uint) -> usize;
 
 // ============================================================================
 // Z80 CPU Debug API (from fbalpha2012)
