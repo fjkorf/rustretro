@@ -265,6 +265,21 @@ independent evidence stream Claude can cross-check — none has to be perfect, b
 **convergence, not any single method, is what makes a finding confirmed.** With (c) ruled out on
 stock cores, convergence rests on the (a)/(b)/content-match trio.
 
+**(d) ROM-file source — the file-resident answer to "the core hides the graphics ROM"** (✅
+shipped, PRs #15/#16). The DMA spike (c) and the core-capability matrix established that a running
+core often won't expose the graphics ROM (NES CHR, CPS2 gfx) as live memory — but the **ROM file
+itself is ours**. RustRetro retains the cart bytes (`DebugState.rom_bytes`/`rom_path`) and exposes
+a `rom_file` source so `render_tiles`/`scan_regions` decode content the core never publishes. For
+NES, an iNES/NES-2.0 parser (`src/mcp/ines.rs`) adds `rom_file:header/:prg/:chr` named spans and a
+`rom_info` tool, so `render_tiles source=rom_file:chr` renders a cart's CHR graphics with no offset
+math — verified live on TMNT (the core exposes nametables/OAM/palette but not the CHR banks). This
+turns "core won't expose it" into a solved problem for file-resident data. Whole-CHR linear decode
+works for all CHR-ROM mappers (bank-switching only selects the live window); CHR-RAM carts are the
+exception (no CHR-ROM in the file). Genesis/CPS2 file-extraction is a separate, larger effort
+(CPS2 is need_fullpath + encrypted/interleaved gfx). Future overlap to explore: ingesting Mesen/
+FCEUX **CDL** (Code/Data Logger) as a runtime-truth code-vs-data-vs-graphics signal stronger than
+the entropy-based `scan_regions` heuristic.
+
 ## Non-goals
 
 - Becoming a general-purpose, configure-everything emulator frontend (RetroArch exists).
