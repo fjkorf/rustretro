@@ -594,6 +594,273 @@ pub fn decode_tiles_to_rgba(
     })
 }
 
+// ── major-region discovery (the "structure" / statistical-signature stream) ──
+//
+// This is the convergent-evidence stream that lets a Claude agent ORIENT inside
+// an unknown ROM before zeroing in: scan the bytes with cheap statistical
+// signatures (Shannon entropy, byte-histogram features, printable/padding
+// fractions) and propose what KIND each span looks like — packed/compressed,
+// code, graphics, a low-entropy table, text, or padding.
+//
+// These are HEURISTICS, deliberately coarse and honestly labelled `guess`/
+// `likely`. No single signature is authoritative; the agent corroborates a
+// proposal with the other streams (`render_tiles` to eyeball graphics,
+// `vram_to_rom` for content match, the PC heatmap for code) — convergence, not
+// any one method, is what promotes a finding to `confirmed`. Everything here is
+// PURE (bytes in, stats/labels out) so it unit-tests against synthetic buffers.
+
+/// Shannon entropy of a byte buffer in BITS PER BYTE (range `0.0..=8.0`): 0 for a
+/// constant buffer, ~8 for uniformly-random/compressed data. Empty input → 0.
+pub fn shannon_entropy(bytes: &[u8]) -> f64 {
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for &b in bytes {
+        counts[b as usize] += 1;
+    }
+    let n = bytes.len() as f64;
+    let mut h = 0.0;
+    for &c in counts.iter() {
+        if c != 0 {
+            let p = c as f64 / n;
+            h -= p * p.log2();
+        }
+    }
+    h
+}
+
+/// Cheap statistical fingerprint of one window of bytes. All fractions are in
+/// `0.0..=1.0`. Pure and `Serialize` so it rides along in the tool's JSON output
+/// for the agent to inspect the raw evidence behind a classification.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct WindowStats {
+    /// Shannon entropy, bits/byte (0..8).
+    pub entropy: f64,
+    /// Fraction of bytes == 0x00 (padding / background fill).
+    pub zero_frac: f64,
+    /// Fraction of bytes == 0xFF (the other common fill value).
+    pub ff_frac: f64,
+    /// Fraction of bytes that are printable ASCII (0x20..=0x7E, plus \t\n\r) —
+    /// the text-table signal.
+    pub printable_frac: f64,
+    /// The single most-common byte value in the window.
+    pub top_byte: u8,
+    /// Fraction the most-common byte accounts for (histogram spikiness).
+    pub top_byte_frac: f64,
+    /// Count of distinct byte values present (1..=256). Flat histograms (gfx /
+    /// packed) trend high; spiky ones (code / sparse tables) trend low.
+    pub distinct_bytes: u16,
+}
+
+/// Compute the [`WindowStats`] fingerprint of a byte window. Empty input yields
+/// an all-zero fingerprint (entropy 0, no distinct bytes).
+pub fn window_stats(bytes: &[u8]) -> WindowStats {
+    if bytes.is_empty() {
+        return WindowStats {
+            entropy: 0.0,
+            zero_frac: 0.0,
+            ff_frac: 0.0,
+            printable_frac: 0.0,
+            top_byte: 0,
+            top_byte_frac: 0.0,
+            distinct_bytes: 0,
+        };
+    }
+    let mut counts = [0u32; 256];
+    let mut printable = 0u32;
+    for &b in bytes {
+        counts[b as usize] += 1;
+        if (0x20..=0x7E).contains(&b) || b == b'\t' || b == b'\n' || b == b'\r' {
+            printable += 1;
+        }
+    }
+    let n = bytes.len() as f64;
+    let mut top_byte = 0u8;
+    let mut top_count = 0u32;
+    let mut distinct = 0u16;
+    for (v, &c) in counts.iter().enumerate() {
+        if c != 0 {
+            distinct += 1;
+            if c > top_count {
+                top_count = c;
+                top_byte = v as u8;
+            }
+        }
+    }
+    WindowStats {
+        entropy: shannon_entropy(bytes),
+        zero_frac: counts[0x00] as f64 / n,
+        ff_frac: counts[0xFF] as f64 / n,
+        printable_frac: printable as f64 / n,
+        top_byte,
+        top_byte_frac: top_count as f64 / n,
+        distinct_bytes: distinct,
+    }
+}
+
+/// A proposed kind for a window, with how much to trust it and the one-line
+/// reasoning. `kind` is drawn from a small controlled set the agent can act on:
+/// `padding`, `text_table`, `packed_data`, `lookup_table`, `graphics`, `code`.
+/// `confidence` mirrors the ROM-map vocabulary (`likely` | `guess`).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct WindowClass {
+    pub kind: &'static str,
+    pub confidence: &'static str,
+    pub reason: String,
+}
+
+/// Classify one window from its [`WindowStats`]. A waterfall of cheap, documented
+/// heuristics — checked most-specific first:
+///
+/// 1. **padding** — ≥97% a single fill value (0x00 or 0xFF). Highest confidence.
+/// 2. **text_table** — ≥80% printable ASCII.
+/// 3. **packed_data** — entropy ≥ 7.3 (compressed / encrypted / packed graphics
+///    or audio; near-uniform histogram). A `guess`: high entropy alone can't say
+///    *what* was packed.
+/// 4. **lookup_table** — low entropy (< 3.5) that ISN'T pure padding: a sparse,
+///    structured table (pointer lists, small data records).
+/// 5. **graphics vs. code** — the mid-entropy band, the genuinely ambiguous one.
+///    Uncompressed tile/bitplane graphics carry large stretches of background
+///    fill, so a meaningful zero fraction (≥ 0.20) with a flat-ish histogram
+///    leans **graphics**; otherwise the spiky-opcode shape leans **code**. Both
+///    are `guess` — this split is exactly what `render_tiles` / the PC heatmap
+///    exist to corroborate.
+pub fn classify_window(s: &WindowStats) -> WindowClass {
+    let mk = |kind, confidence, reason: String| WindowClass {
+        kind,
+        confidence,
+        reason,
+    };
+    if s.zero_frac >= 0.97 || s.ff_frac >= 0.97 {
+        let fill = if s.zero_frac >= s.ff_frac { "0x00" } else { "0xFF" };
+        return mk(
+            "padding",
+            "likely",
+            format!("{:.0}% {fill} fill", s.zero_frac.max(s.ff_frac) * 100.0),
+        );
+    }
+    if s.printable_frac >= 0.80 {
+        return mk(
+            "text_table",
+            "likely",
+            format!("{:.0}% printable ASCII", s.printable_frac * 100.0),
+        );
+    }
+    if s.entropy >= 7.3 {
+        return mk(
+            "packed_data",
+            "guess",
+            format!(
+                "entropy {:.2} b/byte (compressed/packed — could be gfx or audio)",
+                s.entropy
+            ),
+        );
+    }
+    if s.entropy < 3.5 {
+        return mk(
+            "lookup_table",
+            "guess",
+            format!(
+                "low entropy {:.2} b/byte, top byte 0x{:02X} = {:.0}% (structured table)",
+                s.entropy,
+                s.top_byte,
+                s.top_byte_frac * 100.0
+            ),
+        );
+    }
+    // Mid-entropy band: the graphics-vs-code coin-flip. Background fill is the
+    // most reliable cheap discriminator we have here.
+    if s.zero_frac >= 0.20 {
+        mk(
+            "graphics",
+            "guess",
+            format!(
+                "mid entropy {:.2} b/byte, {:.0}% background (0x00) — tile/bitplane shape",
+                s.entropy,
+                s.zero_frac * 100.0
+            ),
+        )
+    } else {
+        mk(
+            "code",
+            "guess",
+            format!(
+                "mid entropy {:.2} b/byte, spiky histogram (top byte {:.0}%) — opcode shape",
+                s.entropy,
+                s.top_byte_frac * 100.0
+            ),
+        )
+    }
+}
+
+/// One proposed major region: a run of adjacent windows that classified the same
+/// way, coalesced into a single span. Offsets are RELATIVE to the start of the
+/// scanned buffer; the MCP layer adds the region base to report absolute guest
+/// addresses.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct RegionCandidate {
+    pub kind: &'static str,
+    pub confidence: &'static str,
+    /// Byte offset of the span start within the scanned buffer.
+    pub start: usize,
+    /// Exclusive byte offset of the span end within the scanned buffer.
+    pub end: usize,
+    pub len: usize,
+    /// How many windows were coalesced into this span.
+    pub windows: usize,
+    /// Mean entropy across the span's windows (bits/byte).
+    pub mean_entropy: f64,
+    /// Reasoning from the first window of the span (representative).
+    pub reason: String,
+}
+
+/// Scan `bytes` window-by-window, classify each window, and coalesce adjacent
+/// same-kind windows into [`RegionCandidate`] spans — so a 512 KB run of packed
+/// data reports as ONE candidate, not 128 windows. `window` is clamped to a sane
+/// floor (256 B) so tiny windows don't make entropy meaningless. A trailing
+/// partial window (< `window` bytes) is still classified so the tail isn't lost.
+///
+/// PURE — no locking, no globals — so the whole scan/coalesce is unit-testable.
+pub fn scan_buffer(bytes: &[u8], window: usize) -> Vec<RegionCandidate> {
+    let window = window.max(256);
+    let mut out: Vec<RegionCandidate> = Vec::new();
+    if bytes.is_empty() {
+        return out;
+    }
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let end = (off + window).min(bytes.len());
+        let stats = window_stats(&bytes[off..end]);
+        let class = classify_window(&stats);
+        match out.last_mut() {
+            // Extend the open span if this window is the same kind.
+            Some(last) if last.kind == class.kind => {
+                last.end = end;
+                last.len = end - last.start;
+                last.windows += 1;
+                last.mean_entropy += stats.entropy;
+            }
+            _ => out.push(RegionCandidate {
+                kind: class.kind,
+                confidence: class.confidence,
+                start: off,
+                end,
+                len: end - off,
+                windows: 1,
+                mean_entropy: stats.entropy,
+                reason: class.reason,
+            }),
+        }
+        off = end;
+    }
+    // Convert the accumulated entropy sums into means.
+    for c in out.iter_mut() {
+        c.mean_entropy /= c.windows as f64;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,5 +1287,128 @@ mod tests {
         assert_eq!(top[0].pc, 0x200);
         assert_eq!(top[0].hits, 50);
         assert_eq!(top[1].pc, 0x300);
+    }
+
+    // ── major-region discovery ──────────────────────────────────────────────
+
+    #[test]
+    fn entropy_spans_zero_to_eight() {
+        // Constant buffer → 0 bits.
+        assert_eq!(shannon_entropy(&[0u8; 1000]), 0.0);
+        // Empty → 0.
+        assert_eq!(shannon_entropy(&[]), 0.0);
+        // All 256 values once → exactly 8 bits/byte (uniform).
+        let uniform: Vec<u8> = (0..=255u8).collect();
+        assert!((shannon_entropy(&uniform) - 8.0).abs() < 1e-9);
+        // Two equally-likely values → exactly 1 bit/byte.
+        let mut two = vec![0u8; 500];
+        two.extend(vec![1u8; 500]);
+        assert!((shannon_entropy(&two) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn window_stats_captures_histogram_features() {
+        // Half 0x00, half 0xFF.
+        let mut b = vec![0x00u8; 100];
+        b.extend(vec![0xFFu8; 100]);
+        let s = window_stats(&b);
+        assert!((s.zero_frac - 0.5).abs() < 1e-9);
+        assert!((s.ff_frac - 0.5).abs() < 1e-9);
+        assert_eq!(s.distinct_bytes, 2);
+        assert!((s.top_byte_frac - 0.5).abs() < 1e-9);
+        assert!((s.entropy - 1.0).abs() < 1e-9);
+
+        // Printable ASCII.
+        let txt = b"HELLO WORLD the quick brown fox 12345".to_vec();
+        let st = window_stats(&txt);
+        assert!(st.printable_frac > 0.99, "printable={}", st.printable_frac);
+
+        // Empty → all-zero fingerprint, no distinct bytes.
+        assert_eq!(window_stats(&[]).distinct_bytes, 0);
+    }
+
+    #[test]
+    fn classify_window_buckets_synthetic_inputs() {
+        // Padding: all zeros.
+        assert_eq!(classify_window(&window_stats(&[0u8; 1024])).kind, "padding");
+        // Padding: all 0xFF.
+        assert_eq!(classify_window(&window_stats(&[0xFFu8; 1024])).kind, "padding");
+        // Text: a printable string repeated to fill a window.
+        let txt: Vec<u8> = b"The quick brown fox jumps over the lazy dog. "
+            .iter()
+            .cycle()
+            .take(1024)
+            .copied()
+            .collect();
+        assert_eq!(classify_window(&window_stats(&txt)).kind, "text_table");
+        // Packed/high-entropy: all 256 values cycled (entropy ~8).
+        let packed: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        assert_eq!(classify_window(&window_stats(&packed)).kind, "packed_data");
+        // Low-entropy structured table: mostly one value with a few others —
+        // low entropy but NOT 97% padding.
+        let mut table = vec![0x01u8; 1024];
+        for i in (0..1024).step_by(8) {
+            table[i] = (i % 251) as u8; // sprinkle distinct bytes, ~12.5% non-fill
+        }
+        assert_eq!(classify_window(&window_stats(&table)).kind, "lookup_table");
+        // Graphics: mid entropy WITH lots of background fill.
+        let mut gfx = vec![0u8; 4096];
+        for i in 0..4096 {
+            // ~40% background, the rest a varied-but-not-uniform pattern.
+            if i % 5 != 0 {
+                gfx[i] = ((i * 37) % 64) as u8;
+            }
+        }
+        let gc = classify_window(&window_stats(&gfx));
+        assert_eq!(gc.kind, "graphics", "stats={:?}", window_stats(&gfx));
+        // Code: mid entropy, little background, spiky-ish histogram.
+        let mut code = vec![0u8; 4096];
+        for i in 0..4096 {
+            // Dominant "opcode" byte 0x4E, varied operands, very little 0x00.
+            code[i] = if i % 3 == 0 { 0x4E } else { ((i * 53) % 200 + 1) as u8 };
+        }
+        let cc = classify_window(&window_stats(&code));
+        assert_eq!(cc.kind, "code", "stats={:?}", window_stats(&code));
+    }
+
+    #[test]
+    fn scan_buffer_coalesces_adjacent_same_kind_windows() {
+        // 4 KB padding ++ 4 KB packed ++ 4 KB padding → 3 candidates.
+        let mut buf = vec![0u8; 4096];
+        buf.extend((0..=255u8).cycle().take(4096));
+        buf.extend(vec![0u8; 4096]);
+        let cands = scan_buffer(&buf, 1024);
+        assert_eq!(cands.len(), 3, "{cands:?}");
+        assert_eq!(cands[0].kind, "padding");
+        assert_eq!(cands[0].start, 0);
+        assert_eq!(cands[0].end, 4096);
+        assert_eq!(cands[0].windows, 4); // 4×1024 coalesced
+        assert_eq!(cands[1].kind, "packed_data");
+        assert_eq!(cands[1].start, 4096);
+        assert_eq!(cands[2].kind, "padding");
+        assert_eq!(cands[2].end, buf.len());
+        // mean_entropy of the all-zero spans is 0.
+        assert_eq!(cands[0].mean_entropy, 0.0);
+        assert!(cands[1].mean_entropy > 7.0);
+    }
+
+    #[test]
+    fn scan_buffer_handles_trailing_partial_window_and_empty() {
+        assert!(scan_buffer(&[], 256).is_empty());
+        // 300 bytes with a 256 window → one full + one 44-byte partial, both
+        // padding, coalesced into a single span covering all 300 bytes.
+        let cands = scan_buffer(&vec![0u8; 300], 256);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].len, 300);
+        assert_eq!(cands[0].windows, 2);
+    }
+
+    #[test]
+    fn scan_buffer_clamps_tiny_window_to_floor() {
+        // A window below the 256 floor is clamped; a 256-byte all-zero buffer
+        // becomes a single window / single padding candidate.
+        let cands = scan_buffer(&vec![0u8; 256], 16);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].windows, 1);
     }
 }
