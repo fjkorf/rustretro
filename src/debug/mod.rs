@@ -260,6 +260,29 @@ impl MemoryRegion {
         Some(self.ptr + self.offset + ((emu_addr & !self.disconnect) - self.addr_start))
     }
 
+    /// Validate that `len` bytes can be safely read at `emu_addr` from this
+    /// region, returning the host pointer only if the read is in-bounds.
+    ///
+    /// Some cores declare descriptors with a null/garbage `ptr` or a `size` that
+    /// doesn't actually back the address range (e.g. libretro "virtual" regions
+    /// like NES NTARAM/PALRAM/OAM at 0x8000xxxx). Dereferencing those segfaults,
+    /// so this guards: the region must have a non-null `ptr` and non-zero `size`,
+    /// and `[host_offset, host_offset + len)` must stay within `[ptr+offset,
+    /// ptr+offset+size)`.
+    pub fn safe_host_ptr(&self, emu_addr: usize, len: usize) -> Option<*const u8> {
+        if self.ptr == 0 || self.size == 0 || len == 0 {
+            return None;
+        }
+        let host = self.host_ptr_for_addr(emu_addr)?;
+        let base = self.ptr.checked_add(self.offset)?;
+        let end = base.checked_add(self.size)?;
+        let read_end = host.checked_add(len)?;
+        if host < base || read_end > end {
+            return None;
+        }
+        Some(host as *const u8)
+    }
+
     /// Get region type as human-readable string.
     pub fn region_type(&self) -> &'static str {
         const RETRO_MEMDESC_CONST: u64 = 1 << 0;
@@ -542,19 +565,21 @@ impl DebugState {
     pub fn read_addr(&self, addr: usize, len: usize) -> Option<u32> {
         let len = len.min(4);
         for region in &self.memory_regions {
-            if let Some(host) = region.host_ptr_for_addr(addr) {
-                let ptr = host as *const u8;
-                if ptr.is_null() {
-                    return None;
-                }
-                let mut value: u32 = 0;
-                unsafe {
-                    for i in 0..len {
-                        value |= (*ptr.add(i) as u32) << (8 * i);
-                    }
-                }
-                return Some(value);
+            // Skip regions that contain the address but whose backing memory is
+            // null/too-small (libretro "virtual" descriptors) — see safe_host_ptr.
+            if region.host_ptr_for_addr(addr).is_none() {
+                continue;
             }
+            let Some(ptr) = region.safe_host_ptr(addr, len) else {
+                continue;
+            };
+            let mut value: u32 = 0;
+            unsafe {
+                for i in 0..len {
+                    value |= (*ptr.add(i) as u32) << (8 * i);
+                }
+            }
+            return Some(value);
         }
         None
     }
@@ -571,14 +596,17 @@ impl DebugState {
     pub fn write_addr(&self, addr: usize, len: usize, value: u32) -> bool {
         let len = len.min(4);
         for region in &self.memory_regions {
-            if let Some(host) = region.host_ptr_for_addr(addr) {
-                if region.is_readonly() {
-                    return false;
-                }
-                let ptr = host as *mut u8;
-                if ptr.is_null() {
-                    return false;
-                }
+            if region.host_ptr_for_addr(addr).is_none() {
+                continue;
+            }
+            if region.is_readonly() {
+                return false;
+            }
+            let Some(cptr) = region.safe_host_ptr(addr, len) else {
+                continue;
+            };
+            let ptr = cptr as *mut u8;
+            {
                 unsafe {
                     for i in 0..len {
                         *ptr.add(i) = ((value >> (8 * i)) & 0xFF) as u8;
@@ -692,13 +720,11 @@ impl DebugState {
 }
 
 /// Read `len` (1-4) bytes little-endian from a region at a guest address.
+/// Bounds-checked via `safe_host_ptr` so unbacked/virtual descriptors (which
+/// would otherwise segfault on deref) return None instead.
 fn read_le(region: &MemoryRegion, addr: usize, len: usize) -> Option<u32> {
-    let host = region.host_ptr_for_addr(addr)?;
-    if host == 0 {
-        return None;
-    }
+    let ptr = region.safe_host_ptr(addr, len)?;
     unsafe {
-        let ptr = host as *const u8;
         let mut value: u32 = 0;
         for i in 0..len {
             value |= (*ptr.add(i) as u32) << (8 * i);
@@ -758,6 +784,43 @@ pub fn decode_to_rgba(src: &[u8], width: u32, height: u32, pitch: usize, fmt: u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn region(name: &str, start: usize, size: usize, ptr: usize) -> MemoryRegion {
+        MemoryRegion {
+            name: name.into(),
+            addr_start: start,
+            addr_end: start + size - 1,
+            size,
+            flags: 0,
+            ptr,
+            offset: 0,
+            select: 0,
+            disconnect: 0,
+        }
+    }
+
+    #[test]
+    fn safe_host_ptr_rejects_unbacked_and_out_of_bounds() {
+        // A real backing buffer.
+        let buf = [1u8, 2, 3, 4];
+        let p = buf.as_ptr() as usize;
+        let r = region("RAM", 0x0000, 4, p);
+        // In-bounds reads OK.
+        assert!(r.safe_host_ptr(0x0000, 1).is_some());
+        assert!(r.safe_host_ptr(0x0003, 1).is_some());
+        // Reading 4 bytes from offset 3 runs past size=4 -> rejected (no segfault).
+        assert!(r.safe_host_ptr(0x0003, 4).is_none());
+
+        // A "virtual"/unbacked descriptor (null ptr) like NES NTARAM/OAM:
+        // contains the address but must NOT be dereferenced.
+        let virt = region("OAM", 0x80004000, 0x100, 0);
+        assert!(virt.host_ptr_for_addr(0x80004000).is_some()); // address is "in" the region
+        assert!(virt.safe_host_ptr(0x80004000, 1).is_none()); // but no safe read
+
+        // A descriptor with a non-null but bogus pointer and zero size -> rejected.
+        let bogus = region("Bogus", 0x6000, 0, 0xdeadbeef);
+        assert!(bogus.safe_host_ptr(0x6000, 1).is_none());
+    }
 
     /// Narrow a synthetic candidate set by applying `compare_passes` against a
     /// per-candidate snapshot, mirroring step_search's kernel without real memory.
