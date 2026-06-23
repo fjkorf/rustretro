@@ -79,6 +79,11 @@ const MAX_SCAN_WINDOW: usize = 64 * 1024;
 /// multi-MB ROM stays bounded. Larger regions are scanned up to this prefix and
 /// the result flags the truncation.
 const MAX_SCAN_LEN: usize = 8 * 1024 * 1024;
+/// Cap on how many frames a single `press_buttons` call holds a button (~10s at
+/// 60fps), so a button can't get stuck on indefinitely.
+const MAX_INPUT_HOLD_FRAMES: u32 = 600;
+/// Human-facing list of valid `press_buttons` names (for error messages).
+const JOYPAD_BUTTON_LIST: &str = "a, b, x, y, l, r, start, select, up, down, left, right";
 /// Sentinel error prefix emitted by [`RetroMcpServer::clone_region_bytes`] when a
 /// region is declared but backed by no readable host memory (a virtual/garbage
 /// descriptor). Format: `"<prefix>:<region_name>"`.
@@ -903,6 +908,55 @@ impl RetroMcpServer {
         }
     }
 
+    /// `press_buttons`: hold one or more controller buttons (port 0) for `frames`
+    /// emulated frames, so an agent can drive the game — advance menus, start a
+    /// match, perform moves — in headless mode where there's no keyboard. Safe: it
+    /// only feeds the controller, it cannot corrupt memory, so it is NOT behind the
+    /// write gate. Buttons are held simultaneously (e.g. ["down","b"]); call again
+    /// to chain inputs. Resume/run must be active for frames to advance.
+    fn press_buttons(&self, names: &[&str], frames: u32) -> Value {
+        let frames = frames.clamp(1, MAX_INPUT_HOLD_FRAMES) as u16;
+        let mut set = Vec::new();
+        let mut unknown = Vec::new();
+        // Resolve names first so we can report errors without holding the lock.
+        let mut indices = Vec::new();
+        for n in names {
+            match joypad_button_index(n) {
+                Some(i) => {
+                    indices.push(i);
+                    set.push(n.to_ascii_lowercase());
+                }
+                None => unknown.push(n.to_string()),
+            }
+        }
+        if !unknown.is_empty() {
+            return json!({
+                "ok": false,
+                "error": format!("unknown button(s): {}. Valid: {}", unknown.join(", "), JOYPAD_BUTTON_LIST),
+            });
+        }
+        let paused = match self.debug.lock() {
+            Ok(mut ds) => {
+                for i in indices {
+                    ds.injected_input[i] = frames;
+                }
+                ds.paused
+            }
+            Err(_) => return json!({ "ok": false, "error": "lock poisoned" }),
+        };
+        json!({
+            "ok": true,
+            "pressed": set,
+            "frames": frames,
+            "port": 0,
+            "note": if paused {
+                "buttons queued, but emulation is PAUSED — call resume so frames advance"
+            } else {
+                "holding for the requested frames, then auto-released"
+            },
+        })
+    }
+
     /// Request a single-frame step: clear pause-edge by arming `step_one`.
     fn step(&self) -> Value {
         if let Ok(mut ds) = self.debug.lock() {
@@ -1377,6 +1431,18 @@ impl RetroMcpServer {
             });
             Arc::new(schema.as_object().unwrap().clone())
         };
+        // Schema for { buttons:[string], frames? } (press_buttons).
+        let press_buttons_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "buttons": { "type": "array", "items": { "type": "string" }, "description": "Buttons to hold simultaneously: a, b, x, y, l, r, start, select, up, down, left, right" },
+                    "frames": { "type": "integer", "description": "How many emulated frames to hold (default 8, max 600 ≈ 10s at 60fps)" }
+                },
+                "required": ["buttons"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
         // Schema for { addr, len, value } (write_memory).
         let write_memory_schema = || -> Arc<Map<String, Value>> {
             let schema = json!({
@@ -1526,6 +1592,16 @@ impl RetroMcpServer {
                 "step",
                 "Advance emulation by one frame while paused (safe control flag).",
                 no_params(),
+            ),
+            Tool::new(
+                "press_buttons",
+                "Drive the game: HOLD controller buttons (port 0) for `frames` emulated frames, so \
+                 you can advance menus, START A MATCH, or perform moves in headless mode (no \
+                 keyboard). Buttons in one call are held SIMULTANEOUSLY (e.g. [\"down\",\"b\"] for a \
+                 special); call repeatedly to chain inputs. Names: a, b, x, y, l, r, start, select, \
+                 up, down, left, right. Emulation must be running (resume) for frames to advance. \
+                 Safe — only feeds the controller, cannot corrupt memory (no write gate).",
+                press_buttons_schema(),
             ),
             Tool::new(
                 "run_lua",
@@ -1902,6 +1978,28 @@ impl ServerHandler for RetroMcpServer {
                 "step" => {
                     Ok(CallToolResult::success(vec![Self::json_content(&this.step())?]))
                 }
+                "press_buttons" => {
+                    let buttons: Vec<String> = args
+                        .get("buttons")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if buttons.is_empty() {
+                        return Err(ErrorData::invalid_params(
+                            "missing/empty `buttons` array",
+                            None,
+                        ));
+                    }
+                    let frames = get_u("frames").unwrap_or(8) as u32;
+                    let refs: Vec<&str> = buttons.iter().map(|s| s.as_str()).collect();
+                    Ok(CallToolResult::success(vec![Self::json_content(
+                        &this.press_buttons(&refs, frames),
+                    )?]))
+                }
                 "run_lua" => {
                     let script = args
                         .get("script")
@@ -2063,6 +2161,27 @@ fn base64_encode(data: &[u8]) -> String {
 /// Format a list of guest addresses as `0x`-prefixed hex strings for JSON output.
 fn fmt_addrs(addrs: &[u32]) -> Vec<String> {
     addrs.iter().map(|a| format!("0x{a:X}")).collect()
+}
+
+/// Map a controller button NAME to its `RETRO_DEVICE_ID_JOYPAD` index (the index
+/// into `DebugState.injected_input` / `Frontend.set_input`). Case-insensitive;
+/// accepts a few friendly aliases. Returns `None` for an unknown name.
+fn joypad_button_index(name: &str) -> Option<usize> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "b" => Some(0),
+        "y" => Some(1),
+        "select" => Some(2),
+        "start" => Some(3),
+        "up" | "u" => Some(4),
+        "down" | "d" => Some(5),
+        "left" => Some(6),
+        "right" => Some(7),
+        "a" => Some(8),
+        "x" => Some(9),
+        "l" | "lb" | "l1" => Some(10),
+        "r" | "rb" | "r1" => Some(11),
+        _ => None,
+    }
 }
 
 /// Map a case-insensitive format string to a [`WatchFormat`]. Accepts the names
@@ -2376,6 +2495,51 @@ mod tests {
         let srv = RetroMcpServer::new(Arc::new(Mutex::new(ds)));
         let err = srv.resolve_source_bytes("rom_file:chr").unwrap_err();
         assert!(err.contains("CHR-RAM"), "err {err:?}");
+    }
+
+    #[test]
+    fn joypad_button_index_maps_names_to_retro_ids() {
+        use super::joypad_button_index as jb;
+        // RETRO_DEVICE_ID_JOYPAD ordering.
+        assert_eq!(jb("b"), Some(0));
+        assert_eq!(jb("select"), Some(2));
+        assert_eq!(jb("START"), Some(3)); // case-insensitive
+        assert_eq!(jb("up"), Some(4));
+        assert_eq!(jb("right"), Some(7));
+        assert_eq!(jb("a"), Some(8));
+        assert_eq!(jb("x"), Some(9));
+        assert_eq!(jb(" l1 "), Some(10)); // alias + trim
+        assert_eq!(jb("nope"), None);
+    }
+
+    #[test]
+    fn press_buttons_sets_injected_frames_and_reports_unknown() {
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let v = srv.press_buttons(&["down", "b"], 8);
+        assert_eq!(v["ok"], true, "{v}");
+        {
+            let ds = srv.debug.lock().unwrap();
+            assert_eq!(ds.injected_input[5], 8); // down
+            assert_eq!(ds.injected_input[0], 8); // b
+            assert_eq!(ds.injected_input[3], 0); // start untouched
+        }
+        // Unknown button → error, nothing set.
+        let e = srv.press_buttons(&["triangle"], 8);
+        assert_eq!(e["ok"], false);
+        assert!(e["error"].as_str().unwrap().contains("unknown"));
+        // Frames clamp to the max.
+        let c = srv.press_buttons(&["a"], 99999);
+        assert_eq!(c["frames"], super::MAX_INPUT_HOLD_FRAMES as u16 as u64);
+    }
+
+    #[test]
+    fn take_injected_input_holds_then_releases() {
+        let mut ds = DebugState::new();
+        ds.injected_input[3] = 2; // start, 2 frames
+        assert_eq!(ds.take_injected_input()[3], true);
+        assert_eq!(ds.injected_input[3], 1);
+        assert_eq!(ds.take_injected_input()[3], true);
+        assert_eq!(ds.take_injected_input()[3], false); // released
     }
 
     #[test]

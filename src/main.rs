@@ -211,6 +211,16 @@ fn run_headless(
     loop {
         let start = Instant::now();
 
+        // (a0) Fold any MCP-injected controller input for this frame (headless has
+        //      no keyboard) so an agent can drive menus/moves via press_buttons.
+        {
+            let injected = match debug_state.lock() {
+                Ok(mut ds) => ds.take_injected_input(),
+                Err(_) => [false; 12],
+            };
+            frontend.set_input(injected);
+        }
+
         // (a) Tick the core one frame. run_frame() honours pause/step/trigger
         //     flags in DebugState internally, so MCP pause/resume/step work.
         let _ = frontend.run_frame();
@@ -298,7 +308,7 @@ fn read_input(
     mut tutorials: ResMut<TutorialPages>,
 ) {
     use KeyCode::*;
-    emu.0.set_input([
+    let mut bits = [
         keys.pressed(KeyZ),
         keys.pressed(KeyA),
         keys.pressed(ShiftLeft) || keys.pressed(ShiftRight),
@@ -311,7 +321,16 @@ fn read_input(
         keys.pressed(KeyS),
         keys.pressed(KeyQ),
         keys.pressed(KeyW),
-    ]);
+    ];
+    // OR in any MCP-injected input (press_buttons) so an agent can drive the game
+    // in windowed mode too, alongside the keyboard.
+    if let Ok(mut ds) = debug_state.0.lock() {
+        let injected = ds.take_injected_input();
+        for i in 0..12 {
+            bits[i] |= injected[i];
+        }
+    }
+    emu.0.set_input(bits);
     if keys.just_pressed(F12) {
         let mut ds = debug_state.0.lock().unwrap();
         ds.debug_open = !ds.debug_open;
