@@ -36,27 +36,55 @@
 //!
 //! Three routes exist, roughly in order of effort:
 //!
-//! **A. Intercept control-port writes (recommended, no core modification needed).**
-//!    The 68K writes VDP registers by writing a 16-bit control word to $C00004 where
-//!    the top two bits are `10`. Hooking `SekFetchByte` is already available, but
-//!    what is needed is a *data write* intercept. fbalpha2012 exposes
-//!    `BurnWriteByte` / `BurnWriteWord` hooks in some configurations; alternatively,
-//!    the data read at $C00004/$C00006 could be intercepted via a custom `SekMapHandler`.
-//!    This approach stays entirely in-process and requires no changes to the core .so.
+//! **A. Intercept control-port writes (the goal — but NOT feasible on stock cores).**
+//!    The 68K writes VDP registers (and arms DMA) by writing a 16-bit control word
+//!    to $C00004 where the top two bits are `10`. Logging each such write is what
+//!    would give *true* DMA-source→VRAM-dest provenance. The catch (confirmed by the
+//!    2026-06 spike below): **libretro exposes no per-memory-access / per-write
+//!    callback at all**, and neither stock core exports a write-intercept symbol.
+//!    `SekFetchByte` is an *instruction* fetch (for disassembly), not a data-write
+//!    hook. fbalpha2012's `BurnWriteByte` / `BurnWriteWord` are INTERNAL and are not
+//!    exported by the stock `.dylib`; a custom `SekMapHandler` likewise lives inside
+//!    the core. So this route requires a **patched / custom-built core**, not the
+//!    stock cores we run — it is out of scope until/unless we ship our own core.
 //!
 //! **B. Read the core's internal register array by pointer.**
 //!    Genesis Plus GX keeps its VDP registers in a global array `vdp_reg[24]` (in
 //!    `vdp_ctrl.c`). If the core is built as a `.so` with exported symbols (or with
 //!    a known module base), the host can obtain the address of that array and read it
 //!    directly. This is fragile (symbol must be exported, ASLR must be accounted for)
-//!    but is the lowest-overhead option if the symbol is available.
+//!    but is the lowest-overhead option if the symbol is available. In practice the
+//!    stock cores do NOT export it, so this shares Option A's blocker.
 //!    For fbalpha2012 the equivalent is `sFd.m_VDP.regs[24]` inside the
 //!    `MD_VDP` struct, also not exported by default.
 //!
-//! **C. Use a save-state / serialisation snapshot.**
+//! **C. Use a save-state / serialisation snapshot (the only stock-core route).**
 //!    Both cores support `retro_serialize`. Parsing the save-state binary for the
 //!    24-byte register block is brittle but requires no new symbols — the offset is
-//!    stable across builds of the same core version.
+//!    stable across builds of the same core version. This yields a *snapshot* of the
+//!    VDP registers (incl. the currently-armed DMA source/length/dest), NOT a history
+//!    of write events — so it can decode "a DMA is configured ROM $X → VRAM $Y right
+//!    now", but cannot attribute an arbitrary on-screen tile to its loader after the
+//!    fact. It is the realistic deliverable if a VDP-register panel is wanted.
+//!
+//! ## Spike conclusion (2026-06)
+//!
+//! A focused feasibility spike (intercept $C00004/$C00006 for ROM→VRAM provenance)
+//! reached this verdict:
+//!
+//! - **True DMA-event provenance is INFEASIBLE on the stock cores we run**
+//!   (genesis_plus_gx, fbalpha2012). libretro has no memory-write callback; the PC
+//!   heatmap and breakpoints are *post-frame polling* of `SekDbgGetRegister(PC)`
+//!   (see `frontend.rs::capture_cpu_state`), not a per-instruction/per-access hook
+//!   that could be extended to watch writes. Routes A and B both need a patched core.
+//! - **What we ship instead is convergent CONTENT/STRUCTURE evidence, not a trace:**
+//!   `vram_to_rom` (frame-granular VRAM byte → ROM content match), `render_tiles`
+//!   (decode a candidate ROM span as tiles and eyeball it), and `scan_regions`
+//!   (entropy/histogram structure scan). Agreement between these is the provenance
+//!   story on stock cores — honestly NOT DMA-traced, and the MCP layer says so.
+//! - **`read_vdp_regs` stays a `None` stub.** If a VDP-register panel is later
+//!   wanted, implement Option C (save-state parse) — that is the only stock-core
+//!   route, and it gives a snapshot of the armed DMA, not write history.
 //!
 //! ## Current deliverable
 //!

@@ -200,7 +200,7 @@ core capability, and it shares the VDP control-port-intercept work already roadm
 | 1 | **MCP server over `DebugState`** — resources (state/screen/memory) + action tools | M | The whole interface; a working "talk to Claude about the app" loop. Screen-as-PNG = vision. |
 | 2 | **`run_lua` MCP tool** | S | Reuses the engine; Claude writes/runs probes. Huge leverage, tiny cost. |
 | 3 | **Sprite / OAM decode** — model active sprites + their VRAM tile refs | M | "What's on screen" structurally; also powers the roadmapped hitbox overlay. |
-| 4 | **VRAM→ROM provenance** — DMA source→dest logging | M–L | The new core capability the sprite query needs; shares the VDP `$C00004/$C00006` intercept. |
+| 4 | ~~**VRAM→ROM provenance** — DMA source→dest logging~~ | M–L | **Spiked 2026-06: INFEASIBLE on stock cores.** libretro exposes no per-write hook and neither genesis_plus_gx nor fbalpha2012 export a write-intercept/VDP-peek symbol; true DMA-event tracing needs a patched core. Stock-core substitute = convergent CONTENT/STRUCTURE evidence (`vram_to_rom` + `render_tiles` + `scan_regions`), which is honestly *not* DMA-traced. See `src/debug/vdp_source.rs`. |
 | 5 | **Structured AI snapshot/event feed** — stable JSON the agent reads each turn | S | Grounded, repeatable conversations. |
 
 **Guardrails & decisions.** Ship **read-mostly first** (perception + suggestions); gate
@@ -256,11 +256,14 @@ end — which is exactly the surface area Claude is good at exploring.
 
 **What this implies for the build order** (folds into the sub-track above): the content-match
 primitive exists (Wave 2). The high-leverage additions are **(a) a ROM-region tile renderer**
-(decode a ROM span as tiles → PNG, so vision/image-recognition can compare it to the screen),
-**(b) major-region discovery** (entropy/histogram/tile-ness scan proposing graphics vs. code vs.
-data blocks), and **(c) the DMA/execution provenance** hook (shared with the VDP source work).
-Each is an independent evidence stream Claude can cross-check — none has to be perfect, because
-**convergence, not any single method, is what makes a finding confirmed.**
+(decode a ROM span as tiles → PNG, so vision/image-recognition can compare it to the screen —
+✅ shipped, PR #9), **(b) major-region discovery** (entropy/histogram/tile-ness scan proposing
+graphics vs. code vs. data blocks — ✅ shipped as `scan_regions`, PR #10), and **(c) the
+DMA/execution provenance** hook (shared with the VDP source work — ⛔ spiked 2026-06 as
+infeasible on stock cores; see Wave 4 above and `src/debug/vdp_source.rs`). Each is an
+independent evidence stream Claude can cross-check — none has to be perfect, because
+**convergence, not any single method, is what makes a finding confirmed.** With (c) ruled out on
+stock cores, convergence rests on the (a)/(b)/content-match trio.
 
 ## Non-goals
 
