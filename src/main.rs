@@ -215,11 +215,20 @@ fn run_headless(
         //     flags in DebugState internally, so MCP pause/resume/step work.
         let _ = frontend.run_frame();
 
-        // (b) Lua per-frame callbacks. Headless has no framebuffer to composite
-        //     onto, so we drain the draw-cmd buffer (so it can't grow unbounded)
-        //     but skip the GUI compositing that run_scripts does.
+        // (b) Lua per-frame callbacks, then composite their draw commands into
+        //     `fb_rgba` — exactly like the GUI's run_scripts system. There IS a
+        //     framebuffer in headless (run_frame() refreshed ds.fb_rgba above),
+        //     and app://screen serves it, so an AGENT can SEE overlays (hitbox
+        //     boxes, frame meter) it or a script draws. Draining without
+        //     compositing previously made overlays GUI-only/invisible to MCP.
         let _ = lua_engine.run_frame_callbacks();
-        let _ = lua_engine.take_draw_cmds();
+        let cmds = lua_engine.take_draw_cmds();
+        if !cmds.is_empty() {
+            if let Ok(mut ds) = debug_state.lock() {
+                let (w, h) = (ds.fb_width, ds.fb_height);
+                lua_engine::composite_into_rgba(&cmds, &mut ds.fb_rgba, w, h);
+            }
+        }
 
         // (c) Service the MCP run_lua round-trip — same logic as the GUI's
         //     drain_lua_requests system. WITHOUT this, MCP `run_lua` hangs (its

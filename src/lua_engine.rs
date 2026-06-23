@@ -18,7 +18,7 @@
 //! memory.read_u16_le(addr)          -> integer  (little-endian)
 //! memory.read_u32_le(addr)          -> integer  (little-endian)
 //! gui.drawBox(x1,y1,x2,y2, fill, line)
-//! gui.drawText(x,y, str [, color])
+//! gui.drawText(x,y, str [, color [, scale]])
 //! gui.drawLine(x1,y1,x2,y2, color)
 //! gui.drawPixel(x,y, color)
 //! event.onframeend(function)
@@ -47,12 +47,14 @@ pub enum DrawCmd {
         fill: u32,
         line: u32,
     },
-    /// Text label. `color` is packed `0xRRGGBBAA`.
+    /// Text label. `color` is packed `0xRRGGBBAA`. `scale` magnifies the 3×5
+    /// bitmap font (each glyph pixel becomes a `scale`×`scale` block); 1 = native.
     Text {
         x: i32,
         y: i32,
         s: String,
         color: u32,
+        scale: i32,
     },
     /// A straight line from (x1,y1) to (x2,y2). `color` is packed `0xRRGGBBAA`.
     Line {
@@ -229,17 +231,19 @@ impl LuaEngine {
             gui.set("drawBox", f)?;
         }
 
-        // drawText(x, y, str [, color])
+        // drawText(x, y, str [, color [, scale]])
         {
             let buf = Rc::clone(draw_cmds);
             let f = lua.create_function(
-                move |_, (x, y, s, color): (i32, i32, String, Option<u32>)| {
+                move |_, (x, y, s, color, scale): (i32, i32, String, Option<u32>, Option<i32>)| {
                     buf.borrow_mut().push(DrawCmd::Text {
                         x,
                         y,
                         s,
                         // Default: opaque white.
                         color: color.unwrap_or(0xFFFF_FFFF),
+                        // Default native scale; clamp so a bad value can't draw nothing.
+                        scale: scale.unwrap_or(1).max(1),
                     });
                     Ok(())
                 },
@@ -490,8 +494,8 @@ pub fn composite_into_rgba(cmds: &[DrawCmd], rgba: &mut [u8], width: u32, height
                     }
                 }
             }
-            DrawCmd::Text { x, y, ref s, color } => {
-                draw_text(rgba, w, h, x, y, s, color);
+            DrawCmd::Text { x, y, ref s, color, scale } => {
+                draw_text(rgba, w, h, x, y, s, color, scale);
             }
             DrawCmd::Line { x1, y1, x2, y2, color } => {
                 let (r, g, b, a) = unpack(color);
@@ -577,34 +581,43 @@ fn draw_line(rgba: &mut [u8], w: i32, h: i32, x1: i32, y1: i32, x2: i32, y2: i32
 /// Minimal blocky text renderer: draws each character as a small filled 3×5 dot
 /// pattern using a tiny built-in font. Good enough to label hitboxes; not a full
 /// typeface. Unsupported glyphs render as a solid block.
-fn draw_text(rgba: &mut [u8], w: i32, h: i32, x: i32, y: i32, s: &str, color: u32) {
+fn draw_text(rgba: &mut [u8], w: i32, h: i32, x: i32, y: i32, s: &str, color: u32, scale: i32) {
     let (r, g, b, a) = unpack(color);
     if a == 0 {
         return;
     }
-    const CW: i32 = 4; // cell width (3px glyph + 1px gap)
-    const GH: i32 = 5; // glyph height
+    let scale = scale.max(1);
+    const GW: i32 = 3; // glyph width in font pixels
+    const CW: i32 = 4; // cell width in font pixels (3px glyph + 1px gap)
     let mut cx = x;
     for ch in s.chars() {
         let rows = glyph(ch);
         for (ry, bits) in rows.iter().enumerate() {
-            for rxi in 0..3i32 {
-                if (bits >> (2 - rxi)) & 1 == 1 {
-                    blend_clamped(rgba, w, h, cx + rxi, y + ry as i32, r, g, b, a);
+            for rxi in 0..GW {
+                if (bits >> (GW - 1 - rxi)) & 1 == 1 {
+                    // Render each font pixel as a scale×scale block.
+                    for sy in 0..scale {
+                        for sx in 0..scale {
+                            let px = cx + rxi * scale + sx;
+                            let py = y + ry as i32 * scale + sy;
+                            blend_clamped(rgba, w, h, px, py, r, g, b, a);
+                        }
+                    }
                 }
             }
         }
-        cx += CW;
+        cx += CW * scale;
         if cx >= w {
             break;
         }
     }
-    let _ = GH;
 }
 
 /// 3×5 bitmap font: each glyph is 5 rows, each row is 3 low bits (MSB = left).
-/// Covers 0-9, A-Z (uppercased), space, and a few symbols; falls back to a solid
-/// block for anything else.
+/// Covers 0-9, the FULL A-Z (uppercased), space, and common symbols; falls back
+/// to a solid block only for genuinely unknown glyphs. The full alphabet matters
+/// for overlay labels — "NEUTRAL", "STARTUP", "ACTIVE", "RECOVERY" all use
+/// letters (N/U/V/W/M/K/etc.) that an incomplete font would render as blocks.
 fn glyph(ch: char) -> [u8; 5] {
     let c = ch.to_ascii_uppercase();
     match c {
@@ -628,17 +641,155 @@ fn glyph(ch: char) -> [u8; 5] {
         'G' => [0b111, 0b100, 0b101, 0b101, 0b111],
         'H' => [0b101, 0b101, 0b111, 0b101, 0b101],
         'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
+        'J' => [0b001, 0b001, 0b001, 0b101, 0b111],
+        'K' => [0b101, 0b101, 0b110, 0b101, 0b101],
         'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
+        'M' => [0b101, 0b111, 0b111, 0b101, 0b101],
+        'N' => [0b101, 0b111, 0b111, 0b111, 0b101],
         'O' => [0b111, 0b101, 0b101, 0b101, 0b111],
         'P' => [0b111, 0b101, 0b111, 0b100, 0b100],
+        'Q' => [0b111, 0b101, 0b101, 0b111, 0b001],
         'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
         'S' => [0b111, 0b100, 0b111, 0b001, 0b111],
         'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
+        'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
+        'V' => [0b101, 0b101, 0b101, 0b101, 0b010],
+        'W' => [0b101, 0b101, 0b111, 0b111, 0b101],
         'X' => [0b101, 0b101, 0b010, 0b101, 0b101],
         'Y' => [0b101, 0b101, 0b010, 0b010, 0b010],
+        'Z' => [0b111, 0b001, 0b010, 0b100, 0b111],
         ':' => [0b000, 0b010, 0b000, 0b010, 0b000],
         '-' => [0b000, 0b000, 0b111, 0b000, 0b000],
+        '+' => [0b000, 0b010, 0b111, 0b010, 0b000],
         '.' => [0b000, 0b000, 0b000, 0b000, 0b010],
+        ',' => [0b000, 0b000, 0b000, 0b010, 0b100],
+        '/' => [0b001, 0b001, 0b010, 0b100, 0b100],
+        '%' => [0b101, 0b001, 0b010, 0b100, 0b101],
+        '(' => [0b001, 0b010, 0b010, 0b010, 0b001],
+        ')' => [0b100, 0b010, 0b010, 0b010, 0b100],
+        '!' => [0b010, 0b010, 0b010, 0b000, 0b010],
+        '#' => [0b101, 0b111, 0b101, 0b111, 0b101],
         _ => [0b111, 0b111, 0b111, 0b111, 0b111], // unknown → solid block
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLOCK: [u8; 5] = [0b111, 0b111, 0b111, 0b111, 0b111];
+
+    /// Count font pixels (set bits) in a glyph.
+    fn glyph_popcount(g: &[u8; 5]) -> u32 {
+        g.iter().map(|row| (row & 0b111).count_ones()).sum()
+    }
+
+    /// Count pixels whose red channel is exactly `v` in an RGBA buffer.
+    fn count_red(rgba: &[u8], v: u8) -> usize {
+        rgba.chunks_exact(4).filter(|p| p[0] == v).count()
+    }
+
+    #[test]
+    fn font_covers_full_alphabet_and_digits() {
+        // The whole point of completing the font: no A-Z / 0-9 glyph may fall
+        // through to the solid-block fallback (which would render as a blob).
+        for ch in ('A'..='Z').chain('0'..='9') {
+            assert_ne!(
+                glyph(ch),
+                BLOCK,
+                "glyph '{ch}' is missing (renders as a solid block)"
+            );
+            // Lowercase maps to the same glyph (uppercased internally).
+            if ch.is_ascii_alphabetic() {
+                assert_eq!(glyph(ch), glyph(ch.to_ascii_lowercase()));
+            }
+        }
+        // The fighting-game category words must be fully renderable.
+        for word in ["NEUTRAL", "STARTUP", "ACTIVE", "RECOVERY", "STUN", "WHIFF"] {
+            for ch in word.chars() {
+                assert_ne!(glyph(ch), BLOCK, "'{ch}' in {word:?} missing");
+            }
+        }
+        // A genuinely unknown glyph still falls back to the block.
+        assert_eq!(glyph('\u{2603}'), BLOCK); // snowman ☃
+    }
+
+    #[test]
+    fn draw_text_scale_magnifies_each_font_pixel() {
+        // '1' has a known popcount; at scale N every font pixel becomes N×N.
+        let g = glyph('1');
+        let pop = glyph_popcount(&g) as usize;
+        let (w, h) = (64i32, 32i32);
+        for scale in [1, 2, 3] {
+            let mut rgba = vec![0u8; (w * h * 4) as usize];
+            draw_text(&mut rgba, w, h, 2, 2, "1", 0xFFFF_FFFF, scale);
+            let lit = count_red(&rgba, 0xFF);
+            assert_eq!(
+                lit,
+                pop * (scale * scale) as usize,
+                "scale {scale}: expected {} lit px",
+                pop * (scale * scale) as usize
+            );
+        }
+    }
+
+    #[test]
+    fn draw_text_zero_alpha_is_noop_and_advances_cells() {
+        let (w, h) = (64i32, 16i32);
+        // Fully transparent → draws nothing.
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        draw_text(&mut rgba, w, h, 0, 0, "ABC", 0xFFFF_FF00, 1);
+        assert_eq!(count_red(&rgba, 0xFF), 0);
+
+        // Two chars at scale 1 occupy distinct 4px cells → the second glyph's
+        // pixels start at x>=4 (cell width). Draw "I I" and confirm pixels exist
+        // past the first cell.
+        let mut rgba2 = vec![0u8; (w * h * 4) as usize];
+        draw_text(&mut rgba2, w, h, 0, 0, "II", 0xFFFF_FFFF, 1);
+        let far = rgba2
+            .chunks_exact(4)
+            .enumerate()
+            .any(|(i, p)| p[0] == 0xFF && (i as i32 % w) >= 4);
+        assert!(far, "second glyph should render in the next cell (x>=4)");
+    }
+
+    #[test]
+    fn composite_text_command_renders_at_scale() {
+        let (w, h) = (64u32, 32u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        let cmds = vec![DrawCmd::Text {
+            x: 1,
+            y: 1,
+            s: "8".to_string(),
+            color: 0xFFFF_FFFF,
+            scale: 2,
+        }];
+        composite_into_rgba(&cmds, &mut rgba, w, h);
+        let pop = glyph_popcount(&glyph('8')) as usize;
+        assert_eq!(count_red(&rgba, 0xFF), pop * 4);
+    }
+
+    #[test]
+    fn composite_box_fill_and_outline_blend() {
+        let (w, h) = (16u32, 16u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        // Opaque red fill, opaque green outline.
+        let cmds = vec![DrawCmd::Box {
+            x1: 2,
+            y1: 2,
+            x2: 6,
+            y2: 6,
+            fill: 0xFF00_00FF,
+            line: 0x00FF_00FF,
+        }];
+        composite_into_rgba(&cmds, &mut rgba, w, h);
+        // A corner pixel (2,2) is on the outline → green.
+        let corner = ((2 * w + 2) * 4) as usize;
+        assert_eq!(&rgba[corner..corner + 3], &[0x00, 0xFF, 0x00]);
+        // An interior pixel (4,4) is fill → red.
+        let inner = ((4 * w + 4) * 4) as usize;
+        assert_eq!(&rgba[inner..inner + 3], &[0xFF, 0x00, 0x00]);
+        // Framebuffer alpha stays opaque.
+        assert_eq!(rgba[inner + 3], 0xFF);
     }
 }
