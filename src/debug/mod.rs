@@ -437,6 +437,13 @@ pub struct DebugState {
     pub debug_open: bool,
     pub paused: bool,
     pub step_one: bool,
+    /// MCP-injected controller input for port 0: per-button countdown of frames
+    /// still to hold (index = RETRO_DEVICE_ID_JOYPAD: 0=B 1=Y 2=Select 3=Start
+    /// 4=Up 5=Down 6=Left 7=Right 8=A 9=X 10=L 11=R). The emulation loop calls
+    /// [`take_injected_input`](Self::take_injected_input) each frame to fold these
+    /// into the controller and decrement them. Lets an agent drive the game
+    /// (menus, moves) in headless mode where there's no keyboard.
+    pub injected_input: [u16; 12],
 
     // --- Breakpoints ---
     /// List of M68K PC addresses that will pause execution when hit.
@@ -556,6 +563,7 @@ impl DebugState {
             debug_open: false,
             paused: false,
             step_one: false,
+            injected_input: [0; 12],
             breakpoints: Vec::new(),
             hit_breakpoint: None,
             run_to_addr: None,
@@ -802,6 +810,21 @@ impl DebugState {
         }
         self.input_history.push_back((frame, state));
         self.input_state = state;
+    }
+
+    /// Fold the MCP-injected input into a controller bitmap for THIS frame and
+    /// decrement the per-button hold counters. A button is "held" while its
+    /// counter is > 0. Call once per frame from the run loop; returns the 12-button
+    /// held state to hand to the core (OR it with any keyboard input in GUI mode).
+    pub fn take_injected_input(&mut self) -> [bool; 12] {
+        let mut held = [false; 12];
+        for i in 0..12 {
+            if self.injected_input[i] > 0 {
+                held[i] = true;
+                self.injected_input[i] -= 1;
+            }
+        }
+        held
     }
 }
 
