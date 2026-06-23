@@ -38,8 +38,20 @@ where it serves that goal. Status reflects the codebase as of the current branch
       the sprite/image/render code; do it litui-free and get green first. **Prerequisite for
       the litui integration below.** Note: `egui_dock` is now adopted at 0.16 (egui 0.31); the
       upgrade must bump it to the egui-0.33-compatible release in lockstep.
+- [ ] **`retro_get_memory_data` fallback** — the highest-leverage core-compat fix for the AI/RE
+      track. RustRetro only reads memory from `SET_MEMORY_MAPS`, but **many cores skip it** and
+      expose RAM only via `retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM)`. Verified live (see the
+      core-capability matrix below): fbalpha2012 (CPS2), Genesis Plus GX (Genesis/MK2), and FBNeo
+      all publish **0 regions** to RustRetro today, so their RAM is unreachable. Consuming
+      `get_memory_data` as a fallback synthesizes a System-RAM region for these cores — unlocking
+      Genesis and CPS2 work-RAM inspection. (Full VRAM/sprite-RAM/ROM still needs `SET_MEMORY_MAPS`
+      or a hardcoded region table.)
 - [ ] **`RETRO_ENVIRONMENT_GET_VARIABLE`** — real core-options support. Today it returns
       false, so cores needing options can misbehave. Highest-leverage correctness fix.
+- [ ] **Mesen NES core fails to load** — `genesis_plus_gx`/`fceumm` load fine, but the Mesen
+      libretro core exits silently during `retro_load_game` in RustRetro (no panic, no AV info).
+      Investigate (likely a `need_fullpath` / system-dir / env-callback expectation). fceumm is the
+      working NES core meanwhile.
 - [ ] **Reconcile + verify MAME path** — confirm `retro_load_game` success across a couple of
       MAME 2003-Plus ROMs and document the BIOS/`--system-dir` requirements.
 - [ ] **Dead-code sweep** — ~28 dead-code warnings (unused FFI constants, methods, fields).
@@ -204,6 +216,22 @@ core capability, and it shares the VDP control-port-intercept work already roadm
 AI-discovered regions should write back into the ROM map as `::: region` blocks with an
 `author: ai` / `confidence` provenance field, so they're distinguishable and reviewable — making
 the AI's findings **durable across sessions**, not just chat.
+
+### Core-capability matrix (verified live via MCP)
+
+Whether the AI/RE workflow can touch bytes depends entirely on whether the loaded core publishes
+its memory map. Measured by launching each core+ROM with `--mcp` and reading `app://memory-map` +
+a Lua RAM scan:
+
+| Core | System | ROM tested | Loads | `SET_MEMORY_MAPS` regions | Bytes readable | Notes |
+|---|---|---|---|---|---|---|
+| **fceumm** | NES | TMNT: Tournament Fighters | ✅ | **14** (RAM/PPUREG/NTARAM/PALRAM/OAM) | ✅ | **The working RE config** — full structured map incl. sprite RAM + palette |
+| mesen | NES | TMNT | ❌ | — | — | Exits silently on load (bug, above) |
+| genesis_plus_gx | Genesis | Mortal Kombat II | ✅ | **0** | ❌ | RAM only via `get_memory_data` (unconsumed) — needs the fallback above |
+| fbalpha2012 | CPS2 | Marvel vs. Capcom | ✅ | **0** | ❌ | No map; FBNeo only adds work-RAM via `get_memory_data` |
+
+**Takeaway:** NES (fceumm) is the cleanest core for the full ROM-DNA demo today — it publishes
+OAM/PALRAM/nametables. Genesis and CPS2 are blocked on the `get_memory_data` fallback (Near-term).
 
 ### Convergent evidence — "ROM DNA" and the literate ROM
 
