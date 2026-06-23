@@ -152,11 +152,6 @@ egui cadence (needs a min-version policy); `egui_dock` must move in lockstep wit
 Keep the sync glue small and report the real ratio of litui-owned vs. bespoke surfaces; don't
 litui-ify the spatial inspectors for purity's sake.
 
-## Non-goals
-
-- Becoming a general-purpose, configure-everything emulator frontend (RetroArch exists).
-  Features earn their place by making a game easier to *take apart*, not just to play.
-
 ## AI-friendly interface — converse with Claude about the running app
 
 The goal: drive a RustRetro session from a Claude conversation — *"identify the ROM that holds
@@ -203,3 +198,8 @@ core capability, and it shares the VDP control-port-intercept work already roadm
 AI-discovered regions should write back into the ROM map as `::: region` blocks with an
 `author: ai` / `confidence` provenance field, so they're distinguishable and reviewable — making
 the AI's findings **durable across sessions**, not just chat.
+
+## Non-goals
+
+- Becoming a general-purpose, configure-everything emulator frontend (RetroArch exists).
+  Features earn their place by making a game easier to *take apart*, not just to play.
