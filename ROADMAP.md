@@ -113,21 +113,44 @@ is a **pure projection**. One `sync(debug, app)` per frame: copy display values 
 works — `create_bookmark` / `save_regions` are "UI flips a bool, the run loop consumes it,"
 which *is* litui's event model. Keep `AppState` a dumb viewmodel; never let domain logic into it.
 
-**Sequencing.**
+### Sequenced execution plan — "tutorials working in litui"
 
-1. Upgrade the egui/Bevy stack (see Near-term) — litui-free, get green.
-2. (litui side) Build the `[custom]` escape hatch — needed both for custom widgets *inside* a
-   page and for whole bespoke panels to live *as pages* in litui's nav. Critical-path unknown;
-   prototype before committing the migration.
-3. Move the shell to litui; bespoke panels become `[custom]` slot pages.
-4. Port the 3 easy panels (audio, log, CPU) with the sync layer.
-5. Build the new standard screens (help → controls → file access) as pure litui.
-6. Watch vars / breakpoint manager / timing once live-data sync is proven.
+The target milestone for the integration phase: **the 15 tutorial pages already authored in
+`docs/tutorials/` render as in-app litui screens (Help → Tutorials).** They are pure
+display/document content with no state round-trip, so they are the *lowest-risk first real
+litui surface* — a better first mount than a form. Everything below is bundled to reach that
+milestone, then the spatial panels follow.
 
-**Risks.** Adopting litui couples RustRetro to litui's egui cadence (needs a litui min-version
-policy); the critical path runs through litui's unbuilt `[custom]` hatch; and the "little Rust"
-claim must stay measurable — keep the sync glue small and report the real ratio of
-litui-owned vs. bespoke surfaces. Don't litui-ify the spatial inspectors for purity's sake.
+Each wave is built **in a dedicated git worktree** (isolated from `master`/the PR branch) by
+sized agents, integrated to a green build, then committed. Build stays green between waves.
+
+| Wave | Goal | Agents (size) |
+|---|---|---|
+| **A — stack upgrade** | egui 0.31→0.33, bevy 0.15→0.18, bevy_egui 0.33→0.39 (`EguiPrimaryContextPass`); bump `egui_dock` to the egui-0.33 release in lockstep. litui-free; get green first. | 1 opus (render/schedule churn) + 1 sonnet (egui_dock/API-rename sweep) |
+| **B — `[custom]` escape-hatch prototype** | The critical-path unknown: prove `[custom](slot)` invoking an `FnMut(&mut egui::Ui)` on a macro-generated `AppState` works across the proc-macro boundary, in the **Bevy** path. Spike one bespoke panel (Hex) as a `[custom]` page. **Go/no-go gate** for the whole migration. | 1 opus (spike) |
+| **C — litui shell + live-resource binding** | Mount `define_markdown_app!` as the window frame/nav; prove per-frame `populate_data` (DebugState → `[display]`) in Bevy. Port the 3 easy panels (Audio, Log, CPU) as litui pages with the sync layer. | 1 opus (shell + sync) + 1 sonnet (3 panel ports) |
+| **D — tutorials as litui pages (the milestone)** | Wire `docs/tutorials/*.md` (+ `_tutorials.md` parent) into the app as a Help → Tutorials nav group via `define_markdown_app!`. Static render first; this is the milestone commit. | 1 sonnet (mounting + nav) |
+| **E — bespoke panels as `[custom]` pages** | Move the spatial inspectors (Frame, Tiles, Hex, Disasm, heatmap) into litui's nav as `[custom]` slot pages; the dock workspace either wraps or is superseded by litui nav (decide during B/C). | 1 opus + 1 sonnet |
+| **F — live tutorial embeds** | Upgrade the tutorial pages' annotated `<!-- litui:live -->` points to real `[display]`/`[custom]` embeds (live watch values, RAM Search candidate count, script output) — tutorials that *run inside the tool*. | 1 sonnet per tutorial cluster |
+
+**Then: the tutorial / workflow-hardening phase** (separate from the above, begins after the
+user's review of the current static tutorials). Walk each tutorial against the live app, fix the
+friction it exposes, and harden navigation/workflow paths. Known seeds for this phase (surfaced
+while authoring the tutorials):
+
+- **Pause/Step is triplicated** across the toolbar, Disasm, and Triggers panels; the toolbar's
+  "Step Frame" currently just single-steps (no real run-to-next-frame). Unify the controls.
+- **No "send to trigger" link** from the Frame Inspector's pixel picker to the Triggers fields —
+  the user re-types coordinates by hand.
+- **VDP ↔ Tiles are conceptually linked but disconnected** (VDP regs name VRAM bases the Tile
+  viewer could show); also VDP stays un-wired until the control-port source lands.
+
+**Risks.** The migration's critical path runs through litui's **unbuilt `[custom]` hatch**
+(Wave B is the gate — if the `FnMut`-on-`AppState` lifetime is intractable, the "litui owns the
+frame" claim fails and we keep the egui_dock shell). Adopting litui couples RustRetro to litui's
+egui cadence (needs a min-version policy); `egui_dock` must move in lockstep with the egui bump.
+Keep the sync glue small and report the real ratio of litui-owned vs. bespoke surfaces; don't
+litui-ify the spatial inspectors for purity's sake.
 
 ## Non-goals
 
