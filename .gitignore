@@ -20,3 +20,6 @@ rustretro_layout.json
 *.nv
 nvram/
 cfg/
+
+# Machine-local Cargo config (external target-dir)
+.cargo/config.toml
