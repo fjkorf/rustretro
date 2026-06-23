@@ -11,7 +11,7 @@
 
 use serde::Serialize;
 
-use crate::debug::DebugState;
+use crate::debug::{DebugState, MemoryRegion};
 
 /// One memory-region summary line: metadata only, never the bytes.
 #[derive(Serialize, Clone)]
@@ -71,6 +71,8 @@ pub struct AiSnapshot {
     pub m68k: M68kRegs,
     pub z80: Z80Regs,
     pub regions: Vec<RegionSummary>,
+    /// Up-front summary of what the agent can actually read on this core.
+    pub capability: MemoryCapability,
     pub counts: SnapshotCounts,
     /// The shared navigation cursor's current address, if any.
     pub nav_address: Option<u32>,
@@ -115,6 +117,7 @@ impl AiSnapshot {
                 hl: ds.z80_hl,
             },
             regions,
+            capability: memory_capability(ds),
             counts: SnapshotCounts {
                 watches: ds.watches.len(),
                 breakpoints: ds.breakpoints.len(),
@@ -155,6 +158,151 @@ pub fn memory_map(ds: &DebugState) -> Vec<MemoryMapEntry> {
             readonly: r.is_readonly(),
         })
         .collect()
+}
+
+/// An up-front, honest summary of what an AI agent can actually *do* with this
+/// core's memory — so it never confuses "no memory map" with "all zeros", and
+/// never assumes a declared region is readable when it's a virtual/unbacked
+/// descriptor.
+///
+/// Computed purely from `&DebugState` (no locking, no host-pointer deref beyond
+/// the bounds-checked `safe_host_ptr` probe), so it is unit-testable.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct MemoryCapability {
+    /// Total number of declared regions (backed OR virtual/unbacked).
+    pub region_count: usize,
+    /// Distinct `region_type()`s present: "RAM"/"ROM"/"VRAM"/"SRAM"/"Unmapped".
+    pub kinds: Vec<String>,
+    /// Sum of sizes of regions that are actually backed by readable host memory
+    /// (i.e. `safe_host_ptr(addr_start, 1)` is `Some`). Virtual/unbacked
+    /// descriptors contribute 0 — this is how the agent tells real memory from a
+    /// declared-but-garbage descriptor.
+    pub total_readable_bytes: usize,
+    pub has_system_ram: bool,
+    pub has_vram: bool,
+    pub has_rom: bool,
+    /// "core memory map" / "get_memory_data fallback" / "none".
+    pub source: String,
+    /// One honest, agent-facing line describing what's reachable.
+    pub note: String,
+}
+
+/// Probe whether a region is backed by readable host memory. A virtual/unbacked
+/// descriptor (null/garbage `ptr`, zero `size`) returns `false` without ever
+/// dereferencing the pointer.
+fn region_is_backed(region: &MemoryRegion) -> bool {
+    region.safe_host_ptr(region.addr_start, 1).is_some()
+}
+
+/// Build the [`MemoryCapability`] summary for the current debug state.
+///
+/// Pure: only calls `region_type()` / `safe_host_ptr()` (a bounds check, not a
+/// deref), so it is safe even when the map contains virtual descriptors.
+pub fn memory_capability(ds: &DebugState) -> MemoryCapability {
+    let regions = &ds.memory_regions;
+    let region_count = regions.len();
+
+    let mut kinds: Vec<String> = Vec::new();
+    for r in regions {
+        let k = r.region_type().to_string();
+        if !kinds.contains(&k) {
+            kinds.push(k);
+        }
+    }
+
+    let total_readable_bytes: usize = regions
+        .iter()
+        .filter(|r| region_is_backed(r))
+        .map(|r| r.size)
+        .sum();
+
+    let has_system_ram = regions.iter().any(|r| r.region_type() == "RAM");
+    let has_vram = regions.iter().any(|r| r.region_type() == "VRAM");
+    let has_rom = regions.iter().any(|r| r.region_type() == "ROM");
+
+    // Source: "none" if empty; "get_memory_data fallback" if every region looks
+    // synthesized (name contains "(fallback)"); otherwise "core memory map".
+    let source = if region_count == 0 {
+        "none".to_string()
+    } else if regions.iter().all(|r| r.name.contains("(fallback)")) {
+        "get_memory_data fallback".to_string()
+    } else {
+        "core memory map".to_string()
+    };
+
+    // A one-line, honest hint tailored to the situation.
+    let note = if region_count == 0 {
+        "No memory map: only the framebuffer (app://screen) and execution control \
+         are available; byte-level reads return nothing."
+            .to_string()
+    } else if total_readable_bytes == 0 {
+        "Regions are declared but none are backed by readable host memory \
+         (virtual/unbacked descriptors); byte-level reads return nothing."
+            .to_string()
+    } else if has_system_ram && !has_vram && !has_rom {
+        "Work RAM only (no VRAM/ROM): sprite/ROM provenance unavailable on this core."
+            .to_string()
+    } else if !has_system_ram && (has_vram || has_rom) {
+        "VRAM/ROM available but no system work RAM exposed; game-state reads may be \
+         limited."
+            .to_string()
+    } else if source == "get_memory_data fallback" {
+        "Synthesized fallback map (core published no descriptors): flat readable \
+         block(s) only; offset/select layout is approximate."
+            .to_string()
+    } else {
+        "Core memory map present: named regions are readable for byte-level inspection \
+         and content search."
+            .to_string()
+    };
+
+    MemoryCapability {
+        region_count,
+        kinds,
+        total_readable_bytes,
+        has_system_ram,
+        has_vram,
+        has_rom,
+        source,
+        note,
+    }
+}
+
+/// Clone up to `len` bytes from a region starting at byte `offset` within the
+/// region, via the bounds-checked `safe_host_ptr` path.
+///
+/// Returns `None` when the region is unbacked (a virtual/garbage descriptor) or
+/// `offset` lies past the region — so callers can treat "declared but not
+/// readable" distinctly from "read some bytes". `len` is clamped to the region
+/// size; the returned vec may be shorter than `len` if a hole is hit mid-range.
+/// NEVER does `from_raw_parts(region.ptr, ..)` blindly — that would segfault on
+/// a virtual descriptor.
+pub fn read_region_bytes(region: &MemoryRegion, offset: usize, len: usize) -> Option<Vec<u8>> {
+    // Unbacked / virtual descriptor: refuse without dereferencing.
+    if !region_is_backed(region) {
+        return None;
+    }
+    // Clamp the readable window to the region's declared size.
+    let region_size = region
+        .size
+        .min(region.addr_end.saturating_sub(region.addr_start) + 1);
+    if offset >= region_size {
+        return None;
+    }
+    let avail = region_size - offset;
+    let want = len.min(avail);
+    let start = region.addr_start + offset;
+
+    let mut out = Vec::with_capacity(want);
+    for i in 0..want {
+        // Per-byte bounds-checked read. A mid-range hole (e.g. a select/disconnect
+        // gap) stops the copy at what we safely have.
+        match region.safe_host_ptr(start + i, 1) {
+            Some(p) => out.push(unsafe { *p }),
+            None => break,
+        }
+    }
+    Some(out)
 }
 
 /// Find every occurrence of `needle` in `haystack`, returning the BYTE OFFSETS
@@ -398,6 +546,152 @@ mod tests {
         let vram = map.iter().find(|m| m.name == "VRAM").expect("VRAM present");
         assert_eq!(vram.kind, "VRAM");
         assert!(!vram.readonly);
+    }
+
+    // memdesc flag bits (mirrors region_type()'s constants).
+    const RETRO_MEMDESC_CONST: u64 = 1 << 0;
+    const RETRO_MEMDESC_SYSTEM_RAM: u64 = 1 << 2;
+
+    #[test]
+    fn capability_none_when_no_regions() {
+        let ds = DebugState::new();
+        let cap = memory_capability(&ds);
+        assert_eq!(cap.region_count, 0);
+        assert_eq!(cap.source, "none");
+        assert!(!cap.has_system_ram);
+        assert!(!cap.has_vram);
+        assert!(!cap.has_rom);
+        assert_eq!(cap.total_readable_bytes, 0);
+        assert!(cap.kinds.is_empty());
+        assert!(cap.note.contains("No memory map"));
+    }
+
+    #[test]
+    fn capability_backed_system_ram_counts_bytes_and_detects_fallback() {
+        // A real stack buffer standing in for the core's work RAM.
+        let buf = [0xAAu8; 64];
+        let p = buf.as_ptr() as usize;
+        let mut ds = DebugState::new();
+        ds.memory_regions.push(MemoryRegion::synth_region(
+            "System RAM (fallback)",
+            0,
+            buf.len(),
+            p,
+            RETRO_MEMDESC_SYSTEM_RAM,
+        ));
+
+        let cap = memory_capability(&ds);
+        assert_eq!(cap.region_count, 1);
+        assert!(cap.has_system_ram);
+        assert!(!cap.has_vram);
+        assert!(!cap.has_rom);
+        assert_eq!(cap.total_readable_bytes, buf.len());
+        assert_eq!(cap.kinds, vec!["RAM".to_string()]);
+        // Name contains "(fallback)" -> source reflects the synthesized map.
+        assert_eq!(cap.source, "get_memory_data fallback");
+        assert!(cap.note.contains("Work RAM only"));
+    }
+
+    #[test]
+    fn capability_virtual_region_counted_but_not_readable() {
+        // A virtual/unbacked descriptor (null ptr), like NES OAM at 0x8000xxxx.
+        let mut ds = DebugState::new();
+        ds.memory_regions.push(MemoryRegion {
+            name: "OAM".to_string(),
+            addr_start: 0x8000_4000,
+            addr_end: 0x8000_40FF,
+            size: 0x100,
+            flags: 1 << 4, // VIDEO_RAM
+            ptr: 0,        // unbacked
+            offset: 0,
+            select: 0,
+            disconnect: 0,
+        });
+
+        let cap = memory_capability(&ds);
+        // Counted in region_count, but contributes ZERO readable bytes.
+        assert_eq!(cap.region_count, 1);
+        assert_eq!(cap.total_readable_bytes, 0);
+        assert!(cap.has_vram);
+        assert!(!cap.has_system_ram);
+        // Declared-but-unreadable note.
+        assert!(cap.note.contains("none are backed") || cap.note.contains("declared"));
+        // Serializes cleanly.
+        let json = serde_json::to_string(&cap).unwrap();
+        assert!(json.contains("\"total_readable_bytes\":0"));
+    }
+
+    #[test]
+    fn capability_core_map_with_ram_and_rom() {
+        let ram = [0u8; 32];
+        let rom = [0u8; 16];
+        let mut ds = DebugState::new();
+        ds.memory_regions.push(MemoryRegion::synth_region(
+            "Work RAM",
+            0,
+            ram.len(),
+            ram.as_ptr() as usize,
+            RETRO_MEMDESC_SYSTEM_RAM,
+        ));
+        ds.memory_regions.push(MemoryRegion::synth_region(
+            "Program ROM",
+            0x10_0000,
+            rom.len(),
+            rom.as_ptr() as usize,
+            RETRO_MEMDESC_CONST,
+        ));
+        let cap = memory_capability(&ds);
+        assert_eq!(cap.source, "core memory map");
+        assert!(cap.has_system_ram && cap.has_rom);
+        assert_eq!(cap.total_readable_bytes, ram.len() + rom.len());
+    }
+
+    #[test]
+    fn read_region_bytes_reads_backed_and_clamps() {
+        let buf = [0u8, 1, 2, 3, 4, 5, 6, 7];
+        let r = MemoryRegion::synth_region(
+            "RAM",
+            0,
+            buf.len(),
+            buf.as_ptr() as usize,
+            RETRO_MEMDESC_SYSTEM_RAM,
+        );
+        // Full read.
+        assert_eq!(read_region_bytes(&r, 0, 8).unwrap(), vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        // Offset + clamp past end.
+        assert_eq!(read_region_bytes(&r, 6, 100).unwrap(), vec![6, 7]);
+        // Offset at/past the end -> None.
+        assert!(read_region_bytes(&r, 8, 4).is_none());
+    }
+
+    #[test]
+    fn read_region_bytes_returns_none_for_virtual_region_no_panic() {
+        // Null-ptr virtual descriptor: must return None, NEVER dereference/panic.
+        let virt = MemoryRegion {
+            name: "NTARAM".to_string(),
+            addr_start: 0x8000_2000,
+            addr_end: 0x8000_27FF,
+            size: 0x800,
+            flags: 1 << 4,
+            ptr: 0,
+            offset: 0,
+            select: 0,
+            disconnect: 0,
+        };
+        assert!(read_region_bytes(&virt, 0, 16).is_none());
+        // Bogus non-null ptr with zero size is also refused.
+        let bogus = MemoryRegion {
+            name: "Bogus".to_string(),
+            addr_start: 0x6000,
+            addr_end: 0x6000,
+            size: 0,
+            flags: 0,
+            ptr: 0xdead_beef,
+            offset: 0,
+            select: 0,
+            disconnect: 0,
+        };
+        assert!(read_region_bytes(&bogus, 0, 4).is_none());
     }
 
     #[test]

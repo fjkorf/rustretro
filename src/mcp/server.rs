@@ -34,7 +34,8 @@ use serde_json::{json, Map, Value};
 
 use crate::debug::SharedDebugState;
 use crate::mcp::snapshot::{
-    memory_map, parse_hex_bytes, rgba_to_png, search_bytes, top_heatmap, AiSnapshot,
+    memory_capability, memory_map, parse_hex_bytes, read_region_bytes, rgba_to_png, search_bytes,
+    top_heatmap, AiSnapshot,
 };
 
 /// How long the `run_lua` tool waits for the main thread to execute a script
@@ -54,6 +55,10 @@ const MAX_NEEDLE_LEN: usize = 256;
 const MAX_SEARCH_HITS: usize = 256;
 /// Number of hottest PCs returned by `app://heatmap`.
 const HEATMAP_TOP_N: usize = 64;
+/// Sentinel error prefix emitted by [`RetroMcpServer::clone_region_bytes`] when a
+/// region is declared but backed by no readable host memory (a virtual/garbage
+/// descriptor). Format: `"<prefix>:<region_name>"`.
+const REGION_UNBACKED: &str = "region-unbacked";
 
 /// The MCP server handler. Cloneable (it's just an `Arc` inside) so the
 /// streamable-http service factory can mint a fresh handler per session.
@@ -127,12 +132,17 @@ impl RetroMcpServer {
     }
 
     /// Clone the bytes of a named region out from under a brief lock. Returns
-    /// `(addr_start, kind, bytes)` or an error string. Reads byte-by-byte through
-    /// the region's host pointer (the same path `read_addr` uses) so it works for
-    /// any mapped region regardless of host-pointer arithmetic (offset/select).
+    /// `(addr_start, kind, bytes)` or an error string.
     ///
-    /// We deliberately materialize the bytes into an owned `Vec` so the caller can
-    /// drop the mutex before doing any expensive scanning.
+    /// Goes through the bounds-checked [`read_region_bytes`] helper, which uses
+    /// `MemoryRegion::safe_host_ptr` and NEVER does a blind
+    /// `from_raw_parts(region.ptr, ..)`. A virtual/unbacked descriptor (null or
+    /// garbage `ptr`, like NES NTARAM/OAM at 0x8000xxxx) yields a dedicated
+    /// [`REGION_UNBACKED`] error instead of crashing, so callers can surface an
+    /// honest "declared but not readable" result.
+    ///
+    /// We materialize the bytes into an owned `Vec` so the caller can drop the
+    /// mutex before doing any expensive scanning.
     fn clone_region_bytes(&self, region_name: &str) -> Result<(usize, String, Vec<u8>), String> {
         let ds = self.debug.lock().map_err(|_| "debug state lock poisoned".to_string())?;
         let region = ds
@@ -141,17 +151,12 @@ impl RetroMcpServer {
             .find(|r| r.name == region_name)
             .ok_or_else(|| format!("no region named '{region_name}'"))?
             .clone();
+        drop(ds);
         let kind = region.region_type().to_string();
         let start = region.addr_start;
-        let size = region.size.min(region.addr_end - region.addr_start + 1);
-        let mut bytes = Vec::with_capacity(size);
-        for off in 0..size {
-            match ds.read_addr(start + off, 1) {
-                Some(b) => bytes.push(b as u8),
-                None => break, // hole / null host ptr — stop at what we have.
-            }
-        }
-        drop(ds);
+        // Read the whole region. None == unbacked/virtual descriptor.
+        let bytes = read_region_bytes(&region, 0, region.size)
+            .ok_or_else(|| format!("{REGION_UNBACKED}:{region_name}"))?;
         Ok((start, kind, bytes))
     }
 
@@ -162,6 +167,15 @@ impl RetroMcpServer {
         let len = len.min(MAX_REGION_READ_LEN);
         let (start, kind, bytes) = match self.clone_region_bytes(region_name) {
             Ok(t) => t,
+            Err(e) if e.starts_with(REGION_UNBACKED) => {
+                return json!({
+                    "region": region_name,
+                    "error": format!(
+                        "region '{region_name}' is declared but not backed by readable \
+                         memory (virtual descriptor)"
+                    ),
+                })
+            }
             Err(e) => return json!({ "error": e }),
         };
         if offset >= bytes.len() {
@@ -613,11 +627,14 @@ impl RetroMcpServer {
                 Ok(vec![ResourceContents::text(s, uri).with_mime_type("application/json")])
             }
             "app://memory-map" => {
-                let map = {
+                let payload = {
                     let ds = self.lock_read()?;
-                    memory_map(&ds)
+                    json!({
+                        "capability": memory_capability(&ds),
+                        "regions": memory_map(&ds),
+                    })
                 };
-                let s = serde_json::to_string_pretty(&map)
+                let s = serde_json::to_string_pretty(&payload)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(vec![ResourceContents::text(s, uri).with_mime_type("application/json")])
             }
