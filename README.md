@@ -19,13 +19,26 @@ dynamically load any libretro core and wire its C callbacks into a Bevy app.
 - **Renders via Bevy** — all three libretro pixel formats (0RGB1555, XRGB8888, RGB565)
   converted and uploaded as a sprite texture; live FPS/resolution in the title bar.
 - **Audio via cpal** — the core's sample callback feeds a ring buffer into a cpal stream.
-- **A 10-panel debug overlay** (`--debug`): frame inspector with pixel picker, hex dump,
-  VRAM tile viewer, input monitor, M68K/Z80 CPU state with per-frame register deltas, live
-  Capstone disassembly (breakpoints, step, run-to-address), audio controls, event log, and
-  frame/pixel pause triggers.
-- **Regions & bookmarks** — label disassembled code ranges, snapshot machine states with
-  64×48 thumbnails, watch a PC heatmap discover the code for you; everything persists to a
-  `<rom>.regions.json` sidecar next to your saves.
+- **A docking debug workspace** (`--debug`): drag/split/dock 14 panels visible at once —
+  frame inspector with pixel picker, hex dump (with changed-cell tint), VRAM tile viewer,
+  input monitor, M68K/Z80 CPU state with per-frame register deltas, live Capstone disassembly
+  (breakpoints, step, run-to-address), audio controls, event log, and frame/pixel pause
+  triggers. A persistent toolbar adds Run/Pause/Step, address history, and Go-to-address;
+  clicking an address anywhere jumps the code and memory views together.
+- **Reverse-engineering tooling** — a Watch table with freeze/lock and frame-granular change
+  tracking, RAM Search (cheat-engine-style iterative narrowing), a decoded VDP register panel,
+  label disassembled code ranges, snapshot machine states with 64×48 thumbnails, and a PC
+  heatmap that discovers the code for you; everything persists to a `<rom>.regions.json` sidecar.
+- **Lua scripting** (`--script` / F10) — a sandboxed `mlua` layer that reads memory and draws
+  overlays onto the framebuffer each frame; the basis for community fighting-game hitbox overlays.
+
+## Tutorials
+
+Task-oriented, per-feature walkthroughs live in [`docs/tutorials/`](docs/tutorials/README.md) —
+start with [Getting Started](docs/tutorials/getting-started.md), then the
+[find-the-health-bar RAM Search](docs/tutorials/ram-search.md) walkthrough. Each tutorial is
+authored as a **litui page**: the same Markdown renders as a GitHub doc today and, once litui is
+integrated (see [ROADMAP](ROADMAP.md)), as an in-app **Help → Tutorials** screen.
 
 ## How it works
 

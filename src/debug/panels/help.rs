@@ -33,6 +33,12 @@ impl HelpPanel {
             ui.label("🗺 Regions    Bookmarks, PC heatmap, code regions");
             ui.separator();
 
+            ui.heading("Tutorials");
+            ui.label("Task-oriented walkthroughs live in docs/tutorials/ (one per feature).");
+            ui.label("Start with getting-started.md, then ram-search.md (find a health bar).");
+            ui.label("Authored as litui pages — they will mount here as a Help → Tutorials screen once litui is integrated.");
+            ui.separator();
+
             ui.heading("About");
             ui.label("RustRetro loads libretro cores (Genesis, CPS-2, NES) and provides first-class debugging facilities.");
             ui.label("Built with Bevy (rendering), egui (UI), and Capstone (disassembly).");
