@@ -484,6 +484,14 @@ pub struct DebugState {
     /// mapped (e.g. multi-system FBNeo) — left blank rather than guessed wrong.
     /// Seeds the scaffolded frontmatter `rom.system`. Set by Frontend on startup.
     pub rom_system: Option<String>,
+    /// The raw ROM-file bytes, retained so the MCP `rom_file` source can decode
+    /// content the running core does NOT expose in memory (e.g. NES CHR-ROM
+    /// graphics). `None` for need_fullpath cores (which never read the bytes here)
+    /// — those fall back to re-reading [`rom_path`](Self::rom_path) on demand.
+    pub rom_bytes: Option<Vec<u8>>,
+    /// Absolute path to the loaded ROM file, kept so the `rom_file` source can
+    /// re-read it when the bytes weren't retained (need_fullpath cores).
+    pub rom_path: Option<std::path::PathBuf>,
 
     // --- Watches ---
     /// User-created memory watches (displayed in the Watch panel).
@@ -564,6 +572,8 @@ impl DebugState {
             rom_sha1: None,
             rom_size: None,
             rom_system: None,
+            rom_bytes: None,
+            rom_path: None,
             watches: Vec::new(),
             ram_search: RamSearch::new(),
             change_log: VecDeque::new(),

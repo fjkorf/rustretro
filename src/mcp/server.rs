@@ -522,30 +522,17 @@ impl RetroMcpServer {
         let len = len.min(MAX_RENDER_TILES_LEN);
         let tiles_per_row = tiles_per_row.clamp(1, MAX_TILES_PER_ROW);
 
-        // Resolve `source` to a concrete region name via a brief lock.
-        let region_name = self
-            .resolve_render_source(source)
+        // Resolve `source` to bytes — a live memory region OR the on-disk rom_file
+        // (the cart bytes the core may not expose, e.g. NES CHR-ROM). Clones the
+        // bytes out under a brief lock, then decodes unlocked.
+        let (region_name, start, kind, all_bytes) = self
+            .resolve_source_bytes(source)
             .map_err(|e| ErrorData::invalid_params(e, None))?;
-
-        // Clone the region bytes out (safe_host_ptr-guarded), then decode unlocked.
-        let (start, kind, all_bytes) = match self.clone_region_bytes(&region_name) {
-            Ok(t) => t,
-            Err(e) if e.starts_with(REGION_UNBACKED) => {
-                return Err(ErrorData::invalid_params(
-                    format!(
-                        "region '{region_name}' is declared but not backed by readable memory \
-                         (virtual descriptor)"
-                    ),
-                    None,
-                ))
-            }
-            Err(e) => return Err(ErrorData::invalid_params(e, None)),
-        };
 
         if offset >= all_bytes.len() {
             return Err(ErrorData::invalid_params(
                 format!(
-                    "offset 0x{offset:X} is beyond region '{region_name}' (len 0x{:X})",
+                    "offset 0x{offset:X} is beyond source '{region_name}' (len 0x{:X})",
                     all_bytes.len()
                 ),
                 None,
@@ -645,6 +632,70 @@ impl RetroMcpServer {
         }
     }
 
+    /// Whether `source` selects the on-disk ROM FILE (the cart bytes) rather than
+    /// a live memory region. The ROM file lets tools decode content the running
+    /// core does NOT expose in memory — e.g. NES CHR-ROM graphics (genesis/CPS2
+    /// graphics ROM, etc.). Accepts a few spellings for convenience.
+    fn is_rom_file_source(source: &str) -> bool {
+        matches!(
+            source.trim().to_ascii_lowercase().as_str(),
+            "rom_file" | "romfile" | "rom-file" | "file"
+        )
+    }
+
+    /// Fetch the loaded ROM file's bytes for the `rom_file` source: prefer the
+    /// bytes retained at load, else re-read the retained path (need_fullpath cores
+    /// never read the bytes into memory). Returns (display_name, bytes). The lock
+    /// is dropped before any disk read.
+    fn rom_file_bytes(&self) -> Result<(String, Vec<u8>), String> {
+        let (name, bytes, path) = {
+            let ds = self
+                .debug
+                .lock()
+                .map_err(|_| "debug state lock poisoned".to_string())?;
+            (ds.rom_name.clone(), ds.rom_bytes.clone(), ds.rom_path.clone())
+        };
+        let label = name.unwrap_or_else(|| "rom".to_string());
+        if let Some(b) = bytes {
+            if !b.is_empty() {
+                return Ok((label, b));
+            }
+        }
+        if let Some(p) = path {
+            return std::fs::read(&p)
+                .map(|b| (label, b))
+                .map_err(|e| format!("failed to read ROM file {}: {e}", p.display()));
+        }
+        Err("no ROM file available (ROM not loaded, or a need_fullpath core whose \
+             path wasn't retained)"
+            .to_string())
+    }
+
+    /// Resolve a tool `source` token to its bytes — handling BOTH live memory
+    /// regions (exact NAME, or rom/vram/memory) AND the on-disk `rom_file`
+    /// pseudo-source. Returns `(display_name, region_addr_start, kind, bytes)`;
+    /// `start`/`kind` are `0`/`"ROMFILE"` for the file source. The error string is
+    /// ready to surface to the client (the `REGION_UNBACKED` sentinel is mapped to
+    /// a friendly message here so both render_tiles and scan_regions share it).
+    fn resolve_source_bytes(
+        &self,
+        source: &str,
+    ) -> Result<(String, usize, String, Vec<u8>), String> {
+        if Self::is_rom_file_source(source) {
+            let (name, bytes) = self.rom_file_bytes()?;
+            return Ok((format!("ROM file ({name})"), 0, "ROMFILE".to_string(), bytes));
+        }
+        let region_name = self.resolve_render_source(source)?;
+        match self.clone_region_bytes(&region_name) {
+            Ok((start, kind, bytes)) => Ok((region_name, start, kind, bytes)),
+            Err(e) if e.starts_with(REGION_UNBACKED) => Err(format!(
+                "region '{region_name}' is declared but not backed by readable memory \
+                 (virtual descriptor)"
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
     /// `scan_regions`: the STRUCTURE / statistical-signature evidence stream.
     /// Window a region's bytes and propose what KIND each span looks like
     /// (padding / text / packed / table / graphics / code) from cheap signatures
@@ -661,23 +712,10 @@ impl RetroMcpServer {
     fn scan_regions(&self, source: &str, window: usize) -> Result<CallToolResult, ErrorData> {
         let window = window.clamp(MIN_SCAN_WINDOW, MAX_SCAN_WINDOW);
 
-        let region_name = self
-            .resolve_render_source(source)
+        // Resolve `source` to bytes — a live memory region OR the on-disk rom_file.
+        let (region_name, start, kind, all_bytes) = self
+            .resolve_source_bytes(source)
             .map_err(|e| ErrorData::invalid_params(e, None))?;
-
-        let (start, kind, all_bytes) = match self.clone_region_bytes(&region_name) {
-            Ok(t) => t,
-            Err(e) if e.starts_with(REGION_UNBACKED) => {
-                return Err(ErrorData::invalid_params(
-                    format!(
-                        "region '{region_name}' is declared but not backed by readable memory \
-                         (virtual descriptor)"
-                    ),
-                    None,
-                ))
-            }
-            Err(e) => return Err(ErrorData::invalid_params(e, None)),
-        };
 
         // Bound the work: scan at most MAX_SCAN_LEN bytes (the prefix), flag if
         // the region is larger so the agent knows the tail wasn't analysed.
@@ -1187,8 +1225,8 @@ impl RetroMcpServer {
             let schema = json!({
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "description": "Where to read bytes: an exact region NAME (see app://memory-map), or a convenience: \"rom\" / \"vram\" / \"memory\" (first ROM/VRAM/any backed region)" },
-                    "offset": { "type": "integer", "description": "Byte offset WITHIN the source region (default 0)" },
+                    "source": { "type": "string", "description": "Where to read bytes: an exact region NAME (see app://memory-map); a convenience \"rom\" / \"vram\" / \"memory\" (first ROM/VRAM/any backed region); or \"rom_file\" — the on-disk CART file, which exposes content the core hides (e.g. NES CHR-ROM graphics). For rom_file, offset is the byte offset into the file (use rom_info / the iNES CHR offset)." },
+                    "offset": { "type": "integer", "description": "Byte offset WITHIN the source region/file (default 0)" },
                     "len":    { "type": "integer", "description": "Number of bytes to decode (capped at 65536)" },
                     "format": { "type": "string", "description": "Tile pixel format: 2bpp | nes_chr (NES, 16 B/tile, 4 colors) or 4bpp | genesis (Genesis, 32 B/tile, 16 colors)" },
                     "tiles_per_row": { "type": "integer", "description": "Tiles laid out per row in the image grid (default 16, max 64)" }
@@ -1202,7 +1240,7 @@ impl RetroMcpServer {
             let schema = json!({
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "description": "What to scan: an exact region NAME (see app://memory-map), or a convenience: \"rom\" / \"vram\" / \"memory\" (first ROM/VRAM/any backed region). Default \"rom\"." },
+                    "source": { "type": "string", "description": "What to scan: an exact region NAME (see app://memory-map); a convenience \"rom\" / \"vram\" / \"memory\" (first ROM/VRAM/any backed region); or \"rom_file\" — the on-disk CART file (scans content the core hides, e.g. NES PRG+CHR). Default \"rom\"." },
                     "window": { "type": "integer", "description": "Sampling window in bytes (default 4096, min 256, max 65536). Smaller = finer boundaries, more candidates." }
                 },
                 "required": []
@@ -1324,7 +1362,9 @@ impl RetroMcpServer {
                  This is the visual evidence stream that COMPLEMENTS vram_to_rom (a raw \
                  byte-content match): rendering survives compressed / re-bitplaned graphics \
                  where verbatim hex matching fails, because it judges PIXELS not bytes. Use \
-                 both for convergent evidence. `source` is a region NAME or rom/vram/memory; \
+                 both for convergent evidence. `source` is a region NAME, rom/vram/memory, or \
+                 \"rom_file\" (the on-disk CART — decodes graphics the core HIDES, e.g. NES \
+                 CHR-ROM at its iNES file offset); \
                  `format` is 2bpp|nes_chr (NES, 16 B/tile) or 4bpp|genesis (Genesis, 32 B/tile, \
                  generic 4bpp planar — approximate for CPS2). Palette is unknown by default, so \
                  a grayscale ramp is used to expose structure. Read-only (no enable_writes).",
@@ -1341,7 +1381,8 @@ impl RetroMcpServer {
                  reasoning per span, plus a per-kind byte composition. These are HEURISTICS \
                  (confidence guess/likely) — corroborate with render_tiles (eyeball 'graphics'), \
                  the PC heatmap (confirm 'code'), and vram_to_rom (content match). `source` is a \
-                 region NAME or rom/vram/memory (default rom). Read-only (no enable_writes).",
+                 region NAME, rom/vram/memory (default rom), or \"rom_file\" (the on-disk CART — \
+                 scans content the core hides, e.g. NES PRG+CHR). Read-only (no enable_writes).",
                 scan_regions_schema(),
             ),
             Tool::new(
@@ -2113,6 +2154,38 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn rom_file_source_resolves_to_retained_bytes() {
+        let mut ds = DebugState::new();
+        ds.rom_name = Some("tmnt".into());
+        ds.rom_bytes = Some(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(ds)));
+
+        // All accepted spellings resolve to the retained cart bytes.
+        for tok in ["rom_file", "romfile", "ROM-FILE", " file "] {
+            let (name, start, kind, bytes) =
+                srv.resolve_source_bytes(tok).expect("rom_file should resolve");
+            assert_eq!(start, 0, "tok {tok:?}");
+            assert_eq!(kind, "ROMFILE", "tok {tok:?}");
+            assert_eq!(bytes, vec![1, 2, 3, 4, 5, 6, 7, 8], "tok {tok:?}");
+            assert!(name.contains("tmnt"), "name {name:?}");
+        }
+
+        // Token recognition is distinct from the region aliases.
+        assert!(RetroMcpServer::is_rom_file_source("rom_file"));
+        assert!(!RetroMcpServer::is_rom_file_source("rom"));
+        assert!(!RetroMcpServer::is_rom_file_source("vram"));
+        assert!(!RetroMcpServer::is_rom_file_source("PRG ROM"));
+    }
+
+    #[test]
+    fn rom_file_source_errors_when_no_rom_available() {
+        // No bytes, no path → honest error (not a panic, not empty bytes).
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let err = srv.resolve_source_bytes("rom_file").unwrap_err();
+        assert!(err.contains("no ROM file"), "err {err:?}");
     }
 
     #[test]
