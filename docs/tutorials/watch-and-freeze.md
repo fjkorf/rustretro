@@ -40,8 +40,8 @@ known address into a practice tool — infinite meter, frozen timer, locked roun
 
 ## See also
 
-- [RAM Search](ram-search.md) — how to *find* the address before you watch it.
-- [Tracking Changes](tracking-changes.md) — once watched, find the code that writes it.
+- [RAM Search](/docs/tutorials/ram-search.md) — how to *find* the address before you watch it.
+- [Tracking Changes](/docs/tutorials/tracking-changes.md) — once watched, find the code that writes it.
 
 <!-- litui:live
 When litui is integrated, this page gains live embeds:

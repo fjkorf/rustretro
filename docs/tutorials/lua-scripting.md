@@ -73,9 +73,9 @@ The shipped template proves the whole pipeline end-to-end:
 
 The commented block at the bottom of the demo is the real shape: read a box count from
 object RAM, loop, read each box's edges with `memory.read_s16_be`, and draw it. Find
-those object-RAM addresses with [RAM Search](ram-search.md) and
-[Tracking Changes](tracking-changes.md), read pixel coordinates with the
-[Frame Inspector](tiles-and-frames.md) picker, then:
+those object-RAM addresses with [RAM Search](/docs/tutorials/ram-search.md) and
+[Tracking Changes](/docs/tutorials/tracking-changes.md), read pixel coordinates with the
+[Frame Inspector](/docs/tutorials/tiles-and-frames.md) picker, then:
 
 ```lua
 local count = memory.read_u8(0xFFB000)
@@ -100,8 +100,8 @@ what this whole instrument is for.
 
 ## See also
 
-- [RAM Search](ram-search.md) / [Tracking Changes](tracking-changes.md) — find the object-RAM addresses to read.
-- [Tiles & Frames](tiles-and-frames.md) — pixel-pick coordinates in the same game-pixel space your script draws in.
+- [RAM Search](/docs/tutorials/ram-search.md) / [Tracking Changes](/docs/tutorials/tracking-changes.md) — find the object-RAM addresses to read.
+- [Tiles & Frames](/docs/tutorials/tiles-and-frames.md) — pixel-pick coordinates in the same game-pixel space your script draws in.
 
 <!-- litui:live
 When litui is integrated, this page gains live embeds:

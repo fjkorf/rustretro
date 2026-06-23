@@ -29,8 +29,8 @@ mute keeps you sane without quitting the emulator or touching your OS mixer.
 
 ## See also
 
-- [Getting Started](getting-started.md) — the `--no-audio` launch flag.
-- [The Docking Workspace](docking-workspace.md) — dock the Audio tab wherever suits you.
+- [Getting Started](/docs/tutorials/getting-started.md) — the `--no-audio` launch flag.
+- [The Docking Workspace](/docs/tutorials/docking-workspace.md) — dock the Audio tab wherever suits you.
 
 <!-- litui:live
 This is the most natural litui-native page: mute/volume are pure list/form/display, so when litui is

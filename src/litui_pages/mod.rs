@@ -51,3 +51,49 @@ impl Default for LituiPages {
         Self { md, open: false }
     }
 }
+
+// ─── Wave D: tutorials as in-app litui pages (Help → Tutorials) ──────────────
+//
+// The 14 task-oriented tutorial pages in `docs/tutorials/` are already authored
+// in litui dialect (YAML `page:` frontmatter). This mounts them as a SECOND,
+// read-only litui app — no live binding needed, they are static document pages.
+// Shares the `_tutorials.md` parent for common styles. Gated by F8.
+
+/// The litui app generated from the tutorial Markdown pages. Excludes the index
+/// `README.md` (the GitHub index, not a mountable page) and `_tutorials.md`
+/// (the parent). Exactly one page (`getting-started`) is `default: true`.
+pub mod tutorials {
+    use bevy_egui::egui;
+    use litui::*;
+
+    define_markdown_app! {
+        parent: "docs/tutorials/_tutorials.md",
+        "docs/tutorials/getting-started.md",
+        "docs/tutorials/docking-workspace.md",
+        "docs/tutorials/watch-and-freeze.md",
+        "docs/tutorials/ram-search.md",
+        "docs/tutorials/tracking-changes.md",
+        "docs/tutorials/hex-dump.md",
+        "docs/tutorials/disassembly-and-breakpoints.md",
+        "docs/tutorials/regions-heatmap-bookmarks.md",
+        "docs/tutorials/cpu-registers.md",
+        "docs/tutorials/tiles-and-frames.md",
+        "docs/tutorials/vdp-registers.md",
+        "docs/tutorials/input-and-triggers.md",
+        "docs/tutorials/audio.md",
+        "docs/tutorials/lua-scripting.md",
+    }
+}
+
+/// Bevy `Resource` wrapping the tutorials litui app plus its F8 visibility flag.
+#[derive(Resource)]
+pub struct TutorialPages {
+    pub md: tutorials::MdApp,
+    pub open: bool,
+}
+
+impl Default for TutorialPages {
+    fn default() -> Self {
+        Self { md: tutorials::MdApp::default(), open: false }
+    }
+}

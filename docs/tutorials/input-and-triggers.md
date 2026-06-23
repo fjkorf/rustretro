@@ -35,7 +35,7 @@ Two panels: **🕹 Input** (history) and **⏸ Triggers** (pause conditions).
    super flash always starts at frame 1820").
 
 6. **Pause When Pixel Changes** — enter an `X` / `Y` (use the
-   [Frame Inspector](tiles-and-frames.md) pixel picker to read coordinates) and **Set**.
+   [Frame Inspector](/docs/tutorials/tiles-and-frames.md) pixel picker to read coordinates) and **Set**.
    The run loop pauses the frame that pixel changes — e.g. watch a health-bar pixel and
    stop on the exact frame damage registers.
 
@@ -52,8 +52,8 @@ timeline lets you read the inputs that got you there.
 
 ## See also
 
-- [Tiles & Frames](tiles-and-frames.md) — pick the pixel coordinates for a pixel trigger.
-- [Disassembly & Breakpoints](disassembly-and-breakpoints.md) — once paused on the frame, step into the code.
+- [Tiles & Frames](/docs/tutorials/tiles-and-frames.md) — pick the pixel coordinates for a pixel trigger.
+- [Disassembly & Breakpoints](/docs/tutorials/disassembly-and-breakpoints.md) — once paused on the frame, step into the code.
 
 <!-- litui:live
 When litui is integrated, this page gains live embeds:

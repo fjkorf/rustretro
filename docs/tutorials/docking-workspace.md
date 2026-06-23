@@ -54,8 +54,8 @@ Disasm, Hex, and CPU all land on the same address together — no hunting, no re
 
 ## See also
 
-- [Getting Started](getting-started.md) — first tour of the toolbar and panels.
-- [Disassembly & Breakpoints](disassembly-and-breakpoints.md) — the central panel most jumps land in.
+- [Getting Started](/docs/tutorials/getting-started.md) — first tour of the toolbar and panels.
+- [Disassembly & Breakpoints](/docs/tutorials/disassembly-and-breakpoints.md) — the central panel most jumps land in.
 
 <!-- litui:live
 This page is pure prose about arranging the dock — it has no meaningful live embed.

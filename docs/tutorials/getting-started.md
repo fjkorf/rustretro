@@ -56,8 +56,8 @@ of using an instrument instead of a player.
 
 ## See also
 
-- [The Docking Workspace](docking-workspace.md) — rearrange and save your layout.
-- [RAM Search](ram-search.md) — your first real hunt: the health bar.
+- [The Docking Workspace](/docs/tutorials/docking-workspace.md) — rearrange and save your layout.
+- [RAM Search](/docs/tutorials/ram-search.md) — your first real hunt: the health bar.
 
 <!-- litui:live
 When litui is integrated, this page gains live embeds:

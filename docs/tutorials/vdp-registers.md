@@ -46,13 +46,13 @@ elsewhere can be understood by reading the matching row here.
 ## Why it matters
 
 Even un-wired, the decoder is a quick reference for what each register byte *means* —
-useful the moment you find VDP-related values via [RAM Search](ram-search.md) or a
-[Lua script](lua-scripting.md), or trace control-port writes in the disassembly.
+useful the moment you find VDP-related values via [RAM Search](/docs/tutorials/ram-search.md) or a
+[Lua script](/docs/tutorials/lua-scripting.md), or trace control-port writes in the disassembly.
 
 ## See also
 
-- [Tiles & Frames](tiles-and-frames.md) — see the VRAM data the registers point at.
-- [Hex Dump](hex-dump.md) — inspect VRAM/CRAM blocks directly.
+- [Tiles & Frames](/docs/tutorials/tiles-and-frames.md) — see the VRAM data the registers point at.
+- [Hex Dump](/docs/tutorials/hex-dump.md) — inspect VRAM/CRAM blocks directly.
 
 <!-- litui:live
 When litui is integrated, this page COULD gain a live [display] of the 24 VDP register Raw/Decoded rows

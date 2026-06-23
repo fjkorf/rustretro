@@ -21,7 +21,7 @@ Open the **🔧 CPU** tab.
 
 2. **Watch the deltas.** Any register that changed since the previous frame is tinted
    yellow; unchanged ones stay light gray (the PC highlights yellow when it moved too).
-   Pause and **Step** in [Disassembly](disassembly-and-breakpoints.md) and watch which
+   Pause and **Step** in [Disassembly](/docs/tutorials/disassembly-and-breakpoints.md) and watch which
    registers light up per instruction — that's the data flow, made visible.
 
 3. **Status flags.** The **Status Register Flags** section breaks SR into `T S M I`
@@ -42,8 +42,8 @@ hit/block branch turns on — turning raw instructions into understood logic.
 
 ## See also
 
-- [Disassembly & Breakpoints](disassembly-and-breakpoints.md) — step the code that moves these registers.
-- [Regions, Heatmap & Bookmarks](regions-heatmap-bookmarks.md) — snapshot a register state into a bookmark.
+- [Disassembly & Breakpoints](/docs/tutorials/disassembly-and-breakpoints.md) — step the code that moves these registers.
+- [Regions, Heatmap & Bookmarks](/docs/tutorials/regions-heatmap-bookmarks.md) — snapshot a register state into a bookmark.
 
 <!-- litui:live
 When litui is integrated, this page gains live embeds:

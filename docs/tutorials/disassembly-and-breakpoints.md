@@ -47,8 +47,8 @@ Disassembly needs the core to expose its code bytes. For arcade cores it pulls 2
 bytes at PC via `SekFetchByte`; otherwise it walks the `SET_MEMORY_MAPS` regions. If a
 core exposes neither, you'll see *"No code bytes — core does not expose memory via
 SekFetchByte or SET_MEMORY_MAPS."* That's correct, not a bug. Workaround: read the
-bytes by hand in the [Hex Dump](hex-dump.md) at the PC shown in the
-[CPU Registers](cpu-registers.md) panel.
+bytes by hand in the [Hex Dump](/docs/tutorials/hex-dump.md) at the PC shown in the
+[CPU Registers](/docs/tutorials/cpu-registers.md) panel.
 
 ## Why it matters
 
@@ -57,8 +57,8 @@ exact instruction stores the damage" — the difference between a guess and a fi
 
 ## See also
 
-- [Tracking Changes](tracking-changes.md) — get a PC lead before you breakpoint.
-- [Regions, Heatmap & Bookmarks](regions-heatmap-bookmarks.md) — manage the ranges you label.
+- [Tracking Changes](/docs/tutorials/tracking-changes.md) — get a PC lead before you breakpoint.
+- [Regions, Heatmap & Bookmarks](/docs/tutorials/regions-heatmap-bookmarks.md) — manage the ranges you label.
 
 <!-- litui:live
 When litui is integrated, this page gains live embeds:

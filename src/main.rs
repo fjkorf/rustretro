@@ -18,7 +18,7 @@ use clap::Parser;
 use debug::{DebugState, SharedDebugState};
 use debug::panels::script_panel::ScriptPanel;
 use frontend::Frontend;
-use litui_pages::LituiPages;
+use litui_pages::{LituiPages, TutorialPages};
 use lua_engine::LuaEngine;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -154,9 +154,10 @@ fn main() -> Result<()> {
         .insert_non_send_resource(LuaRes(lua_engine))
         .insert_resource(ScriptPanel::new())
         .init_resource::<LituiPages>()
+        .init_resource::<TutorialPages>()
         .add_systems(Startup, setup)
         .add_systems(Update, (read_input, run_emulation, run_scripts, drain_lua_requests, sync_video, queue_audio, update_title).chain())
-        .add_systems(EguiPrimaryContextPass, (show_debug, show_script_panel, show_litui_pages))
+        .add_systems(EguiPrimaryContextPass, (show_debug, show_script_panel, show_litui_pages, show_tutorial_pages))
         .run();
 
     Ok(())
@@ -200,6 +201,7 @@ fn read_input(
     debug_state: Res<DebugStateRes>,
     mut script_panel: ResMut<ScriptPanel>,
     mut litui: ResMut<LituiPages>,
+    mut tutorials: ResMut<TutorialPages>,
 ) {
     use KeyCode::*;
     emu.0.set_input([
@@ -233,6 +235,9 @@ fn read_input(
     }
     if keys.just_pressed(F9) {
         litui.open = !litui.open;
+    }
+    if keys.just_pressed(F8) {
+        tutorials.open = !tutorials.open;
     }
 }
 
@@ -422,6 +427,18 @@ fn show_litui_pages(
     sync_litui_pages(&mut litui, &debug_state.0, &mut audio.0);
     if let Ok(ctx) = ctx.ctx_mut() {
         litui.md.show_all(ctx);
+    }
+}
+
+/// Wave D: render the in-app tutorials (Help → Tutorials). These are static
+/// litui document pages authored in `docs/tutorials/` — no live binding needed.
+/// Gated by F8; a no-op when closed, so existing behaviour is unchanged.
+fn show_tutorial_pages(mut ctx: EguiContexts, mut tutorials: ResMut<TutorialPages>) {
+    if !tutorials.open {
+        return;
+    }
+    if let Ok(ctx) = ctx.ctx_mut() {
+        tutorials.md.show_all(ctx);
     }
 }
 
