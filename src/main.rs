@@ -44,6 +44,8 @@ struct Args {
     #[arg(long)] mcp: bool,
     /// TCP port for the MCP server (only used with --mcp).
     #[arg(long, value_name = "N", default_value = "4000")] mcp_port: u16,
+    /// Run with no window — emulator + MCP server only (for AI/agent-driven sessions). Implies --mcp.
+    #[arg(long)] headless: bool,
 }
 
 // ─── Bevy resources ──────────────────────────────────────────────────────────
@@ -72,7 +74,14 @@ struct AudioRes(AudioOutput);
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Headless without MCP is pointless (no window AND no agent channel). Auto-
+    // enable MCP so `--headless` alone is sufficient for an agent-driven session.
+    if args.headless && !args.mcp {
+        args.mcp = true;
+        eprintln!("[headless] --headless implies --mcp; enabling MCP server.");
+    }
 
     // Run Capstone test if requested
     if args.test_capstone {
@@ -129,6 +138,14 @@ fn main() -> Result<()> {
         mcp::spawn_mcp_server(Arc::clone(&debug_state), args.mcp_port);
     }
 
+    // Headless mode: no window, no Bevy, no GPU. Run the emulator + Lua + MCP
+    // round-trip on a plain main-thread loop. The MCP server was spawned above
+    // (headless implies --mcp), so an agent connects exactly as in GUI mode —
+    // there's just no window to crash or close. Return before building the App.
+    if args.headless {
+        return run_headless(frontend, lua_engine, debug_state, &args);
+    }
+
     let fullscreen = if args.fullscreen {
         bevy::window::WindowMode::BorderlessFullscreen(MonitorSelection::Primary)
     } else {
@@ -161,6 +178,74 @@ fn main() -> Result<()> {
         .run();
 
     Ok(())
+}
+
+// ─── Headless mode (AI/agent-driven, no window) ──────────────────────────────
+
+/// Run the emulator with NO GUI: a plain loop on the MAIN thread that ticks the
+/// core + Lua frame callbacks and services the MCP `run_lua` round-trip, while
+/// the MCP server (spawned in `main`) drives it from its own thread via the
+/// shared `Arc<Mutex<DebugState>>`. Frontend and LuaEngine are !Send/main-thread
+/// (libretro requires synchronous single-thread); they stay here and never move.
+///
+/// This replicates the non-GUI parts of the Bevy Update chain
+/// (`run_emulation` → `run_scripts` → `drain_lua_requests`) so that MCP pause,
+/// resume, step, memory reads, and `run_lua` all work identically — they read /
+/// write `DebugState`, which this loop services every frame.
+fn run_headless(
+    mut frontend: Frontend,
+    mut lua_engine: LuaEngine,
+    debug_state: SharedDebugState,
+    args: &Args,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let fps = frontend.fps().max(1.0);
+    let frame_dur = Duration::from_secs_f64(1.0 / fps);
+
+    eprintln!(
+        "[headless] running {fps:.0} fps, no window. MCP on http://127.0.0.1:{}/mcp. Ctrl-C to stop.",
+        args.mcp_port
+    );
+
+    loop {
+        let start = Instant::now();
+
+        // (a) Tick the core one frame. run_frame() honours pause/step/trigger
+        //     flags in DebugState internally, so MCP pause/resume/step work.
+        let _ = frontend.run_frame();
+
+        // (b) Lua per-frame callbacks. Headless has no framebuffer to composite
+        //     onto, so we drain the draw-cmd buffer (so it can't grow unbounded)
+        //     but skip the GUI compositing that run_scripts does.
+        let _ = lua_engine.run_frame_callbacks();
+        let _ = lua_engine.take_draw_cmds();
+
+        // (c) Service the MCP run_lua round-trip — same logic as the GUI's
+        //     drain_lua_requests system. WITHOUT this, MCP `run_lua` hangs (its
+        //     5s poll times out). Runs even while paused, so an agent can pause
+        //     then probe the running app.
+        let pending = {
+            match debug_state.lock() {
+                Ok(mut ds) => ds.pending_lua.take(),
+                Err(_) => None,
+            }
+        };
+        if let Some(script) = pending {
+            let result = lua_engine.eval_to_string(&script);
+            if let Ok(mut ds) = debug_state.lock() {
+                ds.pending_lua_result = Some(result);
+            }
+        }
+
+        // (d) Frame pacing: sleep the remainder of the frame budget. When the
+        //     core is paused, run_frame() returned early (cheap), so this still
+        //     paces the loop at ~fps — the agent keeps a responsive run_lua /
+        //     memory-read channel while paused.
+        if let Some(rem) = frame_dur.checked_sub(start.elapsed()) {
+            std::thread::sleep(rem);
+        }
+    }
 }
 
 // ─── Startup ─────────────────────────────────────────────────────────────────
