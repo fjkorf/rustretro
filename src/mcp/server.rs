@@ -36,7 +36,7 @@ use serde_json::{json, Map, Value};
 use crate::debug::{SharedDebugState, Watch, WatchFormat};
 use crate::mcp::snapshot::{
     decode_tiles_to_rgba, memory_capability, memory_map, parse_hex_bytes, read_region_bytes,
-    rgba_to_png, search_bytes, top_heatmap, AiSnapshot, TileFormat,
+    rgba_to_png, scan_buffer, search_bytes, top_heatmap, AiSnapshot, TileFormat,
 };
 
 /// How long the `run_lua` tool waits for the main thread to execute a script
@@ -65,6 +65,19 @@ const DEFAULT_TILES_PER_ROW: usize = 16;
 /// Hard cap on `tiles_per_row` so a pathological value can't make a 1-pixel-tall
 /// mile-wide image.
 const MAX_TILES_PER_ROW: usize = 64;
+/// Default window size (bytes) for `scan_regions` statistical sampling. 4 KB is
+/// large enough for entropy to be meaningful, small enough to localize a region
+/// boundary to within a few KB.
+const DEFAULT_SCAN_WINDOW: usize = 4 * 1024;
+/// Floor on the `scan_regions` window so tiny windows can't make entropy noise.
+const MIN_SCAN_WINDOW: usize = 256;
+/// Ceiling on the `scan_regions` window so a huge window can't collapse a whole
+/// ROM into one coarse verdict.
+const MAX_SCAN_WINDOW: usize = 64 * 1024;
+/// Cap on total bytes `scan_regions` will analyze in one call, so scanning a
+/// multi-MB ROM stays bounded. Larger regions are scanned up to this prefix and
+/// the result flags the truncation.
+const MAX_SCAN_LEN: usize = 8 * 1024 * 1024;
 /// Sentinel error prefix emitted by [`RetroMcpServer::clone_region_bytes`] when a
 /// region is declared but backed by no readable host memory (a virtual/garbage
 /// descriptor). Format: `"<prefix>:<region_name>"`.
@@ -632,6 +645,96 @@ impl RetroMcpServer {
         }
     }
 
+    /// `scan_regions`: the STRUCTURE / statistical-signature evidence stream.
+    /// Window a region's bytes and propose what KIND each span looks like
+    /// (padding / text / packed / table / graphics / code) from cheap signatures
+    /// (Shannon entropy, byte-histogram, printable/fill fractions), so the agent
+    /// can ORIENT inside an unknown ROM before zeroing in with the precise
+    /// streams (`render_tiles`, `vram_to_rom`, the PC heatmap).
+    ///
+    /// `source` resolves via the same SAFE region path as `render_tiles` (exact
+    /// region name, or "rom"/"vram"/"memory"). Bytes are cloned under a brief lock
+    /// (via [`clone_region_bytes`] → `safe_host_ptr`), capped at [`MAX_SCAN_LEN`],
+    /// then analysed UNLOCKED. READ-ONLY: no write gate. The proposals are
+    /// HEURISTICS (`confidence` = `guess`/`likely`) — convergent evidence, not a
+    /// verdict.
+    fn scan_regions(&self, source: &str, window: usize) -> Result<CallToolResult, ErrorData> {
+        let window = window.clamp(MIN_SCAN_WINDOW, MAX_SCAN_WINDOW);
+
+        let region_name = self
+            .resolve_render_source(source)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+
+        let (start, kind, all_bytes) = match self.clone_region_bytes(&region_name) {
+            Ok(t) => t,
+            Err(e) if e.starts_with(REGION_UNBACKED) => {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "region '{region_name}' is declared but not backed by readable memory \
+                         (virtual descriptor)"
+                    ),
+                    None,
+                ))
+            }
+            Err(e) => return Err(ErrorData::invalid_params(e, None)),
+        };
+
+        // Bound the work: scan at most MAX_SCAN_LEN bytes (the prefix), flag if
+        // the region is larger so the agent knows the tail wasn't analysed.
+        let truncated = all_bytes.len() > MAX_SCAN_LEN;
+        let span = &all_bytes[..all_bytes.len().min(MAX_SCAN_LEN)];
+
+        let candidates = scan_buffer(span, window);
+
+        // Project each candidate to absolute guest addresses and a compact shape.
+        let regions: Vec<Value> = candidates
+            .iter()
+            .map(|c| {
+                json!({
+                    "kind": c.kind,
+                    "confidence": c.confidence,
+                    "addr_start": format!("0x{:X}", start + c.start),
+                    "addr_end": format!("0x{:X}", start + c.end),
+                    "offset": format!("0x{:X}", c.start),
+                    "len": c.len,
+                    "windows": c.windows,
+                    "mean_entropy": (c.mean_entropy * 100.0).round() / 100.0,
+                    "reason": c.reason,
+                })
+            })
+            .collect();
+
+        // Per-kind byte tally so the agent gets a one-glance composition.
+        let mut tally: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for c in &candidates {
+            *tally.entry(c.kind).or_insert(0) += c.len;
+        }
+        let composition: Map<String, Value> = tally
+            .into_iter()
+            .map(|(k, bytes)| (k.to_string(), json!(bytes)))
+            .collect();
+
+        let out = json!({
+            "source": source,
+            "region": region_name,
+            "region_kind": kind,
+            "region_addr_start": format!("0x{:X}", start),
+            "bytes_scanned": span.len(),
+            "region_size": all_bytes.len(),
+            "truncated": truncated,
+            "window": window,
+            "candidate_count": candidates.len(),
+            "composition_bytes": composition,
+            "candidates": regions,
+            "note": "Heuristic STRUCTURE stream: entropy/histogram signatures propose a KIND \
+                     per span. Corroborate before trusting — render_tiles to eyeball 'graphics', \
+                     the PC heatmap to confirm 'code', vram_to_rom for content match. Convergence \
+                     promotes a finding to confirmed.",
+        });
+
+        Ok(CallToolResult::success(vec![Self::json_content(&out)?]))
+    }
+
     /// Set the `paused` control flag. Safe — cannot corrupt memory.
     fn set_paused(&self, paused: bool) -> Value {
         if let Ok(mut ds) = self.debug.lock() {
@@ -1083,6 +1186,18 @@ impl RetroMcpServer {
             });
             Arc::new(schema.as_object().unwrap().clone())
         };
+        // Schema for { source, window? } (scan_regions).
+        let scan_regions_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "What to scan: an exact region NAME (see app://memory-map), or a convenience: \"rom\" / \"vram\" / \"memory\" (first ROM/VRAM/any backed region). Default \"rom\"." },
+                    "window": { "type": "integer", "description": "Sampling window in bytes (default 4096, min 256, max 65536). Smaller = finer boundaries, more candidates." }
+                },
+                "required": []
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
         let run_lua_schema = || -> Arc<Map<String, Value>> {
             let schema = json!({
                 "type": "object",
@@ -1203,6 +1318,20 @@ impl RetroMcpServer {
                  generic 4bpp planar — approximate for CPS2). Palette is unknown by default, so \
                  a grayscale ramp is used to expose structure. Read-only (no enable_writes).",
                 render_tiles_schema(),
+            ),
+            Tool::new(
+                "scan_regions",
+                "STRUCTURE RE primitive: window a region's bytes and propose what KIND each span \
+                 looks like (padding / text_table / packed_data / lookup_table / graphics / code) \
+                 from cheap statistical signatures — Shannon entropy, byte-histogram spikiness, \
+                 printable/fill fractions. Use this to ORIENT inside an unknown ROM ('this 512 KB \
+                 span looks like packed sprite data') BEFORE zeroing in with the precise streams. \
+                 Returns coalesced candidate spans with absolute addresses, mean entropy, and the \
+                 reasoning per span, plus a per-kind byte composition. These are HEURISTICS \
+                 (confidence guess/likely) — corroborate with render_tiles (eyeball 'graphics'), \
+                 the PC heatmap (confirm 'code'), and vram_to_rom (content match). `source` is a \
+                 region NAME or rom/vram/memory (default rom). Read-only (no enable_writes).",
+                scan_regions_schema(),
             ),
             Tool::new(
                 "list_watches",
@@ -1428,7 +1557,11 @@ impl ServerHandler for RetroMcpServer {
              it decodes a ROM/VRAM span AS tiles (NES 2bpp / Genesis 4bpp) and returns a PNG \
              IMAGE so you can SEE the graphics and visually compare a candidate ROM region to \
              the sprite on app://screen — it survives compressed / re-bitplaned graphics where \
-             vram_to_rom's verbatim byte match fails, so use BOTH for convergent evidence. To \
+             vram_to_rom's verbatim byte match fails, so use BOTH for convergent evidence. \
+             scan_regions is the THIRD, STRUCTURE stream: it windows a region and proposes a \
+             KIND per span (packed/code/graphics/table/text/padding) from entropy + histogram \
+             signatures, so you can ORIENT in an unknown ROM before zeroing in — corroborate its \
+             guesses with render_tiles / the heatmap / vram_to_rom. To \
              answer 'which ROM holds the on-screen sprites': enumerate \
              the on-screen sprites' tile refs by writing a game-specific probe with run_lua \
              (see examples/cps2_oam_probe.lua), read those tiles out of VRAM with read_region, \
@@ -1566,6 +1699,12 @@ impl ServerHandler for RetroMcpServer {
                     let tiles_per_row =
                         get_u("tiles_per_row").unwrap_or(DEFAULT_TILES_PER_ROW as u64) as usize;
                     this.render_tiles(source, offset, len, format, tiles_per_row)
+                }
+                "scan_regions" => {
+                    // `source` defaults to "rom" (the structure stream's usual target).
+                    let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("rom");
+                    let window = get_u("window").unwrap_or(DEFAULT_SCAN_WINDOW as u64) as usize;
+                    this.scan_regions(source, window)
                 }
                 "list_watches" => {
                     let watches = { this.lock_read()?.watches.clone() };
