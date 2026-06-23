@@ -250,6 +250,34 @@ pub struct MemoryRegion {
 }
 
 impl MemoryRegion {
+    /// Synthesize a flat memory region backed by a real host pointer.
+    ///
+    /// Used by the SET_MEMORY_MAPS fallback (see Frontend::apply_memory_map_fallback)
+    /// when a core publishes no memory map but does expose
+    /// retro_get_memory_data/size. The region is a simple identity mapping:
+    /// guest addr `base..=base+size-1` maps to host `ptr+0..ptr+size-1`
+    /// (offset/select/disconnect all 0), so `safe_host_ptr` accepts in-bounds
+    /// reads and rejects out-of-bounds ones.
+    pub fn synth_region(
+        name: impl Into<String>,
+        base: usize,
+        size: usize,
+        ptr: usize,
+        flags: u64,
+    ) -> MemoryRegion {
+        MemoryRegion {
+            name: name.into(),
+            addr_start: base,
+            addr_end: base + size.saturating_sub(1),
+            size,
+            flags,
+            ptr,
+            offset: 0,
+            select: 0,
+            disconnect: 0,
+        }
+    }
+
     /// Compute host pointer for an emulated address within this region.
     pub fn host_ptr_for_addr(&self, emu_addr: usize) -> Option<usize> {
         if emu_addr < self.addr_start || emu_addr > self.addr_end {
@@ -820,6 +848,37 @@ mod tests {
         // A descriptor with a non-null but bogus pointer and zero size -> rejected.
         let bogus = region("Bogus", 0x6000, 0, 0xdeadbeef);
         assert!(bogus.safe_host_ptr(0x6000, 1).is_none());
+    }
+
+    #[test]
+    fn synth_region_accepts_in_bounds_rejects_out_of_bounds() {
+        // A real backing buffer standing in for the core's work-RAM block.
+        let buf = [0xAAu8; 64];
+        let p = buf.as_ptr() as usize;
+        const RETRO_MEMDESC_SYSTEM_RAM: u64 = 1 << 2;
+
+        // Mirror the fallback: System RAM at guest base 0, identity-mapped.
+        let r = MemoryRegion::synth_region("System RAM (fallback)", 0, buf.len(), p, RETRO_MEMDESC_SYSTEM_RAM);
+        assert_eq!(r.addr_start, 0);
+        assert_eq!(r.addr_end, buf.len() - 1);
+        assert_eq!(r.region_type(), "RAM");
+
+        // In-bounds reads resolve to the real host pointer.
+        assert_eq!(r.safe_host_ptr(0, 1), Some(p as *const u8));
+        assert_eq!(r.safe_host_ptr(buf.len() - 1, 1), Some((p + buf.len() - 1) as *const u8));
+        assert!(r.safe_host_ptr(0, buf.len()).is_some());
+
+        // Out-of-bounds reads are refused (no segfault).
+        assert!(r.safe_host_ptr(buf.len(), 1).is_none());          // past end addr
+        assert!(r.safe_host_ptr(buf.len() - 1, 2).is_none());      // straddles end
+        assert!(r.safe_host_ptr(0, buf.len() + 1).is_none());      // len overruns
+
+        // A VRAM region at a high non-overlapping base also reads correctly.
+        const RETRO_MEMDESC_VIDEO_RAM: u64 = 1 << 4;
+        let v = MemoryRegion::synth_region("Video RAM (fallback)", 0x1000_0000, buf.len(), p, RETRO_MEMDESC_VIDEO_RAM);
+        assert_eq!(v.region_type(), "VRAM");
+        assert_eq!(v.safe_host_ptr(0x1000_0000, 1), Some(p as *const u8));
+        assert!(v.safe_host_ptr(0, 1).is_none()); // base-0 addr not in VRAM region
     }
 
     /// Narrow a synthetic candidate set by applying `compare_passes` against a

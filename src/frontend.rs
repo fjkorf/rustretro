@@ -16,6 +16,8 @@ pub struct Frontend {
     pub frame_count: u64,
     debug_state: SharedDebugState,
     sidecar_path: Option<std::path::PathBuf>,
+    /// Ensures the SET_MEMORY_MAPS fallback synthesis runs at most once.
+    did_memory_fallback: bool,
 }
 
 impl Frontend {
@@ -51,6 +53,7 @@ impl Frontend {
             frame_count: 0,
             debug_state: Arc::clone(&debug_state),
             sidecar_path: sidecar_path.clone(),
+            did_memory_fallback: false,
         };
 
         // Store sidecar path in debug state and try to load existing data
@@ -88,6 +91,12 @@ impl Frontend {
 
         frontend._game_path_cstring = path_cstring;
 
+        // SET_MEMORY_MAPS env callbacks (if any) have already fired during
+        // load_game, so debug_state.memory_regions is now populated for cores
+        // that publish a map. For cores that DON'T (fbalpha2012, Genesis Plus
+        // GX, FBNeo), synthesize a region from retro_get_memory_data/size.
+        frontend.apply_memory_map_fallback();
+
         if let Ok(av_info) = frontend.core.get_av_info() {
             let w = av_info.geometry.base_width;
             let h = av_info.geometry.base_height;
@@ -99,6 +108,94 @@ impl Frontend {
         }
 
         Ok(frontend)
+    }
+
+    /// Synthesize memory regions for cores that never call SET_MEMORY_MAPS but
+    /// do implement retro_get_memory_data/size (fbalpha2012/CPS2, Genesis Plus
+    /// GX, FBNeo). Without this, the whole memory-perception layer (read_memory,
+    /// read_region, search_memory, Lua memory.read_*) has zero regions to
+    /// address.
+    ///
+    /// Runs at most once (guarded by `did_memory_fallback`). Purely additive: if
+    /// the core DID publish a map, `memory_regions` is non-empty and we return
+    /// without touching it.
+    fn apply_memory_map_fallback(&mut self) {
+        if self.did_memory_fallback {
+            return;
+        }
+
+        // If the core already published a real memory map, we're done — stop
+        // retrying. Otherwise we may need to retry on later frames: some cores
+        // (e.g. Genesis Plus GX) don't return a valid get_memory_data pointer
+        // until after the first retro_run, so a null result here must NOT
+        // permanently disable the fallback.
+        {
+            let ds = match self.debug_state.lock() {
+                Ok(ds) => ds,
+                Err(_) => return,
+            };
+            if !ds.memory_regions.is_empty() {
+                self.did_memory_fallback = true;
+                return;
+            }
+        }
+
+        let mut synthesized: Vec<crate::debug::MemoryRegion> = Vec::new();
+
+        // System work RAM at guest base 0 — the common case that unlocks
+        // work-RAM reads (e.g. Genesis MK II, CPS2 MvC).
+        let sysram_ptr = self.core.get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
+        let sysram_size = self.core.get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
+        if !sysram_ptr.is_null() && sysram_size > 0 {
+            synthesized.push(crate::debug::MemoryRegion::synth_region(
+                "System RAM (fallback)",
+                0,
+                sysram_size,
+                sysram_ptr as usize,
+                RETRO_MEMDESC_SYSTEM_RAM,
+            ));
+        }
+
+        // Video RAM if the core exposes it. Placed at a high, non-overlapping
+        // guest base so its addresses are distinct from System RAM; VRAM is
+        // addressed by region name anyway (vram_to_rom / read_region), so the
+        // exact base only needs to avoid colliding with System RAM (base 0).
+        const VRAM_FALLBACK_BASE: usize = 0x1000_0000;
+        let vram_ptr = self.core.get_memory_data(RETRO_MEMORY_VIDEO_RAM);
+        let vram_size = self.core.get_memory_size(RETRO_MEMORY_VIDEO_RAM);
+        if !vram_ptr.is_null() && vram_size > 0 {
+            synthesized.push(crate::debug::MemoryRegion::synth_region(
+                "Video RAM (fallback)",
+                VRAM_FALLBACK_BASE,
+                vram_size,
+                vram_ptr as usize,
+                RETRO_MEMDESC_VIDEO_RAM,
+            ));
+        }
+
+        if synthesized.is_empty() {
+            return;
+        }
+
+        if let Ok(mut ds) = self.debug_state.lock() {
+            // Re-check under the lock in case a map arrived meanwhile.
+            if !ds.memory_regions.is_empty() {
+                return;
+            }
+            for r in &synthesized {
+                ds.log(format!(
+                    "[mem] no core memory map; synthesized {} region: {} bytes @ host ptr 0x{:x}",
+                    r.region_type(),
+                    r.size,
+                    r.ptr,
+                ));
+            }
+            ds.memory_regions = synthesized;
+        }
+        // Only stop retrying once we've actually synthesized something (or the
+        // core published a map — handled above). A null get_memory_data at
+        // load time leaves did_memory_fallback false so we retry next frame.
+        self.did_memory_fallback = true;
     }
 
     fn setup_callbacks(&mut self) -> Result<()> {
@@ -380,6 +477,11 @@ impl Frontend {
 
     /// Run exactly one emulation frame. Returns true if a new video frame was produced.
     pub fn run_frame(&mut self) -> Result<bool> {
+        // Retry the memory-map fallback until it lands — some cores (Genesis
+        // Plus GX) only expose get_memory_data after the first retro_run. Cheap
+        // no-op once it has succeeded or a real map arrived.
+        self.apply_memory_map_fallback();
+
         // --- Check pause / triggers ---
         let paused = {
             let mut ds = self.debug_state.lock().unwrap();
