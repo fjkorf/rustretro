@@ -318,11 +318,33 @@ impl MemoryRegion {
         const RETRO_MEMDESC_SAVE_RAM: u64 = 1 << 3;
         const RETRO_MEMDESC_VIDEO_RAM: u64 = 1 << 4;
 
-        if self.flags & RETRO_MEMDESC_VIDEO_RAM != 0 { "VRAM" }
-        else if self.flags & RETRO_MEMDESC_SAVE_RAM != 0 { "SRAM" }
-        else if self.flags & RETRO_MEMDESC_SYSTEM_RAM != 0 { "RAM" }
-        else if self.flags & RETRO_MEMDESC_CONST != 0 { "ROM" }
-        else { "Unmapped" }
+        // PRIMARY: descriptor flags (Genesis/CPS2 cores set these).
+        if self.flags & RETRO_MEMDESC_VIDEO_RAM != 0 { return "VRAM"; }
+        if self.flags & RETRO_MEMDESC_SAVE_RAM != 0 { return "SRAM"; }
+        if self.flags & RETRO_MEMDESC_SYSTEM_RAM != 0 { return "RAM"; }
+        if self.flags & RETRO_MEMDESC_CONST != 0 { return "ROM"; }
+
+        // FALLBACK: some cores (e.g. fceumm/NES) publish named regions
+        // (OAM, PALRAM, NTARAM, PPUREG, …) without setting the flags the
+        // classifier expects, so they'd otherwise all read as "Unmapped".
+        // Match on the region NAME (case-insensitive substring). Order
+        // matters: more-specific video/save names are checked before the
+        // generic "RAM" catch so e.g. "PALRAM"/"NTARAM" land as VRAM, not RAM.
+        let name = self.name.to_ascii_uppercase();
+        let has = |needle: &str| name.contains(needle);
+
+        // Save/battery RAM (check before generic RAM/ROM).
+        if has("SRAM") || has("SAVE") || has("BATTERY") { return "SRAM"; }
+        // Video / PPU memory: sprite OAM, palette, nametables, CHR, generic VRAM.
+        if has("OAM") || has("SPRITE") || has("PAL") || has("NAM") || has("NTA")
+            || has("VRAM") || has("VIDEO") || has("CHR") || has("PPU") { return "VRAM"; }
+        // Program/cartridge ROM.
+        if has("ROM") || has("PRG") || has("CART") { return "ROM"; }
+        // Generic work/system RAM (checked last so it doesn't shadow VRAM names
+        // that also contain "RAM", e.g. PALRAM/NTARAM handled above).
+        if has("WRAM") || has("WORK") || has("RAM") { return "RAM"; }
+
+        "Unmapped"
     }
 
     /// Get color for this region type (for UI display).
@@ -454,6 +476,9 @@ pub struct DebugState {
     /// frontmatter `rom.sha1` identity key (§3). `None` for need_fullpath cores
     /// where the bytes aren't read into memory.
     pub rom_sha1: Option<String>,
+    /// Byte length of the loaded ROM, used to seed the scaffolded frontmatter
+    /// `rom.size`. `None` for need_fullpath cores where the bytes aren't read.
+    pub rom_size: Option<usize>,
 
     // --- Watches ---
     /// User-created memory watches (displayed in the Watch panel).
@@ -532,6 +557,7 @@ impl DebugState {
             rom_map_path: None,
             rom_name: None,
             rom_sha1: None,
+            rom_size: None,
             watches: Vec::new(),
             ram_search: RamSearch::new(),
             change_log: VecDeque::new(),
@@ -895,6 +921,31 @@ mod tests {
         assert_eq!(v.region_type(), "VRAM");
         assert_eq!(v.safe_host_ptr(0x1000_0000, 1), Some(p as *const u8));
         assert!(v.safe_host_ptr(0, 1).is_none()); // base-0 addr not in VRAM region
+    }
+
+    #[test]
+    fn region_type_name_fallback_classifies_unflagged_regions() {
+        // NES cores (fceumm) publish these named regions but DON'T set the
+        // RETRO_MEMDESC_* flags, so flag-only classification yields "Unmapped".
+        // The name fallback should recover the intended kind. `region()` builds
+        // a region with flags = 0.
+        assert_eq!(region("OAM", 0, 0x100, 0).region_type(), "VRAM");
+        assert_eq!(region("PALRAM", 0, 0x20, 0).region_type(), "VRAM");
+        assert_eq!(region("NTARAM", 0, 0x800, 0).region_type(), "VRAM");
+        assert_eq!(region("PPUREG", 0, 0x8, 0).region_type(), "VRAM");
+        assert_eq!(region("Work RAM", 0, 0x800, 0).region_type(), "RAM");
+        assert_eq!(region("WRAM", 0, 0x2000, 0).region_type(), "RAM");
+        assert_eq!(region("PRG ROM", 0, 0x8000, 0).region_type(), "ROM");
+        assert_eq!(region("Battery SRAM", 0, 0x2000, 0).region_type(), "SRAM");
+        // Unrecognized name with no flags still falls through to Unmapped.
+        assert_eq!(region("weird", 0, 0x10, 0).region_type(), "Unmapped");
+
+        // Flags remain the PRIMARY signal: a flagged region classifies the same
+        // as before regardless of its name (Genesis/CPS2 cores rely on this).
+        const RETRO_MEMDESC_SYSTEM_RAM: u64 = 1 << 2;
+        let mut flagged = region("anything", 0, 0x10, 0);
+        flagged.flags = RETRO_MEMDESC_SYSTEM_RAM;
+        assert_eq!(flagged.region_type(), "RAM");
     }
 
     /// Narrow a synthetic candidate set by applying `compare_passes` against a

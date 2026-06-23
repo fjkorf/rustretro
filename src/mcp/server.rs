@@ -35,8 +35,8 @@ use serde_json::{json, Map, Value};
 
 use crate::debug::{SharedDebugState, Watch, WatchFormat};
 use crate::mcp::snapshot::{
-    memory_capability, memory_map, parse_hex_bytes, read_region_bytes, rgba_to_png, search_bytes,
-    top_heatmap, AiSnapshot,
+    decode_tiles_to_rgba, memory_capability, memory_map, parse_hex_bytes, read_region_bytes,
+    rgba_to_png, search_bytes, top_heatmap, AiSnapshot, TileFormat,
 };
 
 /// How long the `run_lua` tool waits for the main thread to execute a script
@@ -56,6 +56,15 @@ const MAX_NEEDLE_LEN: usize = 256;
 const MAX_SEARCH_HITS: usize = 256;
 /// Number of hottest PCs returned by `app://heatmap`.
 const HEATMAP_TOP_N: usize = 64;
+/// Cap on bytes decoded by `render_tiles`, so the emitted PNG stays small enough
+/// to embed as a tool-result image (64 KB of ROM ≈ 4096 NES tiles → a 256-wide,
+/// 1024-tall grid at 16 tiles/row).
+const MAX_RENDER_TILES_LEN: usize = 64 * 1024;
+/// Default number of tiles laid out per row by `render_tiles`.
+const DEFAULT_TILES_PER_ROW: usize = 16;
+/// Hard cap on `tiles_per_row` so a pathological value can't make a 1-pixel-tall
+/// mile-wide image.
+const MAX_TILES_PER_ROW: usize = 64;
 /// Sentinel error prefix emitted by [`RetroMcpServer::clone_region_bytes`] when a
 /// region is declared but backed by no readable host memory (a virtual/garbage
 /// descriptor). Format: `"<prefix>:<region_name>"`.
@@ -473,6 +482,156 @@ impl RetroMcpServer {
         })
     }
 
+    /// `render_tiles`: decode a span of ROM/VRAM bytes AS tiles and return the
+    /// result as a PNG IMAGE so Claude can SEE it and visually compare a candidate
+    /// ROM region to what's on screen. This is the image-recognition evidence
+    /// stream that complements `vram_to_rom` (raw byte-content match): it survives
+    /// compressed / re-bitplaned graphics because it judges PIXELS, not bytes.
+    ///
+    /// `source` resolves to a byte span via the SAFE region path: a region NAME
+    /// (exact), or the conveniences "rom"/"vram"/"memory" (first ROM/VRAM/any
+    /// backed region). Bytes are cloned under a brief lock (via
+    /// [`clone_region_bytes`], which goes through `safe_host_ptr` — NEVER a blind
+    /// `from_raw_parts`), then decoded UNLOCKED. `len` is capped at
+    /// [`MAX_RENDER_TILES_LEN`]. READ-ONLY: no write gate needed.
+    ///
+    /// Returns an image `Content` (base64 PNG, mime `image/png` — the same
+    /// mechanism the `app://screen` resource uses to hand a viewable image to the
+    /// MCP client) plus a small text `Content` describing dimensions/tile count.
+    fn render_tiles(
+        &self,
+        source: &str,
+        offset: usize,
+        len: usize,
+        format: TileFormat,
+        tiles_per_row: usize,
+    ) -> Result<CallToolResult, ErrorData> {
+        let len = len.min(MAX_RENDER_TILES_LEN);
+        let tiles_per_row = tiles_per_row.clamp(1, MAX_TILES_PER_ROW);
+
+        // Resolve `source` to a concrete region name via a brief lock.
+        let region_name = self
+            .resolve_render_source(source)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+
+        // Clone the region bytes out (safe_host_ptr-guarded), then decode unlocked.
+        let (start, kind, all_bytes) = match self.clone_region_bytes(&region_name) {
+            Ok(t) => t,
+            Err(e) if e.starts_with(REGION_UNBACKED) => {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "region '{region_name}' is declared but not backed by readable memory \
+                         (virtual descriptor)"
+                    ),
+                    None,
+                ))
+            }
+            Err(e) => return Err(ErrorData::invalid_params(e, None)),
+        };
+
+        if offset >= all_bytes.len() {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "offset 0x{offset:X} is beyond region '{region_name}' (len 0x{:X})",
+                    all_bytes.len()
+                ),
+                None,
+            ));
+        }
+        let end = (offset + len).min(all_bytes.len());
+        let span = &all_bytes[offset..end];
+
+        let img = decode_tiles_to_rgba(span, format, tiles_per_row).ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!(
+                    "not enough bytes at offset 0x{offset:X} of '{region_name}' to decode even one \
+                     {format:?} tile"
+                ),
+                None,
+            )
+        })?;
+
+        let png = rgba_to_png(&img.rgba, img.width, img.height)
+            .ok_or_else(|| ErrorData::internal_error("tile PNG encoding failed", None))?;
+        let b64 = base64_encode(&png);
+
+        // Text part: orient the agent (what it's looking at).
+        let info = json!({
+            "source": source,
+            "region": region_name,
+            "kind": kind,
+            "format": format!("{format:?}"),
+            "region_addr_start": format!("0x{start:X}"),
+            "byte_offset": format!("0x{offset:X}"),
+            "abs_addr": format!("0x{:X}", start + offset),
+            "bytes_decoded": span.len(),
+            "tile_count": img.tile_count,
+            "tiles_per_row": tiles_per_row,
+            "image_px": format!("{}x{}", img.width, img.height),
+            "palette": "grayscale ramp (real palette unknown; structure-only)",
+            "note": "Visual evidence stream: compare this rendering to app://screen. \
+                     Complements vram_to_rom (byte-content match) — use both for \
+                     convergent evidence.",
+        });
+        let info_text = serde_json::to_string_pretty(&info)
+            .map_err(|e| ErrorData::internal_error(format!("serialize error: {e}"), None))?;
+
+        Ok(CallToolResult::success(vec![
+            Content::text(info_text),
+            Content::image(b64, "image/png"),
+        ]))
+    }
+
+    /// Resolve a `render_tiles` `source` token to a concrete region name. Accepts
+    /// an exact region name, or the conveniences "rom"/"vram"/"memory" (first
+    /// ROM/VRAM/any backed region, respectively). Returns an error string listing
+    /// the available regions when nothing matches.
+    fn resolve_render_source(&self, source: &str) -> Result<String, String> {
+        let ds = self
+            .debug
+            .lock()
+            .map_err(|_| "debug state lock poisoned".to_string())?;
+        // Exact name match first (case-insensitive).
+        if let Some(r) = ds
+            .memory_regions
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case(source))
+        {
+            return Ok(r.name.clone());
+        }
+        // Convenience aliases.
+        let want_kind = match source.trim().to_ascii_lowercase().as_str() {
+            "rom" => Some("ROM"),
+            "vram" => Some("VRAM"),
+            "memory" | "" => None, // first backed region of any kind
+            _ => {
+                let names: Vec<String> =
+                    ds.memory_regions.iter().map(|r| r.name.clone()).collect();
+                return Err(format!(
+                    "no region matches source '{source}'. Use a region name, or rom/vram/memory. \
+                     Available: {}",
+                    names.join(", ")
+                ));
+            }
+        };
+        let pick = ds.memory_regions.iter().find(|r| {
+            let backed = read_region_bytes(r, 0, 1).is_some();
+            backed && want_kind.map(|k| r.region_type() == k).unwrap_or(true)
+        });
+        match pick {
+            Some(r) => Ok(r.name.clone()),
+            None => {
+                let names: Vec<String> =
+                    ds.memory_regions.iter().map(|r| r.name.clone()).collect();
+                Err(format!(
+                    "no readable {} region found for source '{source}'. Available: {}",
+                    want_kind.unwrap_or("backed"),
+                    names.join(", ")
+                ))
+            }
+        }
+    }
+
     /// Set the `paused` control flag. Safe — cannot corrupt memory.
     fn set_paused(&self, paused: bool) -> Value {
         if let Ok(mut ds) = self.debug.lock() {
@@ -790,12 +949,12 @@ impl RetroMcpServer {
         let note = note.unwrap_or(DEFAULT_REGION_NOTE);
 
         // Pull the map path + identity fields under a brief lock.
-        let (path, rom_name, rom_sha1) = {
+        let (path, rom_name, rom_sha1, rom_size) = {
             let ds = match self.debug.lock() {
                 Ok(g) => g,
                 Err(_) => return json!({ "error": "debug state lock poisoned" }),
             };
-            (ds.rom_map_path.clone(), ds.rom_name.clone(), ds.rom_sha1.clone())
+            (ds.rom_map_path.clone(), ds.rom_name.clone(), ds.rom_sha1.clone(), ds.rom_size)
         };
         let path = match path {
             Some(p) => p,
@@ -819,7 +978,7 @@ impl RetroMcpServer {
                         });
                     }
                 }
-                scaffold_rom_map(rom_name.as_deref(), rom_sha1.as_deref())
+                scaffold_rom_map(rom_name.as_deref(), rom_sha1.as_deref(), rom_size)
             }
         };
 
@@ -906,6 +1065,21 @@ impl RetroMcpServer {
                     "len":       { "type": "integer", "description": "Number of bytes to lift and search for in ROM (4..256, default 32)" }
                 },
                 "required": ["vram_addr"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+        // Schema for { source, offset?, len?, format, tiles_per_row? } (render_tiles).
+        let render_tiles_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "Where to read bytes: an exact region NAME (see app://memory-map), or a convenience: \"rom\" / \"vram\" / \"memory\" (first ROM/VRAM/any backed region)" },
+                    "offset": { "type": "integer", "description": "Byte offset WITHIN the source region (default 0)" },
+                    "len":    { "type": "integer", "description": "Number of bytes to decode (capped at 65536)" },
+                    "format": { "type": "string", "description": "Tile pixel format: 2bpp | nes_chr (NES, 16 B/tile, 4 colors) or 4bpp | genesis (Genesis, 32 B/tile, 16 colors)" },
+                    "tiles_per_row": { "type": "integer", "description": "Tiles laid out per row in the image grid (default 16, max 64)" }
+                },
+                "required": ["source", "format"]
             });
             Arc::new(schema.as_object().unwrap().clone())
         };
@@ -1015,6 +1189,20 @@ impl RetroMcpServer {
                  compressed or in a different bitplane/tile layout. Corroborate with longer \
                  blocks.",
                 vram_to_rom_schema(),
+            ),
+            Tool::new(
+                "render_tiles",
+                "IMAGE-RECOGNITION RE primitive: decode a span of ROM/VRAM bytes AS tiles and \
+                 return it as a PNG IMAGE so you can SEE it and visually identify graphics — \
+                 e.g. compare a candidate ROM region to the sprite/character on app://screen. \
+                 This is the visual evidence stream that COMPLEMENTS vram_to_rom (a raw \
+                 byte-content match): rendering survives compressed / re-bitplaned graphics \
+                 where verbatim hex matching fails, because it judges PIXELS not bytes. Use \
+                 both for convergent evidence. `source` is a region NAME or rom/vram/memory; \
+                 `format` is 2bpp|nes_chr (NES, 16 B/tile) or 4bpp|genesis (Genesis, 32 B/tile, \
+                 generic 4bpp planar — approximate for CPS2). Palette is unknown by default, so \
+                 a grayscale ramp is used to expose structure. Read-only (no enable_writes).",
+                render_tiles_schema(),
             ),
             Tool::new(
                 "list_watches",
@@ -1236,10 +1424,16 @@ impl ServerHandler for RetroMcpServer {
              guest RAM/ROM/VRAM (read_region addresses by region NAME). search_memory finds a \
              byte pattern across regions, and vram_to_rom lifts VRAM bytes and content-searches \
              ROM for them — these are CONTENT matches, NOT DMA-traced provenance (the cores \
-             expose no DMA hook). To answer 'which ROM holds the on-screen sprites': enumerate \
+             expose no DMA hook). render_tiles is the SECOND, image-recognition evidence stream: \
+             it decodes a ROM/VRAM span AS tiles (NES 2bpp / Genesis 4bpp) and returns a PNG \
+             IMAGE so you can SEE the graphics and visually compare a candidate ROM region to \
+             the sprite on app://screen — it survives compressed / re-bitplaned graphics where \
+             vram_to_rom's verbatim byte match fails, so use BOTH for convergent evidence. To \
+             answer 'which ROM holds the on-screen sprites': enumerate \
              the on-screen sprites' tile refs by writing a game-specific probe with run_lua \
              (see examples/cps2_oam_probe.lua), read those tiles out of VRAM with read_region, \
-             then vram_to_rom/search_memory to get ROM candidates. pause/resume/step control \
+             then vram_to_rom/search_memory to get ROM candidates AND render_tiles to eyeball \
+             the candidate region against the screen. pause/resume/step control \
              execution. Sprite/OAM layout is game- and system-specific; there is no universal \
              decoder. WRITE GATE: the write/action tools (write_memory, freeze, unfreeze, \
              set_breakpoint, clear_breakpoint, run_to) are LOCKED by default; call enable_writes \
@@ -1346,6 +1540,32 @@ impl ServerHandler for RetroMcpServer {
                     let len = get_u("len").unwrap_or(32) as usize;
                     let v = this.vram_to_rom(vram_addr, len);
                     Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
+                }
+                "render_tiles" => {
+                    let source = args
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            ErrorData::invalid_params("missing/invalid `source`", None)
+                        })?;
+                    let fmt_str =
+                        args.get("format").and_then(|v| v.as_str()).ok_or_else(|| {
+                            ErrorData::invalid_params("missing/invalid `format`", None)
+                        })?;
+                    let format = TileFormat::parse(fmt_str).ok_or_else(|| {
+                        ErrorData::invalid_params(
+                            format!(
+                                "unknown tile `format` '{fmt_str}'; valid: {}",
+                                TileFormat::valid_list()
+                            ),
+                            None,
+                        )
+                    })?;
+                    let offset = get_u("offset").unwrap_or(0) as usize;
+                    let len = get_u("len").unwrap_or(MAX_RENDER_TILES_LEN as u64) as usize;
+                    let tiles_per_row =
+                        get_u("tiles_per_row").unwrap_or(DEFAULT_TILES_PER_ROW as u64) as usize;
+                    this.render_tiles(source, offset, len, format, tiles_per_row)
                 }
                 "list_watches" => {
                     let watches = { this.lock_read()?.watches.clone() };
@@ -1577,44 +1797,62 @@ fn normalize_addr(addr: &str) -> Result<String, String> {
 /// yet. Fills the identity fields we know (`rom.name`, `rom.sha1`) and leaves
 /// unknowns blank/sensible. Always includes an (empty) `## Regions` section so
 /// the first `append_region_block` has a home.
-fn scaffold_rom_map(rom_name: Option<&str>, rom_sha1: Option<&str>) -> String {
-    let name = rom_name.unwrap_or("unknown");
+/// Build a fresh ROM-map markdown skeleton with frontmatter seeded from the
+/// loaded ROM's identity. `rom_name`/`rom_sha1` come from `DebugState`; both may
+/// be absent (e.g. need_fullpath cores never read the bytes), in which case we
+/// emit empty strings — an empty value is an honest "human, please fill this"
+/// signal, unlike the old misleading "unknown" placeholder.
+///
+/// `system` is intentionally left empty: only the running core knows the system,
+/// and the ROM name/path doesn't reliably encode it, so guessing would be worse
+/// than blank. `crc32` is likewise left for a human to fill.
+///
+/// The `rom:` block keys are nested under `rom:` with a 2-space indent so the
+/// frontmatter parses as a valid YAML mapping (matching library/mvsc/mvsc.md).
+fn scaffold_rom_map(rom_name: Option<&str>, rom_sha1: Option<&str>, rom_size: Option<usize>) -> String {
+    let name = rom_name.unwrap_or("");
     let sha1 = rom_sha1.unwrap_or("");
+    let size = rom_size.unwrap_or(0);
+    // NOTE: a raw string (not `"…\n\"` line-continuations) is required here —
+    // the `\<newline>` continuation form strips the leading whitespace of the
+    // following line, which silently flattened the indented YAML keys (the
+    // "rom: keys not nested" bug). Raw strings preserve the 2-space indent.
     format!(
-        "---\n\
-schema_version: 1\n\
-\n\
-rom:\n\
-  name: \"{name}\"\n\
-  system: unknown\n\
-  sha1: \"{sha1}\"\n\
-  crc32: \"\"\n\
-  size: 0\n\
-\n\
-settings:\n\
-  scale: 3\n\
-  volume: 0.8\n\
-  muted: false\n\
-  breakpoints: []\n\
-  watches: []\n\
-\n\
-meta:\n\
-  genre: \"\"\n\
-  year: \"\"\n\
-  developer: \"\"\n\
-  progress: \"new\"\n\
-  tags: []\n\
----\n\
-\n\
-# {name} — map\n\
-\n\
-## Overview\n\
-\n\
-_(notes go here)_\n\
-\n\
-## Regions\n\
-\n\
-_(region blocks accumulate here as you explore)_\n"
+        r#"---
+schema_version: 1
+
+rom:
+  name: "{name}"
+  system: ""
+  sha1: "{sha1}"
+  crc32: ""
+  size: {size}
+
+settings:
+  scale: 3
+  volume: 0.8
+  muted: false
+  breakpoints: []
+  watches: []
+
+meta:
+  genre: ""
+  year: ""
+  developer: ""
+  progress: "new"
+  tags: []
+---
+
+# {name} — map
+
+## Overview
+
+_(notes go here)_
+
+## Regions
+
+_(region blocks accumulate here as you explore)_
+"#
     )
 }
 
@@ -1859,11 +2097,37 @@ Title tilemap, drawn by `title_draw`. DO NOT TOUCH THIS PROSE.\n\
 
     #[test]
     fn scaffold_has_frontmatter_and_empty_regions() {
-        let md = scaffold_rom_map(Some("mvsc"), Some("abc123"));
+        let md = scaffold_rom_map(Some("mvsc"), Some("abc123"), Some(22699761));
         assert!(md.starts_with("---\nschema_version: 1"));
-        assert!(md.contains("name: \"mvsc\""));
-        assert!(md.contains("sha1: \"abc123\""));
+        // Identity fields are populated AND nested under `rom:` with a 2-space
+        // indent so the frontmatter is a valid YAML mapping (not flat).
+        assert!(md.contains("\nrom:\n"));
+        assert!(md.contains("\n  name: \"mvsc\"\n"));
+        assert!(md.contains("\n  sha1: \"abc123\"\n"));
+        assert!(md.contains("\n  size: 22699761\n"));
+        // `system` is left empty (honest default), not the misleading "unknown".
+        assert!(md.contains("\n  system: \"\"\n"));
+        assert!(!md.contains("system: unknown"));
+        // Verify the frontmatter block is well-formed: every key line between the
+        // opening `---` and closing `---` that sits under `rom:` is 2-space
+        // indented (a cheap stand-in for a YAML parse, since there's no yaml dep).
+        let fm = md.split("---\n").nth(1).expect("frontmatter block");
+        let mut in_rom = false;
+        for line in fm.lines() {
+            if line == "rom:" { in_rom = true; continue; }
+            if line.is_empty() { continue; }
+            // A new top-level key (no indent, ends the rom: block).
+            if in_rom && !line.starts_with(' ') { in_rom = false; }
+            if in_rom { assert!(line.starts_with("  "), "rom child not indented: {line:?}"); }
+        }
         assert!(md.contains("## Regions"));
+
+        // Missing identity falls back to empty strings / zero size, never "unknown".
+        let bare = scaffold_rom_map(None, None, None);
+        assert!(bare.contains("\n  name: \"\"\n"));
+        assert!(bare.contains("\n  sha1: \"\"\n"));
+        assert!(bare.contains("\n  size: 0\n"));
+        assert!(!bare.contains("unknown"));
         // Round-trip: appending to a fresh scaffold yields a valid AI block.
         let out = append_region_block(
             &md, "ai01", "game_loop", "0x000400", None, "confirmed", "ai", "Main loop.",

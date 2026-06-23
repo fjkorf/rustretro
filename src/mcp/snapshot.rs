@@ -390,6 +390,210 @@ pub fn rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     Some(buf.into_inner())
 }
 
+// ── tile decoders (the image-recognition / RE evidence stream) ───────────────
+//
+// These decode a span of raw ROM/VRAM bytes AS tiles into an RGBA grid so a
+// Claude agent can SEE them (via `render_tiles` → `rgba_to_png` → a PNG image
+// content) and VISUALLY compare a candidate ROM region to what's on screen.
+// This is the convergent-evidence complement to `vram_to_rom`: that one is a
+// raw byte-content match (which fails on compressed / re-bitplaned graphics);
+// this one sidesteps the byte layout by rendering pixels for vision to judge.
+//
+// Every tile is 8×8 px. The decoders are PURE (bytes in, palette-index/RGBA
+// out) so they unit-test against hand-computed tile bytes.
+
+/// Side length, in pixels, of one tile. All supported formats use 8×8 tiles.
+pub const TILE_PX: usize = 8;
+/// Bytes per NES/2bpp planar tile (2 bitplanes × 8 bytes).
+pub const BYTES_PER_2BPP_TILE: usize = 16;
+/// Bytes per Genesis/4bpp planar tile (4 bitplanes × 8 bytes).
+pub const BYTES_PER_4BPP_TILE: usize = 32;
+
+/// Map a palette index in `0..levels` to an evenly-spaced gray level (0=black,
+/// max=white), so structure is visible WITHOUT knowing the real palette. With
+/// `levels == 4` (2bpp) the ramp is 0/85/170/255; with 16 (4bpp) it is the 16
+/// evenly-spaced steps. Returned as an opaque RGBA quad.
+fn gray_ramp_rgba(index: u8, levels: u8) -> [u8; 4] {
+    let levels = levels.max(2);
+    let max = (levels - 1) as u32;
+    let v = ((index.min(levels - 1) as u32) * 255 / max) as u8;
+    [v, v, v, 255]
+}
+
+/// Decode 2bpp PLANAR tiles in the NES CHR layout into a flat vector of palette
+/// indices (0..=3), tile-major then row-major within each tile (8×8 indices per
+/// tile, in screen order). Each 16-byte tile is two bitplanes: bytes 0..8 are
+/// plane 0 (the low bit) and bytes 8..16 are plane 1 (the high bit); row `y`'s
+/// pixel `x` takes bit `(7 - x)` from `plane0[y]` and `plane1[y]`. A trailing
+/// partial tile (fewer than 16 bytes) is ignored.
+///
+/// PURE and unit-testable: feed known tile bytes, assert the indices.
+pub fn decode_2bpp_planar_indices(bytes: &[u8]) -> Vec<u8> {
+    let tiles = bytes.len() / BYTES_PER_2BPP_TILE;
+    let mut out = Vec::with_capacity(tiles * TILE_PX * TILE_PX);
+    for t in 0..tiles {
+        let base = t * BYTES_PER_2BPP_TILE;
+        for y in 0..TILE_PX {
+            let p0 = bytes[base + y];
+            let p1 = bytes[base + TILE_PX + y];
+            for x in 0..TILE_PX {
+                let bit = 7 - x;
+                let lo = (p0 >> bit) & 1;
+                let hi = (p1 >> bit) & 1;
+                out.push((hi << 1) | lo);
+            }
+        }
+    }
+    out
+}
+
+/// Decode 4bpp PLANAR tiles (Genesis VDP layout) into palette indices (0..=15),
+/// tile-major then row-major within each tile. Each 32-byte tile is FOUR
+/// bitplanes of 8 bytes each (planes 0..3, in order); row `y`'s pixel `x` takes
+/// bit `(7 - x)` from each of `plane0[y]..plane3[y]`, assembled LSB-first
+/// (plane0 = bit 0 … plane3 = bit 3). A trailing partial tile is ignored.
+///
+/// NOTE: this is the GENERIC 4bpp planar / Genesis target. CPS2 stores 4bpp
+/// graphics with a different plane interleave, so this may not match CPS2 tiles
+/// exactly; use it for Genesis and treat CPS2 output as approximate.
+pub fn decode_4bpp_planar_indices(bytes: &[u8]) -> Vec<u8> {
+    let tiles = bytes.len() / BYTES_PER_4BPP_TILE;
+    let mut out = Vec::with_capacity(tiles * TILE_PX * TILE_PX);
+    for t in 0..tiles {
+        let base = t * BYTES_PER_4BPP_TILE;
+        for y in 0..TILE_PX {
+            let planes = [
+                bytes[base + y],
+                bytes[base + TILE_PX + y],
+                bytes[base + 2 * TILE_PX + y],
+                bytes[base + 3 * TILE_PX + y],
+            ];
+            for x in 0..TILE_PX {
+                let bit = 7 - x;
+                let mut idx = 0u8;
+                for (plane_no, p) in planes.iter().enumerate() {
+                    idx |= ((p >> bit) & 1) << plane_no;
+                }
+                out.push(idx);
+            }
+        }
+    }
+    out
+}
+
+/// The pixel format `render_tiles` understands. Carries the bytes/tile and the
+/// number of palette levels for the grayscale ramp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileFormat {
+    /// NES CHR / 2bpp planar, 16 bytes/tile, 4 levels.
+    Nes2bpp,
+    /// Genesis / generic 4bpp planar, 32 bytes/tile, 16 levels.
+    Genesis4bpp,
+}
+
+impl TileFormat {
+    /// Parse a user-facing format string. Accepts the system names and the
+    /// bit-depth aliases. Returns `None` for an unknown format (callers reject
+    /// with the valid list).
+    pub fn parse(s: &str) -> Option<TileFormat> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "2bpp" | "nes" | "nes_chr" | "neschr" | "chr" => Some(TileFormat::Nes2bpp),
+            "4bpp" | "genesis" | "megadrive" | "md" => Some(TileFormat::Genesis4bpp),
+            _ => None,
+        }
+    }
+
+    /// The comma-separated list of accepted format strings, for error messages.
+    pub fn valid_list() -> &'static str {
+        "2bpp|nes_chr, 4bpp|genesis"
+    }
+
+    fn bytes_per_tile(self) -> usize {
+        match self {
+            TileFormat::Nes2bpp => BYTES_PER_2BPP_TILE,
+            TileFormat::Genesis4bpp => BYTES_PER_4BPP_TILE,
+        }
+    }
+
+    fn levels(self) -> u8 {
+        match self {
+            TileFormat::Nes2bpp => 4,
+            TileFormat::Genesis4bpp => 16,
+        }
+    }
+
+    fn decode_indices(self, bytes: &[u8]) -> Vec<u8> {
+        match self {
+            TileFormat::Nes2bpp => decode_2bpp_planar_indices(bytes),
+            TileFormat::Genesis4bpp => decode_4bpp_planar_indices(bytes),
+        }
+    }
+}
+
+/// The result of decoding a byte span into a tile-grid image: a row-major
+/// top-down RGBA8888 buffer plus its pixel dimensions and the tile count.
+pub struct TileImage {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub tile_count: usize,
+}
+
+/// Decode `bytes` as `format` tiles, laid out `tiles_per_row` tiles wide, into
+/// an RGBA grid using the default grayscale ramp (since the real palette is
+/// usually unknown). The final row is padded with black tiles so the buffer is
+/// a clean rectangle. Returns `None` if there isn't even one complete tile or
+/// `tiles_per_row == 0`.
+///
+/// PURE — no locking, no globals — so the grid layout is unit-testable.
+pub fn decode_tiles_to_rgba(
+    bytes: &[u8],
+    format: TileFormat,
+    tiles_per_row: usize,
+) -> Option<TileImage> {
+    if tiles_per_row == 0 {
+        return None;
+    }
+    let tile_count = bytes.len() / format.bytes_per_tile();
+    if tile_count == 0 {
+        return None;
+    }
+    let indices = format.decode_indices(bytes); // tile-major, 64 indices/tile
+    let levels = format.levels();
+
+    let cols = tiles_per_row;
+    let rows = tile_count.div_ceil(cols);
+    let width = cols * TILE_PX;
+    let height = rows * TILE_PX;
+
+    // Allocate the full grid as black; fill in the tiles we have.
+    let mut rgba = vec![0u8; width * height * 4];
+    for t in 0..tile_count {
+        let tile_col = t % cols;
+        let tile_row = t / cols;
+        let px0 = tile_col * TILE_PX; // top-left pixel of this tile
+        let py0 = tile_row * TILE_PX;
+        for ty in 0..TILE_PX {
+            for tx in 0..TILE_PX {
+                let idx = indices[t * TILE_PX * TILE_PX + ty * TILE_PX + tx];
+                let [r, g, b, a] = gray_ramp_rgba(idx, levels);
+                let dst = ((py0 + ty) * width + (px0 + tx)) * 4;
+                rgba[dst] = r;
+                rgba[dst + 1] = g;
+                rgba[dst + 2] = b;
+                rgba[dst + 3] = a;
+            }
+        }
+    }
+
+    Some(TileImage {
+        rgba,
+        width: width as u32,
+        height: height as u32,
+        tile_count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,6 +896,115 @@ mod tests {
             disconnect: 0,
         };
         assert!(read_region_bytes(&bogus, 0, 4).is_none());
+    }
+
+    // ── tile decoders ───────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_2bpp_nes_matches_hand_computed_tile() {
+        // One NES CHR tile (16 bytes). Plane 0 (low bit) = rows 0..8,
+        // plane 1 (high bit) = rows 8..16.
+        //
+        // Row 0: plane0 = 0b1000_0001 (0x81), plane1 = 0b0000_0000 → pixels:
+        //   x0: hi0 lo1 = index 1; x1..6: 0; x7: hi0 lo1 = index 1.
+        // Row 1: plane0 = 0b0000_0000, plane1 = 0b1111_1111 (0xFF) → all index 2.
+        // Row 2: plane0 = 0b1111_1111, plane1 = 0b1111_1111 → all index 3.
+        // Rows 3..8: all zero → index 0.
+        let mut tile = [0u8; 16];
+        tile[0] = 0x81; // plane0 row0
+        tile[2] = 0xFF; // plane0 row2
+        tile[8 + 1] = 0xFF; // plane1 row1
+        tile[8 + 2] = 0xFF; // plane1 row2
+
+        let idx = decode_2bpp_planar_indices(&tile);
+        assert_eq!(idx.len(), 64);
+        // Row 0.
+        assert_eq!(&idx[0..8], &[1, 0, 0, 0, 0, 0, 0, 1]);
+        // Row 1: all high bit set → index 2.
+        assert_eq!(&idx[8..16], &[2, 2, 2, 2, 2, 2, 2, 2]);
+        // Row 2: both planes set → index 3.
+        assert_eq!(&idx[16..24], &[3, 3, 3, 3, 3, 3, 3, 3]);
+        // Row 3: empty → index 0.
+        assert_eq!(&idx[24..32], &[0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn decode_4bpp_genesis_matches_simple_pattern() {
+        // One Genesis 4bpp tile (32 bytes): 4 planes of 8 bytes.
+        // Row 0: plane0=0xFF, others 0 → every pixel index 0b0001 = 1.
+        // Row 1: plane3=0xFF, others 0 → every pixel index 0b1000 = 8.
+        // Row 2: all planes=0xFF → index 0b1111 = 15.
+        // Row 3: plane0 row = 0b1000_0000 (0x80) only → only x0 gets bit0 → 1,
+        //        rest 0.
+        let mut tile = [0u8; 32];
+        tile[0] = 0xFF; // plane0 row0
+        tile[3 * 8 + 1] = 0xFF; // plane3 row1
+        // plane0..3 row2 all 0xFF
+        for p in 0..4 {
+            tile[p * 8 + 2] = 0xFF;
+        }
+        tile[3] = 0x80; // plane0 row3
+
+        let idx = decode_4bpp_planar_indices(&tile);
+        assert_eq!(idx.len(), 64);
+        assert_eq!(&idx[0..8], &[1, 1, 1, 1, 1, 1, 1, 1]); // row0 → 1
+        assert_eq!(&idx[8..16], &[8, 8, 8, 8, 8, 8, 8, 8]); // row1 → 8
+        assert_eq!(&idx[16..24], &[15, 15, 15, 15, 15, 15, 15, 15]); // row2 → 15
+        assert_eq!(&idx[24..32], &[1, 0, 0, 0, 0, 0, 0, 0]); // row3 → x0=1
+    }
+
+    #[test]
+    fn decode_2bpp_ignores_trailing_partial_tile() {
+        // 16 + 5 bytes: only one complete tile decoded.
+        let bytes = vec![0u8; 16 + 5];
+        let idx = decode_2bpp_planar_indices(&bytes);
+        assert_eq!(idx.len(), 64);
+    }
+
+    #[test]
+    fn grid_layout_places_multiple_tiles_in_rows() {
+        // 3 NES tiles, 2 per row → 2 rows, 4 cols-worth of pixels wide (2 tiles
+        // = 16 px), 2 rows tall (16 px). Tile count = 3.
+        // Make tile 0 solid index-3 (white), tiles 1,2 zero (black).
+        let mut bytes = vec![0u8; 16 * 3];
+        for i in 0..16 {
+            bytes[i] = 0xFF; // tile 0: both planes all-ones → index 3 everywhere
+        }
+        let img = decode_tiles_to_rgba(&bytes, TileFormat::Nes2bpp, 2).unwrap();
+        assert_eq!(img.tile_count, 3);
+        assert_eq!(img.width, 16); // 2 tiles per row × 8 px
+        assert_eq!(img.height, 16); // ceil(3/2) = 2 rows × 8 px
+        // Top-left pixel (tile 0, index 3 → white).
+        assert_eq!(&img.rgba[0..4], &[255, 255, 255, 255]);
+        // Tile 1 starts at x=8: top-left pixel index 0 → black.
+        let t1 = (0 * 16 + 8) * 4;
+        assert_eq!(&img.rgba[t1..t1 + 4], &[0, 0, 0, 255]);
+        // Padding tile (4th slot, row1 col1) is never written → transparent black.
+        let pad = (8 * 16 + 8) * 4;
+        assert_eq!(&img.rgba[pad..pad + 4], &[0, 0, 0, 0]);
+        // Buffer size matches dimensions (so rgba_to_png will accept it).
+        assert_eq!(img.rgba.len(), (img.width * img.height * 4) as usize);
+        assert!(rgba_to_png(&img.rgba, img.width, img.height).is_some());
+    }
+
+    #[test]
+    fn decode_tiles_rejects_too_few_bytes_and_zero_width() {
+        // Fewer than one tile's worth of bytes → None.
+        assert!(decode_tiles_to_rgba(&[0u8; 8], TileFormat::Nes2bpp, 16).is_none());
+        // Zero tiles_per_row → None.
+        assert!(decode_tiles_to_rgba(&[0u8; 16], TileFormat::Nes2bpp, 0).is_none());
+    }
+
+    #[test]
+    fn tile_format_parse_accepts_aliases_and_rejects_unknown() {
+        assert_eq!(TileFormat::parse("2bpp"), Some(TileFormat::Nes2bpp));
+        assert_eq!(TileFormat::parse("nes_chr"), Some(TileFormat::Nes2bpp));
+        assert_eq!(TileFormat::parse("CHR"), Some(TileFormat::Nes2bpp));
+        assert_eq!(TileFormat::parse("4bpp"), Some(TileFormat::Genesis4bpp));
+        assert_eq!(TileFormat::parse(" genesis "), Some(TileFormat::Genesis4bpp));
+        // Unknown is rejected.
+        assert_eq!(TileFormat::parse("8bpp"), None);
+        assert_eq!(TileFormat::parse(""), None);
     }
 
     #[test]
