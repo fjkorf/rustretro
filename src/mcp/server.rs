@@ -34,6 +34,7 @@ use rmcp::RoleServer;
 use serde_json::{json, Map, Value};
 
 use crate::debug::{SharedDebugState, Watch, WatchFormat};
+use crate::mcp::ines::parse_ines;
 use crate::mcp::snapshot::{
     decode_tiles_to_rgba, memory_capability, memory_map, parse_hex_bytes, read_region_bytes,
     rgba_to_png, scan_buffer, search_bytes, top_heatmap, AiSnapshot, TileFormat,
@@ -632,15 +633,81 @@ impl RetroMcpServer {
         }
     }
 
-    /// Whether `source` selects the on-disk ROM FILE (the cart bytes) rather than
-    /// a live memory region. The ROM file lets tools decode content the running
-    /// core does NOT expose in memory — e.g. NES CHR-ROM graphics (genesis/CPS2
-    /// graphics ROM, etc.). Accepts a few spellings for convenience.
+    /// If `source` selects the on-disk ROM FILE, return its optional iNES
+    /// sub-part: `Some(None)` = the whole cart, `Some(Some("chr"))` = a named span
+    /// (`header`/`prg`/`chr`), `None` = not a rom_file source (a live region). The
+    /// ROM file lets tools decode content the running core does NOT expose in
+    /// memory — e.g. NES CHR-ROM graphics. Accepts a few base spellings.
+    fn rom_file_part(source: &str) -> Option<Option<String>> {
+        let s = source.trim().to_ascii_lowercase();
+        let (base, part) = match s.split_once(':') {
+            Some((b, p)) => (b.trim().to_string(), Some(p.trim().to_string())),
+            None => (s, None),
+        };
+        match base.as_str() {
+            "rom_file" | "romfile" | "rom-file" | "file" => Some(part),
+            _ => None,
+        }
+    }
+
+    /// Whether `source` selects the on-disk ROM FILE (whole cart or a named span).
     fn is_rom_file_source(source: &str) -> bool {
-        matches!(
-            source.trim().to_ascii_lowercase().as_str(),
-            "rom_file" | "romfile" | "rom-file" | "file"
-        )
+        Self::rom_file_part(source).is_some()
+    }
+
+    /// Slice the ROM file to an iNES sub-part (`header`/`prg`/`chr`) or the whole
+    /// cart. Returns `(display_name, file_offset, kind, bytes)`. Errors honestly
+    /// for a CHR-RAM cart's `:chr` (no CHR-ROM in the file) or a non-iNES file.
+    fn slice_rom_file(
+        &self,
+        name: String,
+        bytes: Vec<u8>,
+        part: Option<&str>,
+    ) -> Result<(String, usize, String, Vec<u8>), String> {
+        let part = match part {
+            None | Some("") => {
+                return Ok((format!("ROM file ({name})"), 0, "ROMFILE".to_string(), bytes))
+            }
+            Some(p) => p,
+        };
+        let info = parse_ines(&bytes).ok_or_else(|| {
+            format!("rom_file:{part} needs an iNES (.nes) file, but this ROM has no iNES header")
+        })?;
+        let (start, end, kind) = match part {
+            "header" => (0usize, 16usize.min(bytes.len()), "ROMFILE:HEADER"),
+            "prg" => (
+                info.prg_offset,
+                info.prg_offset + info.prg_rom_size,
+                "ROMFILE:PRG",
+            ),
+            "chr" => {
+                if info.chr_is_ram {
+                    return Err("this cart uses CHR-RAM: there is no CHR-ROM in the file to \
+                                decode (the graphics may live compressed in PRG-ROM, or only \
+                                appear in live CHR-RAM via the core)"
+                        .to_string());
+                }
+                (
+                    info.chr_offset,
+                    info.chr_offset + info.chr_rom_size,
+                    "ROMFILE:CHR",
+                )
+            }
+            other => {
+                return Err(format!(
+                    "unknown rom_file part '{other}'; use header | prg | chr (or plain \
+                     rom_file for the whole cart)"
+                ))
+            }
+        };
+        let end = end.min(bytes.len());
+        let start = start.min(end);
+        Ok((
+            format!("ROM file ({name}):{part}"),
+            start,
+            kind.to_string(),
+            bytes[start..end].to_vec(),
+        ))
     }
 
     /// Fetch the loaded ROM file's bytes for the `rom_file` source: prefer the
@@ -681,9 +748,9 @@ impl RetroMcpServer {
         &self,
         source: &str,
     ) -> Result<(String, usize, String, Vec<u8>), String> {
-        if Self::is_rom_file_source(source) {
+        if let Some(part) = Self::rom_file_part(source) {
             let (name, bytes) = self.rom_file_bytes()?;
-            return Ok((format!("ROM file ({name})"), 0, "ROMFILE".to_string(), bytes));
+            return self.slice_rom_file(name, bytes, part.as_deref());
         }
         let region_name = self.resolve_render_source(source)?;
         match self.clone_region_bytes(&region_name) {
@@ -694,6 +761,59 @@ impl RetroMcpServer {
             )),
             Err(e) => Err(e),
         }
+    }
+
+    /// `rom_info`: parse the loaded ROM file's iNES / NES 2.0 header and report
+    /// the layout — mapper, PRG/CHR sizes, and the exact FILE OFFSETS of PRG-ROM
+    /// and CHR-ROM — so a caller can point `render_tiles`/`scan_regions` at
+    /// `rom_file:chr` (or a raw offset) without hand-computing it. READ-ONLY.
+    /// Non-iNES ROMs (other systems) return a clear note rather than an error, so
+    /// the raw `rom_file` byte source still works.
+    fn rom_info(&self) -> Result<CallToolResult, ErrorData> {
+        let (name, bytes) = self
+            .rom_file_bytes()
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+
+        let v = match parse_ines(&bytes) {
+            Some(i) => json!({
+                "name": name,
+                "format": if i.is_nes2 { "NES 2.0" } else { "iNES" },
+                "system": "nes",
+                "file_len": i.file_len,
+                "mapper": i.mapper,
+                "submapper": i.submapper,
+                "mirroring": i.mirroring,
+                "battery": i.battery,
+                "has_trainer": i.has_trainer,
+                "prg_rom_size": i.prg_rom_size,
+                "chr_rom_size": i.chr_rom_size,
+                "chr_is_ram": i.chr_is_ram,
+                "chr_ram_size": i.chr_ram_size,
+                "prg_offset": format!("0x{:X}", i.prg_offset),
+                "chr_offset": if i.chr_is_ram { "n/a (CHR-RAM)".to_string() } else { format!("0x{:X}", i.chr_offset) },
+                "hint": if i.chr_is_ram {
+                    "CHR-RAM cart: no CHR-ROM in the file. Tiles may live (compressed) in PRG-ROM, \
+                     or only in live CHR-RAM via the core.".to_string()
+                } else {
+                    format!(
+                        "Decode the graphics with: render_tiles source=rom_file:chr format=nes_chr \
+                         (CHR-ROM is {} tiles at file 0x{:X}). scan_regions source=rom_file shows \
+                         the PRG/CHR/data split.",
+                        i.chr_rom_size / 16,
+                        i.chr_offset
+                    )
+                },
+            }),
+            None => json!({
+                "name": name,
+                "format": "non-iNES",
+                "file_len": bytes.len(),
+                "note": "No iNES (.nes) header. The raw `rom_file` source still works for \
+                         render_tiles/scan_regions, but header/prg/chr spans and NES layout \
+                         fields are unavailable for this system.",
+            }),
+        };
+        Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
     }
 
     /// `scan_regions`: the STRUCTURE / statistical-signature evidence stream.
@@ -1225,7 +1345,7 @@ impl RetroMcpServer {
             let schema = json!({
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "description": "Where to read bytes: an exact region NAME (see app://memory-map); a convenience \"rom\" / \"vram\" / \"memory\" (first ROM/VRAM/any backed region); or \"rom_file\" — the on-disk CART file, which exposes content the core hides (e.g. NES CHR-ROM graphics). For rom_file, offset is the byte offset into the file (use rom_info / the iNES CHR offset)." },
+                    "source": { "type": "string", "description": "Where to read bytes: an exact region NAME (see app://memory-map); a convenience \"rom\" / \"vram\" / \"memory\" (first ROM/VRAM/any backed region); \"rom_file\" — the whole on-disk CART file (content the core hides); or a NES iNES span \"rom_file:chr\" / \"rom_file:prg\" / \"rom_file:header\" (call rom_info for the layout). For NES graphics use source=rom_file:chr with format=nes_chr — offset 0 then lands on the first CHR tile." },
                     "offset": { "type": "integer", "description": "Byte offset WITHIN the source region/file (default 0)" },
                     "len":    { "type": "integer", "description": "Number of bytes to decode (capped at 65536)" },
                     "format": { "type": "string", "description": "Tile pixel format: 2bpp | nes_chr (NES, 16 B/tile, 4 colors) or 4bpp | genesis (Genesis, 32 B/tile, 16 colors)" },
@@ -1240,7 +1360,7 @@ impl RetroMcpServer {
             let schema = json!({
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "description": "What to scan: an exact region NAME (see app://memory-map); a convenience \"rom\" / \"vram\" / \"memory\" (first ROM/VRAM/any backed region); or \"rom_file\" — the on-disk CART file (scans content the core hides, e.g. NES PRG+CHR). Default \"rom\"." },
+                    "source": { "type": "string", "description": "What to scan: an exact region NAME (see app://memory-map); a convenience \"rom\" / \"vram\" / \"memory\" (first ROM/VRAM/any backed region); \"rom_file\" — the whole on-disk CART (scans content the core hides, e.g. NES PRG+CHR); or a NES iNES span \"rom_file:prg\" / \"rom_file:chr\". Default \"rom\"." },
                     "window": { "type": "integer", "description": "Sampling window in bytes (default 4096, min 256, max 65536). Smaller = finer boundaries, more candidates." }
                 },
                 "required": []
@@ -1384,6 +1504,16 @@ impl RetroMcpServer {
                  region NAME, rom/vram/memory (default rom), or \"rom_file\" (the on-disk CART — \
                  scans content the core hides, e.g. NES PRG+CHR). Read-only (no enable_writes).",
                 scan_regions_schema(),
+            ),
+            Tool::new(
+                "rom_info",
+                "Parse the loaded ROM FILE's iNES / NES 2.0 header and report the cart layout: \
+                 mapper, PRG/CHR sizes, and the exact FILE OFFSETS of PRG-ROM and CHR-ROM. Use \
+                 this to point render_tiles/scan_regions at `rom_file:chr` (the graphics the \
+                 core hides) without hand-computing offsets. CHR-RAM carts are flagged honestly \
+                 (no CHR-ROM in the file). Non-NES ROMs return a note (raw rom_file still works). \
+                 Read-only.",
+                no_params(),
             ),
             Tool::new(
                 "list_watches",
@@ -1758,6 +1888,7 @@ impl ServerHandler for RetroMcpServer {
                     let window = get_u("window").unwrap_or(DEFAULT_SCAN_WINDOW as u64) as usize;
                     this.scan_regions(source, window)
                 }
+                "rom_info" => this.rom_info(),
                 "list_watches" => {
                     let watches = { this.lock_read()?.watches.clone() };
                     Ok(CallToolResult::success(vec![Self::json_content(&watches)?]))
@@ -2186,6 +2317,65 @@ mod tests {
         let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
         let err = srv.resolve_source_bytes("rom_file").unwrap_err();
         assert!(err.contains("no ROM file"), "err {err:?}");
+    }
+
+    #[test]
+    fn rom_file_part_splits_base_and_part() {
+        use super::RetroMcpServer as S;
+        assert_eq!(S::rom_file_part("rom_file"), Some(None));
+        assert_eq!(S::rom_file_part(" ROM_FILE "), Some(None));
+        assert_eq!(S::rom_file_part("rom_file:chr"), Some(Some("chr".into())));
+        assert_eq!(S::rom_file_part("file:PRG"), Some(Some("prg".into())));
+        assert_eq!(S::rom_file_part("rom"), None); // region alias, not the file
+        assert_eq!(S::rom_file_part("PRG ROM"), None); // region name
+    }
+
+    #[test]
+    fn rom_file_chr_span_slices_at_ines_offset() {
+        // Build a tiny iNES cart: PRG=1×16KiB filled 0xAA, CHR=1×8KiB filled 0xCC.
+        let mut rom = vec![0u8; 16];
+        rom[0..4].copy_from_slice(&[0x4E, 0x45, 0x53, 0x1A]);
+        rom[4] = 1; // PRG 16KiB
+        rom[5] = 1; // CHR 8KiB
+        rom[6] = 0x10; // mapper low nibble 1, no trainer
+        rom.extend(std::iter::repeat(0xAA).take(0x4000)); // PRG
+        rom.extend(std::iter::repeat(0xCC).take(0x2000)); // CHR
+        let mut ds = DebugState::new();
+        ds.rom_name = Some("toy".into());
+        ds.rom_bytes = Some(rom);
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(ds)));
+
+        // rom_file:chr → the CHR span, addressed at its file offset (16 + 16KiB).
+        let (name, start, kind, bytes) =
+            srv.resolve_source_bytes("rom_file:chr").expect("chr span");
+        assert_eq!(start, 16 + 0x4000);
+        assert_eq!(kind, "ROMFILE:CHR");
+        assert_eq!(bytes.len(), 0x2000);
+        assert!(bytes.iter().all(|&b| b == 0xCC), "CHR should be all 0xCC");
+        assert!(name.contains("chr"));
+
+        // rom_file:prg → the PRG span (all 0xAA).
+        let (_, pstart, pkind, pbytes) =
+            srv.resolve_source_bytes("rom_file:prg").expect("prg span");
+        assert_eq!(pstart, 16);
+        assert_eq!(pkind, "ROMFILE:PRG");
+        assert_eq!(pbytes.len(), 0x4000);
+        assert!(pbytes.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn rom_file_chr_errors_on_chr_ram_cart() {
+        // CHR size byte 0 → CHR-RAM; :chr must refuse with an honest message.
+        let mut rom = vec![0u8; 16];
+        rom[0..4].copy_from_slice(&[0x4E, 0x45, 0x53, 0x1A]);
+        rom[4] = 1; // PRG
+        rom[5] = 0; // CHR-RAM
+        rom.extend(std::iter::repeat(0x00).take(0x4000));
+        let mut ds = DebugState::new();
+        ds.rom_bytes = Some(rom);
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(ds)));
+        let err = srv.resolve_source_bytes("rom_file:chr").unwrap_err();
+        assert!(err.contains("CHR-RAM"), "err {err:?}");
     }
 
     #[test]
