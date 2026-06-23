@@ -1,23 +1,61 @@
 use bevy_egui::egui;
 use std::sync::{Arc, Mutex};
 use crate::debug::{DebugState, MemoryRegion};
+use super::hex_tint;
 
 pub struct HexDump {
     goto_addr: String,
     scroll_to: Option<usize>,
     current_region_idx: usize,
+    /// Previous frame's displayed bytes — used for per-byte change tinting.
+    prev_buf: Vec<u8>,
+    /// Index of the region (or usize::MAX for framebuffer) that `prev_buf` belongs to.
+    prev_region_key: usize,
+    /// When true, bytes that changed since the last frame are tinted amber.
+    highlight_changes: bool,
 }
 
 impl HexDump {
     pub fn new() -> Self {
-        HexDump { goto_addr: String::new(), scroll_to: None, current_region_idx: 0 }
+        HexDump {
+            goto_addr: String::new(),
+            scroll_to: None,
+            current_region_idx: 0,
+            prev_buf: Vec::new(),
+            prev_region_key: usize::MAX,
+            highlight_changes: true,
+        }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, state: &Arc<Mutex<DebugState>>) {
-        let (regions, current_fb) = {
+        let (regions, current_fb, nav_focus) = {
             let s = state.lock().unwrap();
-            (s.memory_regions.clone(), (s.framebuffer.clone(), s.fb_width, s.fb_height))
+            (
+                s.memory_regions.clone(),
+                (s.framebuffer.clone(), s.fb_width, s.fb_height),
+                s.nav.pending_focus,
+            )
         };
+
+        // Apply navigation cursor: scroll to the focused address and, if it
+        // falls within a known region, switch to that region automatically.
+        // Do NOT clear pending_focus — the dispatcher owns that.
+        if let Some(focus) = nav_focus {
+            let focus_usize = focus as usize;
+            // Find the region that contains this address and switch to it.
+            if let Some(region_idx) = regions.iter().position(|r| {
+                focus_usize >= r.addr_start && focus_usize <= r.addr_end
+            }) {
+                self.current_region_idx = region_idx;
+                // Row the byte lives in, relative to the region start.
+                let region = &regions[region_idx];
+                let offset = focus_usize.saturating_sub(region.addr_start);
+                self.scroll_to = Some(offset / 16);
+            } else {
+                // Address not in any named region — scroll by raw offset.
+                self.scroll_to = Some(focus_usize / 16);
+            }
+        }
 
         // Clamp region index
         if self.current_region_idx >= regions.len() {
@@ -53,21 +91,27 @@ impl HexDump {
                     self.scroll_to = Some(addr / 16);
                 }
             }
+
+            ui.separator();
+            ui.checkbox(&mut self.highlight_changes, "highlight changes");
         });
 
         ui.separator();
 
-        // Get data from selected region or framebuffer
-        let (region, buf_to_display) = if !regions.is_empty() {
+        // Get data from selected region or framebuffer.
+        // region_key distinguishes which source is active so we can reset
+        // prev_buf on a region switch (avoiding false-positive tints).
+        let (region, buf_to_display, region_key) = if !regions.is_empty() {
             let region = &regions[self.current_region_idx];
-            // Try to read from host memory
             if let Some(buf) = self.read_region(region) {
-                (Some(region.clone()), buf)
+                (Some(region.clone()), buf, self.current_region_idx)
             } else {
-                (None, Vec::new())
+                (None, Vec::new(), usize::MAX)
             }
         } else {
-            (None, current_fb.0)
+            // Framebuffer path: use usize::MAX - 1 as a stable key distinct from
+            // any valid region index.
+            (None, current_fb.0, usize::MAX - 1)
         };
 
         if let Some(ref r) = region {
@@ -95,14 +139,36 @@ impl HexDump {
             return;
         }
 
+        // Compute per-byte changed mask.
+        // Reset prev_buf when the active region changes or lengths differ
+        // (length may change on the same region during init); tint nothing that frame.
+        let changed_mask: Vec<bool> = if self.highlight_changes
+            && self.prev_region_key == region_key
+            && self.prev_buf.len() == buf_to_display.len()
+        {
+            hex_tint::diff_changed(&self.prev_buf, &buf_to_display)
+        } else {
+            // Reset: no tint this frame, just snapshot.
+            vec![false; buf_to_display.len()]
+        };
+
+        // Store snapshot for next frame.
+        self.prev_buf = buf_to_display.clone();
+        self.prev_region_key = region_key;
+
         // Hex dump grid
         let bytes_per_row = 16;
         let num_rows = buf_to_display.len().div_ceil(bytes_per_row);
         let row_height = 16.0;
 
-        egui::ScrollArea::vertical()
-            .auto_shrink(false)
-            .show_rows(ui, row_height, num_rows, |ui, row_range| {
+        // Consume the scroll_to target: set the vertical offset so the requested
+        // row is visible, then clear it so it only fires once.
+        let mut scroll_area = egui::ScrollArea::vertical().auto_shrink(false);
+        if let Some(target_row) = self.scroll_to.take() {
+            let target_row = target_row.min(num_rows.saturating_sub(1));
+            scroll_area = scroll_area.vertical_scroll_offset(target_row as f32 * row_height);
+        }
+        scroll_area.show_rows(ui, row_height, num_rows, |ui, row_range| {
                 egui::Grid::new("hex_grid")
                     .num_columns(3)
                     .spacing([8.0, 2.0])
@@ -127,25 +193,44 @@ impl HexDump {
                                     .color(egui::Color32::from_rgb(150, 150, 200)),
                             );
 
-                            // Hex bytes column
-                            let hex: String = slice
-                                .iter()
-                                .enumerate()
-                                .map(|(i, b)| {
-                                    if i > 0 && i % 8 == 0 {
-                                        format!(" {:02X}", b)
+                            // Hex bytes column — each byte gets its own colored label
+                            // so changed bytes can be tinted amber independently.
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                for (i, &b) in slice.iter().enumerate() {
+                                    let byte_idx = start + i;
+                                    let changed = changed_mask
+                                        .get(byte_idx)
+                                        .copied()
+                                        .unwrap_or(false);
+
+                                    let color = if changed {
+                                        // Amber tint for changed bytes (highlight_changes
+                                        // is implicitly true here because the mask is only
+                                        // non-false when highlight_changes was true).
+                                        hex_tint::changed_color(true)
                                     } else {
-                                        format!(" {:02X}", b)
+                                        // Existing white/dark-gray logic based on non-zero value.
+                                        if b != 0 {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            egui::Color32::DARK_GRAY
+                                        }
+                                    };
+
+                                    // Add a thin space before each byte except the first,
+                                    // and an extra space at the 8-byte mid-group boundary.
+                                    if i > 0 {
+                                        let gap = if i == 8 { "  " } else { " " };
+                                        ui.label(egui::RichText::new(gap).monospace());
                                     }
-                                })
-                                .collect();
-                            let has_nonzero = slice.iter().any(|&b| b != 0);
-                            let color = if has_nonzero {
-                                egui::Color32::WHITE
-                            } else {
-                                egui::Color32::DARK_GRAY
-                            };
-                            ui.label(egui::RichText::new(hex).monospace().color(color));
+                                    ui.label(
+                                        egui::RichText::new(format!("{:02X}", b))
+                                            .monospace()
+                                            .color(color),
+                                    );
+                                }
+                            });
 
                             // ASCII column
                             let ascii: String = slice

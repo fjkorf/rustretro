@@ -1,5 +1,7 @@
 pub mod panels;
 pub mod window;
+pub mod dock;
+pub mod vdp_source;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -7,20 +9,21 @@ use std::sync::{Arc, Mutex};
 pub type SharedDebugState = Arc<Mutex<DebugState>>;
 
 /// A user-created snapshot of machine state at a named moment (e.g. "Title Screen", "Level 2").
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Bookmark {
     pub label: String,
     pub frame: u64,
     pub m68k_pc: u32,
     pub m68k_d_regs: [u32; 8],
     pub m68k_a_regs: [u32; 8],
-    /// 64×48 RGBA thumbnail (downsampled framebuffer), may be empty.
+    /// 64×48 RGBA thumbnail. Not persisted (regenerated during play).
+    #[serde(skip)]
     pub thumbnail: Vec<u8>,
     pub notes: String,
 }
 
 /// A user-labeled range of M68K code addresses (e.g. "game_loop", "sound_driver").
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct CodeRegion {
     pub label: String,
     pub addr_start: u32,
@@ -28,6 +31,208 @@ pub struct CodeRegion {
     /// RGB display color for this region.
     pub color: [u8; 3],
     pub notes: String,
+}
+
+/// How a watched address's bytes are interpreted for display.
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, Debug)]
+pub enum WatchFormat {
+    U8,
+    S8,
+    U16LE,
+    U16BE,
+    U32LE,
+    U32BE,
+    Hex8,
+    Hex16,
+    Hex32,
+}
+
+impl WatchFormat {
+    /// Number of bytes this format reads from memory.
+    pub fn byte_len(&self) -> usize {
+        match self {
+            WatchFormat::U8 | WatchFormat::S8 | WatchFormat::Hex8 => 1,
+            WatchFormat::U16LE | WatchFormat::U16BE | WatchFormat::Hex16 => 2,
+            WatchFormat::U32LE | WatchFormat::U32BE | WatchFormat::Hex32 => 4,
+        }
+    }
+}
+
+/// Value width for a RAM search.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SearchSize {
+    U8,
+    U16,
+    U32,
+}
+
+impl SearchSize {
+    pub fn byte_len(self) -> usize {
+        match self {
+            SearchSize::U8 => 1,
+            SearchSize::U16 => 2,
+            SearchSize::U32 => 4,
+        }
+    }
+
+    /// The matching watch format for this size (hex chosen at call site).
+    pub fn watch_format(self, hex: bool) -> WatchFormat {
+        match (self, hex) {
+            (SearchSize::U8, false) => WatchFormat::U8,
+            (SearchSize::U16, false) => WatchFormat::U16LE,
+            (SearchSize::U32, false) => WatchFormat::U32LE,
+            (SearchSize::U8, true) => WatchFormat::Hex8,
+            (SearchSize::U16, true) => WatchFormat::Hex16,
+            (SearchSize::U32, true) => WatchFormat::Hex32,
+        }
+    }
+}
+
+/// Comparison operator applied during a RAM search step.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SearchCompare {
+    Equal,
+    NotEqual,
+    Less,
+    Greater,
+    Changed,
+    Unchanged,
+    Increased,
+    Decreased,
+    DifferentBy(i64),
+}
+
+/// What a search step compares each candidate's current value against.
+#[derive(Clone)]
+pub enum SearchSource {
+    /// Compare against the value captured at the previous checkpoint.
+    PreviousSnapshot,
+    /// Compare against a fixed user-supplied value.
+    SpecificValue(u32),
+}
+
+/// Pure comparison kernel for one candidate.
+/// `cur` is the freshly read value; `rhs` is either the previous snapshot value
+/// or the specific target value, depending on the operator/source.
+/// `bits` is the value width in bits (8/16/32) used for signed interpretation.
+pub fn compare_passes(cur: u32, rhs: u32, op: SearchCompare, signed: bool, bits: u32) -> bool {
+    let sx = |v: u32| -> i64 {
+        if signed && bits < 32 {
+            let shift = 32 - bits;
+            ((v << shift) as i32 >> shift) as i64
+        } else if signed {
+            (v as i32) as i64
+        } else {
+            v as i64
+        }
+    };
+    match op {
+        SearchCompare::Equal => cur == rhs,
+        SearchCompare::NotEqual => cur != rhs,
+        SearchCompare::Less => sx(cur) < sx(rhs),
+        SearchCompare::Greater => sx(cur) > sx(rhs),
+        SearchCompare::Changed => cur != rhs,
+        SearchCompare::Unchanged => cur == rhs,
+        SearchCompare::Increased => sx(cur) > sx(rhs),
+        SearchCompare::Decreased => sx(cur) < sx(rhs),
+        SearchCompare::DifferentBy(d) => (sx(cur) - sx(rhs)) == d || (sx(rhs) - sx(cur)) == d,
+    }
+}
+
+/// Iterative cheat-engine-style RAM search state. Persists across frames.
+pub struct RamSearch {
+    pub region_idx: usize,
+    pub size: SearchSize,
+    pub signed: bool,
+    pub hex: bool,
+    /// Guest addresses still in the running.
+    pub candidates: Vec<usize>,
+    /// Value captured at each candidate at the last checkpoint (parallel to `candidates`).
+    pub prev_values: Vec<u32>,
+    pub started: bool,
+}
+
+impl RamSearch {
+    pub fn new() -> Self {
+        RamSearch {
+            region_idx: 0,
+            size: SearchSize::U8,
+            signed: false,
+            hex: false,
+            candidates: Vec::new(),
+            prev_values: Vec::new(),
+            started: false,
+        }
+    }
+}
+
+/// A single watched memory location.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Watch {
+    pub addr: usize,
+    pub label: String,
+    pub format: WatchFormat,
+    pub frozen: bool,
+    pub frozen_value: Option<u32>,
+    /// When true, log every frame in which this watch's value changes, together
+    /// with the CPU PC executing that frame ("what changed this address?").
+    /// Frame-granular, not instruction-exact.
+    #[serde(default)]
+    pub track_changes: bool,
+    /// Last raw little-endian value read from memory (for display). Not persisted.
+    #[serde(skip)]
+    pub current: Option<u32>,
+    /// Last value seen for change-detection edge tracking. Not persisted.
+    #[serde(skip)]
+    pub prev_value: Option<u32>,
+}
+
+/// One frame-granular value change recorded for a tracked watch: the value went
+/// from `old` to `new` during `frame`, while the M68K PC was `pc`. Because
+/// libretro has no per-access hook, this only pins the change to a frame, not to
+/// the exact instruction.
+#[derive(Clone, serde::Serialize)]
+pub struct ChangeEvent {
+    pub frame: u64,
+    pub addr: usize,
+    pub old: u32,
+    pub new: u32,
+    pub pc: u32,
+}
+
+/// True when `cur` differs from a known previous value. Used for per-frame
+/// change-detection on tracked watches; a `None` prev (first sighting) is not a
+/// change so we don't log a spurious event on the first frame.
+pub fn detect_change(prev: Option<u32>, cur: u32) -> bool {
+    matches!(prev, Some(p) if p != cur)
+}
+
+/// Shared cross-panel navigation state: a single "current location" cursor plus a
+/// back/forward history stack.
+///
+/// ## Contract for address-aware panels
+/// Every frame, an address-aware panel (Disassembly, Hex, Regions, Watch, RamSearch)
+/// reads [`NavState::pending_focus`]. If it is `Some(addr)`, the panel scrolls/centers
+/// its view to `addr` for this frame. Panels MUST NOT clear `pending_focus` themselves;
+/// it is a one-frame pulse cleared centrally by the dispatcher AFTER all panels have
+/// rendered (see `DebugApp::show`, which sets `nav.pending_focus = None` once the
+/// CentralPanel closure returns). This guarantees every panel sees the same pulse for
+/// exactly one frame regardless of which tab is active.
+///
+/// To change the current location from anywhere, call [`DebugState::goto`] (THE entry
+/// point). Back/forward navigation is driven by the toolbar via [`DebugState::nav_back`]
+/// / [`DebugState::nav_forward`].
+#[derive(Default, serde::Serialize)]
+pub struct NavState {
+    /// The shared "current location" cursor (None until first `goto`).
+    pub current_address: Option<u32>,
+    /// Back/forward stack of visited addresses (oldest at front).
+    pub history: Vec<u32>,
+    /// Index into `history` of the current entry.
+    pub history_idx: usize,
+    /// Set whenever the address changes; address-aware panels consume it by reading
+    /// (the dispatcher clears it after the frame's panels have rendered).
+    pub pending_focus: Option<u32>,
 }
 
 /// Memory region descriptor (from libretro SET_MEMORY_MAPS callback)
@@ -130,6 +335,11 @@ pub struct DebugState {
     pub z80_de: u16,               // DE register pair
     pub z80_hl: u16,               // HL register pair
 
+    // --- VDP registers ---
+    /// Sega Genesis VDP registers $00–$17 (decoded by the VDP panel).
+    /// Source not yet wired from the core; displays zeros until populated.
+    pub vdp_regs: [u8; 24],
+
     // --- Frame counters ---
     pub frame_count: u64,
     pub video_frames: u64,
@@ -176,7 +386,36 @@ pub struct DebugState {
     pub code_regions: Vec<CodeRegion>,
     /// Signal from UI or keyboard: capture a bookmark on the next emulation frame.
     pub create_bookmark: bool,
+    /// Signal from UI: write regions sidecar to disk on the next emulation frame.
+    pub save_regions: bool,
+    /// Path of the regions sidecar file (set by Frontend on startup).
+    pub sidecar_path: Option<std::path::PathBuf>,
+
+    // --- Watches ---
+    /// User-created memory watches (displayed in the Watch panel).
+    pub watches: Vec<Watch>,
+    /// Iterative RAM-search state (cheat-engine-style value narrowing).
+    pub ram_search: RamSearch,
+    /// Rolling log of value changes for tracked watches (capped, newest at back).
+    pub change_log: VecDeque<ChangeEvent>,
+
+    // --- Navigation ---
+    /// Shared cross-panel navigation cursor + back/forward history.
+    pub nav: NavState,
+
+    // --- AI Wave 1: deferred Lua bridge (MCP run_lua round-trip) ---
+    /// Lua source submitted by the MCP `run_lua` tool, waiting for the main
+    /// thread to execute it. The MCP thread sets this under lock; the Bevy
+    /// `drain_lua_requests` system (which owns the NonSend LuaEngine) picks it
+    /// up, runs it, and clears it back to `None`.
+    pub pending_lua: Option<String>,
+    /// Result of the most recently drained `pending_lua` request: `Ok(output)`
+    /// or `Err(message)`. The MCP thread polls this and clears it on read.
+    pub pending_lua_result: Option<Result<String, String>>,
 }
+
+/// Maximum number of change events retained in `change_log`.
+const CHANGE_LOG_CAP: usize = 200;
 
 impl DebugState {
     pub fn new() -> Self {
@@ -202,6 +441,7 @@ impl DebugState {
             z80_bc: 0,
             z80_de: 0,
             z80_hl: 0,
+            vdp_regs: [0u8; 24],
             frame_count: 0,
             video_frames: 0,
             video_real: 0,
@@ -223,7 +463,201 @@ impl DebugState {
             bookmarks: Vec::new(),
             code_regions: Vec::new(),
             create_bookmark: false,
+            save_regions: false,
+            sidecar_path: None,
+            watches: Vec::new(),
+            ram_search: RamSearch::new(),
+            change_log: VecDeque::new(),
+            nav: NavState::default(),
+            pending_lua: None,
+            pending_lua_result: None,
         }
+    }
+
+    /// THE entry point other panels call to change the shared current location.
+    ///
+    /// Sets the cursor to `addr`, pushes it onto the back/forward history (truncating
+    /// any forward entries first, so a new jump from the middle of history discards the
+    /// "forward" branch), and arms `pending_focus` so address-aware panels scroll to it
+    /// on the next render.
+    pub fn goto(&mut self, addr: u32) {
+        self.nav.current_address = Some(addr);
+        // Truncate any forward entries before appending the new location.
+        if !self.nav.history.is_empty() && self.nav.history_idx + 1 < self.nav.history.len() {
+            self.nav.history.truncate(self.nav.history_idx + 1);
+        }
+        self.nav.history.push(addr);
+        self.nav.history_idx = self.nav.history.len() - 1;
+        self.nav.pending_focus = Some(addr);
+    }
+
+    /// Move one step back in history. Updates the cursor + `pending_focus` from the new
+    /// entry. Returns true if it moved.
+    pub fn nav_back(&mut self) -> bool {
+        if !self.can_go_back() {
+            return false;
+        }
+        self.nav.history_idx -= 1;
+        let addr = self.nav.history[self.nav.history_idx];
+        self.nav.current_address = Some(addr);
+        self.nav.pending_focus = Some(addr);
+        true
+    }
+
+    /// Move one step forward in history. Updates the cursor + `pending_focus` from the
+    /// new entry. Returns true if it moved.
+    pub fn nav_forward(&mut self) -> bool {
+        if !self.can_go_forward() {
+            return false;
+        }
+        self.nav.history_idx += 1;
+        let addr = self.nav.history[self.nav.history_idx];
+        self.nav.current_address = Some(addr);
+        self.nav.pending_focus = Some(addr);
+        true
+    }
+
+    /// True if there is an earlier entry in history to navigate back to.
+    pub fn can_go_back(&self) -> bool {
+        !self.nav.history.is_empty() && self.nav.history_idx > 0
+    }
+
+    /// True if there is a later entry in history to navigate forward to.
+    pub fn can_go_forward(&self) -> bool {
+        !self.nav.history.is_empty() && self.nav.history_idx + 1 < self.nav.history.len()
+    }
+
+    /// Push a change event to the rolling log, capping at `CHANGE_LOG_CAP`.
+    pub fn push_change(&mut self, ev: ChangeEvent) {
+        if self.change_log.len() >= CHANGE_LOG_CAP {
+            self.change_log.pop_front();
+        }
+        self.change_log.push_back(ev);
+    }
+
+    /// Read up to 4 bytes from the emulated address space, returning them as a
+    /// little-endian u32. Walks `memory_regions` to find the containing region
+    /// and reads through its host pointer. Returns None if no region contains
+    /// the address or the host pointer is null.
+    pub fn read_addr(&self, addr: usize, len: usize) -> Option<u32> {
+        let len = len.min(4);
+        for region in &self.memory_regions {
+            if let Some(host) = region.host_ptr_for_addr(addr) {
+                let ptr = host as *const u8;
+                if ptr.is_null() {
+                    return None;
+                }
+                let mut value: u32 = 0;
+                unsafe {
+                    for i in 0..len {
+                        value |= (*ptr.add(i) as u32) << (8 * i);
+                    }
+                }
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    /// Read a single byte from the emulated address space (convenience wrapper
+    /// over `read_addr`, used by the Lua `memory.read_u8` binding).
+    pub fn read_u8(&self, addr: u32) -> Option<u8> {
+        self.read_addr(addr as usize, 1).map(|v| v as u8)
+    }
+
+    /// Write `len` little-endian bytes of `value` back to the emulated address
+    /// space. Returns false if no region contains the address, the host pointer
+    /// is null, or the containing region is read-only.
+    pub fn write_addr(&self, addr: usize, len: usize, value: u32) -> bool {
+        let len = len.min(4);
+        for region in &self.memory_regions {
+            if let Some(host) = region.host_ptr_for_addr(addr) {
+                if region.is_readonly() {
+                    return false;
+                }
+                let ptr = host as *mut u8;
+                if ptr.is_null() {
+                    return false;
+                }
+                unsafe {
+                    for i in 0..len {
+                        *ptr.add(i) = ((value >> (8 * i)) & 0xFF) as u8;
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Reset the RAM search: enumerate every aligned address in the selected
+    /// region, snapshot each value, and mark the search as started.
+    pub fn reset_search(&mut self) {
+        let stride = self.ram_search.size.byte_len();
+        let mut candidates = Vec::new();
+        let mut prev_values = Vec::new();
+
+        if let Some(region) = self.memory_regions.get(self.ram_search.region_idx) {
+            let mut addr = region.addr_start;
+            while addr + stride <= region.addr_end + 1 {
+                if let Some(v) = read_le(region, addr, stride) {
+                    candidates.push(addr);
+                    prev_values.push(v);
+                }
+                addr += stride;
+            }
+        }
+
+        self.ram_search.candidates = candidates;
+        self.ram_search.prev_values = prev_values;
+        self.ram_search.started = true;
+    }
+
+    /// Run one search step, keeping only candidates that pass `compare` against
+    /// `source`. Survivors' snapshots are refreshed to the just-read values so
+    /// the next step compares against this checkpoint.
+    pub fn step_search(&mut self, compare: SearchCompare, source: SearchSource) {
+        if !self.ram_search.started {
+            return;
+        }
+        let len = self.ram_search.size.byte_len();
+        let bits = (len * 8) as u32;
+        let signed = self.ram_search.signed;
+
+        let region = match self.memory_regions.get(self.ram_search.region_idx) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+
+        let candidates = std::mem::take(&mut self.ram_search.candidates);
+        let prev_values = std::mem::take(&mut self.ram_search.prev_values);
+
+        let mut new_candidates = Vec::new();
+        let mut new_prev = Vec::new();
+
+        for (i, &addr) in candidates.iter().enumerate() {
+            let cur = match read_le(&region, addr, len) {
+                Some(v) => v,
+                None => continue,
+            };
+            let rhs = match compare {
+                SearchCompare::Changed
+                | SearchCompare::Unchanged
+                | SearchCompare::Increased
+                | SearchCompare::Decreased => prev_values[i],
+                _ => match &source {
+                    SearchSource::PreviousSnapshot => prev_values[i],
+                    SearchSource::SpecificValue(v) => *v,
+                },
+            };
+            if compare_passes(cur, rhs, compare, signed, bits) {
+                new_candidates.push(addr);
+                new_prev.push(cur);
+            }
+        }
+
+        self.ram_search.candidates = new_candidates;
+        self.ram_search.prev_values = new_prev;
     }
 
     /// Push an event to the rolling log (capped at 500 entries).
@@ -254,6 +688,22 @@ impl DebugState {
         }
         self.input_history.push_back((frame, state));
         self.input_state = state;
+    }
+}
+
+/// Read `len` (1-4) bytes little-endian from a region at a guest address.
+fn read_le(region: &MemoryRegion, addr: usize, len: usize) -> Option<u32> {
+    let host = region.host_ptr_for_addr(addr)?;
+    if host == 0 {
+        return None;
+    }
+    unsafe {
+        let ptr = host as *const u8;
+        let mut value: u32 = 0;
+        for i in 0..len {
+            value |= (*ptr.add(i) as u32) << (8 * i);
+        }
+        Some(value)
     }
 }
 
@@ -303,4 +753,105 @@ pub fn decode_to_rgba(src: &[u8], width: u32, height: u32, pitch: usize, fmt: u3
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Narrow a synthetic candidate set by applying `compare_passes` against a
+    /// per-candidate snapshot, mirroring step_search's kernel without real memory.
+    fn narrow(cur: &[u32], prev: &[u32], op: SearchCompare, signed: bool, bits: u32) -> Vec<usize> {
+        (0..cur.len())
+            .filter(|&i| compare_passes(cur[i], prev[i], op, signed, bits))
+            .collect()
+    }
+
+    #[test]
+    fn equal_narrows_to_matching() {
+        let cur = [10, 99, 30, 99];
+        let survivors: Vec<usize> = (0..4)
+            .filter(|&i| compare_passes(cur[i], 30, SearchCompare::Equal, false, 8))
+            .collect();
+        assert_eq!(survivors, vec![2]);
+    }
+
+    #[test]
+    fn changed_and_unchanged_split() {
+        let prev = [1u32, 2, 3, 4];
+        let cur = [1u32, 5, 3, 9];
+        assert_eq!(narrow(&cur, &prev, SearchCompare::Changed, false, 8), vec![1, 3]);
+        assert_eq!(narrow(&cur, &prev, SearchCompare::Unchanged, false, 8), vec![0, 2]);
+    }
+
+    #[test]
+    fn increased_decreased() {
+        let prev = [10u32, 10, 10];
+        let cur = [11u32, 9, 10];
+        assert_eq!(narrow(&cur, &prev, SearchCompare::Increased, false, 8), vec![0]);
+        assert_eq!(narrow(&cur, &prev, SearchCompare::Decreased, false, 8), vec![1]);
+    }
+
+    #[test]
+    fn signed_less_than_handles_high_bit() {
+        assert!(compare_passes(0xFF, 0x01, SearchCompare::Less, true, 8));
+        assert!(!compare_passes(0xFF, 0x01, SearchCompare::Less, false, 8));
+    }
+
+    #[test]
+    fn different_by_is_symmetric() {
+        assert!(compare_passes(15, 10, SearchCompare::DifferentBy(5), false, 8));
+        assert!(compare_passes(10, 15, SearchCompare::DifferentBy(5), false, 8));
+        assert!(!compare_passes(10, 15, SearchCompare::DifferentBy(4), false, 8));
+    }
+
+    #[test]
+    fn nav_history_back_forward_and_truncate() {
+        let mut ds = DebugState::new();
+        assert!(!ds.can_go_back());
+        assert!(!ds.can_go_forward());
+
+        // Push 3 addresses.
+        ds.goto(0x100);
+        ds.goto(0x200);
+        ds.goto(0x300);
+        assert_eq!(ds.nav.current_address, Some(0x300));
+        assert_eq!(ds.nav.history, vec![0x100, 0x200, 0x300]);
+        assert_eq!(ds.nav.history_idx, 2);
+        assert_eq!(ds.nav.pending_focus, Some(0x300));
+        assert!(ds.can_go_back());
+        assert!(!ds.can_go_forward());
+
+        // Back twice -> 0x100.
+        assert!(ds.nav_back());
+        assert_eq!(ds.nav.current_address, Some(0x200));
+        assert!(ds.nav_back());
+        assert_eq!(ds.nav.current_address, Some(0x100));
+        assert_eq!(ds.nav.pending_focus, Some(0x100));
+        assert!(!ds.can_go_back());
+        assert!(ds.can_go_forward());
+
+        // Forward once -> 0x200.
+        assert!(ds.nav_forward());
+        assert_eq!(ds.nav.current_address, Some(0x200));
+        assert_eq!(ds.nav.history_idx, 1);
+
+        // goto a 4th address from the middle truncates the forward branch (0x300).
+        ds.goto(0x400);
+        assert_eq!(ds.nav.history, vec![0x100, 0x200, 0x400]);
+        assert_eq!(ds.nav.history_idx, 2);
+        assert_eq!(ds.nav.current_address, Some(0x400));
+        assert!(!ds.can_go_forward());
+    }
+
+    #[test]
+    fn detect_change_edge_logic() {
+        // First sighting (no prior value) is never a change.
+        assert!(!detect_change(None, 42));
+        // Same value held across frames is not a change.
+        assert!(!detect_change(Some(42), 42));
+        // A differing value is a change.
+        assert!(detect_change(Some(42), 43));
+        assert!(detect_change(Some(0), 1));
+    }
 }

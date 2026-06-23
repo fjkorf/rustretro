@@ -15,6 +15,7 @@ pub struct Frontend {
     _game_path_cstring: Option<CString>,
     pub frame_count: u64,
     debug_state: SharedDebugState,
+    sidecar_path: Option<std::path::PathBuf>,
 }
 
 impl Frontend {
@@ -35,7 +36,12 @@ impl Frontend {
         eprintln!("Core: {} v{}", system_info.library_name, system_info.library_version);
         eprintln!("Valid extensions: {}", system_info.valid_extensions);
 
-        let callback_context = Box::new(CallbackContext::new(save_dir, system_dir, Arc::clone(&debug_state)));
+        let callback_context = Box::new(CallbackContext::new(save_dir.clone(), system_dir, Arc::clone(&debug_state)));
+
+        // Derive sidecar path: <save_dir>/<rom_stem>.regions.json
+        let sidecar_path = std::path::Path::new(rom_path)
+            .file_stem()
+            .map(|stem| save_dir.join(format!("{}.regions.json", stem.to_string_lossy())));
 
         let mut frontend = Frontend {
             core,
@@ -43,8 +49,17 @@ impl Frontend {
             callback_context,
             _game_path_cstring: None,
             frame_count: 0,
-            debug_state,
+            debug_state: Arc::clone(&debug_state),
+            sidecar_path: sidecar_path.clone(),
         };
+
+        // Store sidecar path in debug state and try to load existing data
+        if let Ok(mut ds) = debug_state.lock() {
+            ds.sidecar_path = sidecar_path.clone();
+        }
+        if let Some(ref path) = sidecar_path {
+            load_regions_sidecar(path, &debug_state);
+        }
 
         frontend.setup_callbacks()?;
         frontend
@@ -239,7 +254,14 @@ impl Frontend {
                 }
                 Err(_) => {}
             }
-            
+
+            // Populate VDP registers when a source becomes available.
+            // (Currently a no-op: Genesis VDP regs are write-only and not exposed
+            // by the loaded cores — see debug/vdp_source.rs for the dead-end and routes.)
+            if let Some(vdp) = crate::debug::vdp_source::read_vdp_regs(&ds.memory_regions) {
+                ds.vdp_regs = vdp;
+            }
+
             // Fetch code bytes at PC for disassembly panel (256 bytes via SekFetchByte)
             if ds.m68k_pc > 0 {
                 let code = self.core.read_m68k_code(ds.m68k_pc, 256);
@@ -264,6 +286,67 @@ impl Frontend {
                     ds.hit_breakpoint = Some(pc);
                     ds.log(format!("🔴 Breakpoint hit at ${:06X}", pc));
                 }
+            }
+
+            // Update watches: read current values and apply freezes.
+            // Collect ops first so we don't borrow ds.watches while calling
+            // ds.read_addr / ds.write_addr (which borrow ds immutably).
+            let mut freeze_writes: Vec<(usize, usize, u32)> = Vec::new();
+            let mut change_events: Vec<crate::debug::ChangeEvent> = Vec::new();
+            {
+                let watch_params: Vec<(usize, usize, bool, Option<u32>)> = ds.watches.iter()
+                    .map(|w| (w.addr, w.format.byte_len(), w.frozen, w.frozen_value))
+                    .collect();
+                let mut updates: Vec<(Option<u32>, Option<u32>)> = Vec::with_capacity(watch_params.len());
+                for (addr, len, frozen, frozen_value) in &watch_params {
+                    let current = ds.read_addr(*addr, *len);
+                    let mut new_frozen_value = *frozen_value;
+                    if *frozen {
+                        if new_frozen_value.is_none() {
+                            new_frozen_value = current;
+                        }
+                        if let Some(fv) = new_frozen_value {
+                            freeze_writes.push((*addr, *len, fv));
+                        }
+                    } else {
+                        new_frozen_value = None;
+                    }
+                    updates.push((current, new_frozen_value));
+                }
+                // Detect frame-granular value changes for tracked watches. We
+                // collect events here (while iterating ds.watches mutably) and
+                // push them after the loop, since push_change needs &mut self.
+                // PC for this frame was already captured into ds.m68k_pc above.
+                let frame = ds.frame_count;
+                let pc = ds.m68k_pc;
+                for (w, (current, new_frozen_value)) in ds.watches.iter_mut().zip(updates) {
+                    if w.track_changes {
+                        if let Some(cur) = current {
+                            if crate::debug::detect_change(w.prev_value, cur) {
+                                let old = w.prev_value.unwrap_or(cur);
+                                change_events.push(crate::debug::ChangeEvent {
+                                    frame,
+                                    addr: w.addr,
+                                    old,
+                                    new: cur,
+                                    pc,
+                                });
+                            }
+                            w.prev_value = current;
+                        }
+                    } else {
+                        // Reset edge state so re-enabling tracking starts fresh.
+                        w.prev_value = None;
+                    }
+                    w.current = current;
+                    w.frozen_value = new_frozen_value;
+                }
+            }
+            for ev in change_events {
+                ds.push_change(ev);
+            }
+            for (addr, len, value) in freeze_writes {
+                ds.write_addr(addr, len, value);
             }
 
             if self.frame_count % 300 == 0 && any_success {
@@ -355,6 +438,16 @@ impl Frontend {
         // --- Capture bookmark if requested ---
         self.maybe_capture_bookmark();
 
+        // --- Save regions sidecar if requested ---
+        let needs_save = self.debug_state.try_lock()
+            .map(|mut ds| { let v = ds.save_regions; ds.save_regions = false; v })
+            .unwrap_or(false);
+        if needs_save {
+            if let Some(ref path) = self.sidecar_path {
+                save_regions_sidecar(path, &self.debug_state);
+            }
+        }
+
         // --- Apply pending AV info change ---
         if let Some(new_info) = self.callback_context.pending_av_info.take() {
             let av = new_info.to_rust();
@@ -396,6 +489,10 @@ impl Frontend {
     }
 
     pub fn shutdown(&self) {
+        // Save regions sidecar before shutting down
+        if let Some(ref path) = self.sidecar_path {
+            save_regions_sidecar(path, &self.debug_state);
+        }
         let _ = self.core.unload_game();
         let _ = self.core.deinit();
     }
@@ -710,4 +807,54 @@ fn downsample_thumbnail(rgba: &[u8], w: u32, h: u32, out_w: u32, out_h: u32) -> 
         }
     }
     out
+}
+
+/// Sidecar file format — bookmarks and code regions for one ROM.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RegionsSidecar {
+    bookmarks: Vec<crate::debug::Bookmark>,
+    code_regions: Vec<crate::debug::CodeRegion>,
+}
+
+/// Load a regions sidecar file into debug state. Silently ignores missing files.
+fn load_regions_sidecar(path: &std::path::Path, debug_state: &SharedDebugState) {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(_) => return, // file doesn't exist yet — that's fine
+    };
+    match serde_json::from_str::<RegionsSidecar>(&data) {
+        Ok(sidecar) => {
+            if let Ok(mut ds) = debug_state.lock() {
+                let bm_count  = sidecar.bookmarks.len();
+                let reg_count = sidecar.code_regions.len();
+                ds.bookmarks    = sidecar.bookmarks;
+                ds.code_regions = sidecar.code_regions;
+                ds.log(format!("📂 Loaded {} bookmark(s) and {} region(s) from {}", bm_count, reg_count, path.display()));
+            }
+        }
+        Err(e) => eprintln!("[Regions] Failed to parse sidecar {}: {}", path.display(), e),
+    }
+}
+
+/// Save bookmarks and code regions to a JSON sidecar file (atomic write via .tmp).
+fn save_regions_sidecar(path: &std::path::Path, debug_state: &SharedDebugState) {
+    let (bookmarks, code_regions) = match debug_state.lock() {
+        Ok(ds) => (ds.bookmarks.clone(), ds.code_regions.clone()),
+        Err(_) => return,
+    };
+    let sidecar = RegionsSidecar { bookmarks, code_regions };
+    let json = match serde_json::to_string_pretty(&sidecar) {
+        Ok(j) => j,
+        Err(e) => { eprintln!("[Regions] Serialization failed: {}", e); return; }
+    };
+    let tmp = path.with_extension("regions.json.tmp");
+    if std::fs::write(&tmp, &json).is_ok() {
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            eprintln!("[Regions] Failed to rename sidecar: {}", e);
+        } else if let Ok(mut ds) = debug_state.lock() {
+            ds.log(format!("💾 Saved regions to {}", path.display()));
+        }
+    } else {
+        eprintln!("[Regions] Failed to write sidecar to {}", tmp.display());
+    }
 }

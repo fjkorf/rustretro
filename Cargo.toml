@@ -9,11 +9,20 @@ libloading = "0.8"
 thiserror = "1.0"
 anyhow = "1.0"
 memoffset = "0.9"
-bevy = "0.15"
-bevy_egui = "0.33"
+bevy = "0.18"
+bevy_egui = "0.39"
+egui_dock = { version = "0.18", features = ["serde"] }
 cpal = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }
 capstone = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+
+# --- AI Wave 1: MCP server (only active behind the `--mcp` flag) ---
+rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+axum = "0.8"
 
 [profile.release]
 opt-level = 3
