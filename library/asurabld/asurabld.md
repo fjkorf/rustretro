@@ -86,6 +86,20 @@ pen 15 transparent), priority-vs-layers bits 6-7, yzoom bits 8-11, xzoom bits
 (see [[tilebank]]); effective code = (code&0x3FFF) | nibble<<14, tile bytes at
 [[gfx-sp]] offset code*128. Hardware displays a copy buffered ~2 frames, so a
 live snapshot leads the visible frame slightly.
+
+Pose-level structure (verified live): the list is slot-allocated — HUD at
+~70-110 and ~700+, the zoomed shadow blobs at ~280, characters and their
+effects at ~300-699, and banner machinery PARKED OFF-SCREEN at ~1000+ (not
+skip-flagged). A character pose is a contiguous index run whose strip boxes
+tile together; palette varies per STRIP within one pose (weapon/effect strips
+interleave the body run under a different palette); draw order is descending
+index, back to front. Within one run, codes advance by strip width — a pose is
+one or more contiguous code intervals in [[gfx-sp]], and animation frames sit
+at evenly spaced intervals (e.g. Footee's idle at stride 0x19). Plain pose
+tables were NOT found in program ROM by direct/LE/shifted searches; the
+metadata is packed or computed (write-trace or disassembly needed to go
+ROM-side). `asura_assets.py poses --slots 300-699` harvests deduplicated,
+flip-normalized pose assets (see assets/poses/).
 :::
 
 ::: region kind=palette id=pal addr=0x700000-0x703FFF label="Palette RAM" format=xrgb555_be confidence=confirmed
@@ -165,10 +179,10 @@ The working loop, end to end (all tools in-repo):
 
 Captured assets so far: `assets/bg_layer0.png`, `assets/bg_layer1.png`
 (complete stages, wider than the camera ever shows), `assets/bg_8x8_page0/1.png`,
-`assets/palette_ram.png`, `assets/verify_side_by_side.png`, and
-`assets/sprites/` (578 per-entry strips with manifest; characters are stacks
-of 1-row strips — pose-level grouping of adjacent entries is the natural next
-step).
+`assets/palette_ram.png`, `assets/verify_side_by_side.png`, `assets/sprites/`
+(578 per-entry strips), and `assets/poses/` (62 deduplicated assembled poses —
+stances, specials with effects, throws, splash text — harvested by
+`asura_assets.py poses --watch 35 --slots 300-699` over one driven match).
 
 ## Regions
 

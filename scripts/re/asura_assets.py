@@ -33,7 +33,8 @@ vidhrdw/fuukifg3_vidhrdw.c, mame2003-plus tree):
 Usage (instance from the repo root, MCP on port 4011):
   python3 scripts/re/asura_assets.py palettes
   python3 scripts/re/asura_assets.py bg
-  python3 scripts/re/asura_assets.py sprites [--watch 10]
+  python3 scripts/re/asura_assets.py sprites [--watch 10]   # per-entry strips
+  python3 scripts/re/asura_assets.py poses   [--watch 20]   # assembled, deduped poses
   python3 scripts/re/asura_assets.py verify
 Common flags: --port N (default 4011), --out DIR (default
 library/asurabld/assets), --rom-dir DIR (default from decode_asurabld).
@@ -263,16 +264,25 @@ def calibrate_tilebank(entries, rom, pens, scr):
     (their screen footprint differs). Returns {bank: nibble} for banks whose
     sprites produced any comparable pixels.
     """
+    scr_w, scr_h, _ = scr
     by_bank = {}
     for sx, sy, attr, code in entries:
         if sx & 0x400:
             continue
         unzoomed = ((attr >> 10) & 0x3C) == 0 and ((attr >> 6) & 0x3C) == 0
-        if unzoomed:
+        # Only sprites actually ON screen can vote: games park machinery at
+        # off-screen positions (still "visible" by flag), and a parked sprite
+        # matched against background pixels yields a confidently wrong nibble.
+        px = (sx & 0x1FF) - (sx & 0x200)
+        py = (sy & 0x1FF) - (sy & 0x200)
+        w, h = (((sx >> 12) & 0xF) + 1) * 16, (((sy >> 12) & 0xF) + 1) * 16
+        on_screen = (min(px + w, scr_w) - max(px, 0) >= 8
+                     and min(py + h, scr_h) - max(py, 0) >= 8)
+        if unzoomed and on_screen:
             by_bank.setdefault((code >> 14) & 3, []).append((sx, sy, attr, code))
     nibbles = {}
     for bank, ents in by_bank.items():
-        best, best_frac = None, 0.0
+        best, best_frac, best_cmp = None, 0.0, 0
         for n in range(16):
             matched = compared = 0
             for sx, sy, attr, code in ents:
@@ -283,10 +293,10 @@ def calibrate_tilebank(entries, rom, pens, scr):
                 compared += c
             frac = matched / compared if compared else 0.0
             if frac > best_frac:
-                best, best_frac = n, frac
-        # Require a majority match — below that we'd be guessing, and a wrong
-        # bank produces garbage tiles that poison the asset dump.
-        if best is not None and best_frac >= 0.5:
+                best, best_frac, best_cmp = n, frac, compared
+        # Require a majority match over a meaningful pixel count — below that
+        # we'd be guessing, and a wrong bank poisons the asset dump.
+        if best is not None and best_frac >= 0.5 and best_cmp >= 200:
             nibbles[bank] = best
     return nibbles
 
@@ -435,6 +445,191 @@ def cmd_sprites(live, rom, out, watch=0.0):
         json.dump({"count": len(seen),
                    "sprites": sorted(seen.values())}, f, indent=1)
     print(f"wrote {len(seen)} sprite frame(s) to {os.path.join(out, 'sprites')}")
+
+
+def capture_frame(live):
+    """Atomically capture palette + screen + sprite list from ONE paused frame.
+
+    Everything a pose render needs must come from the same frame: attract mode
+    swaps scenes (and palettes, and the tilebank) faster than sequential reads.
+    """
+    live.mcp.call("pause")
+    try:
+        pens = live.palette()
+        scr = live.mcp.screen_rgba()
+        entries = live.sprites()
+    finally:
+        live.mcp.call("resume")
+    return pens, scr, entries
+
+
+def decode_entries(entries, nibbles):
+    """Visible, unzoomed, bank-resolved sprite entries as dicts.
+
+    Zoomed entries are excluded on purpose: in practice they are the shadow
+    blobs, drawn by the hardware as a darkening blend we cannot reproduce
+    from pens (and their bank often can't be calibrated for the same reason).
+    """
+    rows = []
+    for i, (sx, sy, attr, raw) in enumerate(entries):
+        if sx & 0x400:
+            continue
+        if ((attr >> 10) & 0x3C) or ((attr >> 6) & 0x3C):
+            continue
+        code = sprite_code_banked(raw, nibbles)
+        if code is None:
+            continue
+        rows.append(dict(
+            i=i,
+            x=(sx & 0x1FF) - (sx & 0x200), y=(sy & 0x1FF) - (sy & 0x200),
+            xn=((sx >> 12) & 0xF) + 1, yn=((sy >> 12) & 0xF) + 1,
+            fx=bool(sx & 0x800), fy=bool(sy & 0x800),
+            pal=attr & 0x3F, code=code))
+    return rows
+
+
+def cluster_poses(rows, scr_w=320, scr_h=240, idx_gap=8, slack=8):
+    """Group strips into poses: consecutive list indices + touching boxes.
+
+    Empirically (see library/asurabld/asurabld.md) a pose is a contiguous
+    index run whose strip boxes tile together. Palette is deliberately NOT a
+    grouping key — a character's weapon/effect strips interleave the body run
+    under a different palette. Groups mostly off screen (parked banner
+    machinery at index 1000+) are dropped.
+    """
+    def bbox(r):
+        return (r['x'], r['y'], r['x'] + r['xn'] * 16, r['y'] + r['yn'] * 16)
+
+    def touches(a, b):
+        ax0, ay0, ax1, ay1 = bbox(a)
+        bx0, by0, bx1, by1 = bbox(b)
+        return not (ax1 + slack < bx0 or bx1 + slack < ax0
+                    or ay1 + slack < by0 or by1 + slack < ay0)
+
+    groups = []
+    for r in rows:
+        merged = None
+        for g in groups:
+            if (r['i'] - g[-1]['i'] <= idx_gap and any(touches(r, m) for m in g)):
+                if merged is None:
+                    g.append(r)
+                    merged = g
+                else:
+                    merged.extend(g)   # r bridges two earlier groups
+                    merged.sort(key=lambda m: m['i'])
+                    g.clear()
+        groups = [g for g in groups if g]
+        if merged is None:
+            groups.append([r])
+
+    kept = []
+    for g in groups:
+        x0 = min(m['x'] for m in g); y0 = min(m['y'] for m in g)
+        x1 = max(m['x'] + m['xn'] * 16 for m in g)
+        y1 = max(m['y'] + m['yn'] * 16 for m in g)
+        vis_w = min(x1, scr_w) - max(x0, 0)
+        vis_h = min(y1, scr_h) - max(y0, 0)
+        if vis_w >= 8 and vis_h >= 8:
+            kept.append(g)
+    return kept
+
+
+def canonicalize(group):
+    """Relative strip layout, mirrored to unflipped when uniformly flipped.
+
+    Returns (strips, W, H) where strips are (code, relx, rely, xn, yn, fx, fy,
+    pal) — a left-facing capture and its right-facing twin normalize to the
+    same layout, so they dedupe together.
+    """
+    x0 = min(m['x'] for m in group); y0 = min(m['y'] for m in group)
+    W = max(m['x'] + m['xn'] * 16 for m in group) - x0
+    H = max(m['y'] + m['yn'] * 16 for m in group) - y0
+    flip_all_x = all(m['fx'] for m in group)
+    flip_all_y = all(m['fy'] for m in group)
+    strips = []
+    for m in sorted(group, key=lambda m: m['i']):
+        rx, ry = m['x'] - x0, m['y'] - y0
+        w, h = m['xn'] * 16, m['yn'] * 16
+        fx, fy = m['fx'], m['fy']
+        if flip_all_x:
+            rx, fx = W - (rx + w), False
+        if flip_all_y:
+            ry, fy = H - (ry + h), False
+        strips.append((m['code'], rx, ry, m['xn'], m['yn'], fx, fy, m['pal']))
+    return strips, W, H
+
+
+def render_pose(rom, strips, W, H, pens):
+    """RGBA canvas of a canonical pose; back-to-front = reverse list order."""
+    img = bytearray(W * H * 4)
+    blank = True
+    for code, rx, ry, xn, yn, fx, fy, pal in reversed(strips):
+        r = render_sprite(rom, code, pal, xn, yn, pens)
+        if r is None:
+            continue
+        blank = False
+        w, h, px = r
+        for y in range(h):
+            dy = ry + (h - 1 - y if fy else y)
+            for x in range(w):
+                dx = rx + (w - 1 - x if fx else x)
+                o = (y * w + x) * 4
+                if px[o + 3]:
+                    d = (dy * W + dx) * 4
+                    img[d:d + 4] = px[o:o + 4]
+    return None if blank else bytes(img)
+
+
+def cmd_poses(live, rom, out, watch=0.0, slots=None):
+    """Harvest deduplicated pose-level assets (assembled multi-strip sprites).
+
+    `slots` restricts to a sprite-list index range. The game slot-allocates
+    the list (HUD ~70-110 and ~700+, shadows ~280, characters ~300-699), and
+    the HUD's timer digits change every frame — each tick would otherwise
+    mint a spuriously "unique" HUD pose. `--slots 300-699` keeps the harvest
+    to characters and their effects.
+    """
+    pose_dir = os.path.join(out, "poses")
+    os.makedirs(pose_dir, exist_ok=True)
+    seen = {}
+    frames = 0
+    deadline = time.time() + watch
+    while True:
+        pens, scr, entries = capture_frame(live)
+        frames += 1
+        nibbles = calibrate_tilebank(entries, rom, pens, scr)
+        rows = decode_entries(entries, nibbles)
+        if slots:
+            rows = [r for r in rows if slots[0] <= r['i'] <= slots[1]]
+        for group in cluster_poses(rows):
+            strips, W, H = canonicalize(group)
+            sig = tuple(sorted(strips))
+            if sig in seen:
+                seen[sig]["hits"] += 1
+                continue
+            img = render_pose(rom, strips, W, H, pens)
+            if img is None:
+                continue
+            name = (f"pose_{strips[0][0]:05X}_{W}x{H}_{len(strips)}s"
+                    f"_{abs(hash(sig)) % 0xFFFF:04X}.png")
+            write_png_rgba(os.path.join(pose_dir, name), W, H, img)
+            seen[sig] = {
+                "file": name, "hits": 1, "strips": len(strips),
+                "size": [W, H],
+                "codes": sorted({s[0] for s in strips}),
+                "palettes": sorted({s[7] for s in strips}),
+            }
+        if time.time() >= deadline:
+            break
+        time.sleep(0.25)
+    manifest = {
+        "frames_sampled": frames,
+        "unique_poses": len(seen),
+        "poses": sorted(seen.values(), key=lambda p: p["file"]),
+    }
+    with open(os.path.join(pose_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1)
+    print(f"{len(seen)} unique pose(s) from {frames} frame(s) -> {pose_dir}")
 
 
 PRI_TABLE = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
@@ -599,12 +794,15 @@ def cmd_verify(live, rom, out):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("cmd", choices=["palettes", "bg", "sprites", "verify"])
+    ap.add_argument("cmd", choices=["palettes", "bg", "sprites", "poses", "verify"])
     ap.add_argument("--port", type=int, default=4011)
     ap.add_argument("--out", default="library/asurabld/assets")
     ap.add_argument("--rom-dir", default=dec.ROMDIR)
     ap.add_argument("--watch", type=float, default=0.0,
-                    help="sprites: keep sampling for N seconds")
+                    help="sprites/poses: keep sampling for N seconds")
+    ap.add_argument("--slots", default=None, metavar="LO-HI",
+                    help="poses: only sprite-list indices LO..HI "
+                         "(asurabld characters: 300-699)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -616,6 +814,12 @@ def main():
         cmd_bg(live, rom, args.out)
     elif args.cmd == "sprites":
         cmd_sprites(live, rom, args.out, args.watch)
+    elif args.cmd == "poses":
+        slots = None
+        if args.slots:
+            lo, hi = args.slots.split("-")
+            slots = (int(lo), int(hi))
+        cmd_poses(live, rom, args.out, args.watch, slots)
     elif args.cmd == "verify":
         cmd_verify(live, rom, args.out)
 
