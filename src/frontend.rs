@@ -18,6 +18,13 @@ pub struct Frontend {
     sidecar_path: Option<std::path::PathBuf>,
     /// Ensures the SET_MEMORY_MAPS fallback synthesis runs at most once.
     did_memory_fallback: bool,
+    /// Where bus-window configs persist (`<save_dir>/<rom_stem>.busmap.json`,
+    /// or the `--bus-map` override).
+    busmap_path: Option<std::path::PathBuf>,
+    /// Whether the core's Sek bus-read API worked: None = not yet tried,
+    /// Some(false) = probed and absent (stop retrying — and stop re-running
+    /// dlsym probes every frame), Some(true) = live.
+    bus_bridge_ok: Option<bool>,
 }
 
 impl Frontend {
@@ -27,6 +34,7 @@ impl Frontend {
         save_dir: PathBuf,
         system_dir: PathBuf,
         debug_state: SharedDebugState,
+        bus_map: Option<PathBuf>,
     ) -> Result<Self> {
         let core = RetroCore::load(core_path)
             .map_err(|e| anyhow!("Failed to load core: {}", e))?;
@@ -57,6 +65,13 @@ impl Frontend {
             .as_ref()
             .map(|slug| PathBuf::from("library").join(slug).join(format!("{slug}.md")));
 
+        // Busmap sidecar: explicit --bus-map wins; else <save_dir>/<rom_stem>.busmap.json
+        let busmap_path = bus_map.or_else(|| {
+            std::path::Path::new(rom_path)
+                .file_stem()
+                .map(|stem| save_dir.join(format!("{}.busmap.json", stem.to_string_lossy())))
+        });
+
         let mut frontend = Frontend {
             core,
             av_info: None,
@@ -66,6 +81,8 @@ impl Frontend {
             debug_state: Arc::clone(&debug_state),
             sidecar_path: sidecar_path.clone(),
             did_memory_fallback: false,
+            busmap_path: busmap_path.clone(),
+            bus_bridge_ok: None,
         };
 
         // Store sidecar path in debug state and try to load existing data
@@ -133,6 +150,12 @@ impl Frontend {
         // GX, FBNeo), synthesize a region from retro_get_memory_data/size.
         frontend.apply_memory_map_fallback();
 
+        // Install bus windows from the busmap sidecar (Sek snapshot bridge).
+        // Buffers stay zero-filled until the first post-run refresh.
+        if let Some(ref path) = busmap_path {
+            load_busmap_sidecar(path, &debug_state);
+        }
+
         if let Ok(av_info) = frontend.core.get_av_info() {
             let w = av_info.geometry.base_width;
             let h = av_info.geometry.base_height;
@@ -170,7 +193,9 @@ impl Frontend {
                 Ok(ds) => ds,
                 Err(_) => return,
             };
-            if !ds.memory_regions.is_empty() {
+            // Bus-window regions don't count: they're our own synthesis, not a
+            // core-published map, and must not suppress this fallback.
+            if ds.has_non_bus_regions() {
                 self.did_memory_fallback = true;
                 return;
             }
@@ -215,7 +240,7 @@ impl Frontend {
 
         if let Ok(mut ds) = self.debug_state.lock() {
             // Re-check under the lock in case a map arrived meanwhile.
-            if !ds.memory_regions.is_empty() {
+            if ds.has_non_bus_regions() {
                 return;
             }
             for r in &synthesized {
@@ -226,12 +251,104 @@ impl Frontend {
                     r.ptr,
                 ));
             }
-            ds.memory_regions = synthesized;
+            // Extend, don't assign: bus-window regions may already be installed.
+            ds.memory_regions.extend(synthesized);
         }
         // Only stop retrying once we've actually synthesized something (or the
         // core published a map — handled above). A null get_memory_data at
         // load time leaves did_memory_fallback false so we retry next frame.
         self.did_memory_fallback = true;
+    }
+
+    /// Install bus windows queued by the MCP `map_bus_window` tool, then give
+    /// just the new ones an immediate one-shot snapshot so they hold real data
+    /// even if the emulator is paused.
+    fn drain_pending_bus_windows(&mut self) {
+        let first_new = {
+            let mut ds = match self.debug_state.lock() {
+                Ok(ds) => ds,
+                Err(_) => return,
+            };
+            if ds.pending_bus_windows.is_empty() {
+                return;
+            }
+            let first_new = ds.bus_windows.len();
+            let pending = std::mem::take(&mut ds.pending_bus_windows);
+            for cfg in pending {
+                let desc = format!("{} @ 0x{:X}+0x{:X}", cfg.name, cfg.addr, cfg.len);
+                if ds.install_bus_window(cfg) {
+                    ds.log(format!("[bus] mapped window {desc}"));
+                } else {
+                    ds.log(format!("[bus] rejected window {desc} (empty or name taken)"));
+                }
+            }
+            first_new
+        };
+        self.refresh_bus_windows(Some(first_new));
+    }
+
+    /// Snapshot bus windows into their owned buffers via the core's exported
+    /// Sek read API. `only_from = Some(i)` refreshes windows `i..` regardless
+    /// of interval (one-shot fill of freshly installed windows); `None` is the
+    /// per-frame path honoring each window's `interval`.
+    ///
+    /// All FFI happens WITHOUT the DebugState lock (the emu thread owns the
+    /// core; readers only ever see the buffers), then one short try_lock
+    /// publishes the bytes. On lock contention the publish is skipped — the
+    /// snapshot is simply one frame staler.
+    fn refresh_bus_windows(&mut self, only_from: Option<usize>) {
+        if self.bus_bridge_ok == Some(false) {
+            return;
+        }
+        let windows: Vec<(usize, crate::debug::BusWindowCfg)> = match self.debug_state.lock() {
+            Ok(ds) => ds
+                .bus_windows
+                .iter()
+                .enumerate()
+                .filter(|(i, w)| match only_from {
+                    Some(start) => *i >= start,
+                    None => self.frame_count % (w.interval.max(1) as u64) == 0,
+                })
+                .map(|(i, w)| (i, w.clone()))
+                .collect(),
+            Err(_) => return,
+        };
+        if windows.is_empty() {
+            return;
+        }
+
+        let mut fetched: Vec<(usize, Vec<u8>)> = Vec::with_capacity(windows.len());
+        for (i, w) in &windows {
+            match self.core.sek_read_block(w.addr, w.len as usize) {
+                Some(bytes) => fetched.push((*i, bytes)),
+                None => {
+                    // Core has no (guarded) Sek API — it never will; stop
+                    // probing every frame and say so once.
+                    self.bus_bridge_ok = Some(false);
+                    if let Ok(mut ds) = self.debug_state.lock() {
+                        ds.log(
+                            "[bus] core does not export the Sek bus-read API; \
+                             bus windows will stay zero-filled"
+                                .to_string(),
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+        if self.bus_bridge_ok.is_none() {
+            self.bus_bridge_ok = Some(true);
+        }
+
+        if let Ok(mut ds) = self.debug_state.try_lock() {
+            for (i, bytes) in fetched {
+                if let Some(buf) = ds.bus_buffers.get_mut(i) {
+                    if buf.len() == bytes.len() {
+                        buf.copy_from_slice(&bytes);
+                    }
+                }
+            }
+        }
     }
 
     fn setup_callbacks(&mut self) -> Result<()> {
@@ -518,6 +635,11 @@ impl Frontend {
         // no-op once it has succeeded or a real map arrived.
         self.apply_memory_map_fallback();
 
+        // Install windows the MCP thread queued, and give each an immediate
+        // one-shot fill. This runs BEFORE the paused check so a paused session
+        // that maps a window still gets data instead of zeros.
+        self.drain_pending_bus_windows();
+
         // --- Check pause / triggers ---
         let paused = {
             let mut ds = self.debug_state.lock().unwrap();
@@ -573,6 +695,9 @@ impl Frontend {
         // --- Capture CPU state (fbalpha2012 debug API) ---
         self.capture_cpu_state();
 
+        // --- Refresh bus-window snapshots (Sek bridge) ---
+        self.refresh_bus_windows(None);
+
         // --- Capture bookmark if requested ---
         self.maybe_capture_bookmark();
 
@@ -583,6 +708,16 @@ impl Frontend {
         if needs_save {
             if let Some(ref path) = self.sidecar_path {
                 save_regions_sidecar(path, &self.debug_state);
+            }
+        }
+
+        // --- Save busmap sidecar if requested (map_bus_window persists) ---
+        let needs_busmap_save = self.debug_state.try_lock()
+            .map(|mut ds| { let v = ds.save_busmap; ds.save_busmap = false; v })
+            .unwrap_or(false);
+        if needs_busmap_save {
+            if let Some(path) = self.busmap_path.clone() {
+                save_busmap_sidecar(&path, &self.debug_state);
             }
         }
 
@@ -994,6 +1129,63 @@ fn save_regions_sidecar(path: &std::path::Path, debug_state: &SharedDebugState) 
         }
     } else {
         eprintln!("[Regions] Failed to write sidecar to {}", tmp.display());
+    }
+}
+
+/// Busmap sidecar file format — the bus windows for one ROM (Sek bridge).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BusmapSidecar {
+    windows: Vec<crate::debug::BusWindowCfg>,
+}
+
+/// Load a busmap sidecar and install its windows. Silently ignores a missing
+/// file; parse errors are reported (a hand-authored file deserves a message).
+fn load_busmap_sidecar(path: &std::path::Path, debug_state: &SharedDebugState) {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    match serde_json::from_str::<BusmapSidecar>(&data) {
+        Ok(sidecar) => {
+            if let Ok(mut ds) = debug_state.lock() {
+                let mut installed = 0usize;
+                for cfg in sidecar.windows {
+                    if ds.install_bus_window(cfg) {
+                        installed += 1;
+                    }
+                }
+                ds.log(format!(
+                    "📂 Installed {installed} bus window(s) from {}",
+                    path.display()
+                ));
+            }
+        }
+        Err(e) => eprintln!("[bus] Failed to parse busmap {}: {}", path.display(), e),
+    }
+}
+
+/// Save the current bus windows to the busmap sidecar (atomic write via .tmp).
+fn save_busmap_sidecar(path: &std::path::Path, debug_state: &SharedDebugState) {
+    let windows = match debug_state.lock() {
+        Ok(ds) => ds.bus_windows.clone(),
+        Err(_) => return,
+    };
+    let json = match serde_json::to_string_pretty(&BusmapSidecar { windows }) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("[bus] busmap serialization failed: {e}");
+            return;
+        }
+    };
+    let tmp = path.with_extension("busmap.json.tmp");
+    if std::fs::write(&tmp, &json).is_ok() {
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            eprintln!("[bus] Failed to rename busmap sidecar: {e}");
+        } else if let Ok(mut ds) = debug_state.lock() {
+            ds.log(format!("💾 Saved busmap to {}", path.display()));
+        }
+    } else {
+        eprintln!("[bus] Failed to write busmap to {}", tmp.display());
     }
 }
 
