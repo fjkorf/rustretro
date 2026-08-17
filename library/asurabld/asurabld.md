@@ -184,6 +184,101 @@ Captured assets so far: `assets/bg_layer0.png`, `assets/bg_layer1.png`
 stances, specials with effects, throws, splash text — harvested by
 `asura_assets.py poses --watch 35 --slots 300-699` over one driven match).
 
+## Execution architecture
+
+Mapped live (2026-08-17) by stack-walking: the frontend samples PC/registers
+at frame end, which always lands in the level-1 IRQ handler — but the
+**interrupted PC sits in the exception frame on the stack** (SR.w @ A7, PC.l @
+A7+2), and jsr return addresses below it give a heuristic backtrace
+(`scripts/re/execmap.py bt`). Per-frame flag watching and frame-stepping
+through a start press confirmed every hop below.
+
+The program is NOT a state-machine dispatcher: it is a **top-level script of
+blocking scene routines**. Each scene runs its own per-frame loop (wait for an
+IRQ flag bit, do frame work, check hop flags); scenes end by returning to the
+script, which runs a fade/cleanup helper and calls the next scene.
+
+::: region kind=interrupt_handler id=irq-vbl addr=0x02010E-0x02011E vector=25 confidence=confirmed
+Level-1 (vblank) autovector handler: sets bit 5 of the IRQ flag byte
+[[irq-flags-ram]] ($4064F2) and rte. Frame-end PC always samples here.
+Sibling handlers: $020120 sets bit 7 and acks the raster line via $8C0012
+(level 5, per the driver's vregs 0x1C); $020140 sets bit 2 (+ extra work via
+$406558); $020160-$2059A sets bit 1 (large body, saves d0-d5/a0-a1).
+:::
+
+::: region kind=subroutine id=wait-vblank addr=0x0237B4-0x0237C8 label="wait_vblank" confidence=confirmed
+The sync API: `btst #5,$4064F2; beq self; bclr #5; rts`. Variants: $0237CA
+(saves regs, also clears the frame bookkeeping words $403678/$40636C on the
+way out), $023C4E (waits bit 2), $023C64 (waits bit 1), $02379E-ish (bit 7).
+~70 jsr callers of $0237B4 and ~34 of $0237CA mark every per-frame loop in
+the game. Menus/attract sync on bit 5 (and bit 2 for transitions); the fight
+engine uses the $0237CA/$0237D6 clearing variant.
+:::
+
+::: region kind=game_loop id=master-script addr=0x0207B0-0x021070 label="master game-flow script" confidence=confirmed
+The top-level flow, written as straight-line code with blocking scene calls
+and hop-flag checks between them. Observed anchors (return addresses):
+$0207E2 attract/title block; $020892 = `jsr $6FBF6` (char select + loading);
+$0208FA = `jsr $8F6A` (pre-fight dialogue; runs sub-loop at ~$30042);
+$020920 = `jsr $64DEE` (round intro + fight loop A); $020930 = `jsr $2EA3C`
+(fight loop B); $020940 = `jsr $3B824` (post-round). After each fight call:
+`tst $403678 → bne $20FEC` (game-over path); after post-round:
+`tst $402A32 → bne $2106E` (match-end path).
+:::
+
+::: region kind=game_loop id=loop-attract addr=0x06B6BC-0x06C288 label="attract/title scenes" confidence=confirmed
+Blocking attract-family scenes called from [[master-script]]. $6B6BC entry:
+writes tilebank #$7AAA, clears the advance latch $4065D8, checks credits
+($40655C/E). The title choreography at $6C070+ is the canonical scene shape:
+timed dbra sequences (32-step palette fade streamed to $7013xx, #$B3-frame
+hold, #$1DF-frame page) where EVERY frame does `jsr frame_tick($6DEC4)` then
+`tst $4065D8 → bne exit`. Distinct inner loops observed live: demo-fight
+($6B8C6/$6E39E), credited "press start" hold ($6B788/$6DD68), title pages
+($6C080-$6C120).
+:::
+
+::: region kind=subroutine id=frame-tick addr=0x06DEC4-0x06DEE0 label="frame_tick" confidence=confirmed
+Menu-side per-frame helper: `jsr wait_vblank`, decrements the 1/8 prescaler
+$40633E, on underflow reloads #7 and increments the global frame counter
+$4032BE. All attract/menu loops route through here.
+:::
+
+::: region kind=game_loop id=loop-charselect addr=0x06FBF6-0x070DC0 label="char select scene" confidence=confirmed
+`$6FBF6`, called at [[master-script]] $2088C. Entry animation runs a bit-2
+synced sub-loop ($83F4A ← $6FD56, ~30 frames); steady state parks in
+wait_vblank from $6FDCE. Post-select loading loops at $71894-$719A2 use the
+clearing wait variant.
+:::
+
+::: region kind=game_loop id=loop-fight addr=0x064DEE-0x065256 label="fight round loop" confidence=confirmed
+Round loop A (called at $020920): unrolled 8-frame chunks — per frame:
+`jsr $2FF52; jsr wait_vblank_clr($237CA); tst $403678 (abort); tst $40636C /
+$40636E (per-side round-end) → latch $40646E and exit; jsr $2FFAC; jsr
+$65256`. Loop B at $2EA3C (called $020930) has its own frame loop
+($2EBD8/$2ECFC callers). Victory/continue scenes loop via $2FEA8/$31DDE with
+wait variant $23A4E.
+:::
+
+Hop flags (work RAM), all verified live by per-frame watching:
+
+| addr | meaning |
+|---|---|
+| $4064F2 | IRQ flag bits: 1,2,5(vblank),7(raster) — set by handlers, consumed by waits |
+| $4065D8 | scene-advance latch (coin/start); checked every frame by menu loops |
+| $403678 | in-game abort → master-script $20FEC (game over/continue) |
+| $40636C/E | per-side round-end pulses (cleared next frame) |
+| $40646E | round-over latch inside fight loop |
+| $402A32 | match end (nonzero = result; observed 2) → $2106E |
+| $40655C/E | credits (P1/P2 words) |
+| $40633E / $4032BE | 1/8 frame prescaler / global frame counter |
+| $406558 | checked by bit-2 IRQ handler (extra work gate) |
+
+Transition anatomy (frame-stepped through a start press): scene loop sees
+$4065D8=1 → branches to scene epilogue → returns into [[master-script]] →
+script runs fade helper $241B4 (own wait at $241C4, 2 frames) → next scene
+init (1 frame) → entry animation loop (~30 frames, bit-2 sync) → steady-state
+loop. The "hop" is always a RETURN up to the script, never a jump table.
+
 ## Regions
 
 (Newly confirmed findings from live sessions get appended here by
