@@ -279,6 +279,68 @@ script runs fade helper $241B4 (own wait at $241C4, 2 frames) → next scene
 init (1 frame) → entry animation loop (~30 frames, bit-2 sync) → steady-state
 loop. The "hop" is always a RETURN up to the script, never a jump table.
 
+## Control architecture — ONE shared controller, two actor instances
+
+Answer to "shared character controller vs separate 1P/2P code": there is a
+**single shared controller**. P1 and P2 are two instances of the *same* actor
+struct, updated by the same pointer-parameterized code; they differ only in
+what fills each actor's input fields (human pad vs CPU AI). Not separate
+codebases.
+
+Evidence (2026-08-17 live + disasm):
+
+::: region kind=lookup_table id=actor-p1 addr=0x40454C-0x4052FF label="P1 fighter actor struct" confidence=confirmed
+Player-1 actor. Distinctive live field run at +0x00..: `... 00 31 00 31 00 01
+00 09 00 0f 00 38 ...` (state/anim/timer fields). Pos/velocity churn during
+movement at ~$404543-$404561. Responds to the pad (verified: left/right/down/b
+each change specific fields; input-history ring at [[cmd-ring-p1]] updates in
+lockstep).
+:::
+
+::: region kind=lookup_table id=actor-p2 addr=0x405300-0x4060B3 label="P2 fighter actor struct" confidence=confirmed
+Player-2 (CPU) actor — BYTE-IDENTICAL layout to [[actor-p1]] at a constant
+stride of **0x0DB4**. The init routine [[actor-init]] proves it: fields are
+written as P1/P2 pairs ($40454C↔$405300, $40454E↔$405302, $404550↔$405304,
+each +0x0DB4). During a fight both structs churn identically at the same
+internal offsets — the AI drives the SAME fields the human's pad does.
+:::
+
+::: region kind=subroutine id=actor-init addr=0x020098-0x0200CE label="two-actor field init" confidence=confirmed
+Boot/round init: writes each actor field twice, P1 then P2 at +0x0DB4
+($40454C=1;$405300=1; $40454E=0;$405302=0; $404550=0;$405304=0). Unrolled
+per-player, but the identical field set + fixed stride is the proof the two
+actors are one type.
+:::
+
+::: region kind=subroutine id=input-service addr=0x023BB2-0x023C48 label="coin/start service (both players)" confidence=confirmed
+Reads the single gamepad word $810000 and splits it per player by nibble:
+`andi #$00F0` = P1 start/coin ($23BBC), `andi #$F000` = P2 ($23BFE). Both
+players' inputs come from ONE hardware port — low bits P1, high bits P2. The
+in-game movement pad is likewise the same word, consumed per actor.
+:::
+
+::: region kind=lookup_table id=cmd-ring-p1 addr=0x400FD8-0x401038 label="P1 command-history ring" confidence=confirmed
+Special-move detector's input buffer: ~0x10-byte records tagged with a
+decreasing age counter ($2E,$2D,$2C…) and the frame's decoded direction/button
+(offset +0x0F in each record tracks the pad: right→3, left→4, down→1). A
+parallel P2 ring exists for the AI's synthesized commands (the shared detector
+reads whichever ring belongs to the actor being updated).
+:::
+
+::: region kind=game_loop id=actor-update addr=0x02E3A2-0x02E4EC label="per-frame actor processor" confidence=likely
+Fight per-frame routine (called from [[loop-fight]]). Uses table-indexed
+addressing — `lea $2E4EC,a0; lsl.l #7,d4; adda.l d4,a0; move.w -0x56(a0,a2.l)`
+— i.e. an actor/state index scales into per-actor tables rather than absolute
+per-player code. Consistent with one routine run for each actor pointer;
+exact per-actor dispatch not yet fully traced.
+:::
+
+The picture: the pad is read once into the shared input word; each actor's
+command comes from its own source (pad-derived for P1, AI for P2) but lands in
+the same struct fields; a shared, pointer/index-parameterized update processes
+both. To retarget the AI or the human onto either slot you'd change the
+command SOURCE feeding an actor, not the controller.
+
 ## Regions
 
 (Newly confirmed findings from live sessions get appended here by
