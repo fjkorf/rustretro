@@ -290,11 +290,26 @@ codebases.
 Evidence (2026-08-17 live + disasm):
 
 ::: region kind=lookup_table id=actor-p1 addr=0x40454C-0x4052FF label="P1 fighter actor struct" confidence=confirmed
-Player-1 actor. Distinctive live field run at +0x00..: `... 00 31 00 31 00 01
-00 09 00 0f 00 38 ...` (state/anim/timer fields). Pos/velocity churn during
-movement at ~$404543-$404561. Responds to the pad (verified: left/right/down/b
-each change specific fields; input-history ring at [[cmd-ring-p1]] updates in
-lockstep).
+Player-1 actor (base $40454C). Field offsets below were labeled by controlled
+live diffing — driving one input at a time in a verified-controllable round
+(gate: tap right, confirm X moved) and watching which word ramps. Offsets are
+from the struct base; P2 mirrors at +0x0DB4 (see [[actor-p2]], [[actor-init]]).
+
+| offset | field | how confirmed |
+|---|---|---|
+| +0x00 | free-running frame timer | counts down every frame in all states |
+| +0x12/+0x14 | walk / animation frame counter (dup word) | ramps while moving, resets on state change |
+| +0x28 | right-movement hold accumulator | ramps only while holding right |
+| +0x2A | left-movement hold accumulator | ramps only while holding left |
+| +0x4C/+0x50 | current command / action index (dup word) | tracks decoded pad each frame (right→9, left→…, neutral→0) |
+| +0x54 | **X position** (screen px, +→right) | ramps 0x78→0xB6 on right-walk, plateaus at wall |
+| +0x56 | **Y position** (screen px, +→down, ground≈0xD8) | dips-and-returns through a jump arc |
+| +0x5A | secondary X ref (+0x60 from X) | ramps in lockstep with +0x54 |
+| +0x5C | secondary Y ref | arcs in lockstep with +0x56 |
+
+Not yet isolated: health (needs taking damage in the interactive window),
+facing bit, velocity vs absolute-position split. The input-history ring at
+[[cmd-ring-p1]] updates in lockstep with the command field.
 :::
 
 ::: region kind=lookup_table id=actor-p2 addr=0x405300-0x4060B3 label="P2 fighter actor struct" confidence=confirmed
