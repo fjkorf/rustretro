@@ -218,12 +218,14 @@ fn run_headless(
 
         // (a0) Fold any MCP-injected controller input for this frame (headless has
         //      no keyboard) so an agent can drive menus/moves via press_buttons.
+        //      Both ports: P1 for the agent/user, P2 for the shadow bot / dummy.
         {
-            let injected = match debug_state.lock() {
-                Ok(mut ds) => ds.take_injected_input(),
-                Err(_) => [false; 12],
+            let (injected, injected2) = match debug_state.lock() {
+                Ok(mut ds) => (ds.take_injected_input(), ds.take_injected_input2()),
+                Err(_) => ([false; 12], [false; 12]),
             };
             frontend.set_input(injected);
+            frontend.set_input2(injected2);
         }
 
         // (a) Tick the core one frame. run_frame() honours pause/step/trigger
@@ -313,6 +315,7 @@ fn read_input(
     mut tutorials: ResMut<TutorialPages>,
 ) {
     use KeyCode::*;
+    // Order = RETRO_DEVICE_ID_JOYPAD: B Y Select Start Up Down Left Right A X L R.
     let mut bits = [
         keys.pressed(KeyZ),
         keys.pressed(KeyA),
@@ -327,15 +330,34 @@ fn read_input(
         keys.pressed(KeyQ),
         keys.pressed(KeyW),
     ];
-    // OR in any MCP-injected input (press_buttons) so an agent can drive the game
-    // in windowed mode too, alongside the keyboard.
+    // P2 keymap — disjoint from P1's keys and the F*/Space/B hotkeys: IJKL move,
+    // G/H = B/Y, T/Y = A/X, U/O = L/R, N/M = Select/Start.
+    let mut bits2 = [
+        keys.pressed(KeyG),
+        keys.pressed(KeyH),
+        keys.pressed(KeyN),
+        keys.pressed(KeyM),
+        keys.pressed(KeyI),
+        keys.pressed(KeyK),
+        keys.pressed(KeyJ),
+        keys.pressed(KeyL),
+        keys.pressed(KeyT),
+        keys.pressed(KeyY),
+        keys.pressed(KeyU),
+        keys.pressed(KeyO),
+    ];
+    // OR in any MCP-injected input (press_buttons) so an agent — or the shadow bot
+    // on P2 — can drive either port in windowed mode alongside the keyboard.
     if let Ok(mut ds) = debug_state.0.lock() {
         let injected = ds.take_injected_input();
+        let injected2 = ds.take_injected_input2();
         for i in 0..12 {
             bits[i] |= injected[i];
+            bits2[i] |= injected2[i];
         }
     }
     emu.0.set_input(bits);
+    emu.0.set_input2(bits2);
     if keys.just_pressed(F12) {
         let mut ds = debug_state.0.lock().unwrap();
         ds.debug_open = !ds.debug_open;

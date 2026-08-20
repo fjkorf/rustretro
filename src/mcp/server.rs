@@ -914,7 +914,10 @@ impl RetroMcpServer {
     /// only feeds the controller, it cannot corrupt memory, so it is NOT behind the
     /// write gate. Buttons are held simultaneously (e.g. ["down","b"]); call again
     /// to chain inputs. Resume/run must be active for frames to advance.
-    fn press_buttons(&self, names: &[&str], frames: u32) -> Value {
+    fn press_buttons(&self, names: &[&str], frames: u32, port: usize) -> Value {
+        if port > 1 {
+            return json!({ "ok": false, "error": "`port` must be 0 (P1) or 1 (P2)" });
+        }
         let frames = frames.clamp(1, MAX_INPUT_HOLD_FRAMES) as u16;
         let mut set = Vec::new();
         let mut unknown = Vec::new();
@@ -937,8 +940,9 @@ impl RetroMcpServer {
         }
         let paused = match self.debug.lock() {
             Ok(mut ds) => {
+                let arr = if port == 1 { &mut ds.injected_input2 } else { &mut ds.injected_input };
                 for i in indices {
-                    ds.injected_input[i] = frames;
+                    arr[i] = frames;
                 }
                 ds.paused
             }
@@ -948,7 +952,7 @@ impl RetroMcpServer {
             "ok": true,
             "pressed": set,
             "frames": frames,
-            "port": 0,
+            "port": port,
             "note": if paused {
                 "buttons queued, but emulation is PAUSED — call resume so frames advance"
             } else {
@@ -1451,7 +1455,8 @@ impl RetroMcpServer {
                 "type": "object",
                 "properties": {
                     "buttons": { "type": "array", "items": { "type": "string" }, "description": "Buttons to hold simultaneously: a, b, x, y, l, r, start, select, up, down, left, right" },
-                    "frames": { "type": "integer", "description": "How many emulated frames to hold (default 8, max 600 ≈ 10s at 60fps)" }
+                    "frames": { "type": "integer", "description": "How many emulated frames to hold (default 8, max 600 ≈ 10s at 60fps)" },
+                    "port": { "type": "integer", "description": "Controller port: 0 = P1 (default), 1 = P2 (the second fighter / dummy slot)" }
                 },
                 "required": ["buttons"]
             });
@@ -1622,12 +1627,13 @@ impl RetroMcpServer {
             ),
             Tool::new(
                 "press_buttons",
-                "Drive the game: HOLD controller buttons (port 0) for `frames` emulated frames, so \
+                "Drive the game: HOLD controller buttons for `frames` emulated frames, so \
                  you can advance menus, START A MATCH, or perform moves in headless mode (no \
                  keyboard). Buttons in one call are held SIMULTANEOUSLY (e.g. [\"down\",\"b\"] for a \
                  special); call repeatedly to chain inputs. Names: a, b, x, y, l, r, start, select, \
-                 up, down, left, right. Emulation must be running (resume) for frames to advance. \
-                 Safe — only feeds the controller, cannot corrupt memory (no write gate).",
+                 up, down, left, right. `port` selects the controller: 0 = P1 (default), 1 = P2 (the \
+                 second fighter / dummy slot). Emulation must be running (resume) for frames to \
+                 advance. Safe — only feeds the controller, cannot corrupt memory (no write gate).",
                 press_buttons_schema(),
             ),
             Tool::new(
@@ -2093,9 +2099,10 @@ impl ServerHandler for RetroMcpServer {
                         ));
                     }
                     let frames = get_u("frames").unwrap_or(8) as u32;
+                    let port = get_u("port").unwrap_or(0) as usize;
                     let refs: Vec<&str> = buttons.iter().map(|s| s.as_str()).collect();
                     Ok(CallToolResult::success(vec![Self::json_content(
-                        &this.press_buttons(&refs, frames),
+                        &this.press_buttons(&refs, frames, port),
                     )?]))
                 }
                 "run_lua" => {
@@ -2613,20 +2620,33 @@ mod tests {
     #[test]
     fn press_buttons_sets_injected_frames_and_reports_unknown() {
         let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
-        let v = srv.press_buttons(&["down", "b"], 8);
+        let v = srv.press_buttons(&["down", "b"], 8, 0);
         assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["port"], 0);
         {
             let ds = srv.debug.lock().unwrap();
             assert_eq!(ds.injected_input[5], 8); // down
             assert_eq!(ds.injected_input[0], 8); // b
             assert_eq!(ds.injected_input[3], 0); // start untouched
+            assert_eq!(ds.injected_input2, [0u16; 12]); // P2 untouched
         }
+        // Port 1 targets injected_input2, leaving P1 alone.
+        let p2 = srv.press_buttons(&["right"], 8, 1);
+        assert_eq!(p2["ok"], true, "{p2}");
+        assert_eq!(p2["port"], 1);
+        {
+            let ds = srv.debug.lock().unwrap();
+            assert_eq!(ds.injected_input2[7], 8); // right on P2
+            assert_eq!(ds.injected_input[7], 0); // P1 right untouched
+        }
+        // Invalid port rejected.
+        assert_eq!(srv.press_buttons(&["a"], 8, 2)["ok"], false);
         // Unknown button → error, nothing set.
-        let e = srv.press_buttons(&["triangle"], 8);
+        let e = srv.press_buttons(&["triangle"], 8, 0);
         assert_eq!(e["ok"], false);
         assert!(e["error"].as_str().unwrap().contains("unknown"));
         // Frames clamp to the max.
-        let c = srv.press_buttons(&["a"], 99999);
+        let c = srv.press_buttons(&["a"], 99999, 0);
         assert_eq!(c["frames"], super::MAX_INPUT_HOLD_FRAMES as u16 as u64);
     }
 

@@ -351,6 +351,23 @@ impl Frontend {
         }
     }
 
+    /// Push queued bus-window writes (from `write_addr` / freeze / MCP
+    /// write_memory) to the live 68k bus via `sek_write_block`. Takes the queue
+    /// under a brief lock, then does the FFI unlocked — same discipline as
+    /// `refresh_bus_windows`. Skipped when the core has no Sek bridge.
+    fn drain_bus_writes(&mut self) {
+        if self.bus_bridge_ok == Some(false) {
+            return;
+        }
+        let writes: Vec<(u32, Vec<u8>)> = match self.debug_state.try_lock() {
+            Ok(mut ds) => std::mem::take(&mut ds.pending_bus_writes),
+            Err(_) => return,
+        };
+        for (addr, bytes) in writes {
+            self.core.sek_write_block(addr, &bytes);
+        }
+    }
+
     fn setup_callbacks(&mut self) -> Result<()> {
         let ctx_ptr = &mut *self.callback_context as *mut CallbackContext;
         CALLBACK_CONTEXT.store(ctx_ptr, Ordering::SeqCst);
@@ -394,6 +411,11 @@ impl Frontend {
     /// Push controller state into the callback context before calling run_frame().
     pub fn set_input(&mut self, state: [bool; 12]) {
         self.callback_context.input_state = state;
+    }
+
+    /// Set controller port 1 (P2) button states for the next frame.
+    pub fn set_input2(&mut self, state: [bool; 12]) {
+        self.callback_context.input_state2 = state;
     }
 
     /// Capture M68K and Z80 CPU state from the core (fbalpha2012-specific).
@@ -695,6 +717,13 @@ impl Frontend {
         // --- Capture CPU state (fbalpha2012 debug API) ---
         self.capture_cpu_state();
 
+        // --- Push queued bus-window writes to the live bus (Sek bridge) ---
+        // MUST run AFTER capture_cpu_state (which re-applies freeze writes into
+        // pending_bus_writes) and BEFORE refresh_bus_windows (which re-snapshots),
+        // so a frozen/poked value lands on the live bus and the snapshot then
+        // reads it back — i.e. the freeze actually sticks.
+        self.drain_bus_writes();
+
         // --- Refresh bus-window snapshots (Sek bridge) ---
         self.refresh_bus_windows(None);
 
@@ -788,6 +817,9 @@ pub struct CallbackContext {
     pub pitch: usize,
     pub pixel_format: u32,
     pub input_state: [bool; 12],
+    /// Controller port 1 (P2) button states — separate parallel array so the
+    /// existing port-0 path and its tests are untouched.
+    pub input_state2: [bool; 12],
     pub pending_av_info: Option<RetroSystemAVInfoC>,
     pub pending_audio: Vec<i16>,
     pub video_frames: u64,
@@ -811,6 +843,7 @@ impl CallbackContext {
             pitch: 0,
             pixel_format: RETRO_PIXEL_FORMAT_0RGB1555,
             input_state: [false; 12],
+            input_state2: [false; 12],
             pending_av_info: None,
             pending_audio: Vec::with_capacity(4096),
             video_frames: 0,
@@ -1012,8 +1045,12 @@ impl CallbackContext {
     }
 
     fn input_state_callback(&self, port: u32, device: u32, _index: u32, id: u32) -> i16 {
-        if port == 0 && device == RETRO_DEVICE_JOYPAD && (id as usize) < 12 {
-            self.input_state[id as usize] as i16
+        if device == RETRO_DEVICE_JOYPAD && (id as usize) < 12 {
+            match port {
+                0 => self.input_state[id as usize] as i16,
+                1 => self.input_state2[id as usize] as i16,
+                _ => 0,
+            }
         } else {
             0
         }
