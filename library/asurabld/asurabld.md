@@ -307,9 +307,13 @@ from the struct base; P2 mirrors at +0x0DB4 (see [[actor-p2]], [[actor-init]]).
 | +0x5A | secondary X ref (+0x60 from X) | ramps in lockstep with +0x54 |
 | +0x5C | secondary Y ref | arcs in lockstep with +0x56 |
 
-Not yet isolated: health (needs taking damage in the interactive window),
-facing bit, velocity vs absolute-position split. The input-history ring at
-[[cmd-ring-p1]] updates in lockstep with the command field.
+| +0x47 | **health** (byte, max 0x58 = 88) | dropped 0x58→0 on a full KO; freezing it (+ its P2 mirror) keeps the bar full — verified live via the Sek write path |
+| +0x4F | paired health value (byte, max 0x58) | drops in lockstep with +0x47 (likely display / recoverable HP) |
+
+Still not isolated: facing bit, meter, velocity vs absolute-position split.
+The input-history ring at [[cmd-ring-p1]] updates in lockstep with the command
+field. **Health found 2026-08-20** via `scripts/re/hold_fight.py` (freeze the
+value → bar holds full). P2 health mirrors at +0xDB4 (base $405300 + 0x47/0x4F).
 :::
 
 ::: region kind=lookup_table id=actor-p2 addr=0x405300-0x4060B3 label="P2 fighter actor struct" confidence=confirmed
