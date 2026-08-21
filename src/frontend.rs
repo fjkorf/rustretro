@@ -25,6 +25,8 @@ pub struct Frontend {
     /// Some(false) = probed and absent (stop retrying — and stop re-running
     /// dlsym probes every frame), Some(true) = live.
     bus_bridge_ok: Option<bool>,
+    /// Optional per-frame trace recorder (`--record`) for the shadow project.
+    recorder: Option<crate::record::FrameRecorder>,
 }
 
 impl Frontend {
@@ -83,6 +85,7 @@ impl Frontend {
             did_memory_fallback: false,
             busmap_path: busmap_path.clone(),
             bus_bridge_ok: None,
+            recorder: None,
         };
 
         // Store sidecar path in debug state and try to load existing data
@@ -365,6 +368,54 @@ impl Frontend {
         };
         for (addr, bytes) in writes {
             self.core.sek_write_block(addr, &bytes);
+        }
+    }
+
+    /// Enable per-frame trace recording to `path` (JSONL, `shadow/SPEC.md`).
+    /// Uses the default Asura Blade actor map. Warns if no Work RAM bus window
+    /// is mapped (the actor structs won't be readable without it).
+    pub fn set_recorder(&mut self, path: PathBuf) {
+        let has_work_ram = self
+            .debug_state
+            .lock()
+            .map(|ds| ds.memory_regions.iter().any(|r| {
+                r.addr_start <= 0x40454C && r.addr_end >= 0x406100
+            }))
+            .unwrap_or(false);
+        if !has_work_ram {
+            eprintln!(
+                "[record] warning: no Work RAM window covers the actor structs; \
+                 records will be zero-filled. Pass --bus-map with a Work RAM window."
+            );
+        }
+        match crate::record::FrameRecorder::create(
+            &path,
+            crate::record::ActorMap::default(),
+            "asurabld",
+            "fbalpha2012",
+        ) {
+            Ok(rec) => {
+                eprintln!("[record] tracing per-frame to {}", path.display());
+                self.recorder = Some(rec);
+            }
+            Err(e) => eprintln!("[record] failed to open {}: {e}", path.display()),
+        }
+    }
+
+    /// Append this frame to the trace, if recording. Called at the end of
+    /// `run_frame` after the bus snapshot is refreshed (so actor fields are
+    /// current). P1/P2 input masks come from the callback context — the
+    /// authoritative RETRO joypad words for this frame.
+    fn record_frame(&mut self) {
+        if self.recorder.is_none() {
+            return;
+        }
+        let p1 = crate::record::pack_mask(&self.callback_context.input_state);
+        let p2 = crate::record::pack_mask(&self.callback_context.input_state2);
+        if let Ok(ds) = self.debug_state.lock() {
+            if let Some(rec) = self.recorder.as_mut() {
+                rec.record(&ds, p1, p2);
+            }
         }
     }
 
@@ -726,6 +777,9 @@ impl Frontend {
 
         // --- Refresh bus-window snapshots (Sek bridge) ---
         self.refresh_bus_windows(None);
+
+        // --- Append this frame to the trace recorder (--record) ---
+        self.record_frame();
 
         // --- Capture bookmark if requested ---
         self.maybe_capture_bookmark();

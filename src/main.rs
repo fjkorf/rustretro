@@ -6,6 +6,7 @@ mod frontend;
 mod libretro;
 mod litui_pages;
 mod lua_engine;
+mod record;
 mod mcp;
 
 use anyhow::Result;
@@ -50,6 +51,10 @@ struct Args {
     /// bus API (Sek bridge; see library/asurabld/asurabld.busmap.json).
     /// Defaults to <save-dir>/<rom>.busmap.json when present.
     #[arg(long, value_name = "PATH")] bus_map: Option<PathBuf>,
+    /// Record a per-frame trace (actor structs + P1/P2 input + controllable
+    /// flag) as JSONL to this path — training data for the shadow project
+    /// (schema: shadow/SPEC.md). Needs a Work RAM bus window (--bus-map).
+    #[arg(long, value_name = "PATH")] record: Option<PathBuf>,
 }
 
 // ─── Bevy resources ──────────────────────────────────────────────────────────
@@ -109,12 +114,17 @@ fn main() -> Result<()> {
 
     let debug_state: SharedDebugState = Arc::new(Mutex::new(DebugState::new()));
 
-    let frontend = Frontend::new(
+    let mut frontend = Frontend::new(
         &args.core, &args.rom,
         args.save_dir.clone(), args.system_dir.clone(),
         Arc::clone(&debug_state),
         args.bus_map.clone(),
     )?;
+
+    // Enable per-frame trace recording if requested (both GUI and headless).
+    if let Some(rec_path) = args.record.clone() {
+        frontend.set_recorder(rec_path);
+    }
 
     let w = frontend.video_width().max(320) * args.scale;
     let h = frontend.video_height().max(240) * args.scale;
