@@ -326,25 +326,28 @@ const STICK_DEADZONE: f32 = 0.5;
 /// work. Button layout calibrated live 2026-08-24 on a Mayflash F300
 /// fightstick (gilrs default mapping, DP mode): physical top row L→R =
 /// South/West/RightTrigger2/East, bottom row L→R = RightTrigger/LeftTrigger/
-/// North/(silent); the dedicated Start button emits nothing. Asura Blade's
-/// three attacks are RETRO B/Y/R, so they go on the top row's first three;
-/// coin (Select) and Start live on the bottom row.
+/// North/(silent); the dedicated Start button emits nothing. Asura Blade
+/// (fbalpha2012 source + live injection test) polls exactly three attacks:
+/// RETRO B = Button 1 (Light), A = Button 2 (Medium), Y = Button 3 (Heavy);
+/// X/L/R are never polled. Top row = L/M/H in cabinet order; bottom-1 is a
+/// weapon-toss chord (all three attacks); coin/Start on the bottom row.
 fn pad_bits(pad: &Gamepad) -> [bool; 12] {
     use GamepadButton::*;
     let stick = pad.left_stick(); // +y = up in bevy
+    let toss = pad.pressed(RightTrigger); // bottom-1 → L+M+H chord
     [
-        pad.pressed(South),         // top-1    → B (attack 1)
-        pad.pressed(West),          // top-2    → Y (attack 2)
-        pad.pressed(LeftTrigger),   // bottom-2 → Select (coin)
-        pad.pressed(North),         // bottom-3 → Start
+        pad.pressed(South) || toss,         // top-1 → B (Light)
+        pad.pressed(RightTrigger2) || toss, // top-3 → Y (Heavy)
+        pad.pressed(LeftTrigger),           // bottom-2 → Select (coin)
+        pad.pressed(North),                 // bottom-3 → Start
         pad.pressed(DPadUp) || stick.y > STICK_DEADZONE,
         pad.pressed(DPadDown) || stick.y < -STICK_DEADZONE,
         pad.pressed(DPadLeft) || stick.x < -STICK_DEADZONE,
         pad.pressed(DPadRight) || stick.x > STICK_DEADZONE,
-        pad.pressed(RightTrigger),  // bottom-1 → A (spare)
-        pad.pressed(East),          // top-4    → X (spare)
-        false,                      // L unused by the game (keyboard Q still maps)
-        pad.pressed(RightTrigger2), // top-3    → R (attack 3)
+        pad.pressed(West) || toss,          // top-2 → A (Medium)
+        pad.pressed(East),                  // top-4 → X (unpolled by this game)
+        false,                              // L unpolled (keyboard Q still maps)
+        false,                              // R unpolled by this game
     ]
 }
 
