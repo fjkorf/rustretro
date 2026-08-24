@@ -436,6 +436,32 @@ mod hex_u32 {
     }
 }
 
+/// What the training-mode dummy (controller port 1) does each frame.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DummyMode {
+    /// No injection — a human (or the shadow bot) drives port 1.
+    #[default]
+    Free,
+    Stand,
+    Crouch,
+    /// Repeated hops (Up tapped on a half-second cadence).
+    Jump,
+    /// Hold away from the other fighter (blocks everything blockable).
+    Block,
+}
+
+/// Training-mode control block (shadow PLAN Wave 2b). GUI hotkeys flip these
+/// under the DebugState lock; `training::tick` consumes them on the emulation
+/// thread. `reset_positions`/`finish_round` are one-shots (cleared by tick).
+#[derive(Default)]
+pub struct TrainingConfig {
+    pub enabled: bool,
+    pub dummy: DummyMode,
+    pub refill: bool,
+    pub reset_positions: bool,
+    pub finish_round: bool,
+}
+
 pub struct DebugState {
     // --- Framebuffer ---
     /// Raw framebuffer bytes in the core's native pixel format.
@@ -537,6 +563,9 @@ pub struct DebugState {
     /// (P2), consumed via [`take_injected_input2`](Self::take_injected_input2).
     /// Drives the second fighter slot (e.g. the shadow bot / a training dummy).
     pub injected_input2: [u16; 12],
+    /// Training-mode controls (shadow PLAN Wave 2b) — flipped by `--training`
+    /// and hotkeys in the GUI, consumed by `training::tick` each frame.
+    pub training: TrainingConfig,
 
     // --- Breakpoints ---
     /// List of M68K PC addresses that will pause execution when hit.
@@ -663,6 +692,7 @@ impl DebugState {
             step_one: false,
             injected_input: [0; 12],
             injected_input2: [0; 12],
+            training: TrainingConfig::default(),
             breakpoints: Vec::new(),
             hit_breakpoint: None,
             run_to_addr: None,

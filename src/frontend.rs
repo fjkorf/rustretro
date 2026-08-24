@@ -781,6 +781,13 @@ impl Frontend {
         // --- Append this frame to the trace recorder (--record) ---
         self.record_frame();
 
+        // --- Training mode (--training): enforce sandbox + drive the dummy.
+        // After the snapshot refresh so reads see this frame; its bus writes
+        // drain next frame.
+        if let Ok(mut ds) = self.debug_state.try_lock() {
+            crate::training::tick(&mut ds, self.frame_count);
+        }
+
         // --- Capture bookmark if requested ---
         self.maybe_capture_bookmark();
 

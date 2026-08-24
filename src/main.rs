@@ -8,6 +8,7 @@ mod litui_pages;
 mod lua_engine;
 mod record;
 mod mcp;
+mod training;
 
 use anyhow::Result;
 use audio::AudioOutput;
@@ -58,6 +59,11 @@ struct Args {
     /// Log raw gamepad button names + stick values to stderr whenever they
     /// change ("[pad] …") — for calibrating unmapped controllers.
     #[arg(long)] pad_debug: bool,
+    /// Training mode (shadow PLAN Wave 2b): credits auto-topped-up, round
+    /// timer held, health refilled before KO, dummy presets on port 1.
+    /// Hotkeys: F1 cycle dummy, F2 reset positions, F3 toggle refill,
+    /// F4 finish round.
+    #[arg(long)] training: bool,
 }
 
 // ─── Bevy resources ──────────────────────────────────────────────────────────
@@ -137,6 +143,15 @@ fn main() -> Result<()> {
     let h = frontend.video_height().max(240) * args.scale;
 
     if args.debug { debug_state.lock().unwrap().debug_open = true; }
+    if args.training {
+        let mut ds = debug_state.lock().unwrap();
+        ds.training.enabled = true;
+        ds.training.refill = true;
+        eprintln!(
+            "[training] mode ON — credits auto, timer held, health refill. \
+             F1 cycle dummy, F2 reset positions, F3 toggle refill, F4 finish round."
+        );
+    }
 
     // Build the Lua scripting engine (main-thread NonSend resource). Load the
     // optional --script once at startup. A failure to load logs but does not
@@ -445,6 +460,37 @@ fn read_input(
     }
     emu.0.set_input(bits);
     emu.0.set_input2(bits2);
+    // Training-mode hotkeys (active only with --training).
+    if keys.just_pressed(F1) || keys.just_pressed(F2) || keys.just_pressed(F3) || keys.just_pressed(F4)
+    {
+        if let Ok(mut ds) = debug_state.0.lock() {
+            if ds.training.enabled {
+                use debug::DummyMode::*;
+                if keys.just_pressed(F1) {
+                    ds.training.dummy = match ds.training.dummy {
+                        Free => Stand,
+                        Stand => Crouch,
+                        Crouch => Jump,
+                        Jump => Block,
+                        Block => Free,
+                    };
+                    eprintln!("[training] dummy: {:?}", ds.training.dummy);
+                }
+                if keys.just_pressed(F2) {
+                    ds.training.reset_positions = true;
+                    eprintln!("[training] reset positions");
+                }
+                if keys.just_pressed(F3) {
+                    ds.training.refill = !ds.training.refill;
+                    eprintln!("[training] health refill: {}", ds.training.refill);
+                }
+                if keys.just_pressed(F4) {
+                    ds.training.finish_round = true;
+                    eprintln!("[training] finish round");
+                }
+            }
+        }
+    }
     if keys.just_pressed(F12) {
         let mut ds = debug_state.0.lock().unwrap();
         ds.debug_open = !ds.debug_open;
