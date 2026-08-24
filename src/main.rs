@@ -55,6 +55,9 @@ struct Args {
     /// flag) as JSONL to this path — training data for the shadow project
     /// (schema: shadow/SPEC.md). Needs a Work RAM bus window (--bus-map).
     #[arg(long, value_name = "PATH")] record: Option<PathBuf>,
+    /// Log raw gamepad button names + stick values to stderr whenever they
+    /// change ("[pad] …") — for calibrating unmapped controllers.
+    #[arg(long)] pad_debug: bool,
 }
 
 // ─── Bevy resources ──────────────────────────────────────────────────────────
@@ -79,6 +82,10 @@ struct DebugOverlay(debug::window::DebugApp);
 
 #[derive(Resource)]
 struct AudioRes(AudioOutput);
+
+/// --pad-debug: log raw gamepad state changes from read_input.
+#[derive(Resource)]
+struct PadDebug(bool);
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
@@ -182,6 +189,7 @@ fn main() -> Result<()> {
         .insert_resource(DebugStateRes(debug_state.clone()))
         .insert_resource(AudioRes(AudioOutput::new(!args.no_audio)))
         .insert_resource(WindowScale(args.scale))
+        .insert_resource(PadDebug(args.pad_debug))
         .insert_resource(DebugOverlay(debug::window::DebugApp::new(debug_state)))
         .insert_non_send_resource(LuaRes(lua_engine))
         .insert_resource(ScriptPanel::new())
@@ -324,30 +332,32 @@ const STICK_DEADZONE: f32 = 0.5;
 /// Physical pad → RETRO joypad order (B Y Sel St U D L R A X L R).
 /// D-pad and left stick both drive directions, so hat-vs-axis lever modes both
 /// work. Button layout calibrated live 2026-08-24 on a Mayflash F300
-/// fightstick (gilrs default mapping, DP mode): physical top row L→R =
-/// South/West/RightTrigger2/East, bottom row L→R = RightTrigger/LeftTrigger/
-/// North/(silent); the dedicated Start button emits nothing. Asura Blade
-/// (fbalpha2012 source + live injection test) polls exactly three attacks:
-/// RETRO B = Button 1 (Light), A = Button 2 (Medium), Y = Button 3 (Heavy);
-/// X/L/R are never polled. Top row = L/M/H in cabinet order; bottom-1 is a
-/// weapon-toss chord (all three attacks); coin/Start on the bottom row.
+/// fightstick in **PS3/DInput + DPad mode** (gilrs default mapping; XInput
+/// mode has a different, incomplete element order — keep the switch on
+/// DInput): top row L→R = South/West/North/East, bottom row L→R =
+/// RightTrigger/LeftTrigger/RightTrigger2/Mode, dedicated Start button =
+/// LeftTrigger2. Asura Blade (fbalpha2012 source + live injection test)
+/// polls exactly three attacks: RETRO B = Light, A = Medium, Y = Heavy;
+/// X/L/R never polled. Top row = L/M/H in cabinet order; bottom-1 = weapon
+/// toss (L+M+H chord), bottom-4 = launcher (any-2 chord, "Bash Attack").
 fn pad_bits(pad: &Gamepad) -> [bool; 12] {
     use GamepadButton::*;
     let stick = pad.left_stick(); // +y = up in bevy
     let toss = pad.pressed(RightTrigger); // bottom-1 → L+M+H chord
+    let launcher = pad.pressed(Mode); // bottom-4 → L+M chord (Bash Attack)
     [
-        pad.pressed(South) || toss,         // top-1 → B (Light)
-        pad.pressed(RightTrigger2) || toss, // top-3 → Y (Heavy)
-        pad.pressed(LeftTrigger),           // bottom-2 → Select (coin)
-        pad.pressed(North),                 // bottom-3 → Start
+        pad.pressed(South) || toss || launcher, // top-1 → B (Light)
+        pad.pressed(North) || toss,             // top-3 → Y (Heavy)
+        pad.pressed(LeftTrigger),               // bottom-2 → Select (coin)
+        pad.pressed(RightTrigger2) || pad.pressed(LeftTrigger2), // bottom-3 / Start btn → Start
         pad.pressed(DPadUp) || stick.y > STICK_DEADZONE,
         pad.pressed(DPadDown) || stick.y < -STICK_DEADZONE,
         pad.pressed(DPadLeft) || stick.x < -STICK_DEADZONE,
         pad.pressed(DPadRight) || stick.x > STICK_DEADZONE,
-        pad.pressed(West) || toss,          // top-2 → A (Medium)
-        pad.pressed(East),                  // top-4 → X (unpolled by this game)
-        false,                              // L unpolled (keyboard Q still maps)
-        false,                              // R unpolled by this game
+        pad.pressed(West) || toss || launcher,  // top-2 → A (Medium)
+        pad.pressed(East),                      // top-4 → X (unpolled by this game)
+        false,                                  // L unpolled (keyboard Q still maps)
+        false,                                  // R unpolled by this game
     ]
 }
 
@@ -359,6 +369,8 @@ fn read_input(
     mut script_panel: ResMut<ScriptPanel>,
     mut litui: ResMut<LituiPages>,
     mut tutorials: ResMut<TutorialPages>,
+    pad_debug: Res<PadDebug>,
+    mut last_pad_dbg: Local<String>,
 ) {
     use KeyCode::*;
     // Order = RETRO_DEVICE_ID_JOYPAD: B Y Select Start Up Down Left Right A X L R.
@@ -401,6 +413,24 @@ fn read_input(
         let target = if slot == 0 { &mut bits } else { &mut bits2 };
         for i in 0..12 {
             target[i] |= gb[i];
+        }
+    }
+    // --pad-debug: log the raw pressed set + stick when it changes, so unmapped
+    // controllers' button identities can be observed without a rebuild.
+    if pad_debug.0 {
+        if let Some((_, pad)) = pad_list.first() {
+            let cur = format!(
+                "{:?} stick={:.2},{:.2} dpad={:.2},{:.2}",
+                pad.get_pressed().collect::<Vec<_>>(),
+                pad.left_stick().x,
+                pad.left_stick().y,
+                pad.dpad().x,
+                pad.dpad().y
+            );
+            if *last_pad_dbg != cur {
+                eprintln!("[pad] {cur}");
+                *last_pad_dbg = cur;
+            }
         }
     }
     // OR in any MCP-injected input (press_buttons) so an agent — or the shadow bot
