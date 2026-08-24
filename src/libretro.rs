@@ -542,6 +542,53 @@ impl RetroCore {
         }
     }
 
+    /// Write `bytes` to the live 68k bus starting at `addr` via the core's
+    /// exported SekWriteByte (fbalpha2012). Byte-wise (no long packing) so it is
+    /// endianness-symmetric with `sek_read_block`: byte `i` goes to bus `addr+i`,
+    /// the same position `sek_read_block` reads it back into. Returns false when
+    /// the core does not export the guarded Sek API (same probe/guard as the read
+    /// path — a write with no open CPU context would deref a null memory map).
+    pub fn sek_write_block(&self, addr: u32, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
+        unsafe {
+            if let Ok(initted) = self.library.get::<Symbol<*const u8>>(b"DebugCPU_SekInitted") {
+                let p: *const u8 = **initted;
+                if !p.is_null() && *p == 0 {
+                    return false;
+                }
+            }
+            let write_byte = match self.library.get::<Symbol<SekWriteByteFn>>(b"_Z12SekWriteBytejh") {
+                Ok(f) => f,
+                Err(_) => return false,
+            };
+            let get_active = match self.library.get::<Symbol<SekGetActiveFn>>(b"_Z12SekGetActivev") {
+                Ok(f) => f,
+                Err(_) => return false,
+            };
+            let open = match self.library.get::<Symbol<SekOpenFn>>(b"_Z7SekOpeni") {
+                Ok(f) => f,
+                Err(_) => return false,
+            };
+            let close = match self.library.get::<Symbol<SekCloseFn>>(b"_Z8SekClosev") {
+                Ok(f) => f,
+                Err(_) => return false,
+            };
+            let opened_here = get_active() < 0;
+            if opened_here {
+                open(0);
+            }
+            for (i, b) in bytes.iter().enumerate() {
+                write_byte(addr.wrapping_add(i as u32), *b);
+            }
+            if opened_here {
+                close();
+            }
+            true
+        }
+    }
+
     pub fn get_z80_pc(&self, cpu: i32) -> Result<i32, LibretroError> {
         unsafe {
             let func: Symbol<ZetGetPCFn> = self

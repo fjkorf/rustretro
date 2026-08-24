@@ -466,6 +466,10 @@ pub struct DebugState {
     /// Windows added by the MCP thread, waiting for the emulation thread to
     /// allocate and install them (same handoff pattern as `save_regions`).
     pub pending_bus_windows: Vec<BusWindowCfg>,
+    /// Bus-window writes queued for the emulation thread to push to the live 68k
+    /// bus via `sek_write_block` (DebugState can't reach the core). Same handoff
+    /// pattern as `pending_bus_windows`; each entry is (guest addr, LE bytes).
+    pub pending_bus_writes: Vec<(u32, Vec<u8>)>,
     /// Signal: persist `bus_windows` to the busmap sidecar on the emu thread.
     pub save_busmap: bool,
 
@@ -529,6 +533,10 @@ pub struct DebugState {
     /// into the controller and decrement them. Lets an agent drive the game
     /// (menus, moves) in headless mode where there's no keyboard.
     pub injected_input: [u16; 12],
+    /// Same as [`injected_input`](Self::injected_input) but for controller port 1
+    /// (P2), consumed via [`take_injected_input2`](Self::take_injected_input2).
+    /// Drives the second fighter slot (e.g. the shadow bot / a training dummy).
+    pub injected_input2: [u16; 12],
 
     // --- Breakpoints ---
     /// List of M68K PC addresses that will pause execution when hit.
@@ -625,6 +633,7 @@ impl DebugState {
             bus_windows: Vec::new(),
             bus_buffers: Vec::new(),
             pending_bus_windows: Vec::new(),
+            pending_bus_writes: Vec::new(),
             save_busmap: false,
             m68k_code_bytes: Vec::new(),
             m68k_code_start: 0,
@@ -653,6 +662,7 @@ impl DebugState {
             paused: false,
             step_one: false,
             injected_input: [0; 12],
+            injected_input2: [0; 12],
             breakpoints: Vec::new(),
             hit_breakpoint: None,
             run_to_addr: None,
@@ -808,8 +818,18 @@ impl DebugState {
     /// Write `len` little-endian bytes of `value` back to the emulated address
     /// space. Returns false if no region contains the address, the host pointer
     /// is null, or the containing region is read-only.
-    pub fn write_addr(&self, addr: usize, len: usize, value: u32) -> bool {
+    ///
+    /// For a **bus-window** region (Sek snapshot bridge) the host pointer is an
+    /// owned snapshot Box that `refresh_bus_windows` overwrites every frame, so a
+    /// write there alone would be a no-op. We still poke the Box (so a same-lock
+    /// `read_addr` sees the value this frame) AND queue the real write in
+    /// `pending_bus_writes` for the emulation thread to push to the live 68k bus
+    /// via `sek_write_block` — DebugState has no handle to the core itself.
+    pub fn write_addr(&mut self, addr: usize, len: usize, value: u32) -> bool {
         let len = len.min(4);
+        // Resolve the region + whether it's a bus window, copying what we need
+        // into locals so the immutable region borrow ends before the &mut push.
+        let mut hit: Option<(*mut u8, bool)> = None;
         for region in &self.memory_regions {
             if region.host_ptr_for_addr(addr).is_none() {
                 continue;
@@ -820,17 +840,25 @@ impl DebugState {
             let Some(cptr) = region.safe_host_ptr(addr, len) else {
                 continue;
             };
-            let ptr = cptr as *mut u8;
-            {
-                unsafe {
-                    for i in 0..len {
-                        *ptr.add(i) = ((value >> (8 * i)) & 0xFF) as u8;
-                    }
-                }
-                return true;
+            let is_bus = self.bus_windows.iter().any(|w| w.name == region.name);
+            hit = Some((cptr as *mut u8, is_bus));
+            break;
+        }
+        let Some((ptr, is_bus)) = hit else {
+            return false;
+        };
+        let mut bytes = [0u8; 4];
+        unsafe {
+            for k in 0..len {
+                let b = ((value >> (8 * k)) & 0xFF) as u8;
+                *ptr.add(k) = b;
+                bytes[k] = b;
             }
         }
-        false
+        if is_bus {
+            self.pending_bus_writes.push((addr as u32, bytes[..len].to_vec()));
+        }
+        true
     }
 
     /// Reset the RAM search: enumerate every aligned address in the selected
@@ -943,6 +971,18 @@ impl DebugState {
             if self.injected_input[i] > 0 {
                 held[i] = true;
                 self.injected_input[i] -= 1;
+            }
+        }
+        held
+    }
+
+    /// Port-1 (P2) counterpart of [`take_injected_input`](Self::take_injected_input).
+    pub fn take_injected_input2(&mut self) -> [bool; 12] {
+        let mut held = [false; 12];
+        for i in 0..12 {
+            if self.injected_input2[i] > 0 {
+                held[i] = true;
+                self.injected_input2[i] -= 1;
             }
         }
         held
@@ -1093,6 +1133,49 @@ mod tests {
         // A descriptor with a non-null but bogus pointer and zero size -> rejected.
         let bogus = region("Bogus", 0x6000, 0, 0xdeadbeef);
         assert!(bogus.safe_host_ptr(0x6000, 1).is_none());
+    }
+
+    #[test]
+    fn write_addr_routes_bus_window_to_pending_and_pokes_snapshot() {
+        let mut ds = DebugState::new();
+        // A Work-RAM bus window (Sek snapshot bridge).
+        assert!(ds.install_bus_window(BusWindowCfg {
+            name: "Work RAM".into(),
+            addr: 0x400000,
+            len: 0x1000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        // Write 0xDEADBEEF (LE bytes EF BE AD DE) at base+0x100.
+        let a = 0x400100usize;
+        assert!(ds.write_addr(a, 4, 0xDEAD_BEEF));
+        // Queued for the live 68k bus, exact LE byte order.
+        assert_eq!(
+            ds.pending_bus_writes,
+            vec![(a as u32, vec![0xEF, 0xBE, 0xAD, 0xDE])]
+        );
+        // Snapshot Box poked too, so a same-lock read sees it this frame.
+        assert_eq!(ds.read_addr(a, 4), Some(0xDEAD_BEEF));
+
+        // A non-bus synth region must NOT enqueue — it pokes its host buffer.
+        let mut buf = [0u8; 16];
+        let p = buf.as_mut_ptr() as usize;
+        ds.memory_regions.push(MemoryRegion::synth_region(
+            "Plain",
+            0x900000,
+            buf.len(),
+            p,
+            crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        ));
+        let before = ds.pending_bus_writes.len();
+        assert!(ds.write_addr(0x900000, 2, 0x1234));
+        assert_eq!(
+            ds.pending_bus_writes.len(),
+            before,
+            "non-bus write must not enqueue a bus write"
+        );
+        assert_eq!(buf[0], 0x34);
+        assert_eq!(buf[1], 0x12);
     }
 
     #[test]

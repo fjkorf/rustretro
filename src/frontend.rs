@@ -25,6 +25,8 @@ pub struct Frontend {
     /// Some(false) = probed and absent (stop retrying — and stop re-running
     /// dlsym probes every frame), Some(true) = live.
     bus_bridge_ok: Option<bool>,
+    /// Optional per-frame trace recorder (`--record`) for the shadow project.
+    recorder: Option<crate::record::FrameRecorder>,
 }
 
 impl Frontend {
@@ -83,6 +85,7 @@ impl Frontend {
             did_memory_fallback: false,
             busmap_path: busmap_path.clone(),
             bus_bridge_ok: None,
+            recorder: None,
         };
 
         // Store sidecar path in debug state and try to load existing data
@@ -351,6 +354,71 @@ impl Frontend {
         }
     }
 
+    /// Push queued bus-window writes (from `write_addr` / freeze / MCP
+    /// write_memory) to the live 68k bus via `sek_write_block`. Takes the queue
+    /// under a brief lock, then does the FFI unlocked — same discipline as
+    /// `refresh_bus_windows`. Skipped when the core has no Sek bridge.
+    fn drain_bus_writes(&mut self) {
+        if self.bus_bridge_ok == Some(false) {
+            return;
+        }
+        let writes: Vec<(u32, Vec<u8>)> = match self.debug_state.try_lock() {
+            Ok(mut ds) => std::mem::take(&mut ds.pending_bus_writes),
+            Err(_) => return,
+        };
+        for (addr, bytes) in writes {
+            self.core.sek_write_block(addr, &bytes);
+        }
+    }
+
+    /// Enable per-frame trace recording to `path` (JSONL, `shadow/SPEC.md`).
+    /// Uses the default Asura Blade actor map. Warns if no Work RAM bus window
+    /// is mapped (the actor structs won't be readable without it).
+    pub fn set_recorder(&mut self, path: PathBuf) {
+        let has_work_ram = self
+            .debug_state
+            .lock()
+            .map(|ds| ds.memory_regions.iter().any(|r| {
+                r.addr_start <= 0x40454C && r.addr_end >= 0x406100
+            }))
+            .unwrap_or(false);
+        if !has_work_ram {
+            eprintln!(
+                "[record] warning: no Work RAM window covers the actor structs; \
+                 records will be zero-filled. Pass --bus-map with a Work RAM window."
+            );
+        }
+        match crate::record::FrameRecorder::create(
+            &path,
+            crate::record::ActorMap::default(),
+            "asurabld",
+            "fbalpha2012",
+        ) {
+            Ok(rec) => {
+                eprintln!("[record] tracing per-frame to {}", path.display());
+                self.recorder = Some(rec);
+            }
+            Err(e) => eprintln!("[record] failed to open {}: {e}", path.display()),
+        }
+    }
+
+    /// Append this frame to the trace, if recording. Called at the end of
+    /// `run_frame` after the bus snapshot is refreshed (so actor fields are
+    /// current). P1/P2 input masks come from the callback context — the
+    /// authoritative RETRO joypad words for this frame.
+    fn record_frame(&mut self) {
+        if self.recorder.is_none() {
+            return;
+        }
+        let p1 = crate::record::pack_mask(&self.callback_context.input_state);
+        let p2 = crate::record::pack_mask(&self.callback_context.input_state2);
+        if let Ok(ds) = self.debug_state.lock() {
+            if let Some(rec) = self.recorder.as_mut() {
+                rec.record(&ds, p1, p2);
+            }
+        }
+    }
+
     fn setup_callbacks(&mut self) -> Result<()> {
         let ctx_ptr = &mut *self.callback_context as *mut CallbackContext;
         CALLBACK_CONTEXT.store(ctx_ptr, Ordering::SeqCst);
@@ -394,6 +462,11 @@ impl Frontend {
     /// Push controller state into the callback context before calling run_frame().
     pub fn set_input(&mut self, state: [bool; 12]) {
         self.callback_context.input_state = state;
+    }
+
+    /// Set controller port 1 (P2) button states for the next frame.
+    pub fn set_input2(&mut self, state: [bool; 12]) {
+        self.callback_context.input_state2 = state;
     }
 
     /// Capture M68K and Z80 CPU state from the core (fbalpha2012-specific).
@@ -695,8 +768,18 @@ impl Frontend {
         // --- Capture CPU state (fbalpha2012 debug API) ---
         self.capture_cpu_state();
 
+        // --- Push queued bus-window writes to the live bus (Sek bridge) ---
+        // MUST run AFTER capture_cpu_state (which re-applies freeze writes into
+        // pending_bus_writes) and BEFORE refresh_bus_windows (which re-snapshots),
+        // so a frozen/poked value lands on the live bus and the snapshot then
+        // reads it back — i.e. the freeze actually sticks.
+        self.drain_bus_writes();
+
         // --- Refresh bus-window snapshots (Sek bridge) ---
         self.refresh_bus_windows(None);
+
+        // --- Append this frame to the trace recorder (--record) ---
+        self.record_frame();
 
         // --- Capture bookmark if requested ---
         self.maybe_capture_bookmark();
@@ -788,6 +871,9 @@ pub struct CallbackContext {
     pub pitch: usize,
     pub pixel_format: u32,
     pub input_state: [bool; 12],
+    /// Controller port 1 (P2) button states — separate parallel array so the
+    /// existing port-0 path and its tests are untouched.
+    pub input_state2: [bool; 12],
     pub pending_av_info: Option<RetroSystemAVInfoC>,
     pub pending_audio: Vec<i16>,
     pub video_frames: u64,
@@ -811,6 +897,7 @@ impl CallbackContext {
             pitch: 0,
             pixel_format: RETRO_PIXEL_FORMAT_0RGB1555,
             input_state: [false; 12],
+            input_state2: [false; 12],
             pending_av_info: None,
             pending_audio: Vec::with_capacity(4096),
             video_frames: 0,
@@ -1012,8 +1099,12 @@ impl CallbackContext {
     }
 
     fn input_state_callback(&self, port: u32, device: u32, _index: u32, id: u32) -> i16 {
-        if port == 0 && device == RETRO_DEVICE_JOYPAD && (id as usize) < 12 {
-            self.input_state[id as usize] as i16
+        if device == RETRO_DEVICE_JOYPAD && (id as usize) < 12 {
+            match port {
+                0 => self.input_state[id as usize] as i16,
+                1 => self.input_state2[id as usize] as i16,
+                _ => 0,
+            }
         } else {
             0
         }
