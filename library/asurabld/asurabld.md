@@ -307,13 +307,15 @@ from the struct base; P2 mirrors at +0x0DB4 (see [[actor-p2]], [[actor-init]]).
 | +0x5A | secondary X ref (+0x60 from X) | ramps in lockstep with +0x54 |
 | +0x5C | secondary Y ref | arcs in lockstep with +0x56 |
 
-| +0x47 | **health** (byte, max 0x58 = 88) | dropped 0x58→0 on a full KO; freezing it (+ its P2 mirror) keeps the bar full — verified live via the Sek write path |
-| +0x4F | paired health value (byte, max 0x58) | drops in lockstep with +0x47 (likely display / recoverable HP) |
+| +0x47 | ~~health~~ **DISPROVEN 2026-08-24** | in live 1P play `$404593` bounces with animation state and never tracks the bar; real health is at `$40390F`/`$4046C3` — see [[health-blocks]] |
+| +0x4F | ~~paired health~~ DISPROVEN with +0x47 | same |
 
-Still not isolated: facing bit, meter, velocity vs absolute-position split.
-The input-history ring at [[cmd-ring-p1]] updates in lockstep with the command
-field. **Health found 2026-08-20** via `scripts/re/hold_fight.py` (freeze the
-value → bar holds full). P2 health mirrors at +0xDB4 (base $405300 + 0x47/0x4F).
+Still not isolated: facing bit, meter. The absolute-vs-camera X split is now
+resolved — see [[world-positions]]. The input-history ring at [[cmd-ring-p1]]
+updates in lockstep with the command field. The 2026-08-20 "+0x47 health"
+finding was demo-phase state, disproven live 2026-08-24 — real health is in
+the separate per-fighter blocks [[health-blocks]] (P1 `$40390F`, opp
+`$4046C3`, stride 0x0DB4).
 :::
 
 ::: region kind=lookup_table id=actor-p2 addr=0x405300-0x4060B3 label="P2 fighter actor struct" confidence=confirmed
@@ -364,3 +366,64 @@ command SOURCE feeding an actor, not the controller.
 
 (Newly confirmed findings from live sessions get appended here by
 `add_rom_map_region`.)
+
+::: region kind=lookup_table id=round-timer addr=0x40000A-0x40000B label="round timer (BCD seconds + subsecond)" confidence=confirmed
+`$40000A` = round seconds in **BCD** (displays "58" → holds 0x58); `$40000B` =
+subsecond countdown. Found by frame-exact step-diff (single 0x58→0x57 decrement
+across 80 stepped frames, matching the HUD). **Freezing both bytes holds the
+round indefinitely** (no timeout); the freeze survives round and stage
+transitions. Live 1P session 2026-08-24, author=ai.
+:::
+
+::: region kind=lookup_table id=health-blocks addr=0x40390F-0x4046C5 label="per-fighter health blocks (1P mode)" confidence=confirmed
+Health does **NOT** live at actor+0x47 (that demo-derived claim is disproven —
+`$404593` bounces with animation state in live play and never tracks the bar).
+Real health, live-verified by damage-correlation AND write-tests (writing the
+byte moves the on-screen bar; game's own round refill re-inits it):
+
+| addr | field |
+|---|---|
+| `$40390F` | **P1 health** (byte). Full-bar observed 0x66 (Yashaou); per-char max |
+| `$403911` | P1 displayed-bar value (chases actual downward) |
+| `$4046C3` | **opponent health** (byte) = P1 + 0x0DB4. Full 0xEF (Footee, Zam-B) |
+| `$4046C5` | opponent displayed-bar value |
+
+The 0x0DB4 stride reappears here (same per-fighter allocation unit as the
+actor structs). Freezing `$40390F`/`$4046C3` = both fighters unkillable — the
+"held fight" sandbox is round-timer freeze + these two. Live 1P session
+2026-08-24, author=ai.
+:::
+
+::: region kind=lookup_table id=world-positions addr=0x4027CE-0x4032EF label="world-space X positions + camera (1P mode)" confidence=confirmed
+`$4032EE` = **P1 world X** — equals screen X (`$40454C+0x54`) + camera X.
+`$4027CE` = **opponent world X** (verified: chases P1's world X as P1
+retreats). Camera X readable from the scroll table at `$400024+` (all entries
+equal when the view is settled; `$400032` used as reference). This resolves
+the "absolute-vs-camera X split" pending item: `$40454C+0x54` is SCREEN-space.
+Opponent Y-equivalent and the opponent's full screen-space struct are still
+unmapped in 1P mode. Live 1P session 2026-08-24, author=ai.
+:::
+
+## Mode-dependence warning (1P vs 2P-VS) — 2026-08-24
+
+The `actor-p1`/`actor-p2` bases above are **mode-dependent**:
+
+- **1P (human vs CPU — the shadow recording mode):** P1 = `$40454C`, fully live
+  (X/Y/holds/timers behave exactly as the field table says; in-fight input
+  injection on port 0 verified moving the actor). **`$405300` is NOT the
+  opponent** — that slot stays static; the CPU opponent's screen-space struct
+  base is still unfound (its world X is `$4027CE`).
+- **2P-VS (challenger mode — the shadow deploy mode):** BOTH `$40454C` and
+  `$405300` stay static during a live match; the versus-mode actors live at
+  different, still-unmapped bases. Mapping VS mode is a prerequisite for
+  deploying the P2 bot.
+- The historic "in-fight port-1 injection did not move the P2 actor" note and
+  PR #22's "don't cleanly transfer" caveat both trace to this: injection works
+  fine in-fight (port 0 verified live); the *addresses being watched* were the
+  wrong mode's slots.
+
+Also disproven: `+0x47`/`+0x4F` as health (see [[health-blocks]]). Also
+measured: the recorder's `controllable` gate (hop flags all zero) is **true on
+the title screen** — it needs a positive in-fight signal before training data
+is cut from recordings (open item; `$406485` and `$40FF67` were tested and are
+scratch, not flags).
