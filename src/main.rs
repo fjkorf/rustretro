@@ -316,8 +316,41 @@ fn setup(
 
 // ─── Input ───────────────────────────────────────────────────────────────────
 
+/// Analog→digital threshold for the left stick (libretro convention; high on
+/// purpose for fighting-game inputs — no drift-diagonals). Irrelevant when a
+/// stick reports its lever as a d-pad (e.g. Mayflash F300 in DP mode).
+const STICK_DEADZONE: f32 = 0.5;
+
+/// Physical pad → RETRO joypad order (B Y Sel St U D L R A X L R).
+/// D-pad and left stick both drive directions, so hat-vs-axis lever modes both
+/// work. Button layout calibrated live 2026-08-24 on a Mayflash F300
+/// fightstick (gilrs default mapping, DP mode): physical top row L→R =
+/// South/West/RightTrigger2/East, bottom row L→R = RightTrigger/LeftTrigger/
+/// North/(silent); the dedicated Start button emits nothing. Asura Blade's
+/// three attacks are RETRO B/Y/R, so they go on the top row's first three;
+/// coin (Select) and Start live on the bottom row.
+fn pad_bits(pad: &Gamepad) -> [bool; 12] {
+    use GamepadButton::*;
+    let stick = pad.left_stick(); // +y = up in bevy
+    [
+        pad.pressed(South),         // top-1    → B (attack 1)
+        pad.pressed(West),          // top-2    → Y (attack 2)
+        pad.pressed(LeftTrigger),   // bottom-2 → Select (coin)
+        pad.pressed(North),         // bottom-3 → Start
+        pad.pressed(DPadUp) || stick.y > STICK_DEADZONE,
+        pad.pressed(DPadDown) || stick.y < -STICK_DEADZONE,
+        pad.pressed(DPadLeft) || stick.x < -STICK_DEADZONE,
+        pad.pressed(DPadRight) || stick.x > STICK_DEADZONE,
+        pad.pressed(RightTrigger),  // bottom-1 → A (spare)
+        pad.pressed(East),          // top-4    → X (spare)
+        false,                      // L unused by the game (keyboard Q still maps)
+        pad.pressed(RightTrigger2), // top-3    → R (attack 3)
+    ]
+}
+
 fn read_input(
     keys: Res<ButtonInput<KeyCode>>,
+    pads: Query<(Entity, &Gamepad)>,
     mut emu: NonSendMut<Emu>,
     debug_state: Res<DebugStateRes>,
     mut script_panel: ResMut<ScriptPanel>,
@@ -356,6 +389,17 @@ fn read_input(
         keys.pressed(KeyU),
         keys.pressed(KeyO),
     ];
+    // Fold physical gamepads: lowest entity id → P1, next → P2 (keyboard still
+    // live — OR, not replace). Note: replugging mid-session can reorder pads.
+    let mut pad_list: Vec<_> = pads.iter().collect();
+    pad_list.sort_by_key(|(e, _)| *e);
+    for (slot, (_, pad)) in pad_list.iter().take(2).enumerate() {
+        let gb = pad_bits(pad);
+        let target = if slot == 0 { &mut bits } else { &mut bits2 };
+        for i in 0..12 {
+            target[i] |= gb[i];
+        }
+    }
     // OR in any MCP-injected input (press_buttons) so an agent — or the shadow bot
     // on P2 — can drive either port in windowed mode alongside the keyboard.
     if let Ok(mut ds) = debug_state.0.lock() {
