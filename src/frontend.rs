@@ -390,7 +390,7 @@ impl Frontend {
         }
         match crate::record::FrameRecorder::create(
             &path,
-            crate::record::ActorMap::default(),
+            crate::record::GameMap::default(),
             "asurabld",
             "fbalpha2012",
         ) {
