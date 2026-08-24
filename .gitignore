@@ -27,3 +27,4 @@ cfg/
 # Local secrets / migration credentials — never commit
 .env
 .env.*
+shadow/train/.venv/
