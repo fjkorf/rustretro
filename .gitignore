@@ -23,3 +23,7 @@ cfg/
 
 # Machine-local Cargo config (external target-dir)
 .cargo/config.toml
+
+# Local secrets / migration credentials — never commit
+.env
+.env.*
