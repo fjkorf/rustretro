@@ -366,6 +366,76 @@ impl MemoryRegion {
 }
 
 /// All data shared from the emulation thread → debug window.
+/// A named window of the emulated 68k bus, snapshotted into an ordinary
+/// [`MemoryRegion`] once per frame via the core's exported bus-read API
+/// (`LibretroCore::sek_read_block`, fbalpha2012). This is how cores that
+/// publish no libretro memory map still get live RAM/VRAM visibility: the
+/// window list comes from the `<rom>.busmap.json` sidecar or the MCP
+/// `map_bus_window` tool, and every existing reader (read_memory, RAM search,
+/// watches, Lua) sees the snapshot as a plain region.
+///
+/// Only RAM-backed bus ranges should be mapped — reads of I/O handler ranges
+/// can have side effects on the emulated machine.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BusWindowCfg {
+    pub name: String,
+    /// Guest bus address of the window's first byte. Serialized as a hex
+    /// string ("0x400000"); plain JSON numbers are also accepted on load.
+    #[serde(with = "hex_u32")]
+    pub addr: u32,
+    /// Window length in bytes (hex string or number, like `addr`).
+    #[serde(with = "hex_u32")]
+    pub len: u32,
+    /// Refresh every N frames (1 = every frame) — the only throttle knob.
+    #[serde(default = "bus_interval_default")]
+    pub interval: u32,
+    /// RETRO_MEMDESC_* flags for the synthesized region.
+    #[serde(default = "bus_flags_default")]
+    pub flags: u64,
+}
+
+fn bus_interval_default() -> u32 {
+    1
+}
+
+fn bus_flags_default() -> u64 {
+    crate::libretro::RETRO_MEMDESC_SYSTEM_RAM
+}
+
+/// Serde adapter: write a u32 as "0xHEX", accept "0xHEX"/"HEX" strings or
+/// plain numbers on read — busmap sidecars are hand-authored and bus
+/// addresses are naturally hexadecimal.
+mod hex_u32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u32, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("0x{v:X}"))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Num(u64),
+            Str(String),
+        }
+        let raw = Raw::deserialize(d)?;
+        let v = match raw {
+            Raw::Num(n) => n,
+            Raw::Str(s) => {
+                let t = s.trim();
+                let (digits, radix) = match t.strip_prefix("0x").or(t.strip_prefix("0X")) {
+                    Some(h) => (h, 16),
+                    None => (t, 16), // bare strings are hex too: "C00000"
+                };
+                u64::from_str_radix(digits, radix)
+                    .map_err(|e| serde::de::Error::custom(format!("bad hex '{s}': {e}")))?
+            }
+        };
+        u32::try_from(v).map_err(|_| serde::de::Error::custom(format!("0x{v:X} exceeds u32")))
+    }
+}
+
 pub struct DebugState {
     // --- Framebuffer ---
     /// Raw framebuffer bytes in the core's native pixel format.
@@ -383,6 +453,21 @@ pub struct DebugState {
     // --- Memory regions ---
     /// Accessible memory regions (from SET_MEMORY_MAPS callback)
     pub memory_regions: Vec<MemoryRegion>,
+
+    // --- Bus windows (Sek snapshot bridge) ---
+    /// Installed bus windows, index-aligned with `bus_buffers`. Windows are
+    /// only ever appended (no replace/remove) — see `bus_buffers`.
+    pub bus_windows: Vec<BusWindowCfg>,
+    /// Owned snapshot buffers backing the bus-window regions. APPEND-ONLY for
+    /// the life of the process: MCP readers clone a `MemoryRegion` and deref
+    /// its `ptr` after dropping this state's lock, so a published buffer must
+    /// never be freed or resized.
+    pub bus_buffers: Vec<Box<[u8]>>,
+    /// Windows added by the MCP thread, waiting for the emulation thread to
+    /// allocate and install them (same handoff pattern as `save_regions`).
+    pub pending_bus_windows: Vec<BusWindowCfg>,
+    /// Signal: persist `bus_windows` to the busmap sidecar on the emu thread.
+    pub save_busmap: bool,
 
     // --- M68K code bytes for disassembly ---
     /// Raw bytes fetched from M68K address space starting at `m68k_code_start`.
@@ -537,6 +622,10 @@ impl DebugState {
             fb_rgba: Vec::new(),
             fb_generation: 0,
             memory_regions: Vec::new(),
+            bus_windows: Vec::new(),
+            bus_buffers: Vec::new(),
+            pending_bus_windows: Vec::new(),
+            save_busmap: false,
             m68k_code_bytes: Vec::new(),
             m68k_code_start: 0,
             m68k_d_regs: [0; 8],
@@ -589,6 +678,38 @@ impl DebugState {
             pending_lua: None,
             pending_lua_result: None,
         }
+    }
+
+    /// Install a bus window: allocate its stable snapshot buffer and publish a
+    /// [`MemoryRegion`] over it at the window's guest address. The buffer is
+    /// zero-filled until the emulation thread's first refresh. Rejects (false)
+    /// a name that's already taken by any region — windows are append-only, so
+    /// there is no replace path for a colliding name to mean.
+    pub fn install_bus_window(&mut self, cfg: BusWindowCfg) -> bool {
+        if cfg.len == 0 || self.memory_regions.iter().any(|r| r.name == cfg.name) {
+            return false;
+        }
+        let buf: Box<[u8]> = vec![0u8; cfg.len as usize].into_boxed_slice();
+        let ptr = buf.as_ptr() as usize;
+        self.bus_buffers.push(buf);
+        self.memory_regions.push(MemoryRegion::synth_region(
+            cfg.name.clone(),
+            cfg.addr as usize,
+            cfg.len as usize,
+            ptr,
+            cfg.flags,
+        ));
+        self.bus_windows.push(cfg);
+        true
+    }
+
+    /// Whether any region came from somewhere other than the bus-window bridge.
+    /// The SET_MEMORY_MAPS fallback uses this instead of `memory_regions.is_empty()`
+    /// so installed bus windows don't suppress a core's own (better) map.
+    pub fn has_non_bus_regions(&self) -> bool {
+        self.memory_regions
+            .iter()
+            .any(|r| !self.bus_windows.iter().any(|w| w.name == r.name))
     }
 
     /// THE entry point other panels call to change the shared current location.

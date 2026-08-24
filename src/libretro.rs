@@ -415,12 +415,21 @@ impl RetroCore {
 
     pub fn get_m68k_register(&self, reg: SekRegister) -> Result<u32, LibretroError> {
         unsafe {
-            // Try both symbol name variations
             let symbol_name = b"_Z17SekDbgGetRegister11SekRegister";
             match self.library.get::<Symbol<SekDbgGetRegisterFn>>(symbol_name) {
                 Ok(func) => Ok(func(reg)),
                 Err(e) => {
-                    eprintln!("[LIBLOAD] SekDbgGetRegister ({:?}) failed: {}", String::from_utf8_lossy(symbol_name), e);
+                    // This probe runs every frame on every core; a non-FBA core
+                    // will never grow the symbol, so warn exactly once.
+                    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                    WARN_ONCE.call_once(|| {
+                        eprintln!(
+                            "[LIBLOAD] SekDbgGetRegister ({:?}) failed: {} \
+                             (core has no 68k debug API; further probes are silent)",
+                            String::from_utf8_lossy(symbol_name),
+                            e
+                        );
+                    });
                     Err(LibretroError::CoreNotLoaded)
                 }
             }
@@ -468,6 +477,68 @@ impl RetroCore {
                     .collect(),
                 Err(_) => Vec::new(),
             }
+        }
+    }
+
+    /// Bulk-read `len` bytes of the live M68K bus via the core's exported
+    /// SekReadByte/SekReadLong (fbalpha2012). Bytes come back in guest
+    /// (big-endian) order: `out[i]` is the byte the CPU sees at `addr + i`.
+    ///
+    /// Returns `None` when the core does not export the full Sek read API —
+    /// including the SekGetActive/SekOpen/SekClose guard trio, because a read
+    /// with no open CPU context dereferences a null memory map inside the core.
+    /// `DebugCPU_SekInitted` (when exported) additionally rejects cores whose
+    /// 68k was never initialised (e.g. a Z80-only game on fbalpha2012).
+    ///
+    /// Symbols are resolved once per call, not once per read: a bus-window
+    /// refresh makes ~50k reads per frame and per-read dlsym would dominate.
+    pub fn sek_read_block(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        unsafe {
+            if let Ok(initted) = self.library.get::<Symbol<*const u8>>(b"DebugCPU_SekInitted") {
+                let addr: *const u8 = **initted;
+                if !addr.is_null() && *addr == 0 {
+                    return None;
+                }
+            }
+            let read_byte = self
+                .library
+                .get::<Symbol<SekReadByteFn>>(b"_Z11SekReadBytej")
+                .ok()?;
+            let read_long = self
+                .library
+                .get::<Symbol<SekReadLongFn>>(b"_Z11SekReadLongj")
+                .ok()?;
+            let get_active = self
+                .library
+                .get::<Symbol<SekGetActiveFn>>(b"_Z12SekGetActivev")
+                .ok()?;
+            let open = self.library.get::<Symbol<SekOpenFn>>(b"_Z7SekOpeni").ok()?;
+            let close = self.library.get::<Symbol<SekCloseFn>>(b"_Z8SekClosev").ok()?;
+
+            let opened_here = get_active() < 0;
+            if opened_here {
+                open(0);
+            }
+            let (head, longs, tail) = plan_block_reads(addr, len);
+            let mut out = Vec::with_capacity(len);
+            for a in head {
+                out.push(read_byte(a as u32));
+            }
+            let mut a = longs.start;
+            while a < longs.end {
+                out.extend_from_slice(&read_long(a as u32).to_be_bytes());
+                a += 4;
+            }
+            for a in tail {
+                out.push(read_byte(a as u32));
+            }
+            if opened_here {
+                close();
+            }
+            Some(out)
         }
     }
 
@@ -618,6 +689,37 @@ pub type SekDbgGetCPUTypeFn = extern "C" fn() -> i32;
 pub type SekDbgGetPendingIRQFn = extern "C" fn() -> i32;
 pub type SekFetchByteFn = extern "C" fn(u32) -> u8;
 
+// Sek bus access (fbalpha2012 exports its 68k memory API; INT32 returns ignored)
+pub type SekReadByteFn = extern "C" fn(u32) -> u8;
+pub type SekReadWordFn = extern "C" fn(u32) -> u16;
+pub type SekReadLongFn = extern "C" fn(u32) -> u32;
+pub type SekWriteByteFn = extern "C" fn(u32, u8);
+pub type SekWriteWordFn = extern "C" fn(u32, u16);
+pub type SekWriteLongFn = extern "C" fn(u32, u32);
+pub type SekGetActiveFn = extern "C" fn() -> i32;
+pub type SekOpenFn = extern "C" fn(i32) -> i32;
+pub type SekCloseFn = extern "C" fn() -> i32;
+
+/// Split an `(addr, len)` bus span into unaligned head bytes, aligned 4-byte
+/// longs, and tail bytes (all as `u64` address ranges, so `addr + len` can't
+/// wrap). Pure so the alignment arithmetic is unit-testable without a core.
+pub fn plan_block_reads(
+    addr: u32,
+    len: usize,
+) -> (
+    std::ops::Range<u64>,
+    std::ops::Range<u64>,
+    std::ops::Range<u64>,
+) {
+    let start = addr as u64;
+    let end = start + len as u64;
+    // Head runs to the next 4-byte boundary, but never past the span's end.
+    let head_end = end.min((start + 3) & !3);
+    // Longs cover whole 4-byte words between the head and the last boundary.
+    let long_end = head_end.max(end & !3);
+    (start..head_end, head_end..long_end, long_end..end)
+}
+
 // retro_get_memory_data(unsigned) -> void* ; retro_get_memory_size(unsigned) -> size_t
 pub type RetroGetMemoryDataFn = extern "C" fn(std::ffi::c_uint) -> *mut c_void;
 pub type RetroGetMemorySizeFn = extern "C" fn(std::ffi::c_uint) -> usize;
@@ -631,3 +733,55 @@ pub type ZetBcFn = extern "C" fn(i32) -> i32;
 pub type ZetDeFn = extern "C" fn(i32) -> i32;
 pub type ZetHLFn = extern "C" fn(i32) -> i32;
 pub type ZetGetActiveFn = extern "C" fn() -> i32;
+
+#[cfg(test)]
+mod tests {
+    use super::plan_block_reads;
+
+    /// Reassemble a plan into the flat list of addresses each byte comes from,
+    /// tagging long-reads so tests can also assert the read widths.
+    fn covered(addr: u32, len: usize) -> Vec<u64> {
+        let (head, longs, tail) = plan_block_reads(addr, len);
+        assert_eq!(head.start, addr as u64);
+        assert_eq!(head.end, longs.start);
+        assert_eq!(longs.end, tail.start);
+        assert_eq!(tail.end, addr as u64 + len as u64);
+        assert_eq!(longs.start % 4, if longs.is_empty() { longs.start % 4 } else { 0 });
+        assert_eq!((longs.end - longs.start) % 4, 0);
+        head.chain(longs).chain(tail).collect()
+    }
+
+    #[test]
+    fn plan_covers_every_byte_exactly_once() {
+        for addr in 0u32..8 {
+            for len in 0usize..20 {
+                let bytes = covered(addr, len);
+                let expect: Vec<u64> = (addr as u64..addr as u64 + len as u64).collect();
+                assert_eq!(bytes, expect, "addr={addr} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn plan_small_unaligned_span_is_all_head() {
+        let (head, longs, tail) = plan_block_reads(1, 2);
+        assert_eq!((head.start, head.end), (1, 3));
+        assert!(longs.is_empty());
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn plan_aligned_span_is_all_longs() {
+        let (head, longs, tail) = plan_block_reads(0x500000, 0x2000);
+        assert!(head.is_empty());
+        assert_eq!((longs.start, longs.end), (0x500000, 0x502000));
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn plan_no_overflow_at_top_of_address_space() {
+        let (head, longs, tail) = plan_block_reads(u32::MAX - 3, 4);
+        let total = (head.end - head.start) + (longs.end - longs.start) + (tail.end - tail.start);
+        assert_eq!(total, 4);
+    }
+}

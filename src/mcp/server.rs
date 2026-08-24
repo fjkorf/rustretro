@@ -1409,6 +1409,20 @@ impl RetroMcpServer {
             });
             Arc::new(schema.as_object().unwrap().clone())
         };
+        // Schema for { name, addr, len, interval? } (map_bus_window).
+        let map_bus_window_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Region name to publish (must not collide with an existing region), e.g. \"Sprite RAM\"" },
+                    "addr": { "type": ["integer", "string"], "description": "Guest bus address of the window start — integer or hex string \"0x600000\"" },
+                    "len":  { "type": ["integer", "string"], "description": "Window length in bytes (max 1 MiB) — integer or hex string" },
+                    "interval": { "type": "integer", "description": "Refresh every N frames (default 1 = every frame)" }
+                },
+                "required": ["name", "addr", "len"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
         // Schema for { source, window? } (scan_regions).
         let scan_regions_schema = || -> Arc<Map<String, Value>> {
             let schema = json!({
@@ -1511,6 +1525,19 @@ impl RetroMcpServer {
                 "list_regions",
                 "List the mapped memory regions (name, type, address range, size, readonly).",
                 no_params(),
+            ),
+            Tool::new(
+                "map_bus_window",
+                "Publish a live memory region for cores with NO libretro memory map by \
+                 snapshotting a window of the emulated CPU bus each frame through the core's \
+                 exported bus-read API (fbalpha2012 exports its 68k `SekRead*`; the window \
+                 then feeds read_memory / read_region / search_memory / render_tiles / Lua \
+                 like any region). Give the window a name, a guest bus address, and a length. \
+                 ONLY map RAM-backed ranges (work RAM, VRAM, sprite/palette RAM — e.g. from \
+                 the game's MAME driver memory map); reading I/O handler ranges can perturb \
+                 the machine. Persists to the busmap sidecar. If the core lacks the API the \
+                 window stays zero-filled and the event log says so.",
+                map_bus_window_schema(),
             ),
             Tool::new(
                 "read_region",
@@ -1891,6 +1918,77 @@ impl ServerHandler for RetroMcpServer {
                         AiSnapshot::from_debug_state(&ds)
                     };
                     Ok(CallToolResult::success(vec![Self::json_content(&snap.regions)?]))
+                }
+                "map_bus_window" => {
+                    // addr/len accept a JSON integer or a hex string ("0x600000").
+                    let num_arg = |key: &str| -> Option<u64> {
+                        match args.get(key)? {
+                            Value::Number(n) => n.as_u64(),
+                            Value::String(s) => {
+                                let t = s.trim();
+                                let h = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))
+                                    .unwrap_or(t);
+                                u64::from_str_radix(h, 16).ok()
+                            }
+                            _ => None,
+                        }
+                    };
+                    let name = args
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ErrorData::invalid_params("missing/invalid `name`", None))?
+                        .to_string();
+                    let addr = num_arg("addr").ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `addr` (int or hex string)", None)
+                    })?;
+                    let len = num_arg("len").ok_or_else(|| {
+                        ErrorData::invalid_params("missing/invalid `len` (int or hex string)", None)
+                    })?;
+                    const MAX_BUS_WINDOW: u64 = 1 << 20; // 1 MiB
+                    if len == 0 || len > MAX_BUS_WINDOW {
+                        return Err(ErrorData::invalid_params(
+                            format!("`len` must be 1..={MAX_BUS_WINDOW} bytes"),
+                            None,
+                        ));
+                    }
+                    if addr > u32::MAX as u64 || addr + len > u32::MAX as u64 + 1 {
+                        return Err(ErrorData::invalid_params(
+                            "window must fit in the 32-bit bus",
+                            None,
+                        ));
+                    }
+                    let interval = get_u("interval").unwrap_or(1).max(1) as u32;
+                    let cfg = crate::debug::BusWindowCfg {
+                        name: name.clone(),
+                        addr: addr as u32,
+                        len: len as u32,
+                        interval,
+                        flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+                    };
+                    {
+                        let mut ds = this.lock_read()?;
+                        if ds.memory_regions.iter().any(|r| r.name == name)
+                            || ds.pending_bus_windows.iter().any(|w| w.name == name)
+                        {
+                            return Err(ErrorData::invalid_params(
+                                format!("a region named '{name}' already exists"),
+                                None,
+                            ));
+                        }
+                        ds.pending_bus_windows.push(cfg);
+                        ds.save_busmap = true;
+                    }
+                    Ok(CallToolResult::success(vec![Self::json_content(&json!({
+                        "ok": true,
+                        "name": name,
+                        "addr": format!("0x{addr:X}"),
+                        "len": len,
+                        "interval": interval,
+                        "note": "window queued; the emulation thread installs and fills it \
+                                 on the next frame (list_regions will then show it). If the \
+                                 core lacks the bus-read API it stays zero-filled — check \
+                                 the event log."
+                    }))?]))
                 }
                 "read_region" => {
                     let region_name = args

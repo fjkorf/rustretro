@@ -46,6 +46,10 @@ struct Args {
     #[arg(long, value_name = "N", default_value = "4000")] mcp_port: u16,
     /// Run with no window — emulator + MCP server only (for AI/agent-driven sessions). Implies --mcp.
     #[arg(long)] headless: bool,
+    /// Busmap sidecar of bus windows to snapshot via the core's exported CPU
+    /// bus API (Sek bridge; see library/asurabld/asurabld.busmap.json).
+    /// Defaults to <save-dir>/<rom>.busmap.json when present.
+    #[arg(long, value_name = "PATH")] bus_map: Option<PathBuf>,
 }
 
 // ─── Bevy resources ──────────────────────────────────────────────────────────
@@ -109,6 +113,7 @@ fn main() -> Result<()> {
         &args.core, &args.rom,
         args.save_dir.clone(), args.system_dir.clone(),
         Arc::clone(&debug_state),
+        args.bus_map.clone(),
     )?;
 
     let w = frontend.video_width().max(320) * args.scale;

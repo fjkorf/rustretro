@@ -1,0 +1,14 @@
+{
+  "windows": [
+    { "name": "Work RAM",   "addr": "0x400000", "len": "0x10000" },
+    { "name": "Tilemap L0", "addr": "0x500000", "len": "0x2000" },
+    { "name": "Tilemap L1", "addr": "0x502000", "len": "0x2000" },
+    { "name": "Tilemap BG", "addr": "0x504000", "len": "0x2000" },
+    { "name": "Tilemap BG2", "addr": "0x506000", "len": "0x2000" },
+    { "name": "Sprite RAM", "addr": "0x600000", "len": "0x2000" },
+    { "name": "Palette RAM", "addr": "0x700000", "len": "0x4000" },
+    { "name": "Video Regs", "addr": "0x8C0000", "len": "0x20" },
+    { "name": "Layer Priority", "addr": "0x8E0000", "len": "0x4" },
+    { "name": "Tilebank", "addr": "0xA00000", "len": "0x4" }
+  ]
+}
