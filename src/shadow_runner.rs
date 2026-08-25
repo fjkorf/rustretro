@@ -302,6 +302,12 @@ struct MetaJson {
     created: Option<String>,
     #[serde(default)]
     bucket_counts: Option<std::collections::BTreeMap<String, u64>>,
+    // Matchup key (phase A metas): which chars this model was filtered to.
+    // Absent/None = a general model (any me / any opponent).
+    #[serde(default)]
+    char_filter: Option<u8>,
+    #[serde(default)]
+    opp_filter: Option<u8>,
 }
 
 /// Canonical bucket display order (matches the trainer's coverage report).
@@ -531,6 +537,7 @@ struct Fighter {
     health: u8,
     meter: u8,
     meter_max: u8,
+    char_id: u8,
 }
 
 /// `read_addr` returns little-endian bytes; the 68k stores big-endian — swap
@@ -553,6 +560,7 @@ fn read_fighter(ds: &DebugState, base: u32) -> Fighter {
         health: u8g(ds, base + 0x177),
         meter: u8g(ds, base + 0x17B),
         meter_max: u8g(ds, base + 0x17F),
+        char_id: u8g(ds, base + 0x639),
     }
 }
 
@@ -623,11 +631,27 @@ impl HitstunTracker {
 
 // ── the runner ──────────────────────────────────────────────────────────────
 
-pub struct ShadowRunner {
+/// One fitted model plus everything needed to run and identify it. A runner
+/// holds one or many of these (a model SET); per-matchup selection picks the
+/// active one at round start.
+pub struct LoadedModel {
     model: KnnModel,
     cal: Calibration,
     /// Identity card for the Training panel (published via `shadow_model`).
     pub info: crate::debug::ShadowModelInfo,
+    /// Matchup key from meta.json: (my char, opponent char); None = any.
+    me: Option<u8>,
+    opp: Option<u8>,
+    /// Fit timestamp, for newest-per-key dedup when loading a set.
+    created: String,
+}
+
+pub struct ShadowRunner {
+    /// The loaded model(s). A single-model load has exactly one entry; a set
+    /// load has one per matchup key (newest per key wins).
+    library: Vec<LoadedModel>,
+    /// Index into `library` currently driving decisions.
+    active: usize,
     pub enabled: bool,
     rng: XorShift64,
     // Per-round buffers (runtime.RoundBuffers) — cleared on every gate edge.
@@ -656,10 +680,122 @@ pub struct ShadowRunner {
 }
 
 impl ShadowRunner {
-    /// Load `<dir>/cases.npz` + `<dir>/meta.json`, validate the feature-name
-    /// contract, and return an ENABLED runner. Errors are strings meant for a
-    /// fatal `--shadow` startup message.
+    /// Load a model directory — either a single model (`cases.npz` +
+    /// `meta.json` directly inside) or a SET (a directory of model dirs, e.g.
+    /// `shadow/models`). Set loads keep the newest model per matchup key and
+    /// pick the right one automatically at every round start. Returns an
+    /// ENABLED runner; errors are strings meant for a fatal `--shadow`
+    /// startup message (runtime loads report them softly instead).
     pub fn load(dir: &Path) -> Result<ShadowRunner, String> {
+        let mut library: Vec<LoadedModel> = Vec::new();
+        if dir.join("cases.npz").is_file() {
+            library.push(Self::load_single(dir)?);
+        } else {
+            // Set: newest model per (me, opp) key; individual failures warn.
+            let mut best: std::collections::BTreeMap<(Option<u8>, Option<u8>), LoadedModel> =
+                std::collections::BTreeMap::new();
+            let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            for e in entries.flatten() {
+                let sub = e.path();
+                if !sub.join("cases.npz").is_file() {
+                    continue;
+                }
+                match Self::load_single(&sub) {
+                    Ok(lm) => {
+                        let key = (lm.me, lm.opp);
+                        let replace = best
+                            .get(&key)
+                            .map(|cur| lm.created > cur.created)
+                            .unwrap_or(true);
+                        if replace {
+                            best.insert(key, lm);
+                        }
+                    }
+                    Err(err) => eprintln!("[shadow] set: skipping {}: {err}", sub.display()),
+                }
+            }
+            library.extend(best.into_values());
+            if library.is_empty() {
+                return Err(format!(
+                    "{}: no loadable models (need cases.npz directly inside, or in subdirs)",
+                    dir.display()
+                ));
+            }
+            let keys: Vec<String> = library.iter().map(|m| m.info.name.clone()).collect();
+            eprintln!(
+                "[shadow] set {}: {} model(s) — {} — matchup picked at each round start",
+                dir.display(),
+                library.len(),
+                keys.join(", ")
+            );
+        }
+        // Start on the general model if the set has one, else the first.
+        let active = library
+            .iter()
+            .position(|m| m.me.is_none() && m.opp.is_none())
+            .unwrap_or(0);
+        Ok(ShadowRunner {
+            library,
+            active,
+            enabled: true,
+            rng: XorShift64::new(0),
+            was_live: false,
+            me_block1: None,
+            frames_live: 0,
+            tick: 0,
+            stacker: VecDeque::with_capacity(4),
+            me_hitstun: HitstunTracker::default(),
+            opp_hitstun: HitstunTracker::default(),
+            prev_opp: None,
+            prev_opp_combo: 0,
+            last_emitted_mask: 0,
+            latched_mask: 0,
+            driving: false,
+        })
+    }
+
+    /// The active model's identity card (what `shadow_model` publishes).
+    pub fn info(&self) -> &crate::debug::ShadowModelInfo {
+        &self.library[self.active].info
+    }
+
+    /// Per-matchup selection at round start: exact (me, opp) → per-char
+    /// (me, any) → (any, opp) → general (any, any) → keep current. Publishes
+    /// the switch into `shadow_model` so the panel card follows.
+    fn select_model(&mut self, me_char: u8, opp_char: u8, ds: &mut DebugState) {
+        if self.library.len() < 2 {
+            return;
+        }
+        let score = |m: &LoadedModel| -> Option<u32> {
+            match (m.me, m.opp) {
+                (Some(a), Some(b)) if a == me_char && b == opp_char => Some(0),
+                (Some(a), None) if a == me_char => Some(1),
+                (None, Some(b)) if b == opp_char => Some(2),
+                (None, None) => Some(3),
+                _ => None,
+            }
+        };
+        let pick = self
+            .library
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| score(m).map(|s| (s, i)))
+            .min();
+        if let Some((_, idx)) = pick {
+            if idx != self.active {
+                self.active = idx;
+                eprintln!(
+                    "[shadow] matchup c{me_char}-vs-c{opp_char} → model {}",
+                    self.library[idx].info.name
+                );
+                ds.shadow_model = Some(self.library[idx].info.clone());
+            }
+        }
+    }
+
+    /// Load one model directory: `<dir>/cases.npz` + `<dir>/meta.json`,
+    /// validating the feature-name contract.
+    fn load_single(dir: &Path) -> Result<LoadedModel, String> {
         let npz_path = dir.join("cases.npz");
         let bytes = std::fs::read(&npz_path)
             .map_err(|e| format!("{}: {e}", npz_path.display()))?;
@@ -726,24 +862,13 @@ impl ShadowRunner {
             buckets,
         };
 
-        Ok(ShadowRunner {
+        Ok(LoadedModel {
             model,
             cal,
             info,
-            enabled: true,
-            rng: XorShift64::new(0),
-            was_live: false,
-            me_block1: None,
-            frames_live: 0,
-            tick: 0,
-            stacker: VecDeque::with_capacity(4),
-            me_hitstun: HitstunTracker::default(),
-            opp_hitstun: HitstunTracker::default(),
-            prev_opp: None,
-            prev_opp_combo: 0,
-            last_emitted_mask: 0,
-            latched_mask: 0,
-            driving: false,
+            me: meta.char_filter,
+            opp: meta.opp_filter,
+            created: meta.created.clone().unwrap_or_default(),
         })
     }
 
@@ -784,7 +909,7 @@ impl ShadowRunner {
             return;
         }
         let snap = read_tick(ds);
-        let live = is_controllable(&snap, self.cal.HEALTH_MAX as u8);
+        let live = is_controllable(&snap, self.library[self.active].cal.HEALTH_MAX as u8);
 
         if !live {
             // Off-gate: no injection, buffers cleared for the next round
@@ -817,9 +942,17 @@ impl ShadowRunner {
                 snap.block1.x,
                 snap.block2.x
             );
+            // Matchup selection: chars are valid once positions are — pick
+            // the best model for (my char, opponent char) from the set.
+            let (me_f, opp_f) = if self.me_block1 == Some(true) {
+                (snap.block1, snap.block2)
+            } else {
+                (snap.block2, snap.block1)
+            };
+            self.select_model(me_f.char_id, opp_f.char_id, ds);
         }
 
-        if self.frames_live % self.cal.P == 0 {
+        if self.frames_live % self.library[self.active].cal.P == 0 {
             self.decide(&snap);
         }
         self.frames_live += 1;
@@ -860,24 +993,24 @@ impl ShadowRunner {
         let fwd_hold = (self.last_emitted_mask >> fwd_bit & 1) as f64;
         let back_hold = (self.last_emitted_mask >> back_bit & 1) as f64;
 
-        let window_ticks = (self.cal.HITSTUN_RECENT_FRAMES / self.cal.P).max(1);
+        let window_ticks = (self.library[self.active].cal.HITSTUN_RECENT_FRAMES / self.library[self.active].cal.P).max(1);
         let me_hit = self.me_hitstun.update(self.tick, me_combo_now, window_ticks);
         let opp_hit = self.opp_hitstun.update(self.tick, opp_combo_lagged, window_ticks);
 
-        let scal = build_scalars(&self.cal, &me_now, &opp_lagged, s, fwd_hold, back_hold, me_hit, opp_hit);
-        if self.stacker.len() == self.cal.K {
+        let scal = build_scalars(&self.library[self.active].cal, &me_now, &opp_lagged, s, fwd_hold, back_hold, me_hit, opp_hit);
+        if self.stacker.len() == self.library[self.active].cal.K {
             self.stacker.pop_front();
         }
         self.stacker.push_back(scal);
 
-        if self.stacker.len() == self.cal.K {
+        if self.stacker.len() == self.library[self.active].cal.K {
             // Oldest → newest concatenation (dataset.build stacking order).
             let q: Vec<f64> = self
                 .stacker
                 .iter()
                 .flat_map(|s| s.iter().map(|&v| v as f64))
                 .collect();
-            let (pm, pa) = self.model.predict_proba(&q);
+            let (pm, pa) = self.library[self.active].model.predict_proba(&q);
             let mv = self.rng.sample(&pm);
             let at = self.rng.sample(&pa);
             let mask = intent_to_mask(mv, at, s);
@@ -1019,14 +1152,15 @@ mod tests {
 
         // Model card lifted from meta.json (Training panel display).
         let runner = ShadowRunner::load(&goat_v2()).unwrap();
-        assert_eq!(runner.info.name, "goat-v2");
-        assert_eq!(runner.info.cases, 13405);
-        assert_eq!(runner.info.rounds, Some(112));
-        assert!(runner.info.created.as_deref().unwrap_or("").starts_with("2026-08-25"));
+        assert_eq!(runner.library.len(), 1);
+        assert_eq!(runner.info().name, "goat-v2");
+        assert_eq!(runner.info().cases, 13405);
+        assert_eq!(runner.info().rounds, Some(112));
+        assert!(runner.info().created.as_deref().unwrap_or("").starts_with("2026-08-25"));
         // Canonical bucket order, counts as fitted.
-        let names: Vec<&str> = runner.info.buckets.iter().map(|(b, _)| b.as_str()).collect();
+        let names: Vec<&str> = runner.info().buckets.iter().map(|(b, _)| b.as_str()).collect();
         assert_eq!(names, ["defense", "offense", "air", "corner", "neutral"]);
-        assert_eq!(runner.info.buckets[0].1, 183);
+        assert_eq!(runner.info().buckets[0].1, 183);
 
         let model = KnnModel::from_npz(entries).unwrap();
         assert_eq!(model.n, 13405);
@@ -1173,11 +1307,11 @@ mod tests {
         let cal = Calibration::default();
         let me = Fighter {
             timer: 512, anim: 128, x: 84, y: 216, facing: 1,
-            health: 239, meter: 32, meter_max: 64,
+            health: 239, meter: 32, meter_max: 64, char_id: 1,
         };
         let opp = Fighter {
             timer: 256, anim: 64, x: 232, y: 200, facing: 0,
-            health: 120, meter: 0, meter_max: 64,
+            health: 120, meter: 0, meter_max: 64, char_id: 7,
         };
         let s = 1; // me.facing == 1
         let v = build_scalars(&cal, &me, &opp, s, 1.0, 0.0, false, true);
@@ -1237,5 +1371,42 @@ mod tests {
         assert!(!is_controllable(&TickSnapshot { block2: f(0xF0, 232), ..snap }, 0xEF));
         assert!(!is_controllable(&TickSnapshot { timer_bcd: 0x3A, ..snap }, 0xEF));
         assert!(!is_controllable(&TickSnapshot { timer_bcd: 0, ..snap }, 0xEF));
+    }
+
+    #[test]
+    fn set_load_dedups_and_selects_per_matchup() {
+        // Build a temp set from the tracked goat-v2 artifacts: a general
+        // model plus a synthetic (me=1, opp=7) matchup model with the same
+        // cases but an edited meta.
+        let set = std::env::temp_dir().join(format!("shadow_set_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&set);
+        for (name, me, opp) in [("general", None, None), ("goat-vs-rosemary", Some(1), Some(7))] {
+            let d = set.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::copy(goat_v2().join("cases.npz"), d.join("cases.npz")).unwrap();
+            let mut meta: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(goat_v2().join("meta.json")).unwrap(),
+            )
+            .unwrap();
+            meta["char_filter"] = serde_json::json!(me);
+            meta["opp_filter"] = serde_json::json!(opp);
+            std::fs::write(d.join("meta.json"), meta.to_string()).unwrap();
+        }
+        let mut runner = ShadowRunner::load(&set).unwrap();
+        assert_eq!(runner.library.len(), 2);
+        // Starts on the general model.
+        assert_eq!(runner.info().name, "general");
+
+        let mut ds = DebugState::new();
+        // Known matchup → the per-matchup model; unknown → back to general.
+        runner.select_model(1, 7, &mut ds);
+        assert_eq!(runner.info().name, "goat-vs-rosemary");
+        assert_eq!(ds.shadow_model.as_ref().unwrap().name, "goat-vs-rosemary");
+        runner.select_model(1, 3, &mut ds);
+        assert_eq!(runner.info().name, "general");
+        // Same matchup again is a no-op (stays where it is).
+        runner.select_model(1, 3, &mut ds);
+        assert_eq!(runner.info().name, "general");
+        let _ = std::fs::remove_dir_all(&set);
     }
 }

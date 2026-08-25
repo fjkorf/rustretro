@@ -165,6 +165,24 @@ fn timer_bcd_valid(t: u8) -> bool {
     t != 0 && (t >> 4) <= 9 && (t & 0xF) <= 9
 }
 
+/// Roster name for a char id (`+0x639`). Hand-kept mirror of `CHAR_NAMES` in
+/// `shadow_train/asurabld.py` and the roster table in `asurabld.md` — update
+/// all three together. Unverified ids render as "c<N>".
+pub fn char_name(id: u8) -> String {
+    match id {
+        0 => "yashaou".into(),
+        1 => "goat".into(),
+        7 => "rosemary".into(),
+        n => format!("c{n}"),
+    }
+}
+
+/// Matchup slug matching `shadow_train.asurabld.matchup_slug(me, opp)` —
+/// used to find per-matchup arenas (`shadow/arenas/<slug>.state`).
+pub fn matchup_slug(me: u8, opp: u8) -> String {
+    format!("{}-vs-{}", char_name(me), char_name(opp))
+}
+
 /// Pack a 12-button held state into the low 12 bits (RETRO_DEVICE_ID order).
 pub fn pack_mask(bits: &[bool; 12]) -> u16 {
     let mut m = 0u16;

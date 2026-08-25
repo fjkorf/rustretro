@@ -543,9 +543,9 @@ impl Frontend {
                     runner.enabled = prev_enabled.unwrap_or(false);
                     let msg = format!(
                         "loaded {} ({} cases{}) — {}",
-                        runner.info.name,
-                        runner.info.cases,
-                        runner.info.rounds.map_or(String::new(), |r| format!(", {r} rounds")),
+                        runner.info().name,
+                        runner.info().cases,
+                        runner.info().rounds.map_or(String::new(), |r| format!(", {r} rounds")),
                         if runner.enabled { "ACTIVE" } else { "press Enable / Shift+F5 to fight" },
                     );
                     self.shadow = Some(runner);
@@ -563,7 +563,7 @@ impl Frontend {
 
         let on = self.shadow.as_ref().map(|s| s.enabled);
         let info = if self.shadow_info_dirty {
-            Some(self.shadow.as_ref().map(|s| s.info.clone()))
+            Some(self.shadow.as_ref().map(|s| s.info().clone()))
         } else {
             None
         };

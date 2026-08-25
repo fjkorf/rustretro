@@ -453,6 +453,15 @@ impl TrainingPanel {
             .show(ui, |ui| {
                 if self.models.is_empty() {
                     ui.label(format!("Nothing under {MODELS_DIR}/ — run shadow/loop.sh --fit-only."));
+                } else if ui
+                    .small_button("Load ALL as set")
+                    .on_hover_text(
+                        "Load every model as a SET: the newest per matchup key is kept and \
+                         the right one is picked automatically at each round start",
+                    )
+                    .clicked()
+                {
+                    state.pending_shadow_load = Some(PathBuf::from(MODELS_DIR));
                 }
                 for (name, path) in &self.models {
                     ui.horizontal(|ui| {

@@ -34,6 +34,7 @@ use crate::debug::panels::{
     frame_log::FrameLog,
     help::HelpPanel,
     hex_dump::HexDump,
+    matchup::MatchupPanel,
     input_monitor::InputMonitor,
     ram_search::RamSearchPanel,
     regions::RegionsPanel,
@@ -70,13 +71,14 @@ pub enum Tab {
     Help,
     State,
     Training,
+    Matchup,
 }
 
 /// Every Tab variant. Drives layout reconciliation (`load_layout` appends any
 /// variant missing from a saved sidecar) and the toolbar Panels menu — adding
 /// a variant without extending this list is a compile-time-invisible bug, so
 /// the `default_layout_contains_all_tabs` test cross-checks it.
-pub const ALL_TABS: [Tab; 16] = [
+pub const ALL_TABS: [Tab; 17] = [
     Tab::FrameInspector,
     Tab::HexDump,
     Tab::TileViewer,
@@ -93,6 +95,7 @@ pub const ALL_TABS: [Tab; 16] = [
     Tab::Help,
     Tab::State,
     Tab::Training,
+    Tab::Matchup,
 ];
 
 impl Tab {
@@ -114,6 +117,7 @@ impl Tab {
             Tab::Help => "❓ Help",
             Tab::State => "💾 State",
             Tab::Training => "🎯 Training",
+            Tab::Matchup => "🥊 Matchup",
         }
     }
 }
@@ -136,6 +140,7 @@ pub struct Panels {
     pub help_panel: HelpPanel,
     pub state_panel: StatePanel,
     pub training_panel: TrainingPanel,
+    pub matchup_panel: MatchupPanel,
 }
 
 impl Panels {
@@ -156,6 +161,7 @@ impl Panels {
             help_panel: HelpPanel::new(),
             state_panel: StatePanel::new(),
             training_panel: TrainingPanel::new(),
+            matchup_panel: MatchupPanel::new(),
         }
     }
 }
@@ -250,6 +256,13 @@ impl<'a> egui_dock::TabViewer for DockViewer<'a> {
                     ui.label("Error: Could not acquire debug state lock");
                 }
             }
+            Tab::Matchup => {
+                if let Ok(mut ds) = self.state.lock() {
+                    self.panels.matchup_panel.show(ui, &mut ds);
+                } else {
+                    ui.label("Error: Could not acquire debug state lock");
+                }
+            }
 
             // shape: &mut self, ui, &mut DebugState
             Tab::Disasm => {
@@ -312,7 +325,11 @@ pub fn default_layout() -> DockState<Tab> {
         vec![Tab::Watch, Tab::CpuState, Tab::InputMonitor],
     );
     let [_live, _control] =
-        surface.split_below(right, 0.5, vec![Tab::State, Tab::Training, Tab::Audio]);
+        surface.split_below(
+        right,
+        0.5,
+        vec![Tab::Training, Tab::Matchup, Tab::State, Tab::Audio],
+    );
 
     // TOOLS — full-width bottom strip.
     let [_top, _tools] = surface.split_below(

@@ -19,6 +19,11 @@
       demo rounds excluded, exactly as fit would count them) plus a per-style
       breakdown from the recording meta sidecars. Defaults to
       shadow/recordings/*.jsonl (v2 only). The fill-the-gaps view.
+
+  index [recordings...] [--force]
+      Backfill .rounds.jsonl sidecars (the per-round matchup index the app's
+      recorder writes for new recordings) for recordings that lack one.
+      Same schema as src/record.rs emit_round_summary.
 """
 
 import argparse
@@ -171,6 +176,56 @@ def cmd_coverage(args) -> None:
           "unnamed characters print as c<N> — see asurabld.CHAR_NAMES)")
 
 
+def cmd_index(args) -> None:
+    recs = args.recordings or sorted(Path("shadow/recordings").glob("*.jsonl"))
+    done = skipped = 0
+    for p in recs:
+        if str(p).endswith(".rounds.jsonl"):
+            continue
+        try:
+            if '"block1"' not in open(p).readline():
+                continue
+        except OSError:
+            continue
+        out = Path(str(p).removesuffix(".jsonl") + ".rounds.jsonl")
+        if out.exists() and not args.force:
+            skipped += 1
+            continue
+        style = _recording_style(p)
+        lines = []
+        cur = None  # (round_id, b1c, b2c, p1_block, frames, mass)
+        prev_controllable = False
+        for line in open(p):
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            c = bool(r.get("controllable"))
+            if c and not prev_controllable:
+                cur = {"round_id": r["round_id"],
+                       "block1_char": r["block1"].get("char_id", 0),
+                       "block2_char": r["block2"].get("char_id", 0),
+                       "p1_block": r.get("p1_block"),
+                       "frames": 0, "p1_input_mass": 0}
+            if not c and prev_controllable and cur is not None:
+                lines.append(cur)
+                cur = None
+            if c and cur is not None:
+                cur["frames"] += 1
+                cur["p1_input_mass"] += r.get("p1_input", 0)
+            prev_controllable = c
+        if cur is not None:  # file ended mid-round
+            lines.append(cur)
+        with open(out, "w") as f:
+            for row in lines:
+                row["demo"] = row["p1_input_mass"] == 0
+                row["style"] = style
+                f.write(json.dumps(row) + chr(10))
+        print(f"  {out.name}: {len(lines)} round(s)")
+        done += 1
+    print(f"indexed {done} recording(s), {skipped} already had sidecars")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="shadow_train")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -209,6 +264,13 @@ def main():
     p_cov.add_argument("recordings", nargs="*", type=Path,
                        help="recordings to scan (default: shadow/recordings/*.jsonl)")
     p_cov.set_defaults(func=cmd_coverage)
+
+    p_idx = sub.add_parser("index",
+                           help="backfill .rounds.jsonl matchup-index sidecars")
+    p_idx.add_argument("recordings", nargs="*", type=Path)
+    p_idx.add_argument("--force", action="store_true",
+                       help="rewrite sidecars that already exist")
+    p_idx.set_defaults(func=cmd_index)
 
     args = ap.parse_args()
     args.func(args)

@@ -85,8 +85,17 @@ asurabld.md's roster table). `python -m shadow_train coverage` prints the
 matchup matrix (decisions per me×opp cell, demo-filtered). The recorder
 writes a `.rounds.jsonl` sidecar per recording (one summary line per round:
 matchup chars, frames, demo-ness, style) — the cheap index for coverage
-tooling; the panel's Record section takes an optional style tag ("rushdown",
-"zoning") stored in the sidecars and selectable at fit time.
+tooling (`python -m shadow_train index` backfills old recordings); the
+panel's Record section takes an optional style tag ("rushdown", "zoning")
+stored in the sidecars and selectable at fit time.
+
+The 🥊 Matchup panel renders that index as a coverage grid (≈decisions per
+me×opp cell, ✓ = fitted model, amber = sparse); clicking a cell offers its
+model, its `shadow/arenas/<slug>.state` arena, and the fit command for gaps.
+Model SETS: loading a directory of model dirs (e.g. `shadow/models` via the
+panel's "Load ALL as set" or `load_shadow`) keeps the newest model per
+matchup key and auto-switches at every round start by reading both char ids
+— fallback exact → per-char → per-opp → general.
 
 Training saves: the panel's Arena section lists `shadow/arenas/*.state`,
 loads one, captures the on-screen situation as a new named arena, or promotes
