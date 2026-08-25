@@ -17,7 +17,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PORT="${PORT:-4025}"
-ARENA="${ARENA:-shadow/arenas/goat-vs-rosemary.state}"
+# Arena resolution: ARENA env wins; else the current-arena pointer (set from
+# the 🎯 Training panel's Arena section); else the committed canonical one.
+if [[ -z "${ARENA:-}" ]]; then
+  if [[ -f shadow/arenas/current.state ]]; then
+    ARENA=shadow/arenas/current.state
+  else
+    ARENA=shadow/arenas/goat-vs-rosemary.state
+  fi
+fi
 PY=shadow/train/.venv/bin/python3
 FIT=1
 MODEL=""

@@ -79,6 +79,12 @@ unless a shadow was already enabled; `--shadow` startup loads stay
 enabled-and-fatal-on-error. The MCP `load_shadow` tool is the scripted twin
 (gated behind `enable_writes`).
 
+Training saves: the panel's Arena section lists `shadow/arenas/*.state`,
+loads one, captures the on-screen situation as a new named arena, or promotes
+one to `shadow/arenas/current.state` — the pointer loop.sh starts fights from
+(fallback: ARENA env → current.state → goat-vs-rosemary.state). current.state
+is gitignored; named arenas are committable.
+
 Python side: `shadow_train` is `pip install -e`'d into `shadow/train/.venv`
 (works from any cwd): `python -m shadow_train fit|eval|report`. The deploy
 alternatives are the native runner (Shift+F5, in-app) and `shadow/play.py`

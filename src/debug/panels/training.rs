@@ -1,8 +1,8 @@
 use bevy_egui::egui;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
-use crate::debug::{DebugState, DummyMode, RecordControl};
+use crate::debug::{DebugState, DummyMode, RecordControl, StateOp};
 
 /// GUI face of the shadow lifecycle's two app-side stages — demonstrate
 /// (recorder start/stop + status) and deploy (model card, runtime model load,
@@ -13,6 +13,19 @@ pub struct TrainingPanel {
     /// Cached `shadow/models/*` listing (dirs containing cases.npz).
     models: Vec<(String, PathBuf)>,
     models_refreshed: Option<Instant>,
+    /// Cached `shadow/arenas/*.state` listing: (display name, path, age).
+    arenas: Vec<(String, PathBuf, String)>,
+    arenas_refreshed: Option<Instant>,
+    /// "Save new arena" name field.
+    arena_name: String,
+    /// Make the newly saved arena the current one.
+    arena_make_current: bool,
+    /// Deferred make-current: the queued StateOp::Save drains on the emu
+    /// thread, so the copy to current.state must wait until the named file
+    /// actually lands (mtime after the request). (target, requested-at).
+    pending_current: Option<(PathBuf, SystemTime)>,
+    /// Sticky result of the last make-current copy.
+    arena_note: Option<String>,
 }
 
 const DUMMY_MODES: [(DummyMode, &str); 5] = [
@@ -27,6 +40,10 @@ const DUMMY_MODES: [(DummyMode, &str); 5] = [
 /// launch cwd (the repo root by convention — same assumption loop.sh makes).
 const MODELS_DIR: &str = "shadow/models";
 const RECORDINGS_DIR: &str = "shadow/recordings";
+const ARENAS_DIR: &str = "shadow/arenas";
+/// The active training save: loop.sh starts fights from this if it exists
+/// (ARENA env still wins). Machine-local — gitignored, unlike named arenas.
+const CURRENT_ARENA: &str = "current";
 
 const MODELS_REFRESH_SECS: f64 = 2.0;
 
@@ -73,9 +90,57 @@ fn scan_models() -> Vec<(String, PathBuf)> {
     out
 }
 
+fn age_str(mtime: SystemTime) -> String {
+    let age = mtime.elapsed().unwrap_or_default().as_secs();
+    if age < 60 {
+        format!("{age}s ago")
+    } else if age < 3600 {
+        format!("{}m ago", age / 60)
+    } else if age < 86400 {
+        format!("{}h ago", age / 3600)
+    } else {
+        format!("{}d ago", age / 86400)
+    }
+}
+
+/// `shadow/arenas/*.state`, `current` first, then alphabetical.
+fn scan_arenas() -> Vec<(String, PathBuf, String)> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(ARENAS_DIR) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("state") {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let age = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map(age_str)
+                .unwrap_or_default();
+            out.push((name, path, age));
+        }
+    }
+    out.sort_by(|a, b| {
+        (a.0 != CURRENT_ARENA).cmp(&(b.0 != CURRENT_ARENA)).then(a.0.cmp(&b.0))
+    });
+    out
+}
+
 impl TrainingPanel {
     pub fn new() -> Self {
-        TrainingPanel { models: Vec::new(), models_refreshed: None }
+        TrainingPanel {
+            models: Vec::new(),
+            models_refreshed: None,
+            arenas: Vec::new(),
+            arenas_refreshed: None,
+            arena_name: String::new(),
+            arena_make_current: true,
+            pending_current: None,
+            arena_note: None,
+        }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DebugState) {
@@ -121,6 +186,122 @@ impl TrainingPanel {
         self.record_section(ui, state);
         ui.separator();
         self.shadow_section(ui, state);
+        ui.separator();
+        self.arena_section(ui, state);
+    }
+
+    /// The training save: list `shadow/arenas/*.state`, load one, promote one
+    /// to `current.state` (what loop.sh starts fights from), or capture the
+    /// on-screen situation as a new named arena.
+    fn arena_section(&mut self, ui: &mut egui::Ui, state: &mut DebugState) {
+        ui.heading("🏟 Arena");
+
+        // Deferred make-current: wait for the queued save to land on disk
+        // (mtime after the request), then copy it over current.state.
+        if let Some((target, requested)) = self.pending_current.clone() {
+            let landed = std::fs::metadata(&target)
+                .and_then(|m| m.modified())
+                .map(|mtime| mtime >= requested)
+                .unwrap_or(false);
+            if landed {
+                self.make_current(&target);
+                self.pending_current = None;
+            } else if requested.elapsed().map(|e| e.as_secs() > 5).unwrap_or(true) {
+                self.arena_note =
+                    Some(format!("save of {} never landed — not made current", target.display()));
+                self.pending_current = None;
+            }
+        }
+
+        let stale = self
+            .arenas_refreshed
+            .map(|t| t.elapsed().as_secs_f64() > MODELS_REFRESH_SECS)
+            .unwrap_or(true);
+        if stale {
+            self.arenas = scan_arenas();
+            self.arenas_refreshed = Some(Instant::now());
+        }
+
+        if self.arenas.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("No arenas under {ARENAS_DIR}/ yet."))
+                    .color(egui::Color32::DARK_GRAY),
+            );
+        }
+        let mut promote: Option<PathBuf> = None;
+        for (name, path, age) in &self.arenas {
+            ui.horizontal(|ui| {
+                if *name == CURRENT_ARENA {
+                    ui.label(egui::RichText::new("📌 current").strong());
+                } else {
+                    ui.monospace(name);
+                }
+                ui.label(egui::RichText::new(age).small().color(egui::Color32::DARK_GRAY));
+                if ui.small_button("📂 Load").clicked() {
+                    state.pending_state_op = Some(StateOp::Load(path.clone()));
+                }
+                if *name != CURRENT_ARENA && ui.small_button("📌 Make current").clicked() {
+                    promote = Some(path.clone());
+                }
+            });
+        }
+        if let Some(path) = promote {
+            self.make_current(&path);
+        }
+
+        // ── Capture the on-screen situation as a new arena ────────────
+        ui.horizontal(|ui| {
+            ui.label("New:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.arena_name)
+                    .desired_width(140.0)
+                    .hint_text("e.g. goat-vs-alice"),
+            );
+            ui.checkbox(&mut self.arena_make_current, "make current");
+            let name = self.arena_name.trim().trim_end_matches(".state").to_string();
+            let ok = !name.is_empty() && !name.contains('/') && name != CURRENT_ARENA;
+            if ui.add_enabled(ok, egui::Button::new("💾 Save arena")).clicked() {
+                let path = PathBuf::from(ARENAS_DIR).join(format!("{name}.state"));
+                state.pending_state_op = Some(StateOp::Save(path.clone()));
+                if self.arena_make_current {
+                    // 1s slack so coarse fs mtime granularity can't round the
+                    // landed file below the request time.
+                    let requested = SystemTime::now() - std::time::Duration::from_secs(1);
+                    self.pending_current = Some((path, requested));
+                }
+                self.arena_name.clear();
+                self.arenas_refreshed = None; // relist next frame
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "loop.sh starts fights from current.state when it exists (ARENA env overrides).",
+            )
+            .small()
+            .color(egui::Color32::DARK_GRAY),
+        );
+        if let Some(note) = &self.arena_note {
+            let color = if note.contains("FAILED") || note.contains("never landed") {
+                egui::Color32::from_rgb(230, 120, 120)
+            } else {
+                egui::Color32::GRAY
+            };
+            ui.label(egui::RichText::new(format!("Last: {note}")).small().color(color));
+        }
+    }
+
+    /// Copy a named arena over `current.state` (copy, not symlink: portable,
+    /// and re-saving the named arena later doesn't silently retarget current).
+    fn make_current(&mut self, src: &PathBuf) {
+        let dst = PathBuf::from(ARENAS_DIR).join(format!("{CURRENT_ARENA}.state"));
+        self.arena_note = Some(match std::fs::copy(src, &dst) {
+            Ok(_) => format!(
+                "current ← {}",
+                src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+            ),
+            Err(e) => format!("make current FAILED: {e}"),
+        });
+        self.arenas_refreshed = None; // relist next frame
     }
 
     /// Demonstrate stage: recorder status + start/stop.
