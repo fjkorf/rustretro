@@ -69,14 +69,23 @@ ROUND_START_Y = GROUND_Y
 
 # ── roster (char id at CHAR_ID/+0x639) ──────────────────────────────────────
 # 8 playable characters (ids 0-7) + 2 bosses (0x08/0x09, per the cheat DB).
-# Names are filled in only where the id has been live-verified in-game; the
-# rest render as "c<N>" until a naming session pins them (pick each char once
-# while recording; the id lands in the rounds sidecar). Keep in lockstep with
-# the roster note in library/asurabld/asurabld.md.
+# COMPLETE mapping, live-verified 2026-08-25 by the headless roster probe:
+# one boot per char-select slot, id read in-fight, name read from the select
+# screen + health bar (the three previously known ids all reconfirmed).
+# Select-screen slot order (cursor Rights from default): 0=yashaou 1=taros
+# 2=zamb 3=goat 4=footee 5=rosemary 6=lightning 7=alice.
+# Keep in lockstep with record.rs::char_name and asurabld.md's roster table.
 CHAR_NAMES: dict[int, str] = {
-    0: "yashaou",    # live: 1P read 0 while playing Yashaou
-    1: "goat",       # live: the user's main (goat-vs-rosemary arena)
-    7: "rosemary",   # live: canonical arena opponent
+    0: "yashaou",
+    1: "goat",
+    2: "lightning",
+    3: "footee",
+    4: "alice",
+    5: "taros",
+    6: "zamb",
+    7: "rosemary",
+    8: "curfue",     # boss; playable via hold Down+Start through the map screen
+    9: "sgeist",     # boss; playable via hold Up+Start through the map screen
 }
 
 

@@ -167,12 +167,20 @@ fn timer_bcd_valid(t: u8) -> bool {
 
 /// Roster name for a char id (`+0x639`). Hand-kept mirror of `CHAR_NAMES` in
 /// `shadow_train/asurabld.py` and the roster table in `asurabld.md` — update
-/// all three together. Unverified ids render as "c<N>".
+/// all three together. Complete mapping live-verified 2026-08-25 (headless
+/// roster probe; see asurabld.md). Bosses/unknowns render as "c<N>".
 pub fn char_name(id: u8) -> String {
     match id {
         0 => "yashaou".into(),
         1 => "goat".into(),
+        2 => "lightning".into(),
+        3 => "footee".into(),
+        4 => "alice".into(),
+        5 => "taros".into(),
+        6 => "zamb".into(),
         7 => "rosemary".into(),
+        8 => "curfue".into(),
+        9 => "sgeist".into(),
         n => format!("c{n}"),
     }
 }
