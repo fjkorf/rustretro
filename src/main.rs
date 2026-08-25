@@ -76,6 +76,9 @@ struct Args {
     /// action, captures the next gamepad button press, writes
     /// <save-dir>/keymap.json and exits. Esc skips a step.
     #[arg(long)] calibrate: bool,
+    /// Start with audio muted (the stream still runs; unmute live from the
+    /// debugger's audio controls). --no-audio disables audio entirely.
+    #[arg(long)] mute: bool,
 }
 
 // ─── Bevy resources ──────────────────────────────────────────────────────────
@@ -160,6 +163,8 @@ fn main() -> Result<()> {
 
     let w = frontend.video_width().max(320) * args.scale;
     let h = frontend.video_height().max(240) * args.scale;
+    // Core audio rate for the resampler (e.g. fbalpha2012: 32040 Hz).
+    let core_sample_rate = frontend.sample_rate();
 
     if args.debug { debug_state.lock().unwrap().debug_open = true; }
     if args.training {
@@ -221,7 +226,14 @@ fn main() -> Result<()> {
         .add_plugins(EguiPlugin::default())
         .insert_non_send_resource(Emu(frontend))
         .insert_resource(DebugStateRes(debug_state.clone()))
-        .insert_resource(AudioRes(AudioOutput::new(!args.no_audio)))
+        .insert_resource(AudioRes({
+            let mut a = AudioOutput::new(!args.no_audio, core_sample_rate);
+            if args.mute {
+                a.set_mute(true);
+                eprintln!("[audio] starting muted (--mute)");
+            }
+            a
+        }))
         .insert_resource(WindowScale(args.scale))
         .insert_resource(PadDebug(args.pad_debug))
         .insert_resource(keymap_cfg)
@@ -761,6 +773,8 @@ fn sync_video(
 // ─── Audio ───────────────────────────────────────────────────────────────────
 
 fn queue_audio(mut emu: NonSendMut<Emu>, audio: Res<AudioRes>) {
+    // Track the core rate each frame (SET_SYSTEM_AV_INFO can change it).
+    audio.0.set_input_rate(emu.0.sample_rate());
     let samples = emu.0.drain_audio();
     audio.0.queue(&samples);
 }
