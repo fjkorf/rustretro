@@ -8,7 +8,11 @@ is satisfied by construction: only demonstrated actions can be emitted.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
+
+CASES_FILE = "cases.npz"
 
 
 class KnnPolicy:
@@ -23,6 +27,39 @@ class KnnPolicy:
         self.y_move = y_move
         self.y_attack = y_attack
         return self
+
+    def save(self, out_dir: str | Path) -> None:
+        """Persist the fitted case store (task 3). Saves exactly the state
+        `predict`/`predict_proba` read: the standardization params (mu, sd),
+        the already-standardized case matrix, both label arrays, and k/
+        temperature -- so `load` reconstructs a policy that is bit-for-bit
+        equivalent to this one (see the round-trip test in test_knn.py)."""
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            out_dir / CASES_FILE,
+            X=self.X,
+            mu=self.mu,
+            sd=self.sd,
+            y_move=self.y_move,
+            y_attack=self.y_attack,
+            k=np.array(self.k),
+            temperature=np.array(self.temperature),
+        )
+
+    @classmethod
+    def load(cls, model_dir: str | Path) -> "KnnPolicy":
+        """Inverse of save(). Does NOT call fit() -- it restores the fitted
+        arrays directly so no data or standardization is recomputed."""
+        model_dir = Path(model_dir)
+        with np.load(model_dir / CASES_FILE) as data:
+            policy = cls(k=int(data["k"]), temperature=float(data["temperature"]))
+            policy.X = data["X"]
+            policy.mu = data["mu"]
+            policy.sd = data["sd"]
+            policy.y_move = data["y_move"]
+            policy.y_attack = data["y_attack"]
+        return policy
 
     def _neighbors(self, x: np.ndarray) -> np.ndarray:
         d = np.linalg.norm(self.X - (x - self.mu) / self.sd, axis=1)

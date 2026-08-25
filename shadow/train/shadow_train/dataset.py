@@ -7,7 +7,11 @@ Pipeline per file:
   4. one decision every P frames (§4); label = mode of the window's p1 masks,
      mapped to (move_class, attack_class) with chord rules (§3d)
   5. features per §1a, opponent fields STALE frames old (§4), stacked over the
-     last K decision steps (§4)
+     last K decision steps (§4); me_hitstun/opp_hitstun require the combo
+     counter to have CHANGED within HITSTUN_RECENT_FRAMES, not just be
+     nonzero -- see the evidence comment above _recent_change_mask()
+  6. segment rounds longer than SEGMENT_DECISIONS decisions into pseudo-round
+     split units (file, round_id, seg_k) -- see _segment()
 
 Raw fields stay raw on disk; everything here is train-time (§5).
 """
@@ -32,6 +36,32 @@ P = 8          # decision period, frames (§4)
 K = 4          # stacked decision-step snapshots (§4)
 STALE = 3      # opponent observation delay, frames (§4)
 SCREEN_W = 320
+
+# Task 1 (pseudo-round segmentation): training-mode sessions freeze the round
+# timer, so a single round_id can run tens of thousands of frames -- with only
+# 1-2 real rounds per file, splitting train/test by round_id is degenerate
+# (observed on the two real recordings: 933 train vs 5611 held-out decisions
+# from just 2 rounds total). Chop any round longer than SEGMENT_DECISIONS
+# decisions into fixed-size pseudo-rounds so the number of split units scales
+# with session length instead of "however many real KOs happened". ~150
+# decisions * 1/8s each ~= 20s of play -- long enough to still contain a
+# coherent chunk of a exchange, short enough that a session yields many units.
+SEGMENT_DECISIONS = 150
+
+# Task 2 (hitstun bucket audit): see the evidence comment above _bucket() and
+# _recent_change_mask() below. combo_on_b1/b2 ($4041E7/$40470B) are cross-block
+# "combo counter" bytes that increment once per hit landed but do NOT reset to
+# 0 when hitstun ends -- they linger at the last combo's hit count as a
+# display value. HITSTUN_RECENT_FRAMES bounds how long ago the counter must
+# have last changed for it to still count as "opponent is actively in
+# hitstun right now" rather than "combo counter is showing a stale number".
+# Chosen from the observed frame-gap distribution between counter increments:
+# within an actual combo, increments land ~7-25 frames apart; between combos
+# the counter sits constant for hundreds to thousands of frames (max observed
+# run: 7582 frames / ~126s in session-2026-08-24-training-v1.jsonl). 20 frames
+# (2.5x the P=8 decision period) sits cleanly in the gap between those two
+# populations.
+HITSTUN_RECENT_FRAMES = 20
 
 # RETRO mask bits
 BIT_B, BIT_Y, BIT_SELECT, BIT_START = 0, 1, 2, 3
@@ -134,6 +164,47 @@ def _bucket(scal: dict, me_action_mask_fwdback: tuple[int, int]) -> str:
     return "neutral"
 
 
+def _recent_change_mask(rows: list[dict], key: str, window: int) -> np.ndarray:
+    """True where `gate[key]` is nonzero AND changed within the last `window`
+    frames (see the HITSTUN_RECENT_FRAMES comment above for the evidence).
+
+    Naive "nonzero" gating on combo_on_b1/b2 was the bug the audit found: the
+    first eval run against the two real recordings reported 84% of ALL
+    decisions in the "defense" bucket (me_hitstun nonzero), which is not
+    plausible for real play. Dumping the raw byte confirmed why -- run-length
+    analysis of session-2026-08-24-training-v1.jsonl round 1 (44916
+    controllable frames):
+
+        combo_on_b1: nonzero 92.0% of the round; longest constant-nonzero run
+                     = 7582 frames (~126s); only 60 value changes total
+        combo_on_b2: nonzero  3.2% of the round; longest run = 93 frames
+
+    and session-2026-08-24-recorder-v2.jsonl round 1 (7493 frames):
+    combo_on_b1 nonzero 34.9% (longest run 1483 frames), combo_on_b2 nonzero
+    28.8% (longest run 1310 frames). A byte that stays pinned at a constant
+    nonzero value for 100+ seconds is not tracking "is this fighter currently
+    in hitstun" (hitstun is at most a couple seconds); it is a last-combo hit
+    count that the game leaves on screen after the combo ends and only
+    overwrites when the next combo starts. The value-change events themselves
+    cluster tightly (7-25 frames apart) exactly while a combo is actually
+    landing, then go quiet for hundreds-to-thousands of frames between
+    combos -- a clean bimodal gap distribution, which is what
+    HITSTUN_RECENT_FRAMES=20 is picked to split.
+    """
+    vals = [r["gate"][key] for r in rows]
+    frames = [r["frame"] for r in rows]
+    out = np.zeros(len(rows), dtype=bool)
+    last_change_frame = None
+    prev = None
+    for i, v in enumerate(vals):
+        if prev is not None and v != prev:
+            last_change_frame = frames[i]
+        prev = v
+        if v != 0 and last_change_frame is not None and frames[i] - last_change_frame <= window:
+            out[i] = True
+    return out
+
+
 def _rounds(path: Path):
     """Yield (round_key, rows) for controllable, non-demo rounds."""
     rounds: dict = {}
@@ -162,6 +233,11 @@ def _rounds(path: Path):
 def _decisions_for_round(round_key: tuple, rows: list[dict]):
     p1b = "block1" if rows[0]["p1_block"] == 1 else "block2"
     oppb = "block2" if p1b == "block1" else "block1"
+    # active-hitstun masks (task 2) -- "recently changed", not "nonzero"
+    b1_active = _recent_change_mask(rows, "combo_on_b1", HITSTUN_RECENT_FRAMES)
+    b2_active = _recent_change_mask(rows, "combo_on_b2", HITSTUN_RECENT_FRAMES)
+    me_active = b1_active if p1b == "block1" else b2_active
+    opp_active = b2_active if p1b == "block1" else b1_active
     out = []
     for i in range(P * 1, len(rows), P):
         row = rows[i]
@@ -192,12 +268,11 @@ def _decisions_for_round(round_key: tuple, rows: list[dict]):
             "health_lead": (me["health"] - opp["health"]) / HEALTH_MAX,
             "me_meter": me["meter"] / max(1, me["meter_max"]),
             "opp_meter": opp["meter"] / max(1, opp["meter_max"]),
-            "me_hitstun": 1.0
-            if row["gate"]["combo_on_b1" if p1b == "block1" else "combo_on_b2"]
-            else 0.0,
-            "opp_hitstun": 1.0
-            if row["gate"]["combo_on_b2" if p1b == "block1" else "combo_on_b1"]
-            else 0.0,
+            # me_hitstun: self-feature, stays current (§4 -- "you know your own
+            # hands"); opp_hitstun: opponent-sourced, so it's read STALE like
+            # the rest of the opp_* block (§4 humanness rule, spec §1a #21).
+            "me_hitstun": 1.0 if me_active[i] else 0.0,
+            "opp_hitstun": 1.0 if opp_active[max(0, i - STALE)] else 0.0,
             "me_corner": 1.0
             if me["x"] <= CORNER_PX or me["x"] >= SCREEN_W - CORNER_PX
             else 0.0,
@@ -221,6 +296,20 @@ def _decisions_for_round(round_key: tuple, rows: list[dict]):
     return out
 
 
+def _segment(round_decisions: list[Decision]) -> list[Decision]:
+    """Split an over-long round's decisions into pseudo-round split units
+    (task 1). Rekeys round_key from (file, round_id) to
+    (file, round_id, seg_k), chunking every SEGMENT_DECISIONS decisions.
+    Rounds at or under the threshold get a single seg_k=0 -- unchanged in
+    substance, just uniformly 3-tuples so evaluate.split_by_round doesn't need
+    to special-case key shape.
+    """
+    for idx, d in enumerate(round_decisions):
+        file, rid = d.round_key
+        d.round_key = (file, rid, idx // SEGMENT_DECISIONS)
+    return round_decisions
+
+
 def build(paths: list[Path], char_filter: int | None = None):
     """Load recordings -> stacked dataset arrays.
 
@@ -230,7 +319,7 @@ def build(paths: list[Path], char_filter: int | None = None):
     decisions: list[Decision] = []
     for p in paths:
         for round_key, rows in _rounds(p):
-            decisions.extend(_decisions_for_round(round_key, rows))
+            decisions.extend(_segment(_decisions_for_round(round_key, rows)))
     if char_filter is not None:
         decisions = [d for d in decisions if d.me_char == char_filter]
     # K-step stacking within each round (§4)

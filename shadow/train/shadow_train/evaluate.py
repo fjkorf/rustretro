@@ -18,11 +18,22 @@ from .knn import KnnPolicy
 MIN_EXAMPLES = 25
 
 
-def split_by_round(data: dict, holdout_frac: float = 0.2):
+def split_by_round(data: dict, holdout_frac: float = 0.2, seed: int = 0):
+    """Split unit = round_key, which after dataset._segment (task 1) is a
+    pseudo-round (file, round_id, seg_k) rather than a bare (file, round_id) --
+    long training-mode rounds get chopped into many segments so this split
+    isn't degenerate (see dataset.SEGMENT_DECISIONS). With dozens of pseudo-
+    round units instead of 1-2 real rounds, holding out a chronological tail
+    (the old behavior) would sample only the endgame of the last file/round;
+    shuffle the unique keys with a fixed seed instead so the held-out set
+    covers the whole session while still never splitting a round/segment
+    across train and test (no frame-level leakage, §7.4)."""
     keys = data["rounds"]
-    uniq = list(dict.fromkeys(keys))  # order-preserving
+    uniq = list(dict.fromkeys(keys))  # order of first appearance
+    order = np.random.default_rng(seed).permutation(len(uniq))
+    shuffled = [uniq[i] for i in order]
     n_hold = max(1, int(len(uniq) * holdout_frac))
-    hold = set(uniq[-n_hold:])
+    hold = set(shuffled[:n_hold])
     test_idx = np.array([i for i, k in enumerate(keys) if k in hold])
     train_idx = np.array([i for i, k in enumerate(keys) if k not in hold])
     return train_idx, test_idx
@@ -41,7 +52,7 @@ def _js_distance(p: np.ndarray, q: np.ndarray) -> float:
 
 
 def evaluate(data: dict, k: int = 15, holdout_frac: float = 0.2, seed: int = 7):
-    train_idx, test_idx = split_by_round(data, holdout_frac)
+    train_idx, test_idx = split_by_round(data, holdout_frac, seed=seed)
     X, ym, ya, buckets = data["X"], data["y_move"], data["y_attack"], data["buckets"]
     policy = KnnPolicy(k=k).fit(X[train_idx], ym[train_idx], ya[train_idx])
     rng = np.random.default_rng(seed)
