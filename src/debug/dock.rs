@@ -34,10 +34,13 @@ use crate::debug::panels::{
     frame_log::FrameLog,
     help::HelpPanel,
     hex_dump::HexDump,
+    matchup::MatchupPanel,
     input_monitor::InputMonitor,
     ram_search::RamSearchPanel,
     regions::RegionsPanel,
+    state::StatePanel,
     tile_viewer::TileViewer,
+    training::TrainingPanel,
     triggers::Triggers,
     vdp_registers::VdpRegisters,
     watch::WatchPanel,
@@ -66,10 +69,37 @@ pub enum Tab {
     RamSearch,
     VdpRegisters,
     Help,
+    State,
+    Training,
+    Matchup,
 }
 
+/// Every Tab variant. Drives layout reconciliation (`load_layout` appends any
+/// variant missing from a saved sidecar) and the toolbar Panels menu — adding
+/// a variant without extending this list is a compile-time-invisible bug, so
+/// the `default_layout_contains_all_tabs` test cross-checks it.
+pub const ALL_TABS: [Tab; 17] = [
+    Tab::FrameInspector,
+    Tab::HexDump,
+    Tab::TileViewer,
+    Tab::InputMonitor,
+    Tab::FrameLog,
+    Tab::Triggers,
+    Tab::CpuState,
+    Tab::Audio,
+    Tab::Disasm,
+    Tab::Regions,
+    Tab::Watch,
+    Tab::RamSearch,
+    Tab::VdpRegisters,
+    Tab::Help,
+    Tab::State,
+    Tab::Training,
+    Tab::Matchup,
+];
+
 impl Tab {
-    fn title(self) -> &'static str {
+    pub fn title(self) -> &'static str {
         match self {
             Tab::FrameInspector => "🖼 Frame",
             Tab::HexDump => "📋 Hex",
@@ -85,6 +115,9 @@ impl Tab {
             Tab::RamSearch => "🔍 Search",
             Tab::VdpRegisters => "📺 VDP",
             Tab::Help => "❓ Help",
+            Tab::State => "💾 State",
+            Tab::Training => "🎯 Training",
+            Tab::Matchup => "🥊 Matchup",
         }
     }
 }
@@ -105,6 +138,9 @@ pub struct Panels {
     pub ram_search_panel: RamSearchPanel,
     pub vdp_registers: VdpRegisters,
     pub help_panel: HelpPanel,
+    pub state_panel: StatePanel,
+    pub training_panel: TrainingPanel,
+    pub matchup_panel: MatchupPanel,
 }
 
 impl Panels {
@@ -123,6 +159,9 @@ impl Panels {
             ram_search_panel: RamSearchPanel::new(),
             vdp_registers: VdpRegisters::new(),
             help_panel: HelpPanel::new(),
+            state_panel: StatePanel::new(),
+            training_panel: TrainingPanel::new(),
+            matchup_panel: MatchupPanel::new(),
         }
     }
 }
@@ -195,8 +234,35 @@ impl<'a> egui_dock::TabViewer for DockViewer<'a> {
                 }
             }
 
-            // shape: &mut self, ui  (no state)
-            Tab::Help => self.panels.help_panel.show(ui),
+            // shape: &mut self, ui, &DebugState / &mut DebugState (needs the lock)
+            Tab::Help => {
+                if let Ok(ds) = self.state.lock() {
+                    self.panels.help_panel.show(ui, &ds);
+                } else {
+                    ui.label("Error: Could not acquire debug state lock");
+                }
+            }
+            Tab::State => {
+                if let Ok(mut ds) = self.state.lock() {
+                    self.panels.state_panel.show(ui, &mut ds);
+                } else {
+                    ui.label("Error: Could not acquire debug state lock");
+                }
+            }
+            Tab::Training => {
+                if let Ok(mut ds) = self.state.lock() {
+                    self.panels.training_panel.show(ui, &mut ds);
+                } else {
+                    ui.label("Error: Could not acquire debug state lock");
+                }
+            }
+            Tab::Matchup => {
+                if let Ok(mut ds) = self.state.lock() {
+                    self.panels.matchup_panel.show(ui, &mut ds);
+                } else {
+                    ui.label("Error: Could not acquire debug state lock");
+                }
+            }
 
             // shape: &mut self, ui, &mut DebugState
             Tab::Disasm => {
@@ -223,47 +289,58 @@ impl<'a> egui_dock::TabViewer for DockViewer<'a> {
     }
 }
 
-/// Build the default workspace layout proving simultaneous multi-panel
-/// visibility:
+/// Build the default workspace layout. Panels are grouped into four regions by
+/// how they are used — big canvases you look at, glanceable readouts, controls
+/// you operate, and on-demand investigation tools:
 ///
 /// ```text
 /// +-------------------------------------------------------+
 /// |  toolbar (TopBottomPanel, rendered separately)        |
 /// +----------------------------+--------------------------+
-/// |                            |   CPU                    |
-/// |        Disasm (central)    +--------------------------+
-/// |                            |   Watch / Regions (tabs) |
+/// |  CANVAS (tabbed)           |  LIVE: Watch|CPU|Input   |
+/// |  Frame|Disasm|Hex|Tiles    +--------------------------+
+/// |                            |  CONTROL: State|Training |
+/// |                            |           |Audio         |
 /// +----------------------------+--------------------------+
-/// |  Hex | Frame | Tiles | Input | Log | Trig | Audio |   |
-/// |  RamSearch | VDP | Help            (bottom, tabbed)   |
+/// |  TOOLS: Search|Triggers|Regions|VDP|Log|Help          |
 /// +-------------------------------------------------------+
 /// ```
 pub fn default_layout() -> DockState<Tab> {
-    // Central node starts with Disasm.
-    let mut dock = DockState::new(vec![Tab::Disasm]);
+    // CANVAS — the large-surface panels, Frame first (during training/shadow
+    // sessions the framebuffer is the thing being watched; Disasm is one tab
+    // away for code sessions).
+    let mut dock = DockState::new(vec![
+        Tab::FrameInspector,
+        Tab::Disasm,
+        Tab::HexDump,
+        Tab::TileViewer,
+    ]);
 
     let surface = dock.main_surface_mut();
 
-    // Split right: CPU above, Watch+Regions (tabbed) below.
-    let [_central, right] =
-        surface.split_right(NodeIndex::root(), 0.62, vec![Tab::CpuState]);
-    let [_cpu, _watch_regions] =
-        surface.split_below(right, 0.5, vec![Tab::Watch, Tab::Regions]);
-
-    // Split the central area's bottom into a tabbed strip of the remaining panels.
-    let [_central2, _bottom] = surface.split_below(
+    // LIVE (right-top) / CONTROL (right-bottom).
+    let [_canvas, right] = surface.split_right(
         NodeIndex::root(),
-        0.66,
+        0.62,
+        vec![Tab::Watch, Tab::CpuState, Tab::InputMonitor],
+    );
+    let [_live, _control] =
+        surface.split_below(
+        right,
+        0.5,
+        vec![Tab::Training, Tab::Matchup, Tab::State, Tab::Audio],
+    );
+
+    // TOOLS — full-width bottom strip.
+    let [_top, _tools] = surface.split_below(
+        NodeIndex::root(),
+        0.70,
         vec![
-            Tab::HexDump,
-            Tab::FrameInspector,
-            Tab::TileViewer,
-            Tab::InputMonitor,
-            Tab::FrameLog,
-            Tab::Triggers,
-            Tab::Audio,
             Tab::RamSearch,
+            Tab::Triggers,
+            Tab::Regions,
             Tab::VdpRegisters,
+            Tab::FrameLog,
             Tab::Help,
         ],
     );
@@ -271,17 +348,34 @@ pub fn default_layout() -> DockState<Tab> {
     dock
 }
 
-/// Path of the layout sidecar file. Kept simple for v1: a fixed name in the
-/// current working directory (next to where the regions sidecar lives by
-/// default). Saved/loaded via the Save/Reset layout toolbar buttons.
-pub const LAYOUT_PATH: &str = "rustretro_layout.json";
+/// Path of the layout sidecar file: a fixed name in the current working
+/// directory (next to where the regions sidecar lives by default). Saved/
+/// loaded via the ☰ toolbar menu. Versioned: the `_v2` bump (region-grouped
+/// default + State/Training tabs) orphans pre-region sidecars so everyone
+/// lands on the new default once instead of pinning the old layout forever.
+pub const LAYOUT_PATH: &str = "rustretro_layout_v2.json";
+
+/// Append any [`Tab`] variant missing from `dock` (a sidecar saved before
+/// that panel existed) to the first leaf, so new panels are reachable without
+/// deleting the layout file. Closing a tab in the UI removes it from the live
+/// `DockState`, so this also means a save-after-close forgets the tab only
+/// until the next launch — the Panels menu reopens it immediately.
+fn reconcile(mut dock: DockState<Tab>) -> DockState<Tab> {
+    let present: Vec<Tab> = dock.iter_all_tabs().map(|(_, t)| *t).collect();
+    for tab in ALL_TABS {
+        if !present.contains(&tab) {
+            dock.push_to_first_leaf(tab);
+        }
+    }
+    dock
+}
 
 /// Load a previously saved dock layout from [`LAYOUT_PATH`], falling back to
 /// [`default_layout`] if the file is absent or fails to parse.
 pub fn load_layout() -> DockState<Tab> {
     match std::fs::read_to_string(LAYOUT_PATH) {
         Ok(json) => match serde_json::from_str::<DockState<Tab>>(&json) {
-            Ok(state) => state,
+            Ok(state) => reconcile(state),
             Err(e) => {
                 eprintln!("[dock] failed to parse {LAYOUT_PATH}: {e}; using default layout");
                 default_layout()
@@ -317,4 +411,30 @@ pub fn show_dock(
     DockArea::new(dock_state)
         .style(Style::from_egui(ui.style().as_ref()))
         .show_inside(ui, &mut viewer);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_layout_contains_all_tabs_exactly_once() {
+        let dock = default_layout();
+        let present: Vec<Tab> = dock.iter_all_tabs().map(|(_, t)| *t).collect();
+        for tab in ALL_TABS {
+            assert!(present.contains(&tab), "{tab:?} missing from default layout");
+        }
+        assert_eq!(present.len(), ALL_TABS.len(), "duplicate tab in default layout");
+    }
+
+    #[test]
+    fn reconcile_appends_missing_tabs() {
+        // A v1-era sidecar layout that predates most panels.
+        let old = DockState::new(vec![Tab::Disasm]);
+        let fixed = reconcile(old);
+        let present: Vec<Tab> = fixed.iter_all_tabs().map(|(_, t)| *t).collect();
+        for tab in ALL_TABS {
+            assert!(present.contains(&tab), "{tab:?} not reconciled in");
+        }
+    }
 }

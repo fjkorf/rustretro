@@ -78,6 +78,17 @@ impl DebugApp {
 
                     ui.separator();
 
+                    // Quick save/load, slot 1 — same queue as the F6/F7 hotkeys.
+                    // Everything beyond slot 1 lives in the 💾 State panel.
+                    if ui.button("💾 S1").on_hover_text("Save state → slot 1 (F6)").clicked() {
+                        ds.pending_state_op = Some(crate::debug::StateOp::SaveSlot(1));
+                    }
+                    if ui.button("📂 S1").on_hover_text("Load state ← slot 1 (F7)").clicked() {
+                        ds.pending_state_op = Some(crate::debug::StateOp::LoadSlot(1));
+                    }
+
+                    ui.separator();
+
                     // Go-to-address (hex). Enter in the field or the Go button both jump.
                     ui.label("Go to:");
                     let resp = ui.add(
@@ -109,15 +120,31 @@ impl DebugApp {
 
                 ui.separator();
 
-                // --- Layout persistence controls ---
-                // Save writes the current dock layout to `dock::LAYOUT_PATH`;
-                // Reset restores the built-in default layout.
-                if ui.button("💾 Save layout").clicked() {
-                    dock::save_layout(&self.dock_state);
-                }
-                if ui.button("⟲ Reset layout").clicked() {
-                    self.dock_state = dock::default_layout();
-                }
+                // --- ☰ menu: layout persistence + the Panels list ---
+                // Panels focuses an open tab or reopens a closed one (tabs are
+                // closable, and a closed tab has no other way back in-session).
+                ui.menu_button("☰", |ui| {
+                    ui.menu_button("Panels", |ui| {
+                        for tab in dock::ALL_TABS {
+                            if ui.button(tab.title()).clicked() {
+                                match self.dock_state.find_tab(&tab) {
+                                    Some(loc) => self.dock_state.set_active_tab(loc),
+                                    None => self.dock_state.push_to_first_leaf(tab),
+                                }
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("💾 Save layout").clicked() {
+                        dock::save_layout(&self.dock_state);
+                        ui.close();
+                    }
+                    if ui.button("⟲ Reset layout").clicked() {
+                        self.dock_state = dock::default_layout();
+                        ui.close();
+                    }
+                });
 
                 // --- Status readout ---
                 if let Some((fc, vf, vr, fps, w, h, fmt, paused)) = state_snapshot {

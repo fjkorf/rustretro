@@ -15,7 +15,7 @@
 
 # Per-run sidecars and machine-local state
 *.regions.json
-rustretro_layout.json
+rustretro_layout*.json
 *.srm
 *.nv
 nvram/
@@ -37,3 +37,6 @@ scripts/re/revenv/
 # Training data & derived models (goat-v2 stays tracked for the runner tests)
 shadow/recordings/
 shadow/models/
+shadow/arenas/current.state
+scratchpad/
+.DS_Store

@@ -120,6 +120,7 @@ MATCH_END_ABORT_LEN = MATCH_END_ABORT_OFFSET + 2  # abort is a u16
 
 ROUND_OVER_ADDR = gm.ROUND_OVER
 ROUND_TIMER_ADDR = gm.ROUND_TIMER  # BCD seconds
+CHAR_SELECT_ADDR = gm.CHAR_SELECT  # select-screen countdown (gate v3)
 
 CREDITS_ADDR = gm.CREDITS  # startup-only (not part of the per-tick read plan)
 
@@ -129,7 +130,9 @@ READ_PLAN = [
     ("block2", BLOCK2_ADDR, BLOCK2_LEN),
     ("match_end_abort", MATCH_END_ADDR, MATCH_END_ABORT_LEN),
     ("round_over", ROUND_OVER_ADDR, 2),
-    ("round_timer", ROUND_TIMER_ADDR, 1),
+    # One read spans $400006..$40000A: char-select countdown at [0] (gate v3
+    # -- the v2 gate is TRUE on the select screen), round clock at [4].
+    ("clock", CHAR_SELECT_ADDR, 5),
 ]
 
 
@@ -152,6 +155,7 @@ class TickSnapshot:
     abort: int
     match_end: int
     timer_bcd: int
+    char_sel: int
 
 
 def parse_tick(blobs: dict) -> TickSnapshot:
@@ -167,7 +171,8 @@ def parse_tick(blobs: dict) -> TickSnapshot:
         round_over=_be(blobs["round_over"], 0, 2),
         abort=_be(me_blob, MATCH_END_ABORT_OFFSET, 2),
         match_end=_be(me_blob, 0, 2),
-        timer_bcd=blobs["round_timer"][0],
+        timer_bcd=blobs["clock"][4],
+        char_sel=blobs["clock"][0],
     )
 
 
@@ -187,6 +192,7 @@ def is_controllable(snap: TickSnapshot) -> bool:
         and healthy(snap.block1)
         and healthy(snap.block2)
         and timer_bcd_valid(snap.timer_bcd)
+        and snap.char_sel == 0  # gate v3: NOT on the char-select screen
     )
 
 

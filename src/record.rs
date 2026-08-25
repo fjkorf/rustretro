@@ -27,6 +27,10 @@ pub struct GameMap {
     pub block2: u32,
     /// Round timer seconds, BCD (`$40000A`); subseconds at +1.
     pub round_timer: u32,
+    /// Char-select countdown (`$400006`, BCD; 0 outside select). Gate v3:
+    /// the v2 composite gate is TRUE on the char-select screen (healths +
+    /// clock still read live there — probe-verified 2026-08-25).
+    pub char_select: u32,
     /// Hop flags for the `controllable` gate (execution map, `asurabld.md`).
     pub round_over: u32,
     pub abort: u32,
@@ -46,6 +50,7 @@ impl Default for GameMap {
             block1: 0x403798,
             block2: 0x40454C, // block1 + 0x0DB4
             round_timer: 0x40000A,
+            char_select: 0x400006,
             round_over: 0x40646E,
             abort: 0x403678,
             match_end: 0x402A32,
@@ -87,6 +92,9 @@ struct Gate {
     abort: u16,
     match_end: u16,
     timer_bcd: u8,
+    /// Char-select countdown — must be 0 for `controllable` (gate v3);
+    /// recorded raw like the other gate inputs (additive to jsonl-v2).
+    char_sel: u8,
     demo_flag: u16,
     combo_on_b1: u8,
     combo_on_b2: u8,
@@ -111,10 +119,22 @@ struct Row {
 pub struct FrameRecorder {
     map: GameMap,
     out: BufWriter<File>,
+    /// Where the jsonl is being written (for status display / stop messages).
+    path: PathBuf,
+    /// Per-round summary sidecar (`<name>.rounds.jsonl`) — the cheap coverage
+    /// index the matchup tooling reads instead of parsing the full trace.
+    rounds_out: Option<BufWriter<File>>,
+    /// Play-style declaration for this whole recording ("rushdown", …),
+    /// echoed into the meta sidecar and every round summary.
+    style: Option<String>,
     frames: u64,
     round_id: u64,
     prev_controllable: bool,
     p1_block: Option<u8>,
+    // Per-round accumulators for the summary line (reset on the rising edge).
+    round_frames: u64,
+    round_p1_mass: u64,
+    round_chars: (u8, u8),
 }
 
 /// Read a guest 16-bit word big-endian (the 68k byte order) from a bus window
@@ -153,6 +173,62 @@ fn timer_bcd_valid(t: u8) -> bool {
     t != 0 && (t >> 4) <= 9 && (t & 0xF) <= 9
 }
 
+/// Roster name for a char id (`+0x639`). Hand-kept mirror of `CHAR_NAMES` in
+/// `shadow_train/asurabld.py` and the roster table in `asurabld.md` — update
+/// all three together. Complete mapping live-verified 2026-08-25 (headless
+/// roster probe; see asurabld.md). Bosses/unknowns render as "c<N>".
+pub fn char_name(id: u8) -> String {
+    match id {
+        0 => "yashaou".into(),
+        1 => "goat".into(),
+        2 => "lightning".into(),
+        3 => "footee".into(),
+        4 => "alice".into(),
+        5 => "taros".into(),
+        6 => "zamb".into(),
+        7 => "rosemary".into(),
+        8 => "curfue".into(),
+        9 => "sgeist".into(),
+        n => format!("c{n}"),
+    }
+}
+
+/// Matchup slug matching `shadow_train.asurabld.matchup_slug(me, opp)` —
+/// used to find per-matchup arenas (`shadow/arenas/<slug>.state`).
+pub fn matchup_slug(me: u8, opp: u8) -> String {
+    format!("{}-vs-{}", char_name(me), char_name(opp))
+}
+
+/// The stage/opponent selector byte: freezing `$40364D` through the
+/// post-select map screen forces the next fight's venue AND its home
+/// character as the opponent (write-verified; see asurabld.md "Stages").
+pub const STAGE_SELECT_ADDR: u32 = 0x40364D;
+
+/// Selector value whose home character is `opp` — i.e. what to freeze
+/// [`STAGE_SELECT_ADDR`] to in order to fight `opp` next. Footee (3) has no
+/// selector value (her beach is only the default venue); 10+ overflow.
+/// Hand-kept mirror of the value→home-char table in asurabld.md.
+pub fn stage_value_for_opponent(opp: u8) -> Option<u8> {
+    match opp {
+        0 => Some(7), // yashaou's inferno (mirror-capable)
+        1 => Some(6), // goat's desert castle
+        2 => Some(2), // lightning's water cavern
+        4 => Some(3), // alice's shipwreck
+        5 => Some(4), // taros' foundry hall
+        6 => Some(1), // zam-b's dungeon
+        7 => Some(5), // rosemary's hall
+        8 => Some(8), // curfue
+        9 => Some(9), // s. geist
+        _ => None,    // 3 = footee: no selector value
+    }
+}
+
+/// Inverse of [`stage_value_for_opponent`]: which character a frozen
+/// selector value will summon.
+pub fn opponent_for_stage_value(v: u8) -> Option<u8> {
+    (0u8..=9).find(|&opp| stage_value_for_opponent(opp) == Some(v))
+}
+
 /// Pack a 12-button held state into the low 12 bits (RETRO_DEVICE_ID order).
 pub fn pack_mask(bits: &[bool; 12]) -> u16 {
     let mut m = 0u16;
@@ -167,7 +243,13 @@ pub fn pack_mask(bits: &[bool; 12]) -> u16 {
 impl FrameRecorder {
     /// Open `path` for a fresh recording (truncates) and drop a `.meta.json`
     /// sidecar next to it. `game`/`core` are free-form provenance strings.
-    pub fn create(path: &Path, map: GameMap, game: &str, core: &str) -> std::io::Result<Self> {
+    pub fn create(
+        path: &Path,
+        map: GameMap,
+        game: &str,
+        core: &str,
+        style: Option<&str>,
+    ) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -177,6 +259,7 @@ impl FrameRecorder {
             "format": "jsonl-v2",
             "game": game,
             "core": core,
+            "style": style,
             "fps": 60,
             "blocks": {
                 "block1": format!("0x{:X}", map.block1),
@@ -189,14 +272,43 @@ impl FrameRecorder {
         });
         let meta_path: PathBuf = path.with_extension("meta.json");
         std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default()).ok();
+        let rounds_out = File::create(path.with_extension("rounds.jsonl"))
+            .ok()
+            .map(BufWriter::new);
         Ok(FrameRecorder {
             map,
             out: BufWriter::new(file),
+            path: path.to_path_buf(),
+            rounds_out,
+            style: style.map(str::to_string),
             frames: 0,
             round_id: 0,
             prev_controllable: false,
             p1_block: None,
+            round_frames: 0,
+            round_p1_mass: 0,
+            round_chars: (0, 0),
         })
+    }
+
+    /// Append the finished (or aborted) round's summary to the rounds sidecar.
+    /// `demo` mirrors the trainer's filter exactly: a round with zero total
+    /// p1-input mass is attract-mode/CPU play, not a demonstration.
+    fn emit_round_summary(&mut self) {
+        let Some(out) = self.rounds_out.as_mut() else { return };
+        let line = serde_json::json!({
+            "round_id": self.round_id,
+            "block1_char": self.round_chars.0,
+            "block2_char": self.round_chars.1,
+            "p1_block": self.p1_block,
+            "frames": self.round_frames,
+            "p1_input_mass": self.round_p1_mass,
+            "demo": self.round_p1_mass == 0,
+            "style": self.style,
+        });
+        let _ = out.write_all(line.to_string().as_bytes());
+        let _ = out.write_all(b"\n");
+        let _ = out.flush(); // rounds are rare; keep the index crash-current
     }
 
     /// Append one frame. `p1_mask`/`p2_mask` are the authoritative 12-bit RETRO
@@ -212,6 +324,7 @@ impl FrameRecorder {
             abort: u16be(ds, m.abort),
             match_end: u16be(ds, m.match_end),
             timer_bcd: u8g(ds, m.round_timer),
+            char_sel: u8g(ds, m.char_select),
             demo_flag: u16be(ds, m.demo_flag),
             combo_on_b1: u8g(ds, m.combo_on_b1),
             combo_on_b2: u8g(ds, m.combo_on_b2),
@@ -228,12 +341,26 @@ impl FrameRecorder {
             && gate.match_end == 0
             && healthy(&b1)
             && healthy(&b2)
-            && timer_bcd_valid(gate.timer_bcd);
+            && timer_bcd_valid(gate.timer_bcd)
+            // Gate v3: the above is all TRUE on the char-select screen too
+            // (probe-verified) — require its countdown to be over.
+            && gate.char_sel == 0;
         // A false->true edge starts a new round: bump the id and re-anchor
         // which block is P1 (left side starts with the smaller screen X).
         if controllable && !self.prev_controllable {
             self.round_id += 1;
             self.p1_block = Some(if b1.x <= b2.x { 1 } else { 2 });
+            self.round_frames = 0;
+            self.round_p1_mass = 0;
+            self.round_chars = (b1.char_id, b2.char_id);
+        }
+        // A true->false edge ends one: index it (matchup, size, demo-ness).
+        if !controllable && self.prev_controllable {
+            self.emit_round_summary();
+        }
+        if controllable {
+            self.round_frames += 1;
+            self.round_p1_mass += p1_mask as u64;
         }
         self.prev_controllable = controllable;
 
@@ -263,8 +390,17 @@ impl FrameRecorder {
         self.frames
     }
 
-    /// Flush the buffer (call at shutdown).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Flush the buffer (call at shutdown). A round still in progress gets a
+    /// partial summary — stopping mid-round shouldn't lose its index entry.
     pub fn finish(&mut self) {
+        if self.prev_controllable {
+            self.emit_round_summary();
+            self.prev_controllable = false;
+        }
         let _ = self.out.flush();
     }
 }
@@ -300,7 +436,8 @@ mod tests {
         let ds = DebugState::new();
         let path = std::env::temp_dir().join(format!("shadow_rec_{}.jsonl", std::process::id()));
         {
-            let mut rec = FrameRecorder::create(&path, GameMap::default(), "test", "test").unwrap();
+            let mut rec =
+                FrameRecorder::create(&path, GameMap::default(), "test", "test", None).unwrap();
             rec.record(&ds, 0x081, 0x000);
             rec.record(&ds, 0x000, 0x040);
             assert_eq!(rec.frames_written(), 2);
@@ -321,7 +458,74 @@ mod tests {
         }
         let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(v0["p1_input"], 0x081);
+        // Gate never opened → the rounds index exists but holds no rounds.
+        let rounds = std::fs::read_to_string(path.with_extension("rounds.jsonl")).unwrap();
+        assert!(rounds.is_empty());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("meta.json"));
+        let _ = std::fs::remove_file(path.with_extension("rounds.jsonl"));
+    }
+
+    #[test]
+    fn stage_selector_mapping_inverts_cleanly() {
+        for opp in 0u8..=9 {
+            match stage_value_for_opponent(opp) {
+                Some(v) => assert_eq!(opponent_for_stage_value(v), Some(opp)),
+                None => assert_eq!(opp, 3, "only footee lacks a selector value"),
+            }
+        }
+        assert_eq!(opponent_for_stage_value(0), None); // 0 = unset
+        assert_eq!(opponent_for_stage_value(10), None); // overflow
+    }
+
+    #[test]
+    fn recorder_emits_round_summaries_to_the_rounds_sidecar() {
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-test".into(),
+            addr: 0x400000,
+            len: 0x7000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let m = GameMap::default();
+        // Open the v2 gate: live healths + valid BCD clock (hop flags are 0).
+        assert!(ds.write_addr((m.block1 + 0x177) as usize, 1, 0xEF));
+        assert!(ds.write_addr((m.block2 + 0x177) as usize, 1, 0xEF));
+        assert!(ds.write_addr(m.round_timer as usize, 1, 0x90));
+        // Matchup: Goat (1) vs Rose Mary (7).
+        assert!(ds.write_addr((m.block1 + 0x639) as usize, 1, 1));
+        assert!(ds.write_addr((m.block2 + 0x639) as usize, 1, 7));
+
+        let path =
+            std::env::temp_dir().join(format!("shadow_rounds_{}.jsonl", std::process::id()));
+        {
+            let mut rec =
+                FrameRecorder::create(&path, m, "test", "test", Some("rushdown")).unwrap();
+            rec.record(&ds, 0x010, 0); // rising edge; input held
+            rec.record(&ds, 0x000, 0); // still live, idle
+            // Corrupt the clock → gate closes → falling edge indexes the round.
+            assert!(ds.write_addr(m.round_timer as usize, 1, 0xFF));
+            rec.record(&ds, 0x000, 0);
+            rec.finish();
+        }
+        let rounds = std::fs::read_to_string(path.with_extension("rounds.jsonl")).unwrap();
+        let lines: Vec<&str> = rounds.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one round summary: {rounds}");
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["round_id"], 1);
+        assert_eq!(v["block1_char"], 1);
+        assert_eq!(v["block2_char"], 7);
+        assert_eq!(v["p1_block"], 1);
+        assert_eq!(v["frames"], 2);
+        assert_eq!(v["p1_input_mass"], 0x10);
+        assert_eq!(v["demo"], false);
+        assert_eq!(v["style"], "rushdown");
+        // The meta sidecar carries the style declaration too.
+        let meta = std::fs::read_to_string(path.with_extension("meta.json")).unwrap();
+        assert!(meta.contains("\"style\": \"rushdown\""));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("meta.json"));
+        let _ = std::fs::remove_file(path.with_extension("rounds.jsonl"));
     }
 }

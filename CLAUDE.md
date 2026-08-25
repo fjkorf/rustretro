@@ -48,6 +48,14 @@ SLOT|PATH`, `--calibrate` (controller wizard → `keymap.json`), `--keymap`,
 | F8/F9/F10 | tutorials / litui / Lua script panel |
 | F12, Space | debugger, pause |
 
+The F12 debugger groups panels into regions: Canvas (Frame/Disasm/Hex/Tiles,
+center), Live (Watch/CPU/Input, top right), Control (💾 State / 🎯 Training /
+Audio, bottom right), Tools (bottom strip). The ☰ toolbar menu saves/resets
+the layout and reopens closed panels; the sidecar is `rustretro_layout_v2.json`
+(cwd, gitignored). Hotkey docs live in ONE place: `KEYBINDINGS` in
+`src/main.rs` (rendered by the Help panel + printed at startup) — update it in
+the same commit as any hotkey change.
+
 Keyboard P1: arrows + Z/X/A/S (attacks L/M/·/·), Enter=Start, Shift=coin.
 P2: IJKL + G/T/H, M=Start, N=coin. The Mayflash F300 fightstick must be in
 **PS3-DInput + DPad** switch mode (mapping in `keymap.json`; recalibrate with
@@ -59,7 +67,44 @@ P2: IJKL + G/T/H, M=Start, N=coin. The Mayflash F300 fightstick must be in
 shadow/loop.sh              # fit goat-vNEXT from recent recordings, drill list, fight
 shadow/loop.sh --fit-only   # just fit + coverage report
 shadow/loop.sh --model NAME # fight an existing model
+shadow/loop.sh --push       # fit, then load into the running app's NATIVE
+                            # runner (MCP load_shadow; Shift+F5 to fight)
 ```
+
+The whole lifecycle is also driveable from the 🎯 Training panel: recorder
+start/stop (auto-named into `shadow/recordings/`), the loaded-model card with
+per-bucket coverage (sparse buckets ⚠ = the drill list), and a model picker
+that hot-loads any `shadow/models/*` dir. Runtime loads arrive DISABLED
+unless a shadow was already enabled; `--shadow` startup loads stay
+enabled-and-fatal-on-error. The MCP `load_shadow` tool is the scripted twin
+(gated behind `enable_writes`).
+
+Matchups: models can be per-matchup — `shadow/loop.sh --me 1 --opp 7` fits a
+`goat-vs-rosemary-vN` (slugs from `shadow_train.asurabld.CHAR_NAMES`; ids in
+asurabld.md's roster table). `python -m shadow_train coverage` prints the
+matchup matrix (decisions per me×opp cell, demo-filtered). The recorder
+writes a `.rounds.jsonl` sidecar per recording (one summary line per round:
+matchup chars, frames, demo-ness, style) — the cheap index for coverage
+tooling (`python -m shadow_train index` backfills old recordings); the
+panel's Record section takes an optional style tag ("rushdown", "zoning")
+stored in the sidecars and selectable at fit time.
+
+The 🥊 Matchup panel renders that index as a coverage grid (≈decisions per
+me×opp cell, ✓ = fitted model, amber = sparse); clicking a cell offers its
+model, its `shadow/arenas/<slug>.state` arena, the fit command for gaps, and
+"⚔ Force next fight" — freezes `$40364D` (write-verified opponent+venue
+selector, asurabld.md "Stages") so every next fight is that matchup until
+cleared. Bosses get quick-force buttons; Footee has no selector value.
+Model SETS: loading a directory of model dirs (e.g. `shadow/models` via the
+panel's "Load ALL as set" or `load_shadow`) keeps the newest model per
+matchup key and auto-switches at every round start by reading both char ids
+— fallback exact → per-char → per-opp → general.
+
+Training saves: the panel's Arena section lists `shadow/arenas/*.state`,
+loads one, captures the on-screen situation as a new named arena, or promotes
+one to `shadow/arenas/current.state` — the pointer loop.sh starts fights from
+(fallback: ARENA env → current.state → goat-vs-rosemary.state). current.state
+is gitignored; named arenas are committable.
 
 Python side: `shadow_train` is `pip install -e`'d into `shadow/train/.venv`
 (works from any cwd): `python -m shadow_train fit|eval|report`. The deploy

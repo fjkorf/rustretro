@@ -219,6 +219,68 @@ pub fn key_bits(pressed: impl Fn(KeyCode) -> bool, port: &PortMap) -> [bool; 12]
     bits
 }
 
+/// All RETRO buttons in bit order (the enum has no iterator).
+const ALL_BUTTONS: [RetroButton; 12] = [
+    RetroButton::B, RetroButton::Y, RetroButton::Select, RetroButton::Start,
+    RetroButton::Up, RetroButton::Down, RetroButton::Left, RetroButton::Right,
+    RetroButton::A, RetroButton::X, RetroButton::L, RetroButton::R,
+];
+
+/// Shorten a Bevy KeyCode debug name for display ("KeyZ" → "Z", arrows → glyphs).
+fn key_name(k: KeyCode) -> String {
+    let s = format!("{k:?}");
+    match s.as_str() {
+        "ArrowUp" => "↑".into(),
+        "ArrowDown" => "↓".into(),
+        "ArrowLeft" => "←".into(),
+        "ArrowRight" => "→".into(),
+        _ => s
+            .strip_prefix("Key")
+            .or_else(|| s.strip_prefix("Digit"))
+            .map(str::to_string)
+            .unwrap_or(s),
+    }
+}
+
+/// Human-readable lines describing the ACTIVE mapping (whatever `load`
+/// resolved — flag, sidecar, or default), for the Help panel's "Game
+/// controls" section. One `(label, mapping)` pair per port per device kind;
+/// empty maps are skipped.
+pub fn summary(cfg: &InputConfig) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (port_idx, port) in cfg.ports.iter().enumerate() {
+        let pn = port_idx + 1;
+        if !port.keyboard.is_empty() {
+            let mut parts = Vec::new();
+            for btn in ALL_BUTTONS {
+                let keys: Vec<String> = port
+                    .keyboard
+                    .iter()
+                    .filter(|(_, b)| **b == btn)
+                    .map(|(k, _)| key_name(*k))
+                    .collect();
+                if !keys.is_empty() {
+                    parts.push(format!("{btn:?}={}", keys.join("/")));
+                }
+            }
+            out.push((format!("P{pn} keyboard"), parts.join("  ")));
+        }
+        if !port.gamepad.is_empty() {
+            let parts: Vec<String> = port
+                .gamepad
+                .iter()
+                .map(|(pad_btn, bits)| {
+                    let chord: Vec<String> =
+                        bits.iter().map(|b| format!("{b:?}")).collect();
+                    format!("{pad_btn:?}={}", chord.join("+"))
+                })
+                .collect();
+            out.push((format!("P{pn} pad"), parts.join("  ")));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

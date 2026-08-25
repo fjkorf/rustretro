@@ -442,8 +442,73 @@ facing rather than assuming slot order.
 Also disproven: `+0x47`/`+0x4F` as health (see [[health-blocks]]). Also
 measured: the recorder's `controllable` gate (hop flags all zero) is **true on
 the title screen** — it needs a positive in-fight signal before training data
-is cut from recordings (open item; `$406485` and `$40FF67` were tested and are
-scratch, not flags).
+is cut from recordings (`$406485` and `$40FF67` were tested and are scratch,
+not flags). **RESOLVED 2026-08-25 (gate v3):** the composite v2 gate was also
+true on the CHAR-SELECT screen (probe-verified — healths + round clock still
+read live there); `$400006` (char-select countdown, BCD, 0 outside select)
+is the positive discriminator. All four gate copies now additionally require
+`$400006 == 0`: `src/record.rs`, `src/shadow_runner.rs`,
+`shadow_train/runtime.py`, and the probe helpers. Recordings additionally
+log the raw byte per frame (`gate.char_sel`, additive to jsonl-v2).
+
+### Roster — character IDs (`+0x639`) — COMPLETE
+
+8 playable (ids 0–7) + 2 bosses (0x08/0x09, cheat DB). **Fully mapped
+2026-08-25** by the headless roster probe: one cold boot per char-select
+slot, cursor walked Right ×k, id read in-fight (strict gate: recorder gate
+AND `$400006` == 0 — the plain gate is TRUE on char select!), name read from
+the select screen + health bar. The three previously known ids (0/1/7) all
+reconfirmed, plus four ids double-confirmed from fight health bars.
+Hand-kept mirrors: `CHAR_NAMES` in `shadow/train/shadow_train/asurabld.py`
+and `char_name` in `src/record.rs` — update all three together.
+
+| id | name | select slot (Rights from default) |
+|---|---|---|
+| 0 | Yashaou | 0 |
+| 1 | Goat | 3 |
+| 2 | Lightning | 6 |
+| 3 | Footee | 4 |
+| 4 | Alice | 7 |
+| 5 | Taros | 1 |
+| 6 | Zam-B | 2 |
+| 7 | Rose Mary | 5 |
+| 8 | Curfue (boss) | code: hold Down+Start from confirm until the battle begins (per fight) |
+| 9 | S. Geist (boss) | code: hold Up+Start likewise (GameFAQs codes; both probe-verified live, health-bar names + in-fight id reads) |
+
+Probe gotchas (for future probes): char ids at `+0x639` are STALE during
+char select and the VS splash — only trust them once the strict gate holds
+for ~2 s. `$400006` (char-select countdown, BCD) doubles as the phase
+discriminator: live BCD = on select, 0 = in fight. From a cold boot, press
+Start repeatedly until `$400006` reads live BCD — one early press just sits
+on the title screen.
+
+### Stages — `$40364D` is a WRITE-VERIFIED opponent+venue selector (1–9)
+
+Freezing `$40364D` through the post-select map screen forces both the stage
+AND its home character as the next opponent (paired-control verified
+2026-08-25: same player char, values 2/6/none → reproducibly different
+venues; value 2 reproduced the same venue+opponent across independent runs).
+The cheat DB's "stage select (1–8)" undersells it — 9 works too and forces
+the S. Geist fight. Unwritten, the byte stays 0 (it is a selector input, NOT
+a live stage indicator) and the ladder picks normally.
+
+| value | home char (forced opponent) | venue (probe screenshots) |
+|---|---|---|
+| 0 | — unset/default (first ladder fight often Footee) | Footee's beach courtyard |
+| 1 | Zam-B | torch-lit dungeon, gargoyle gate |
+| 2 | Lightning | floating-rock water cavern |
+| 3 | Alice | sunken-shipwreck graveyard |
+| 4 | Taros | skull-pile foundry hall |
+| 5 | Rose Mary | skull-pile hall (visually near-identical to 4) |
+| 6 | Goat | red desert castle at sunset |
+| 7 | Yashaou | fiery inferno (forces a mirror match) |
+| 8 | Curfue | (venue matched the shipwreck in the probe) |
+| 9 | S. Geist | direct boss fight |
+| 10+ | overflow: Yashaou mirror on the desert stage — invalid | |
+
+Footee's beach has no dedicated selector value in 1–9 (open oddity — it may
+be the "default" venue only). Probe artifacts (screenshots + jsonl log):
+scratchpad/roster-probe-20260825/.
 
 ::: region kind=lookup_table id=system-control addr=0x400000-0x40655D label="match/system control bytes" confidence=confirmed
 From the pugsy cheat DB + FBNeo training-mode Lua, live-verified where noted:

@@ -46,6 +46,10 @@ METER_MAX = 0x17F  # u8: per-character max-meter constant
 CHAR_ID = 0x639    # u8
 
 # ── system / match-control addresses ────────────────────────────────────────
+CHAR_SELECT = 0x400006   # char-select countdown (BCD); 0 outside select.
+                         # Gate v3 discriminator: the v2 composite gate is
+                         # TRUE on the char-select screen (probe-verified
+                         # 2026-08-25) -- require this byte == 0 too.
 ROUND_TIMER = 0x40000A   # BCD seconds; +1 byte is the subsecond countdown
 DEMO_FLAG = 0x4065D8     # scene-advance latch (coin/start); record.rs calls
                          # this "demo_flag" -- semantics still being pinned
@@ -66,3 +70,40 @@ GROUND_Y = 216
 ROUND_START_X_LEFT = 84
 ROUND_START_X_RIGHT = 232
 ROUND_START_Y = GROUND_Y
+
+# ── roster (char id at CHAR_ID/+0x639) ──────────────────────────────────────
+# 8 playable characters (ids 0-7) + 2 bosses (0x08/0x09, per the cheat DB).
+# COMPLETE mapping, live-verified 2026-08-25 by the headless roster probe:
+# one boot per char-select slot, id read in-fight, name read from the select
+# screen + health bar (the three previously known ids all reconfirmed).
+# Select-screen slot order (cursor Rights from default): 0=yashaou 1=taros
+# 2=zamb 3=goat 4=footee 5=rosemary 6=lightning 7=alice.
+# Keep in lockstep with record.rs::char_name and asurabld.md's roster table.
+CHAR_NAMES: dict[int, str] = {
+    0: "yashaou",
+    1: "goat",
+    2: "lightning",
+    3: "footee",
+    4: "alice",
+    5: "taros",
+    6: "zamb",
+    7: "rosemary",
+    8: "curfue",     # boss; playable via hold Down+Start through the map screen
+    9: "sgeist",     # boss; playable via hold Up+Start through the map screen
+}
+
+
+def char_name(char_id: int) -> str:
+    return CHAR_NAMES.get(char_id, f"c{char_id}")
+
+
+def matchup_slug(me: int | None, opp: int | None) -> str:
+    """Model-directory naming for matchup-filtered fits:
+    'goat-vs-rosemary', 'goat' (any opponent), 'any-vs-rosemary', or 'all'."""
+    if me is None and opp is None:
+        return "all"
+    if opp is None:
+        return char_name(me)
+    if me is None:
+        return f"any-vs-{char_name(opp)}"
+    return f"{char_name(me)}-vs-{char_name(opp)}"

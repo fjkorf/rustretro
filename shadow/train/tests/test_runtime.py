@@ -101,7 +101,7 @@ class MemoryParsingTest(unittest.TestCase):
             "block2": bytes(b2),
             "match_end_abort": bytes(rt.MATCH_END_ABORT_LEN),
             "round_over": bytes(2),
-            "round_timer": bytes([0x58]),
+            "clock": bytes([0, 0, 0, 0, 0x58]),
         }
         snap = rt.parse_tick(blobs)
         self.assertEqual(snap.block1["x"], 100)
@@ -120,7 +120,7 @@ class MemoryParsingTest(unittest.TestCase):
         blobs = {
             "block1": bytes(b1), "block2": bytes(b2),
             "match_end_abort": bytes(rt.MATCH_END_ABORT_LEN),
-            "round_over": bytes(2), "round_timer": bytes([0x58]),
+            "round_over": bytes(2), "clock": bytes([0, 0, 0, 0, 0x58]),
         }
         self.assertFalse(rt.is_controllable(rt.parse_tick(blobs)))
 
@@ -130,7 +130,7 @@ class MemoryParsingTest(unittest.TestCase):
         blobs = {
             "block1": bytes(b1), "block2": bytes(b2),
             "match_end_abort": bytes(rt.MATCH_END_ABORT_LEN),
-            "round_over": bytes(2), "round_timer": bytes([0x00]),
+            "round_over": bytes(2), "clock": bytes([0, 0, 0, 0, 0x00]),
         }
         self.assertFalse(rt.is_controllable(rt.parse_tick(blobs)))
 
@@ -142,7 +142,7 @@ class MemoryParsingTest(unittest.TestCase):
         blobs = {
             "block1": bytes(b1), "block2": bytes(b2),
             "match_end_abort": bytes(me_blob),
-            "round_over": bytes(2), "round_timer": bytes([0x58]),
+            "round_over": bytes(2), "clock": bytes([0, 0, 0, 0, 0x58]),
         }
         self.assertFalse(rt.is_controllable(rt.parse_tick(blobs)))
 

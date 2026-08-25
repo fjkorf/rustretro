@@ -310,18 +310,30 @@ def _segment(round_decisions: list[Decision]) -> list[Decision]:
     return round_decisions
 
 
-def build(paths: list[Path], char_filter: int | None = None):
-    """Load recordings -> stacked dataset arrays.
-
-    Returns dict with X (N, K*len(SCALAR_FEATURES)), y_move, y_attack, buckets,
-    round keys, and the per-decision categorical columns.
-    """
+def load_decisions(paths: list[Path], char_filter: int | None = None,
+                   opp_filter: int | None = None) -> list[Decision]:
+    """Recordings -> filtered Decision list (pre-stacking). The demo filter
+    (zero p1_input rounds) is applied inside _rounds; matchup filters here.
+    Shared by build() and the coverage command so both count identically."""
     decisions: list[Decision] = []
     for p in paths:
         for round_key, rows in _rounds(p):
             decisions.extend(_segment(_decisions_for_round(round_key, rows)))
     if char_filter is not None:
         decisions = [d for d in decisions if d.me_char == char_filter]
+    if opp_filter is not None:
+        decisions = [d for d in decisions if d.opp_char == opp_filter]
+    return decisions
+
+
+def build(paths: list[Path], char_filter: int | None = None,
+          opp_filter: int | None = None):
+    """Load recordings -> stacked dataset arrays.
+
+    Returns dict with X (N, K*len(SCALAR_FEATURES)), y_move, y_attack, buckets,
+    round keys, and the per-decision categorical columns.
+    """
+    decisions = load_decisions(paths, char_filter, opp_filter)
     # K-step stacking within each round (§4)
     X, y_move, y_attack, buckets, keys = [], [], [], [], []
     by_round: dict = {}
