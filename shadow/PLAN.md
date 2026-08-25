@@ -137,3 +137,23 @@ imperfect recordings and swap in v2 data.
 - Stage-dependent speed-up quirk in some ROM versions — watch frame pacing
   in recordings.
 - Specials/EX out of v1 scope by design; macro layer is the committed path.
+
+## Post-plan addendum (2026-08-25) — the matchup layer
+
+Waves 2a–2f all shipped, and the loop then grew a layer this plan did not
+foresee: **matchup-first organization**. The recordings turned out to be
+self-describing (char ids per frame), the roster and the `$40364D`
+opponent+venue selector were fully mapped by headless probes, and the
+architecture pivoted accordingly:
+
+- per-matchup models (`--char`/`--opp` fit filters, slug-named dirs) and
+  model SETS with automatic per-round matchup switching in the native runner;
+- a `.rounds.jsonl` per-round matchup index written by the recorder, rendered
+  as the 🥊 Matchup coverage grid (with force-matchup buttons that freeze the
+  selector);
+- gate v3: the composite gate gained the `$400006 == 0` term after probes
+  showed v2 was open on the char-select screen.
+
+Current working notes live in CLAUDE.md; addresses and probe evidence in
+`library/asurabld/asurabld.md`. This file is kept as the historical plan of
+record for waves 1–2f.

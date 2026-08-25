@@ -77,13 +77,15 @@ if [[ $FIT -ge 1 ]]; then
 fi
 
 if [[ $PUSH -eq 1 ]]; then
-  # Native path: swap the in-app runner's model over MCP (load_shadow needs
-  # the write gate; both calls share one MCP session so the arm sticks).
-  # A disabled shadow stays disabled (Shift+F5 to fight); an active one
-  # swaps brains mid-fight.
+  # Native path: reload the WHOLE models dir as a SET over MCP — the fresh
+  # model folds in via newest-per-key dedup and auto-matchup-switching stays
+  # armed (pushing just the single model would replace a loaded set).
+  # load_shadow needs the write gate; both calls share one MCP session so
+  # the arm sticks. A disabled shadow stays disabled (Shift+F5 to fight);
+  # an active one swaps brains at the next round start.
   echo
-  echo "── pushing $MODEL into the app on port $PORT (native runner) ──"
-  "$PY" -u - "$(pwd)/shadow/models/$MODEL" "$PORT" <<'PYEOF'
+  echo "── pushing $MODEL (as part of the shadow/models set) on port $PORT ──"
+  "$PY" -u - "$(pwd)/shadow/models" "$PORT" <<'PYEOF'
 import sys
 from shadow_train.mcpclient import McpClient
 path, port = sys.argv[1], sys.argv[2]

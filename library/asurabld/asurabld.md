@@ -442,8 +442,14 @@ facing rather than assuming slot order.
 Also disproven: `+0x47`/`+0x4F` as health (see [[health-blocks]]). Also
 measured: the recorder's `controllable` gate (hop flags all zero) is **true on
 the title screen** — it needs a positive in-fight signal before training data
-is cut from recordings (open item; `$406485` and `$40FF67` were tested and are
-scratch, not flags).
+is cut from recordings (`$406485` and `$40FF67` were tested and are scratch,
+not flags). **RESOLVED 2026-08-25 (gate v3):** the composite v2 gate was also
+true on the CHAR-SELECT screen (probe-verified — healths + round clock still
+read live there); `$400006` (char-select countdown, BCD, 0 outside select)
+is the positive discriminator. All four gate copies now additionally require
+`$400006 == 0`: `src/record.rs`, `src/shadow_runner.rs`,
+`shadow_train/runtime.py`, and the probe helpers. Recordings additionally
+log the raw byte per frame (`gate.char_sel`, additive to jsonl-v2).
 
 ### Roster — character IDs (`+0x639`) — COMPLETE
 

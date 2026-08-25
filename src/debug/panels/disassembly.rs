@@ -122,11 +122,11 @@ impl Disassembly {
                                 resp.context_menu(|ui| {
                                     if ui.button("▶ Run to here").clicked() {
                                         run_to = Some(*addr);
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                     if ui.button("🏷 Label range starting here…").clicked() {
                                         label_addr = Some(*addr);
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                 });
                             });

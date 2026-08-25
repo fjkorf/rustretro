@@ -74,6 +74,7 @@ const ROUND_OVER: u32 = 0x40646E;
 const ABORT: u32 = 0x403678;
 const MATCH_END: u32 = 0x402A32;
 const ROUND_TIMER: u32 = 0x40000A; // BCD seconds
+const CHAR_SELECT: u32 = 0x400006; // select countdown (gate v3: must be 0)
 
 // ── minimal .npz reader (uncompressed zip of .npy, np.savez output) ─────────
 
@@ -568,6 +569,7 @@ fn read_fighter(ds: &DebugState, base: u32) -> Fighter {
 struct TickSnapshot {
     block1: Fighter,
     block2: Fighter,
+    char_sel: u8,
     combo_on_b1: u8,
     combo_on_b2: u8,
     round_over: u16,
@@ -580,6 +582,7 @@ fn read_tick(ds: &DebugState) -> TickSnapshot {
     TickSnapshot {
         block1: read_fighter(ds, BLOCK1),
         block2: read_fighter(ds, BLOCK2),
+        char_sel: u8g(ds, CHAR_SELECT),
         combo_on_b1: u8g(ds, COMBO_ON_B1),
         combo_on_b2: u8g(ds, COMBO_ON_B2),
         round_over: u16be(ds, ROUND_OVER),
@@ -603,6 +606,10 @@ fn is_controllable(snap: &TickSnapshot, health_max: u8) -> bool {
         && healthy(&snap.block1)
         && healthy(&snap.block2)
         && timer_bcd_valid(snap.timer_bcd)
+        // Gate v3: all of the above is TRUE on the char-select screen too —
+        // without this an ENABLED shadow injects into char select (it would
+        // drive the P2 cursor between matches). Probe-verified 2026-08-25.
+        && snap.char_sel == 0
 }
 
 // ── hitstun edge tracker (runtime.HitstunTracker, tick-granular) ────────────
@@ -1355,6 +1362,7 @@ mod tests {
         let snap = TickSnapshot {
             block1: f(0xEF, 84),
             block2: f(0x80, 232),
+            char_sel: 0,
             combo_on_b1: 0,
             combo_on_b2: 0,
             round_over: 0,
@@ -1371,6 +1379,8 @@ mod tests {
         assert!(!is_controllable(&TickSnapshot { block2: f(0xF0, 232), ..snap }, 0xEF));
         assert!(!is_controllable(&TickSnapshot { timer_bcd: 0x3A, ..snap }, 0xEF));
         assert!(!is_controllable(&TickSnapshot { timer_bcd: 0, ..snap }, 0xEF));
+        // Gate v3: a live char-select countdown closes the gate.
+        assert!(!is_controllable(&TickSnapshot { char_sel: 0x28, ..snap }, 0xEF));
     }
 
     #[test]

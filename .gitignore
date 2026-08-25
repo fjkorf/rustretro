@@ -39,3 +39,4 @@ shadow/recordings/
 shadow/models/
 shadow/arenas/current.state
 scratchpad/
+.DS_Store

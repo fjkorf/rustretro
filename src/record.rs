@@ -27,6 +27,10 @@ pub struct GameMap {
     pub block2: u32,
     /// Round timer seconds, BCD (`$40000A`); subseconds at +1.
     pub round_timer: u32,
+    /// Char-select countdown (`$400006`, BCD; 0 outside select). Gate v3:
+    /// the v2 composite gate is TRUE on the char-select screen (healths +
+    /// clock still read live there — probe-verified 2026-08-25).
+    pub char_select: u32,
     /// Hop flags for the `controllable` gate (execution map, `asurabld.md`).
     pub round_over: u32,
     pub abort: u32,
@@ -46,6 +50,7 @@ impl Default for GameMap {
             block1: 0x403798,
             block2: 0x40454C, // block1 + 0x0DB4
             round_timer: 0x40000A,
+            char_select: 0x400006,
             round_over: 0x40646E,
             abort: 0x403678,
             match_end: 0x402A32,
@@ -87,6 +92,9 @@ struct Gate {
     abort: u16,
     match_end: u16,
     timer_bcd: u8,
+    /// Char-select countdown — must be 0 for `controllable` (gate v3);
+    /// recorded raw like the other gate inputs (additive to jsonl-v2).
+    char_sel: u8,
     demo_flag: u16,
     combo_on_b1: u8,
     combo_on_b2: u8,
@@ -316,6 +324,7 @@ impl FrameRecorder {
             abort: u16be(ds, m.abort),
             match_end: u16be(ds, m.match_end),
             timer_bcd: u8g(ds, m.round_timer),
+            char_sel: u8g(ds, m.char_select),
             demo_flag: u16be(ds, m.demo_flag),
             combo_on_b1: u8g(ds, m.combo_on_b1),
             combo_on_b2: u8g(ds, m.combo_on_b2),
@@ -332,7 +341,10 @@ impl FrameRecorder {
             && gate.match_end == 0
             && healthy(&b1)
             && healthy(&b2)
-            && timer_bcd_valid(gate.timer_bcd);
+            && timer_bcd_valid(gate.timer_bcd)
+            // Gate v3: the above is all TRUE on the char-select screen too
+            // (probe-verified) — require its countdown to be over.
+            && gate.char_sel == 0;
         // A false->true edge starts a new round: bump the id and re-anchor
         // which block is P1 (left side starts with the smaller screen X).
         if controllable && !self.prev_controllable {

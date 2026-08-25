@@ -46,6 +46,10 @@ METER_MAX = 0x17F  # u8: per-character max-meter constant
 CHAR_ID = 0x639    # u8
 
 # ── system / match-control addresses ────────────────────────────────────────
+CHAR_SELECT = 0x400006   # char-select countdown (BCD); 0 outside select.
+                         # Gate v3 discriminator: the v2 composite gate is
+                         # TRUE on the char-select screen (probe-verified
+                         # 2026-08-25) -- require this byte == 0 too.
 ROUND_TIMER = 0x40000A   # BCD seconds; +1 byte is the subsecond countdown
 DEMO_FLAG = 0x4065D8     # scene-advance latch (coin/start); record.rs calls
                          # this "demo_flag" -- semantics still being pinned
