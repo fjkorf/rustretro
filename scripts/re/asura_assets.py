@@ -41,54 +41,31 @@ library/asurabld/assets), --rom-dir DIR (default from decode_asurabld).
 """
 
 import argparse
-import base64
 import json
 import os
 import struct
 import sys
 import time
-import urllib.request
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import decode_asurabld as dec  # noqa: E402  (swizzle/expand4/combine8 + ROMDIR)
 import screen_tools  # noqa: E402  (stdlib PNG reader for app://screen)
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "..", "shadow", "train"))
+from shadow_train.mcpclient import McpClient  # noqa: E402
+
 
 # ---------------------------------------------------------------- MCP client
-class Mcp:
-    """Minimal MCP streamable-HTTP client (initialize + tools/call + resource)."""
+class Mcp(McpClient):
+    """asura_assets' Mcp -- constructed by port, eager-handshakes like before;
+    adds the region-read and screen_rgba helpers this script needs."""
 
     def __init__(self, port):
-        self.url = f"http://127.0.0.1:{port}/mcp"
-        self.sid = None
-        self._post({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
-            "protocolVersion": "2024-11-05", "capabilities": {},
-            "clientInfo": {"name": "asura-assets", "version": "0"}}})
-        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
-
-    def _post(self, payload):
-        req = urllib.request.Request(
-            self.url, data=json.dumps(payload).encode(), method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Accept", "application/json, text/event-stream")
-        if self.sid:
-            req.add_header("mcp-session-id", self.sid)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            self.sid = r.headers.get("mcp-session-id", self.sid)
-            body = r.read().decode()
-        for line in body.splitlines():
-            if line.startswith("data:") and line[5:].strip():
-                return json.loads(line[5:].strip())
-        return None
-
-    def call(self, tool, **kwargs):
-        resp = self._post({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                           "params": {"name": tool, "arguments": kwargs}})
-        result = resp["result"]
-        if result.get("isError"):
-            raise RuntimeError(f"{tool}: {result}")
-        return json.loads(result["content"][0]["text"])
+        super().__init__(f"http://127.0.0.1:{port}/mcp", timeout=30.0,
+                          client_name="asura-assets")
+        self.connect()
 
     def read_region(self, name, offset, length):
         """Chunked region read (server caps read_region at 8 KiB per call)."""
@@ -104,9 +81,7 @@ class Mcp:
 
     def screen_rgba(self):
         """(w, h, rgba bytes) of the live framebuffer via app://screen."""
-        resp = self._post({"jsonrpc": "2.0", "id": 1, "method": "resources/read",
-                           "params": {"uri": "app://screen"}})
-        png = base64.b64decode(resp["result"]["contents"][0]["blob"])
+        png = self.read_resource("app://screen")
         tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            ".screen_tmp.png")
         with open(tmp, "wb") as f:

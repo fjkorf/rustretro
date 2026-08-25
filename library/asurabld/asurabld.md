@@ -454,6 +454,64 @@ records. Live round timer is [[round-timer]] (`$40000A` BCD, starts 0x90;
 final tie-breaker round starts at 40 per FAQ).
 :::
 
+## Training script
+
+`library/asurabld/training.lua` is a standalone Lua v2 training surface —
+launch it with `--script library/asurabld/training.lua`, with or without
+`--training`. It rides entirely on the sandboxed Lua API (`src/lua_engine.rs`;
+`table`/`string`/`math` only, no `io`/`os`/`package`) and duplicates the native
+`--training` enforcement (`src/training.rs`) in Lua so a script-only launch
+still gets a held round: the constants match field-for-field (block1
+`$403798`, block2 `$40454C`, timer `$40000A/B` pinned `0x85/0x03`, credits
+`$40655D`, health pair `+0x177/+0x179` max `0xEF`), so running both at once is
+a no-op overlap rather than a fight over the RAM. Writes are gated the normal
+way (`memory.writebyte`/`writeword` need `--training` or the MCP
+`enable_writes` tool); every write in the script goes through a `pcall`
+wrapper that flips a "writes locked" flag instead of throwing, and the
+overlay shows a red **WRITES LOCKED** line whenever it's set — verified live
+by loading the script *without* `--training` and confirming the overlay text
+and a `false` return from `finish_round()`, then calling MCP `enable_writes`
+and confirming both flip.
+
+**CONFIG table** (top of the file; edit + reload via F10, or mutate live with
+MCP `run_lua` — e.g. `run_lua("CONFIG.dummy = 'crouch'")` — since `run_lua`
+executes in the *same* VM as the loaded script and every CONFIG field is read
+fresh each frame):
+
+| field | default | effect |
+|---|---|---|
+| `credits_enabled` / `credits_target` | `true` / `9` | tops up `$40655D` once/second |
+| `timer_hold_enabled` / `timer_hold_sec` / `timer_hold_sub` | `true` / `0x85` / `0x03` | pins the round timer |
+| `health_refill_enabled` / `refill_below` / `refill_value` | `true` / `0x40` / `0xEF` | refills both health bytes on either fighter when either drops below the threshold |
+| `dummy` | `"off"` | `off\|stand\|crouch\|jump\|block\|replay` — drives port 1 each frame |
+| `record` | `false` | arms in-memory capture of port-0 input (cap 600 frames); flip back to `false` to stop |
+| `overlay_enabled` | `true` | top-left HUD: round-live state, both blocks' HP/meter/position/facing, hitstun (combo-counter-changed-in-last-20-frames), dummy/record state, write-lock warning |
+
+Enforcement (`credits`/`timer`/`health`) only runs while a round is judged
+live (`round_live()`: hop flags `$40646E`/`$403678`/`$402A32` all clear, both
+blocks' health in `1..0xEF`, timer byte valid BCD). `dummy` releases port 1
+outside a live round so it doesn't wander through menus.
+
+**Record/replay caveat**: the sandbox has no `io`, and reloading the script
+(`F10` Reload, or a fresh `--script` load) throws away the whole Lua VM
+(`LuaEngine::reload()`), so an in-memory recording does **not** survive a
+reload. To go from `record=true` to `dummy="replay"` without losing the
+buffer, flip both live via MCP `run_lua` instead of editing-and-reloading the
+file. Live-verified: 27 frames captured from `input.get(0)` over a burst of
+`right` presses, read back with `run_lua("#recording.buffer")`, then replayed
+onto port 1 (`input.get(1)` sampled the recorded mask on a loop).
+
+**One-shot helpers** (globals, callable from the F10 panel or MCP `run_lua`):
+`reset_positions()` writes round-start X/Y (block1 84/216, block2 232/216 —
+ground `y=216`); `finish_round()` writes 0 to `$400000`; `arena_save(slot)` /
+`arena_load(slot)` wrap `savestate.save/load`. All log their result via
+`console.log`. `reset_positions()` was verified with the MCP `pause`/`step`
+tools: while paused it lands both blocks exactly on 84/232, holds through one
+single-frame `step`, and only reverts after `resume` — because `+0x54/+0x56`
+are live-recomputed screen positions once the fight is actually running, not
+free-standing state, so the helper is most useful at a genuine round start or
+while paused, not mid-scramble.
+
 ## Input mapping & controls (source + live verified 2026-08-24)
 
 fbalpha2012's driver (`d_fuukifg3.cpp` AsurabldInputList) declares exactly

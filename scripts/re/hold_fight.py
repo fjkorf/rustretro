@@ -3,52 +3,43 @@
   1P fight -> freeze round timer (no timeout) -> find+freeze P1 health (no KO)
   => a controllable fight held indefinitely. Also DISCOVERS the health address.
 Run ON bigmac."""
-import json, sys, time, urllib.request, base64
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "..", "shadow", "train"))
+from shadow_train.mcpclient import McpClient  # noqa: E402
+
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 4025
 URL = f"http://127.0.0.1:{PORT}/mcp"
-sid = None
 P1X = 0x40454C + 0x54
 
-
-def post(p):
-    global sid
-    r = urllib.request.Request(URL, data=json.dumps(p).encode(), method="POST")
-    r.add_header("Content-Type", "application/json")
-    r.add_header("Accept", "application/json, text/event-stream")
-    if sid:
-        r.add_header("mcp-session-id", sid)
-    with urllib.request.urlopen(r, timeout=15) as x:
-        sid = x.headers.get("mcp-session-id", sid)
-        b = x.read().decode()
-    for l in b.splitlines():
-        if l.startswith("data:") and l[5:].strip():
-            return json.loads(l[5:].strip())
+mcp = McpClient(URL, client_name="hold-fight")
 
 
 def call(t, **a):
-    return json.loads(post({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                            "params": {"name": t, "arguments": a}})["result"]["content"][0]["text"])
+    return mcp.call(t, **a)
 
 
 def press(b, f=8, p=0):
-    call("press_buttons", buttons=b, frames=f, port=p)
+    mcp.press(b, frames=f, port=p)
 
 
 def u16(a):
-    x = bytes.fromhex(call("read_memory", addr=a, len=2)["hex"].replace(" ", ""))
+    x = mcp.read_memory(a, 2)
     return x[0] << 8 | x[1]
 
 
 def wram():
     out = bytearray()
     for off in range(0, 0x8000, 0x1000):
-        out += bytes.fromhex(call("read_memory", addr=0x400000 + off, len=0x1000)["hex"].replace(" ", ""))
+        out += mcp.read_memory(0x400000 + off, 0x1000)
     return out
 
 
 def shot(name):
-    r = post({"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": "app://screen"}})
-    open(name, "wb").write(base64.b64decode(r["result"]["contents"][0]["blob"]))
+    mcp.screenshot(name)
 
 
 def p1_ctrl():
@@ -72,9 +63,7 @@ def enter_1p():
     return False
 
 
-init = post({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
-    "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "h", "version": "0"}}})
-post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+mcp.connect()
 
 if not enter_1p():
     print("FAILED to reach a controllable fight"); shot("/tmp/hold_state.png"); sys.exit(1)

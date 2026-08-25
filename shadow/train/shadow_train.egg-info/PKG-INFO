@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: shadow-train
+Version: 0.1.0
+Summary: Shadow AI trainer/runtime for the Asura Blade behavioral-cloning project (shadow/SPEC.md).
+Requires-Python: >=3.10
+Requires-Dist: numpy

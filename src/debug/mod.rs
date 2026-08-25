@@ -567,6 +567,9 @@ pub struct DebugState {
     // --- Input ---
     /// Current joypad button states (12 buttons, RETRO_DEVICE_ID order).
     pub input_state: [bool; 12],
+    /// Port-1 (P2) counterpart of [`input_state`](Self::input_state), mirrored
+    /// from the frontend each frame so `input.get(1)` in Lua is a cheap read.
+    pub input_state2: [bool; 12],
     /// Rolling history: (frame_number, button_states).
     pub input_history: VecDeque<(u64, [bool; 12])>,
 
@@ -592,6 +595,13 @@ pub struct DebugState {
     /// Training-mode controls (shadow PLAN Wave 2b) — flipped by `--training`
     /// and hotkeys in the GUI, consumed by `training::tick` each frame.
     pub training: TrainingConfig,
+    /// Gate for the Lua `memory.writebyte`/`memory.writeword` bindings. Scripts
+    /// are user-authored, but memory pokes can corrupt a session, so they are
+    /// opt-in: defaults to TRUE when launched with `--training` (a training
+    /// session exists to poke RAM), FALSE otherwise; the MCP `enable_writes` /
+    /// `disable_writes` tools also arm/lock it (one write switch for the whole
+    /// app). A blocked Lua write raises an error naming this gate.
+    pub lua_writes_enabled: bool,
 
     // --- Breakpoints ---
     /// List of M68K PC addresses that will pause execution when hit.
@@ -720,6 +730,7 @@ impl DebugState {
             av_width: 0,
             av_height: 0,
             input_state: [false; 12],
+            input_state2: [false; 12],
             input_history: VecDeque::with_capacity(120),
             event_log: VecDeque::with_capacity(500),
             debug_open: false,
@@ -728,6 +739,7 @@ impl DebugState {
             injected_input: [0; 12],
             injected_input2: [0; 12],
             training: TrainingConfig::default(),
+            lua_writes_enabled: false,
             breakpoints: Vec::new(),
             hit_breakpoint: None,
             run_to_addr: None,

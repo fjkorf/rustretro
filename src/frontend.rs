@@ -27,6 +27,9 @@ pub struct Frontend {
     bus_bridge_ok: Option<bool>,
     /// Optional per-frame trace recorder (`--record`) for the shadow project.
     recorder: Option<crate::record::FrameRecorder>,
+    /// Optional in-app shadow bot (`--shadow`): drives controller port 1 from
+    /// a fitted kNN model, ticked from `run_frame` on the emu thread.
+    shadow: Option<crate::shadow_runner::ShadowRunner>,
     /// Where slot save-state files live (`<save_dir>/<rom_stem>.state<N>`).
     save_dir: PathBuf,
     /// ROM file stem used to name slot save-state files.
@@ -97,6 +100,7 @@ impl Frontend {
             busmap_path: busmap_path.clone(),
             bus_bridge_ok: None,
             recorder: None,
+            shadow: None,
             save_dir: save_dir.clone(),
             rom_stem: rom_stem.clone(),
         };
@@ -524,6 +528,24 @@ impl Frontend {
         }
     }
 
+    /// Install the in-app shadow bot (`--shadow`). It arrives already enabled;
+    /// Shift+F5 (→ [`toggle_shadow`](Self::toggle_shadow)) flips it later.
+    pub fn set_shadow(&mut self, runner: crate::shadow_runner::ShadowRunner) {
+        self.shadow = Some(runner);
+    }
+
+    /// Shift+F5: toggle the shadow bot on/off. With no model loaded, prints a
+    /// hint naming the `--shadow` flag instead.
+    pub fn toggle_shadow(&mut self) {
+        match self.shadow.as_mut() {
+            Some(sh) => sh.toggle(self.frame_count),
+            None => eprintln!(
+                "[shadow] no model loaded — launch with --shadow shadow/models/<name> \
+                 to arm the in-app shadow bot"
+            ),
+        }
+    }
+
     /// Append this frame to the trace, if recording. Called at the end of
     /// `run_frame` after the bus snapshot is refreshed (so actor fields are
     /// current). P1/P2 input masks come from the callback context — the
@@ -839,6 +861,8 @@ impl Frontend {
         let paused = {
             let mut ds = self.debug_state.lock().unwrap();
             ds.push_input(self.callback_context.input_state, self.frame_count);
+            // Mirror port 1 too so Lua `input.get(1)` has a cheap read.
+            ds.input_state2 = self.callback_context.input_state2;
             ds.frame_count = self.frame_count;
 
             if let Some(tf) = ds.trigger_frame {
@@ -922,6 +946,15 @@ impl Frontend {
         // drain next frame.
         if let Ok(mut ds) = self.debug_state.try_lock() {
             crate::training::tick(&mut ds, self.frame_count);
+        }
+
+        // --- Shadow bot (--shadow): decide every P frames while the fight
+        // gate is open and inject the sampled intent on port 1. Runs AFTER
+        // training::tick so its injection wins over a non-Free dummy preset.
+        if let Some(sh) = self.shadow.as_mut() {
+            if let Ok(mut ds) = self.debug_state.try_lock() {
+                sh.tick(&mut ds, self.frame_count);
+            }
         }
 
         // --- Capture bookmark if requested ---

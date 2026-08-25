@@ -344,3 +344,35 @@ def build(paths: list[Path], char_filter: int | None = None):
         "buckets": np.array(buckets),
         "rounds": keys,
     }
+
+
+# Cap on fully-idle decisions relative to everything else at FIT time. Real
+# demonstrations are ~90% (Neutral, None), which makes ~80% of kNN
+# neighborhoods vote unanimously idle — temperature sampling can't produce an
+# action from a unanimous jury, and a shadow that stands still stays in
+# standing-range states forever (an absorbing state; observed live: the first
+# deployed shadow never pressed a button). Subsampling idle decisions to
+# NEUTRAL_CAP_RATIO x the active count re-weights the case store without
+# inventing anything the user never did.
+NEUTRAL_CAP_RATIO = 2.5
+
+
+def subsample_neutral(data: dict, cap_ratio: float = NEUTRAL_CAP_RATIO, seed: int = 11) -> dict:
+    """Return a copy of `data` with (move=Neutral AND attack=None) decisions
+    randomly capped at cap_ratio x the count of all other decisions.
+    cap_ratio <= 0 disables. Apply at FIT time only — eval's held-out side
+    must keep the true distribution."""
+    if cap_ratio <= 0:
+        return data
+    idle = (data["y_move"] == 0) & (data["y_attack"] == 0)
+    n_active = int((~idle).sum())
+    n_keep = int(n_active * cap_ratio)
+    if idle.sum() <= n_keep or n_active == 0:
+        return data
+    rng = np.random.default_rng(seed)
+    idle_idx = np.flatnonzero(idle)
+    kept_idle = rng.choice(idle_idx, n_keep, replace=False)
+    keep = np.sort(np.concatenate([np.flatnonzero(~idle), kept_idle]))
+    out = {k: (v[keep] if isinstance(v, np.ndarray) else [v[i] for i in keep])
+           for k, v in data.items()}
+    return out

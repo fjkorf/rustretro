@@ -17,16 +17,42 @@
 //! memory.read_s16_be(addr)          -> integer (signed)
 //! memory.read_u16_le(addr)          -> integer  (little-endian)
 //! memory.read_u32_le(addr)          -> integer  (little-endian)
+//! memory.writebyte(addr, v)                     (GATED, see below)
+//! memory.writeword(addr, v)                     (16-bit guest big-endian; GATED)
+//! savestate.save(slot_or_path)      -> true     (queued; slot 1-9 or path string)
+//! savestate.load(slot_or_path)      -> true     (queued)
+//! input.set(port, mask_or_table)                (port 0/1; 2-frame hold)
+//! input.get(port)                   -> integer  (12-bit mask, last folded state)
 //! gui.drawBox(x1,y1,x2,y2, fill, line)
 //! gui.drawText(x,y, str [, color [, scale]])
+//! gui.text(x,y, str [, color [, scale]])        (drawText + 1px drop shadow)
 //! gui.drawLine(x1,y1,x2,y2, color)
 //! gui.drawPixel(x,y, color)
 //! event.onframeend(function)
 //! console.log(str)
 //! emu.framecount()                  -> integer
-//! _RUSTRETRO_API                    = 1  (version sentinel)
+//! _RUSTRETRO_API                    = 2  (version sentinel)
 //! ```
 //! Colors are packed RGBA u32: `0xRRGGBBAA`.
+//!
+//! ## FBNeo/FBA naming
+//! The write/savestate/input/gui.text names follow the FBNeo Lua conventions
+//! (`memory.writebyte`, `savestate.save`, `joypad`-style button tables,
+//! `gui.text`) because that ecosystem's scripts are our porting reference.
+//!
+//! ## Write gate
+//! `memory.writebyte`/`memory.writeword` are refused with a Lua error unless
+//! [`DebugState::lua_writes_enabled`] is on — armed by launching with
+//! `--training`, or at runtime by the MCP `enable_writes` tool (and re-locked
+//! by `disable_writes`). `savestate.load` is deliberately NOT behind that gate:
+//! scripts are user-authored and loading a state can't corrupt live RAM in a
+//! way the user didn't ask for — it's the same trust level as the F-key /
+//! `--load-state` paths, whereas raw pokes can wedge the emulated machine.
+//!
+//! ## Endianness of `memory.writeword`
+//! Guest (68k) order, i.e. big-endian: the HIGH byte lands at `addr`, matching
+//! how `memory.read_u16_be` reads. `writeword(a, v)` followed by
+//! `read_u16_be(a)` round-trips `v & 0xFFFF`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -49,12 +75,15 @@ pub enum DrawCmd {
     },
     /// Text label. `color` is packed `0xRRGGBBAA`. `scale` magnifies the 3×5
     /// bitmap font (each glyph pixel becomes a `scale`×`scale` block); 1 = native.
+    /// `shadow` adds a 1px black drop shadow (down-right, same alpha as `color`)
+    /// for legibility over bright game art — used by `gui.text`.
     Text {
         x: i32,
         y: i32,
         s: String,
         color: u32,
         scale: i32,
+        shadow: bool,
     },
     /// A straight line from (x1,y1) to (x2,y2). `color` is packed `0xRRGGBBAA`.
     Line {
@@ -84,6 +113,106 @@ fn read1(dbg: &SharedDebugState, addr: u32) -> mlua::Result<u8> {
     let b = ds.read_u8(addr).unwrap_or(0);
     drop(ds);
     Ok(b)
+}
+
+/// Shared body of the Lua memory-write bindings. Refuses (Lua error naming the
+/// gate) unless [`DebugState::lua_writes_enabled`] is on, then routes through
+/// `DebugState::write_addr` — which pokes the snapshot AND, for bus-window
+/// regions, queues the real poke for the live 68k bus. `le_value` carries the
+/// value bytes in ascending-address order exactly as `write_addr` expects; the
+/// `writeword` caller pre-swaps so the guest sees big-endian.
+fn write_guest(dbg: &SharedDebugState, addr: u32, len: usize, le_value: u32) -> mlua::Result<()> {
+    let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+    if !ds.lua_writes_enabled {
+        return Err(mlua::Error::RuntimeError(
+            "memory write blocked: the lua_writes_enabled gate is OFF \
+             (launch with --training or arm it via the MCP enable_writes tool)"
+                .to_string(),
+        ));
+    }
+    if !ds.write_addr(addr as usize, len, le_value) {
+        return Err(mlua::Error::RuntimeError(format!(
+            "memory write failed: no writable region contains 0x{addr:X}"
+        )));
+    }
+    Ok(())
+}
+
+/// Frames `input.set` holds each pressed button — the same 2-frame idiom as the
+/// training-mode dummy injection (`training::tick`): long enough to bridge into
+/// the next input fold, short enough that a per-frame callback re-asserting a
+/// button reads as continuously held and a dropped button releases in ≤2 frames.
+const INPUT_SET_HOLD_FRAMES: u16 = 2;
+
+/// Decode a 12-bit integer button mask (bit i = `RETRO_DEVICE_ID_JOYPAD` id i:
+/// 0=B 1=Y 2=Select 3=Start 4=Up 5=Down 6=Left 7=Right 8=A 9=X 10=L 11=R).
+fn buttons_from_mask(mask: i64) -> Result<[bool; 12], String> {
+    if !(0..=0xFFF).contains(&mask) {
+        return Err(format!(
+            "input.set: mask must be 0..=0xFFF (12 buttons), got {mask}"
+        ));
+    }
+    let mut bits = [false; 12];
+    for (i, b) in bits.iter_mut().enumerate() {
+        *b = (mask >> i) & 1 == 1;
+    }
+    Ok(bits)
+}
+
+/// Decode `{up=true, b=true, ...}`-style name/pressed pairs (RETRO button names,
+/// shared with the MCP `press_buttons` tool). Unknown names are an error so a
+/// typo ("bb") fails loudly instead of silently doing nothing.
+fn buttons_from_pairs(pairs: &[(String, bool)]) -> Result<[bool; 12], String> {
+    let mut bits = [false; 12];
+    for (name, pressed) in pairs {
+        let Some(i) = crate::mcp::server::joypad_button_index(name) else {
+            return Err(format!(
+                "input.set: unknown button '{name}' (valid: b y select start up down left right a x l r)"
+            ));
+        };
+        bits[i] = *pressed;
+    }
+    Ok(bits)
+}
+
+/// Pack a 12-button state into the `input.get` mask (bit i = button i pressed).
+fn mask_from_buttons(bits: &[bool; 12]) -> u32 {
+    bits.iter()
+        .enumerate()
+        .fold(0u32, |m, (i, b)| m | ((*b as u32) << i))
+}
+
+/// Parse the `savestate.save`/`savestate.load` argument: an integer 1-9 is a
+/// slot (resolved to `<save_dir>/<rom_stem>.stateN` by the Frontend), a string
+/// is a filesystem path. Anything else is an error.
+fn parse_state_target(v: &mlua::Value, load: bool) -> Result<crate::debug::StateOp, String> {
+    use crate::debug::StateOp;
+    let slot_op = |n: i64| -> Result<StateOp, String> {
+        if !(1..=9).contains(&n) {
+            return Err(format!("savestate: slot must be 1-9, got {n}"));
+        }
+        Ok(if load {
+            StateOp::LoadSlot(n as u8)
+        } else {
+            StateOp::SaveSlot(n as u8)
+        })
+    };
+    match v {
+        mlua::Value::Integer(n) => slot_op(*n),
+        mlua::Value::Number(f) if f.fract() == 0.0 => slot_op(*f as i64),
+        mlua::Value::String(s) => {
+            let p = s.to_string_lossy().trim().to_string();
+            if p.is_empty() {
+                return Err("savestate: path must be a non-empty string".to_string());
+            }
+            let pb = std::path::PathBuf::from(p);
+            Ok(if load { StateOp::Load(pb) } else { StateOp::Save(pb) })
+        }
+        other => Err(format!(
+            "savestate: expected a slot number (1-9) or a path string, got {}",
+            other.type_name()
+        )),
+    }
 }
 
 /// The Lua scripting engine. Owns the VM, the registered `event.onframeend`
@@ -207,7 +336,127 @@ impl LuaEngine {
             memory.set("read_u32_le", f)?;
         }
 
+        // writebyte(addr, v) — FBNeo-style name. GATED on lua_writes_enabled.
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, (addr, v): (u32, u32)| {
+                write_guest(&dbg, addr, 1, v & 0xFF)
+            })?;
+            memory.set("writebyte", f)?;
+        }
+
+        // writeword(addr, v) — 16-bit in GUEST (68k big-endian) order: high byte
+        // at addr, mirroring read_u16_be. write_addr wants ascending-address
+        // (little-endian) value bytes, so swap — same idiom as training::wr16be.
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, (addr, v): (u32, u32)| {
+                write_guest(&dbg, addr, 2, (v as u16).swap_bytes() as u32)
+            })?;
+            memory.set("writeword", f)?;
+        }
+
         globals.set("memory", memory)?;
+
+        // ── savestate.* ───────────────────────────────────────────────────────
+        // Queued, not immediate: core FFI may only happen on the emu thread, so
+        // save/load set `pending_state_op` and Frontend::drain_state_op applies
+        // it on the next frame. Returns true when enqueued; raises a Lua error
+        // when another op is still in flight. NOT behind the write gate (see
+        // module docs — user-authored scripts get the same trust as hotkeys).
+        let savestate = lua.create_table()?;
+        for (name, load) in [("save", false), ("load", true)] {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, v: mlua::Value| -> mlua::Result<bool> {
+                let op = parse_state_target(&v, load).map_err(mlua::Error::RuntimeError)?;
+                let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                if ds.pending_state_op.is_some() {
+                    return Err(mlua::Error::RuntimeError(
+                        "savestate: another save/load is already queued (ops apply on the \
+                         next frame drain) — retry on a later frame"
+                            .to_string(),
+                    ));
+                }
+                ds.pending_state_op = Some(op);
+                Ok(true)
+            })?;
+            savestate.set(name, f)?;
+        }
+        globals.set("savestate", savestate)?;
+
+        // ── input.* ───────────────────────────────────────────────────────────
+        let input = lua.create_table()?;
+
+        // set(port, mask_or_table) — port 0 (P1) / 1 (P2). Accepts a 12-bit
+        // integer mask (bit i = RETRO id i) or {up=true, b=true, ...} with RETRO
+        // names. Overwrites ALL 12 hold counters: pressed → 2-frame hold,
+        // absent/false → released (same idiom as the training dummy), so a
+        // per-frame onframeend callback holding a button "just works".
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, (port, spec): (u32, mlua::Value)| {
+                if port > 1 {
+                    return Err(mlua::Error::RuntimeError(
+                        "input.set: port must be 0 (P1) or 1 (P2)".to_string(),
+                    ));
+                }
+                let bits = match &spec {
+                    mlua::Value::Integer(m) => buttons_from_mask(*m),
+                    mlua::Value::Number(f) if f.fract() == 0.0 => buttons_from_mask(*f as i64),
+                    mlua::Value::Table(t) => {
+                        let mut pairs = Vec::new();
+                        for kv in t.clone().pairs::<String, mlua::Value>() {
+                            let (k, v) = kv.map_err(|e| {
+                                mlua::Error::RuntimeError(format!(
+                                    "input.set: button table keys must be strings: {e}"
+                                ))
+                            })?;
+                            // Lua truthiness: only false/nil mean released.
+                            let pressed =
+                                !matches!(v, mlua::Value::Nil | mlua::Value::Boolean(false));
+                            pairs.push((k, pressed));
+                        }
+                        buttons_from_pairs(&pairs)
+                    }
+                    other => Err(format!(
+                        "input.set: expected an integer mask or a button table, got {}",
+                        other.type_name()
+                    )),
+                }
+                .map_err(mlua::Error::RuntimeError)?;
+                let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                let arr = if port == 1 {
+                    &mut ds.injected_input2
+                } else {
+                    &mut ds.injected_input
+                };
+                for (i, on) in bits.iter().enumerate() {
+                    arr[i] = if *on { INPUT_SET_HOLD_FRAMES } else { 0 };
+                }
+                Ok(())
+            })?;
+            input.set("set", f)?;
+        }
+
+        // get(port) -> integer mask of the port's CURRENT buttons (the state fed
+        // to the core on the last input fold — keyboard/pad OR injected). Cheap:
+        // the frontend mirrors both ports into DebugState each frame.
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, port: u32| -> mlua::Result<u32> {
+                if port > 1 {
+                    return Err(mlua::Error::RuntimeError(
+                        "input.get: port must be 0 (P1) or 1 (P2)".to_string(),
+                    ));
+                }
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                let bits = if port == 1 { ds.input_state2 } else { ds.input_state };
+                Ok(mask_from_buttons(&bits))
+            })?;
+            input.set("get", f)?;
+        }
+
+        globals.set("input", input)?;
 
         // ── gui.* ─────────────────────────────────────────────────────────────
         let gui = lua.create_table()?;
@@ -244,11 +493,32 @@ impl LuaEngine {
                         color: color.unwrap_or(0xFFFF_FFFF),
                         // Default native scale; clamp so a bad value can't draw nothing.
                         scale: scale.unwrap_or(1).max(1),
+                        shadow: false,
                     });
                     Ok(())
                 },
             )?;
             gui.set("drawText", f)?;
+        }
+
+        // text(x, y, str [, color [, scale]]) — FBNeo-style name: drawText plus
+        // a 1px black drop shadow so labels stay legible over bright game art.
+        {
+            let buf = Rc::clone(draw_cmds);
+            let f = lua.create_function(
+                move |_, (x, y, s, color, scale): (i32, i32, String, Option<u32>, Option<i32>)| {
+                    buf.borrow_mut().push(DrawCmd::Text {
+                        x,
+                        y,
+                        s,
+                        color: color.unwrap_or(0xFFFF_FFFF),
+                        scale: scale.unwrap_or(1).max(1),
+                        shadow: true,
+                    });
+                    Ok(())
+                },
+            )?;
+            gui.set("text", f)?;
         }
 
         // drawLine(x1,y1,x2,y2, color)
@@ -323,8 +593,9 @@ impl LuaEngine {
         globals.set("emu", emu)?;
 
         // ── version sentinel ──────────────────────────────────────────────────
-        // Scripts can check `if _RUSTRETRO_API >= 1 then … end` to feature-detect.
-        globals.set("_RUSTRETRO_API", 1u32)?;
+        // Scripts can check `if _RUSTRETRO_API >= 2 then … end` to feature-detect
+        // (2 added memory.write*, savestate.*, input.*, gui.text).
+        globals.set("_RUSTRETRO_API", 2u32)?;
 
         Ok(())
     }
@@ -494,7 +765,13 @@ pub fn composite_into_rgba(cmds: &[DrawCmd], rgba: &mut [u8], width: u32, height
                     }
                 }
             }
-            DrawCmd::Text { x, y, ref s, color, scale } => {
+            DrawCmd::Text { x, y, ref s, color, scale, shadow } => {
+                if shadow {
+                    // 1px down-right drop shadow: same string in black, keeping
+                    // the source alpha (low byte) so translucent text shadows
+                    // translucently.
+                    draw_text(rgba, w, h, x + 1, y + 1, s, color & 0xFF, scale);
+                }
                 draw_text(rgba, w, h, x, y, s, color, scale);
             }
             DrawCmd::Line { x1, y1, x2, y2, color } => {
@@ -676,8 +953,174 @@ fn glyph(ch: char) -> [u8; 5] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::debug::{BusWindowCfg, DebugState, StateOp};
+    use std::sync::{Arc, Mutex};
 
     const BLOCK: [u8; 5] = [0b111, 0b111, 0b111, 0b111, 0b111];
+
+    /// A LuaEngine over a DebugState with one writable Work-RAM bus window at
+    /// 0x400000 (owned snapshot buffer + pending_bus_writes queue — no core).
+    fn engine_with_ram() -> (LuaEngine, SharedDebugState) {
+        let dbg: SharedDebugState = Arc::new(Mutex::new(DebugState::new()));
+        assert!(dbg.lock().unwrap().install_bus_window(BusWindowCfg {
+            name: "Work RAM".into(),
+            addr: 0x400000,
+            len: 0x1000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let eng = LuaEngine::new(SharedDebugState::clone(&dbg)).unwrap();
+        (eng, dbg)
+    }
+
+    #[test]
+    fn write_gate_blocks_then_allows() {
+        let (eng, dbg) = engine_with_ram();
+        // Gate off (default): the write raises an error NAMING the gate.
+        let err = eng
+            .eval_to_string("memory.writebyte(0x400010, 0xAB)")
+            .unwrap_err();
+        assert!(err.contains("lua_writes_enabled"), "error must name the gate: {err}");
+        assert!(dbg.lock().unwrap().pending_bus_writes.is_empty());
+
+        // Armed: the write lands in the snapshot AND the live-bus queue.
+        dbg.lock().unwrap().lua_writes_enabled = true;
+        eng.eval_to_string("memory.writebyte(0x400010, 0xAB)").unwrap();
+        {
+            let ds = dbg.lock().unwrap();
+            assert_eq!(ds.read_u8(0x400010), Some(0xAB));
+            assert_eq!(ds.pending_bus_writes, vec![(0x400010, vec![0xAB])]);
+        }
+        // Out-of-map address: distinct error, nothing queued.
+        let err = eng
+            .eval_to_string("memory.writebyte(0xDEAD0000, 1)")
+            .unwrap_err();
+        assert!(err.contains("no writable region"), "{err}");
+    }
+
+    #[test]
+    fn writeword_is_guest_big_endian() {
+        let (eng, dbg) = engine_with_ram();
+        dbg.lock().unwrap().lua_writes_enabled = true;
+        eng.eval_to_string("memory.writeword(0x400020, 0x1234)").unwrap();
+        {
+            let ds = dbg.lock().unwrap();
+            // High byte at the lower address — guest (68k) big-endian order.
+            assert_eq!(ds.read_u8(0x400020), Some(0x12));
+            assert_eq!(ds.read_u8(0x400021), Some(0x34));
+            // The live-bus queue carries the same ascending-address bytes.
+            assert_eq!(ds.pending_bus_writes, vec![(0x400020, vec![0x12, 0x34])]);
+        }
+        // Round-trips through the matching BE read.
+        assert_eq!(
+            eng.eval_to_string("memory.read_u16_be(0x400020)").unwrap(),
+            "4660" // 0x1234
+        );
+    }
+
+    #[test]
+    fn savestate_enqueues_slots_and_paths_and_refuses_in_flight() {
+        let (eng, dbg) = engine_with_ram();
+        // Slot save enqueues; returns true.
+        assert_eq!(eng.eval_to_string("savestate.save(3)").unwrap(), "true");
+        assert_eq!(
+            dbg.lock().unwrap().pending_state_op,
+            Some(StateOp::SaveSlot(3))
+        );
+        // A second op while one is queued is an error, and the queue is untouched.
+        let err = eng.eval_to_string("savestate.load(2)").unwrap_err();
+        assert!(err.contains("already queued"), "{err}");
+        assert_eq!(
+            dbg.lock().unwrap().pending_state_op.take(),
+            Some(StateOp::SaveSlot(3))
+        );
+        // Path form (string) → Load(path).
+        assert_eq!(
+            eng.eval_to_string("savestate.load('/tmp/rr_test.state')").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            dbg.lock().unwrap().pending_state_op.take(),
+            Some(StateOp::Load(std::path::PathBuf::from("/tmp/rr_test.state")))
+        );
+        // Bad slots / types are errors and enqueue nothing.
+        for bad in ["savestate.save(0)", "savestate.save(10)", "savestate.save(true)"] {
+            assert!(eng.eval_to_string(bad).is_err(), "{bad} should fail");
+        }
+        assert!(dbg.lock().unwrap().pending_state_op.is_none());
+    }
+
+    #[test]
+    fn buttons_mask_and_pairs_parse() {
+        // Mask decode: bit i = RETRO id i.
+        let b = buttons_from_mask(0b0000_1001_0000).unwrap(); // Up(4) + Right(7)
+        assert!(b[4] && b[7]);
+        assert_eq!(b.iter().filter(|x| **x).count(), 2);
+        assert_eq!(mask_from_buttons(&b), 0b0000_1001_0000);
+        // Out-of-range masks refused.
+        assert!(buttons_from_mask(-1).is_err());
+        assert!(buttons_from_mask(0x1000).is_err());
+        // Name pairs (case-insensitive, shared with MCP press_buttons).
+        let b = buttons_from_pairs(&[("Right".into(), true), ("b".into(), true)]).unwrap();
+        assert!(b[7] && b[0]);
+        // Unknown names fail loudly.
+        let err = buttons_from_pairs(&[("bb".into(), true)]).unwrap_err();
+        assert!(err.contains("unknown button 'bb'"), "{err}");
+    }
+
+    #[test]
+    fn input_set_writes_hold_counters_and_validates() {
+        let (eng, dbg) = engine_with_ram();
+        // Table form on port 1 → 2-frame holds on injected_input2 only.
+        eng.eval_to_string("input.set(1, {right=true, b=true})").unwrap();
+        {
+            let ds = dbg.lock().unwrap();
+            assert_eq!(ds.injected_input2[7], 2);
+            assert_eq!(ds.injected_input2[0], 2);
+            assert_eq!(ds.injected_input2.iter().filter(|c| **c > 0).count(), 2);
+            assert_eq!(ds.injected_input, [0u16; 12], "P1 untouched");
+        }
+        // Mask form on port 0; a later set(0, 0) releases everything.
+        eng.eval_to_string("input.set(0, 0x30)").unwrap(); // Up+Down
+        assert_eq!(dbg.lock().unwrap().injected_input[4], 2);
+        assert_eq!(dbg.lock().unwrap().injected_input[5], 2);
+        eng.eval_to_string("input.set(0, 0)").unwrap();
+        assert_eq!(dbg.lock().unwrap().injected_input, [0u16; 12]);
+        // Bad port / bad button / bad type all raise.
+        assert!(eng.eval_to_string("input.set(2, 0)").is_err());
+        assert!(eng.eval_to_string("input.set(0, {zz=true})").is_err());
+        assert!(eng.eval_to_string("input.set(0, 'up')").is_err());
+    }
+
+    #[test]
+    fn input_get_returns_mirrored_masks() {
+        let (eng, dbg) = engine_with_ram();
+        {
+            let mut ds = dbg.lock().unwrap();
+            ds.input_state[7] = true; // P1 Right
+            ds.input_state2[0] = true; // P2 B
+        }
+        assert_eq!(eng.eval_to_string("input.get(0)").unwrap(), "128");
+        assert_eq!(eng.eval_to_string("input.get(1)").unwrap(), "1");
+        assert!(eng.eval_to_string("input.get(2)").is_err());
+    }
+
+    #[test]
+    fn gui_text_pushes_shadowed_command() {
+        let (eng, _dbg) = engine_with_ram();
+        eng.eval_to_string("gui.text(2, 3, 'HI', 0x00FF00FF)").unwrap();
+        eng.eval_to_string("gui.drawText(4, 5, 'YO')").unwrap();
+        let cmds = eng.take_draw_cmds();
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(
+            &cmds[0],
+            DrawCmd::Text { x: 2, y: 3, s, color: 0x00FF00FF, shadow: true, .. } if s == "HI"
+        ));
+        assert!(matches!(
+            &cmds[1],
+            DrawCmd::Text { shadow: false, .. }
+        ));
+    }
 
     /// Count font pixels (set bits) in a glyph.
     fn glyph_popcount(g: &[u8; 5]) -> u32 {
@@ -763,10 +1206,40 @@ mod tests {
             s: "8".to_string(),
             color: 0xFFFF_FFFF,
             scale: 2,
+            shadow: false,
         }];
         composite_into_rgba(&cmds, &mut rgba, w, h);
         let pop = glyph_popcount(&glyph('8')) as usize;
         assert_eq!(count_red(&rgba, 0xFF), pop * 4);
+    }
+
+    #[test]
+    fn text_shadow_darkens_offset_pixels() {
+        // Mid-gray background so a BLACK shadow is measurable (on black it
+        // would be invisible). shadow=true must produce (a) full-white glyph
+        // pixels and (b) some pixels DARKER than the background at the +1,+1
+        // offset; shadow=false must produce no darkened pixels at all.
+        let (w, h) = (64u32, 32u32);
+        let render = |shadow: bool| {
+            let mut rgba = vec![0x80u8; (w * h * 4) as usize];
+            let cmds = vec![DrawCmd::Text {
+                x: 4,
+                y: 4,
+                s: "I".to_string(),
+                color: 0xFFFF_FFFF,
+                scale: 1,
+                shadow,
+            }];
+            composite_into_rgba(&cmds, &mut rgba, w, h);
+            rgba
+        };
+        let with = render(true);
+        let without = render(false);
+        let dark = |buf: &[u8]| buf.chunks_exact(4).filter(|p| p[0] < 0x80).count();
+        let pop = glyph_popcount(&glyph('I')) as usize;
+        assert_eq!(count_red(&with, 0xFF), pop, "glyph must render over shadow");
+        assert!(dark(&with) > 0, "shadow must darken offset pixels");
+        assert_eq!(dark(&without), 0, "drawText (no shadow) must not darken");
     }
 
     #[test]

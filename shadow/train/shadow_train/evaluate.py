@@ -51,10 +51,22 @@ def _js_distance(p: np.ndarray, q: np.ndarray) -> float:
     return float(np.sqrt(max(0.0, (kl(p, m) + kl(q, m)) / 2)))
 
 
-def evaluate(data: dict, k: int = 15, holdout_frac: float = 0.2, seed: int = 7):
+def evaluate(data: dict, k: int = 15, holdout_frac: float = 0.2, seed: int = 7,
+             neutral_cap: float | None = None):
+    from .dataset import NEUTRAL_CAP_RATIO, subsample_neutral
+
+    if neutral_cap is None:
+        neutral_cap = NEUTRAL_CAP_RATIO
     train_idx, test_idx = split_by_round(data, holdout_frac, seed=seed)
     X, ym, ya, buckets = data["X"], data["y_move"], data["y_attack"], data["buckets"]
-    policy = KnnPolicy(k=k).fit(X[train_idx], ym[train_idx], ya[train_idx])
+    # Fit-side neutral cap mirrors what `fit` ships (deploy parity); the
+    # held-out side keeps the true distribution.
+    train = subsample_neutral(
+        {"X": X[train_idx], "y_move": ym[train_idx], "y_attack": ya[train_idx],
+         "buckets": buckets[train_idx], "rounds": [data["rounds"][i] for i in train_idx]},
+        cap_ratio=neutral_cap,
+    )
+    policy = KnnPolicy(k=k).fit(train["X"], train["y_move"], train["y_attack"])
     rng = np.random.default_rng(seed)
 
     pred_m = np.empty(len(test_idx), dtype=int)
@@ -65,12 +77,12 @@ def evaluate(data: dict, k: int = 15, holdout_frac: float = 0.2, seed: int = 7):
         pred_m[j], pred_a[j] = policy.predict(X[i])
         samp_m[j], samp_a[j] = policy.predict(X[i], rng=rng)
 
-    report = {"n_train": len(train_idx), "n_test": len(test_idx), "buckets": {}}
+    report = {"n_train": len(train["X"]), "n_test": len(test_idx), "buckets": {}}
     tb = buckets[test_idx]
     for b in sorted(set(buckets)):
         mask = tb == b
         n = int(mask.sum())
-        entry = {"n_test": n, "n_train": int((buckets[train_idx] == b).sum())}
+        entry = {"n_test": n, "n_train": int((train["buckets"] == b).sum())}
         if n:
             tm, ta = ym[test_idx][mask], ya[test_idx][mask]
             entry["move_acc"] = float((pred_m[mask] == tm).mean())

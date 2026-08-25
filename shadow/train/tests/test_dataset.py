@@ -155,3 +155,25 @@ class BucketIntegrationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSubsampleNeutral(unittest.TestCase):
+    def test_caps_idle_and_keeps_all_active(self):
+        import numpy as np
+        from shadow_train.dataset import subsample_neutral
+        n = 1000
+        y_move = np.zeros(n, dtype=int)
+        y_attack = np.zeros(n, dtype=int)
+        y_move[:50] = 1          # 50 active-by-move
+        y_attack[50:80] = 2      # 30 active-by-attack
+        data = {"X": np.arange(n * 2, dtype=np.float32).reshape(n, 2),
+                "y_move": y_move, "y_attack": y_attack,
+                "buckets": np.array(["neutral"] * n),
+                "rounds": [("f", 1, 0)] * n}
+        out = subsample_neutral(data, cap_ratio=2.0)
+        idle = (out["y_move"] == 0) & (out["y_attack"] == 0)
+        self.assertEqual(int((~idle).sum()), 80)          # every active kept
+        self.assertEqual(int(idle.sum()), 160)            # 2.0 x 80
+        self.assertEqual(len(out["rounds"]), len(out["X"]))
+        # disabled path returns data unchanged
+        self.assertIs(subsample_neutral(data, cap_ratio=0), data)
