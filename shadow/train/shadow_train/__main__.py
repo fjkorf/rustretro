@@ -49,6 +49,12 @@ def _label_counts(y, classes: list[str]) -> dict:
 
 def cmd_fit(args) -> None:
     data = build(args.recordings, char_filter=args.char)
+    n_raw = len(data["X"])
+    neutral_cap = getattr(args, "neutral_cap", dataset.NEUTRAL_CAP_RATIO)
+    data = dataset.subsample_neutral(data, cap_ratio=neutral_cap)
+    if len(data["X"]) < n_raw:
+        print(f"neutral cap: {n_raw} -> {len(data['X'])} decisions "
+              f"(idle capped at {neutral_cap}x active)")
     policy = KnnPolicy(k=args.k).fit(data["X"], data["y_move"], data["y_attack"])
 
     out_dir = Path(args.out)
@@ -60,6 +66,7 @@ def cmd_fit(args) -> None:
         "attack_classes": ATTACK_CLASSES,
         "k": policy.k,
         "temperature": policy.temperature,
+        "neutral_cap": neutral_cap,
         "char_filter": args.char,
         "source_files": [str(p) for p in args.recordings],
         "n_decisions": int(len(data["X"])),
@@ -113,6 +120,9 @@ def main():
     p_fit.add_argument("--char", type=int, default=None,
                         help="me character id filter (per-char models, SPEC §6)")
     p_fit.add_argument("--k", type=int, default=15)
+    p_fit.add_argument("--neutral-cap", type=float, default=dataset.NEUTRAL_CAP_RATIO,
+                        help="cap idle (Neutral,None) decisions at this ratio x "
+                             "active decisions; 0 disables (default %(default)s)")
     p_fit.set_defaults(func=cmd_fit)
 
     p_eval = sub.add_parser("eval", help="build + round-holdout evaluate")

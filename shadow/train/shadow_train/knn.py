@@ -61,12 +61,25 @@ class KnnPolicy:
             policy.y_attack = data["y_attack"]
         return policy
 
-    def _neighbors(self, x: np.ndarray) -> np.ndarray:
-        d = np.linalg.norm(self.X - (x - self.mu) / self.sd, axis=1)
-        return np.argsort(d)[: self.k]
+    # Soft retrieval widens the electorate beyond the top-k: the k nearest
+    # cases set the distance scale (sigma = the k-th neighbor's distance), and
+    # every case within WIDE_K votes with weight exp(-(d/sigma)^2). Cure for
+    # the absorbing-state failure: in a "both standing at range" state whose
+    # top-15 are unanimously idle, the nearest ATTACK case a little further
+    # out now gets real (small) probability instead of exactly zero — while
+    # states with nearby active cases behave as before.
+    WIDE_K = 100
 
-    def _vote(self, labels: np.ndarray, n_classes: int) -> np.ndarray:
-        counts = np.bincount(labels, minlength=n_classes).astype(np.float64)
+    def _weighted_neighbors(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        d = np.linalg.norm(self.X - (x - self.mu) / self.sd, axis=1)
+        order = np.argsort(d)[: max(self.k, self.WIDE_K)]
+        sigma = max(float(d[order[min(self.k, len(order)) - 1]]), 1e-6)
+        w = np.exp(-((d[order] / sigma) ** 2))
+        return order, w
+
+    def _vote(self, labels: np.ndarray, weights: np.ndarray, n_classes: int) -> np.ndarray:
+        counts = np.zeros(n_classes)
+        np.add.at(counts, labels, weights)
         if self.temperature <= 0:  # argmax
             p = np.zeros(n_classes)
             p[counts.argmax()] = 1.0
@@ -76,8 +89,8 @@ class KnnPolicy:
         return p / p.sum()
 
     def predict_proba(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        idx = self._neighbors(x)
-        return self._vote(self.y_move[idx], 9), self._vote(self.y_attack[idx], 6)
+        idx, w = self._weighted_neighbors(x)
+        return self._vote(self.y_move[idx], w, 9), self._vote(self.y_attack[idx], w, 6)
 
     def predict(self, x: np.ndarray, rng: np.random.Generator | None = None):
         pm, pa = self.predict_proba(x)
