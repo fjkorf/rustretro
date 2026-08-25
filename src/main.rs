@@ -9,6 +9,7 @@ mod lua_engine;
 mod record;
 mod mcp;
 mod training;
+mod input_config;
 
 use anyhow::Result;
 use audio::AudioOutput;
@@ -64,6 +65,17 @@ struct Args {
     /// Hotkeys: F1 cycle dummy, F2 reset positions, F3 toggle refill,
     /// F4 finish round.
     #[arg(long)] training: bool,
+    /// Input mapping file (see src/input_config.rs). Default search:
+    /// <save-dir>/<rom>.keymap.json, then <save-dir>/keymap.json, then the
+    /// built-in maps.
+    #[arg(long, value_name = "PATH")] keymap: Option<PathBuf>,
+    /// Print the active input mapping as JSON to stdout and exit — the
+    /// starting point for a hand-edited keymap file.
+    #[arg(long)] dump_keymap: bool,
+    /// Interactive controller calibration: prompts on stderr for each game
+    /// action, captures the next gamepad button press, writes
+    /// <save-dir>/keymap.json and exits. Esc skips a step.
+    #[arg(long)] calibrate: bool,
 }
 
 // ─── Bevy resources ──────────────────────────────────────────────────────────
@@ -124,6 +136,13 @@ fn main() -> Result<()> {
     eprintln!("Core: {}", args.core);
     eprintln!("ROM:  {}", args.rom);
     eprintln!("Press F12 to toggle debug overlay, Space to pause.");
+
+    // Input mapping: resolve config, honor --dump-keymap before anything else.
+    let keymap_cfg = input_config::InputConfig::load(&args.keymap, &args.save_dir, &args.rom);
+    if args.dump_keymap {
+        println!("{}", serde_json::to_string_pretty(&keymap_cfg).unwrap());
+        return Ok(());
+    }
 
     let debug_state: SharedDebugState = Arc::new(Mutex::new(DebugState::new()));
 
@@ -205,13 +224,15 @@ fn main() -> Result<()> {
         .insert_resource(AudioRes(AudioOutput::new(!args.no_audio)))
         .insert_resource(WindowScale(args.scale))
         .insert_resource(PadDebug(args.pad_debug))
+        .insert_resource(keymap_cfg)
+        .insert_resource(CalibrateState::new(args.calibrate, &args.save_dir))
         .insert_resource(DebugOverlay(debug::window::DebugApp::new(debug_state)))
         .insert_non_send_resource(LuaRes(lua_engine))
         .insert_resource(ScriptPanel::new())
         .init_resource::<LituiPages>()
         .init_resource::<TutorialPages>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (read_input, run_emulation, run_scripts, drain_lua_requests, sync_video, queue_audio, update_title).chain())
+        .add_systems(Update, (calibrate_wizard, read_input, run_emulation, run_scripts, drain_lua_requests, sync_video, queue_audio, update_title).chain())
         .add_systems(EguiPrimaryContextPass, (show_debug, show_script_panel, show_litui_pages, show_tutorial_pages))
         .run();
 
@@ -339,41 +360,120 @@ fn setup(
 
 // ─── Input ───────────────────────────────────────────────────────────────────
 
-/// Analog→digital threshold for the left stick (libretro convention; high on
-/// purpose for fighting-game inputs — no drift-diagonals). Irrelevant when a
-/// stick reports its lever as a d-pad (e.g. Mayflash F300 in DP mode).
-const STICK_DEADZONE: f32 = 0.5;
+/// Interactive controller calibration (--calibrate): prompts through the
+/// wizard steps on stderr, captures one gamepad button per game action,
+/// writes keymap.json, exits. Eliminates every "which physical button was
+/// that" ambiguity — the user answers by pressing, never by describing.
+#[derive(Resource)]
+struct CalibrateState {
+    active: bool,
+    step: usize,
+    announced: bool,
+    captured: std::collections::BTreeMap<GamepadButton, Vec<input_config::RetroButton>>,
+    out_path: PathBuf,
+}
 
-/// Physical pad → RETRO joypad order (B Y Sel St U D L R A X L R).
-/// D-pad and left stick both drive directions, so hat-vs-axis lever modes both
-/// work. Button layout calibrated live 2026-08-24 on a Mayflash F300
-/// fightstick in **PS3/DInput + DPad mode** (gilrs default mapping; XInput
-/// mode has a different, incomplete element order — keep the switch on
-/// DInput): top row L→R = South/West/North/East, bottom row L→R =
-/// RightTrigger/LeftTrigger/RightTrigger2/Mode, dedicated Start button =
-/// LeftTrigger2. Asura Blade (fbalpha2012 source + live injection test)
-/// polls exactly three attacks: RETRO B = Light, A = Medium, Y = Heavy;
-/// X/L/R never polled. Top row = L/M/H in cabinet order; bottom-1 = weapon
-/// toss (L+M+H chord), bottom-4 = launcher (any-2 chord, "Bash Attack").
-fn pad_bits(pad: &Gamepad) -> [bool; 12] {
-    use GamepadButton::*;
-    let stick = pad.left_stick(); // +y = up in bevy
-    let toss = pad.pressed(RightTrigger); // bottom-1 → L+M+H chord
-    let launcher = pad.pressed(Mode); // bottom-4 → L+M chord (Bash Attack)
-    [
-        pad.pressed(South) || toss || launcher, // top-1 → B (Light)
-        pad.pressed(North) || toss,             // top-3 → Y (Heavy)
-        pad.pressed(LeftTrigger),               // bottom-2 → Select (coin)
-        pad.pressed(RightTrigger2) || pad.pressed(LeftTrigger2), // bottom-3 / Start btn → Start
-        pad.pressed(DPadUp) || stick.y > STICK_DEADZONE,
-        pad.pressed(DPadDown) || stick.y < -STICK_DEADZONE,
-        pad.pressed(DPadLeft) || stick.x < -STICK_DEADZONE,
-        pad.pressed(DPadRight) || stick.x > STICK_DEADZONE,
-        pad.pressed(West) || toss || launcher,  // top-2 → A (Medium)
-        pad.pressed(East),                      // top-4 → X (unpolled by this game)
-        false,                                  // L unpolled (keyboard Q still maps)
-        false,                                  // R unpolled by this game
+impl CalibrateState {
+    fn new(active: bool, save_dir: &std::path::Path) -> Self {
+        CalibrateState {
+            active,
+            step: 0,
+            announced: false,
+            captured: Default::default(),
+            out_path: input_config::InputConfig::global_path(save_dir),
+        }
+    }
+}
+
+/// (prompt, RETRO bits the captured button will emit)
+fn calibrate_steps() -> Vec<(&'static str, Vec<input_config::RetroButton>)> {
+    use input_config::RetroButton::*;
+    vec![
+        ("LIGHT attack", vec![B]),
+        ("MEDIUM attack", vec![A]),
+        ("HEAVY attack", vec![Y]),
+        ("WEAPON TOSS (chord: all three attacks)", vec![B, A, Y]),
+        ("LAUNCHER (chord: two attacks)", vec![B, A]),
+        ("COIN / select", vec![Select]),
+        ("START", vec![Start]),
     ]
+}
+
+fn calibrate_wizard(
+    mut cal: ResMut<CalibrateState>,
+    pads: Query<&Gamepad>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cfg: ResMut<input_config::InputConfig>,
+) {
+    if !cal.active {
+        return;
+    }
+    let steps = calibrate_steps();
+    if cal.step >= steps.len() {
+        // Finish: keep keyboard maps + deadzone from the active config, use
+        // the captured gamepad map (plus lever passthrough) on both ports.
+        use input_config::RetroButton::{Down, Left, Right, Up};
+        let mut gp = cal.captured.clone();
+        for (b, d) in [
+            (GamepadButton::DPadUp, Up),
+            (GamepadButton::DPadDown, Down),
+            (GamepadButton::DPadLeft, Left),
+            (GamepadButton::DPadRight, Right),
+        ] {
+            gp.entry(b).or_insert_with(|| vec![d]);
+        }
+        for port in cfg.ports.iter_mut() {
+            port.gamepad = gp.clone();
+        }
+        let json = serde_json::to_string_pretty(&*cfg).unwrap();
+        match std::fs::write(&cal.out_path, &json) {
+            Ok(()) => eprintln!(
+                "[calibrate] wrote {} — relaunch (without --calibrate) to play",
+                cal.out_path.display()
+            ),
+            Err(e) => eprintln!("[calibrate] FAILED to write {}: {e}", cal.out_path.display()),
+        }
+        std::process::exit(0);
+    }
+    let (prompt, bits) = &steps[cal.step];
+    if !cal.announced {
+        eprintln!(
+            "[calibrate] step {}/{}: press the button for {prompt}  (Esc = skip)",
+            cal.step + 1,
+            steps.len()
+        );
+        cal.announced = true;
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        eprintln!("[calibrate] skipped");
+        cal.step += 1;
+        cal.announced = false;
+        return;
+    }
+    let Some(pad) = pads.iter().next() else { return };
+    let fresh: Option<GamepadButton> = pad
+        .get_just_pressed()
+        .copied()
+        .find(|b| {
+            !matches!(
+                b,
+                GamepadButton::DPadUp
+                    | GamepadButton::DPadDown
+                    | GamepadButton::DPadLeft
+                    | GamepadButton::DPadRight
+            )
+        });
+    if let Some(btn) = fresh {
+        if cal.captured.contains_key(&btn) {
+            eprintln!("[calibrate] {btn:?} is already assigned — press a different button");
+            return;
+        }
+        eprintln!("[calibrate]   {prompt} = {btn:?}");
+        let bits = bits.clone();
+        cal.captured.insert(btn, bits);
+        cal.step += 1;
+        cal.announced = false;
+    }
 }
 
 fn read_input(
@@ -385,47 +485,34 @@ fn read_input(
     mut litui: ResMut<LituiPages>,
     mut tutorials: ResMut<TutorialPages>,
     pad_debug: Res<PadDebug>,
+    cfg: Res<input_config::InputConfig>,
     mut last_pad_dbg: Local<String>,
 ) {
     use KeyCode::*;
-    // Order = RETRO_DEVICE_ID_JOYPAD: B Y Select Start Up Down Left Right A X L R.
-    let mut bits = [
-        keys.pressed(KeyZ),
-        keys.pressed(KeyA),
-        keys.pressed(ShiftLeft) || keys.pressed(ShiftRight),
-        keys.pressed(Enter),
-        keys.pressed(ArrowUp),
-        keys.pressed(ArrowDown),
-        keys.pressed(ArrowLeft),
-        keys.pressed(ArrowRight),
-        keys.pressed(KeyX),
-        keys.pressed(KeyS),
-        keys.pressed(KeyQ),
-        keys.pressed(KeyW),
-    ];
-    // P2 keymap — disjoint from P1's keys and the F*/Space/B hotkeys: IJKL move,
-    // G/H = B/Y, T/Y = A/X, U/O = L/R, N/M = Select/Start.
-    let mut bits2 = [
-        keys.pressed(KeyG),
-        keys.pressed(KeyH),
-        keys.pressed(KeyN),
-        keys.pressed(KeyM),
-        keys.pressed(KeyI),
-        keys.pressed(KeyK),
-        keys.pressed(KeyJ),
-        keys.pressed(KeyL),
-        keys.pressed(KeyT),
-        keys.pressed(KeyY),
-        keys.pressed(KeyU),
-        keys.pressed(KeyO),
-    ];
-    // Fold physical gamepads: lowest entity id → P1, next → P2 (keyboard still
-    // live — OR, not replace). Note: replugging mid-session can reorder pads.
+    // Keyboard bindings per port, from the active keymap config.
+    let mut bits = input_config::key_bits(|k| keys.pressed(k), &cfg.ports[0]);
+    let mut bits2 = if cfg.ports.len() > 1 {
+        input_config::key_bits(|k| keys.pressed(k), &cfg.ports[1])
+    } else {
+        [false; 12]
+    };
+    // Fold physical gamepads: lowest entity id → slot 0, routed to ports via
+    // cfg.pad_order (keyboard still live — OR, not replace). Replugging
+    // mid-session can reorder pads; pad_order [1,0] swaps two pads.
     let mut pad_list: Vec<_> = pads.iter().collect();
     pad_list.sort_by_key(|(e, _)| *e);
     for (slot, (_, pad)) in pad_list.iter().take(2).enumerate() {
-        let gb = pad_bits(pad);
-        let target = if slot == 0 { &mut bits } else { &mut bits2 };
+        let port = cfg.pad_order.get(slot).copied().unwrap_or(slot);
+        if port >= cfg.ports.len().min(2) {
+            continue;
+        }
+        let gb = input_config::pad_bits(
+            |b| pad.pressed(b),
+            pad.left_stick(),
+            &cfg.ports[port],
+            cfg.stick_deadzone,
+        );
+        let target = if port == 0 { &mut bits } else { &mut bits2 };
         for i in 0..12 {
             target[i] |= gb[i];
         }
@@ -516,8 +603,29 @@ fn read_input(
 
 // ─── Emulation ───────────────────────────────────────────────────────────────
 
-fn run_emulation(mut emu: NonSendMut<Emu>) {
-    let _ = emu.0.run_frame();
+/// Pace emulation to the core's fps regardless of display refresh. Bevy's
+/// Update schedule runs at the panel rate (120 Hz on ProMotion), and calling
+/// run_frame unconditionally ran the game at 2x. Accumulate real time and run
+/// whole emulated frames as the budget allows; cap catch-up bursts so a long
+/// stall doesn't fast-forward.
+fn run_emulation(
+    mut emu: NonSendMut<Emu>,
+    mut acc: Local<Option<(std::time::Instant, f64)>>,
+) {
+    const MAX_BURST: u32 = 3;
+    let fps = emu.0.fps().max(1.0);
+    let frame = 1.0 / fps;
+    let now = std::time::Instant::now();
+    let (last, mut budget) = acc.unwrap_or((now, frame));
+    budget += now.duration_since(last).as_secs_f64();
+    let mut ran = 0;
+    while budget >= frame && ran < MAX_BURST {
+        let _ = emu.0.run_frame();
+        budget -= frame;
+        ran += 1;
+    }
+    budget = budget.min(frame * MAX_BURST as f64);
+    *acc = Some((now, budget));
 }
 
 // ─── Scripting ───────────────────────────────────────────────────────────────
