@@ -28,3 +28,4 @@ cfg/
 .env
 .env.*
 shadow/train/.venv/
+*.state[1-9]

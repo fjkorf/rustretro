@@ -398,6 +398,64 @@ impl RetroCore {
         }
     }
 
+    // ========================================================================
+    // Save states (retro_serialize / retro_unserialize)
+    // ========================================================================
+
+    /// `retro_serialize_size()` — size in bytes of a serialized state, or 0 if
+    /// the symbol is missing or the core reports no state.
+    pub fn serialize_size(&self) -> usize {
+        unsafe {
+            match self
+                .library
+                .get::<Symbol<RetroSerializeSizeFn>>(b"retro_serialize_size")
+            {
+                Ok(func) => func(),
+                Err(_) => 0,
+            }
+        }
+    }
+
+    /// Serialize the core's full machine state into an owned buffer.
+    /// Returns `None` when the core exposes no serialization (size 0 / missing
+    /// symbol) or `retro_serialize` reports failure.
+    pub fn serialize(&self) -> Option<Vec<u8>> {
+        let size = self.serialize_size();
+        if size == 0 {
+            return None;
+        }
+        unsafe {
+            let func = self
+                .library
+                .get::<Symbol<RetroSerializeFn>>(b"retro_serialize")
+                .ok()?;
+            let mut buf = vec![0u8; size];
+            if func(buf.as_mut_ptr() as *mut c_void, size) {
+                Some(buf)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Restore a previously serialized state. Returns false when the symbol is
+    /// missing, `data` is empty, or the core rejects the buffer (wrong size /
+    /// version / game).
+    pub fn unserialize(&self, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return false;
+        }
+        unsafe {
+            match self
+                .library
+                .get::<Symbol<RetroUnserializeFn>>(b"retro_unserialize")
+            {
+                Ok(func) => func(data.as_ptr() as *const c_void, data.len()),
+                Err(_) => false,
+            }
+        }
+    }
+
     pub fn unload_game(&self) -> Result<(), LibretroError> {
         unsafe {
             let func: Symbol<extern "C" fn()> = self
@@ -770,6 +828,12 @@ pub fn plan_block_reads(
 // retro_get_memory_data(unsigned) -> void* ; retro_get_memory_size(unsigned) -> size_t
 pub type RetroGetMemoryDataFn = extern "C" fn(std::ffi::c_uint) -> *mut c_void;
 pub type RetroGetMemorySizeFn = extern "C" fn(std::ffi::c_uint) -> usize;
+
+// Save states: retro_serialize_size() -> size_t;
+// retro_serialize(void*, size_t) -> bool; retro_unserialize(const void*, size_t) -> bool
+pub type RetroSerializeSizeFn = extern "C" fn() -> usize;
+pub type RetroSerializeFn = extern "C" fn(*mut c_void, usize) -> bool;
+pub type RetroUnserializeFn = extern "C" fn(*const c_void, usize) -> bool;
 
 // ============================================================================
 // Z80 CPU Debug API (from fbalpha2012)

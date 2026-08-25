@@ -79,6 +79,20 @@ struct Args {
     /// Start with audio muted (the stream still runs; unmute live from the
     /// debugger's audio controls). --no-audio disables audio entirely.
     #[arg(long)] mute: bool,
+    /// Load a save state right after boot: a slot number 1-9 (resolved to
+    /// <save-dir>/<rom>.state<N>) or an explicit state-file path. Applied on
+    /// the first emulated frame (saving is interactive: F6/Shift+F6 or the MCP
+    /// save_state tool).
+    #[arg(long, value_name = "PATH_OR_SLOT")] load_state: Option<String>,
+}
+
+/// Parse the --load-state argument: a bare 1-9 selects a slot; anything else
+/// is an explicit state-file path.
+fn parse_load_state(spec: &str) -> debug::StateOp {
+    match spec.trim().parse::<u8>() {
+        Ok(n @ 1..=9) => debug::StateOp::LoadSlot(n),
+        _ => debug::StateOp::Load(PathBuf::from(spec)),
+    }
 }
 
 // ─── Bevy resources ──────────────────────────────────────────────────────────
@@ -159,6 +173,16 @@ fn main() -> Result<()> {
     // Enable per-frame trace recording if requested (both GUI and headless).
     if let Some(rec_path) = args.record.clone() {
         frontend.set_recorder(rec_path);
+    }
+
+    // --load-state: queue the load now; the Frontend drains it at the safe
+    // point right after the FIRST core.run (the core has warmed up one frame
+    // by then — retro_unserialize before any retro_run is not reliable across
+    // cores).
+    if let Some(spec) = &args.load_state {
+        let op = parse_load_state(spec);
+        debug_state.lock().unwrap().pending_state_op = Some(op);
+        eprintln!("[state] --load-state {spec}: queued, applied after the first frame");
     }
 
     let w = frontend.video_width().max(320) * args.scale;
@@ -612,6 +636,20 @@ fn read_input(
             }
         }
     }
+    // Save-state hotkeys: F6 save / F7 load, slot 1 (Shift → slot 2). The op is
+    // queued here and performed by the emulation thread at its safe point.
+    if keys.just_pressed(F6) || keys.just_pressed(F7) {
+        let slot = if keys.pressed(ShiftLeft) || keys.pressed(ShiftRight) { 2u8 } else { 1u8 };
+        if let Ok(mut ds) = debug_state.0.lock() {
+            if keys.just_pressed(F6) {
+                ds.pending_state_op = Some(debug::StateOp::SaveSlot(slot));
+                eprintln!("[state] F6: save state → slot {slot} queued");
+            } else {
+                ds.pending_state_op = Some(debug::StateOp::LoadSlot(slot));
+                eprintln!("[state] F7: load state ← slot {slot} queued");
+            }
+        }
+    }
     if keys.just_pressed(F12) {
         let mut ds = debug_state.0.lock().unwrap();
         ds.debug_open = !ds.debug_open;
@@ -907,6 +945,26 @@ fn sync_litui_pages(litui: &mut LituiPages, debug_state: &SharedDebugState, audi
 }
 
 // ─── Window title ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod load_state_arg_tests {
+    use super::parse_load_state;
+    use crate::debug::StateOp;
+    use std::path::PathBuf;
+
+    #[test]
+    fn bare_digit_is_slot_anything_else_is_path() {
+        assert_eq!(parse_load_state("1"), StateOp::LoadSlot(1));
+        assert_eq!(parse_load_state(" 9 "), StateOp::LoadSlot(9));
+        // 0 and >9 are not valid slots — treated as (odd) paths, not slots.
+        assert_eq!(parse_load_state("0"), StateOp::Load(PathBuf::from("0")));
+        assert_eq!(parse_load_state("12"), StateOp::Load(PathBuf::from("12")));
+        assert_eq!(
+            parse_load_state("/tmp/foo.state1"),
+            StateOp::Load(PathBuf::from("/tmp/foo.state1"))
+        );
+    }
+}
 
 fn update_title(emu: NonSend<Emu>, mut windows: Query<&mut Window>) {
     if emu.0.frame_count % 60 != 0 { return; }

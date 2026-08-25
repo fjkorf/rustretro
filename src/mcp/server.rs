@@ -33,7 +33,7 @@ use rmcp::service::RequestContext;
 use rmcp::RoleServer;
 use serde_json::{json, Map, Value};
 
-use crate::debug::{SharedDebugState, Watch, WatchFormat};
+use crate::debug::{SharedDebugState, StateOp, Watch, WatchFormat};
 use crate::mcp::ines::parse_ines;
 use crate::mcp::snapshot::{
     decode_tiles_to_rgba, memory_capability, memory_map, parse_hex_bytes, read_region_bytes,
@@ -43,6 +43,9 @@ use crate::mcp::snapshot::{
 /// How long the `run_lua` tool waits for the main thread to execute a script
 /// before giving up and returning a timeout error.
 const LUA_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `save_state`/`load_state` wait for the emulation thread to drain
+/// the queued state op (it resolves within a frame or two, like `run_lua`).
+const STATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cap on bytes returned by `read_memory` to avoid huge dumps.
 const MAX_READ_LEN: usize = 4096;
 /// Cap on bytes returned by `read_region` (larger than read_memory so Claude can
@@ -1012,6 +1015,77 @@ impl RetroMcpServer {
         }
     }
 
+    // ── save states ────────────────────────────────────────────────────────
+
+    /// Submit a [`StateOp`] to the emulation thread and poll for its result —
+    /// the same deferred round-trip as `run_lua` (core FFI only happens on the
+    /// emu thread; `Frontend::drain_state_op` services the queue every frame,
+    /// paused or not).
+    fn state_op_roundtrip(&self, op: StateOp) -> Value {
+        // Submit.
+        {
+            let mut ds = match self.debug.lock() {
+                Ok(g) => g,
+                Err(_) => return json!({ "ok": false, "error": "lock poisoned" }),
+            };
+            if ds.pending_state_op.is_some() {
+                return json!({ "ok": false, "error": "another state operation is in flight" });
+            }
+            ds.state_op_result = None;
+            ds.pending_state_op = Some(op);
+        }
+
+        // Poll for completion (drained once per emulated frame, ~60Hz).
+        let deadline = Instant::now() + STATE_TIMEOUT;
+        loop {
+            std::thread::sleep(Duration::from_millis(8));
+            if let Ok(mut ds) = self.debug.lock() {
+                if let Some(res) = ds.state_op_result.take() {
+                    return match res {
+                        Ok(done) => json!({
+                            "ok": true,
+                            "op": if done.loaded { "load" } else { "save" },
+                            "path": done.path.display().to_string(),
+                            "bytes": done.bytes,
+                        }),
+                        Err(e) => json!({ "ok": false, "error": e }),
+                    };
+                }
+            }
+            if Instant::now() >= deadline {
+                // Clear our request so we don't wedge future calls.
+                if let Ok(mut ds) = self.debug.lock() {
+                    ds.pending_state_op = None;
+                }
+                return json!({
+                    "ok": false,
+                    "error": "timed out waiting for the emulation thread (is the app running?)"
+                });
+            }
+        }
+    }
+
+    /// `save_state`: serialize the core to a slot file or explicit path.
+    /// NOT gated — it reads game state and writes only a state file.
+    fn save_state(&self, slot: Option<u64>, path: Option<&str>) -> Value {
+        match parse_state_target(slot, path, false) {
+            Ok(op) => self.state_op_roundtrip(op),
+            Err(e) => json!({ "ok": false, "error": e }),
+        }
+    }
+
+    /// `load_state`: restore the core from a slot file or explicit path.
+    /// GATED — it replaces the entire game state.
+    fn load_state(&self, slot: Option<u64>, path: Option<&str>) -> Value {
+        if let Err(e) = self.check_writes_armed() {
+            return json!({ "error": e });
+        }
+        match parse_state_target(slot, path, true) {
+            Ok(op) => self.state_op_roundtrip(op),
+            Err(e) => json!({ "ok": false, "error": e }),
+        }
+    }
+
     // ── gated write tools ──────────────────────────────────────────────────
 
     /// `write_memory`: poke `len` little-endian bytes of `value` at guest `addr`
@@ -1503,6 +1577,18 @@ impl RetroMcpServer {
             });
             Arc::new(schema.as_object().unwrap().clone())
         };
+        // Schema for { slot?, path? } (save_state / load_state).
+        let state_target_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "slot": { "type": "integer", "description": "Save-state slot 1-9 → <save_dir>/<rom>.state<N> (default 1 when `path` is absent)" },
+                    "path": { "type": "string", "description": "Explicit state-file path (mutually exclusive with `slot`)" }
+                },
+                "required": []
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
         // Schema for { addr } (unfreeze / breakpoint ops / run_to).
         let addr_only_schema = || -> Arc<Map<String, Value>> {
             let schema = json!({
@@ -1640,6 +1726,24 @@ impl RetroMcpServer {
                 "run_lua",
                 "Run a Lua script in the app's sandboxed engine on the main thread and return its console output. Gated/deferred round-trip.",
                 run_lua_schema(),
+            ),
+            // ── save states ────────────────────────────────────────────────
+            Tool::new(
+                "save_state",
+                "Snapshot the ENTIRE machine state (retro_serialize) to a file: slot 1-9 \
+                 (<save_dir>/<rom>.state<N>, default slot 1) or an explicit `path`. Returns \
+                 {ok, path, bytes}. Read-only w.r.t. the game (no enable_writes needed) — \
+                 pair with load_state to bank and replay exact game situations.",
+                state_target_schema(),
+            ),
+            Tool::new(
+                "load_state",
+                "Restore the machine from a save-state file (retro_unserialize): slot 1-9 \
+                 or an explicit `path`. REPLACES the entire game state, so it REQUIRES \
+                 enable_writes first. Bus-window snapshots are refreshed immediately after \
+                 the load, so memory reads see the restored RAM on the same frame. Returns \
+                 {ok, path, bytes}.",
+                state_target_schema(),
             ),
             // ── write gate + gated write/action tools ──────────────────────
             Tool::new(
@@ -2116,6 +2220,17 @@ impl ServerHandler for RetroMcpServer {
                     let v = this.run_lua(script);
                     Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
                 }
+                // ── save states ─────────────────────────────────────────────
+                "save_state" | "load_state" => {
+                    let slot = get_u("slot");
+                    let path = args.get("path").and_then(|v| v.as_str());
+                    let v = if name == "save_state" {
+                        this.save_state(slot, path)
+                    } else {
+                        this.load_state(slot, path)
+                    };
+                    Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
+                }
                 // ── write gate ──────────────────────────────────────────────
                 "enable_writes" => Ok(CallToolResult::success(vec![Self::json_content(
                     &this.enable_writes(),
@@ -2304,6 +2419,32 @@ fn parse_watch_format(s: &str) -> Option<WatchFormat> {
         "hex16" | "hex_16" => Some(WatchFormat::Hex16),
         "hex32" | "hex_32" => Some(WatchFormat::Hex32),
         _ => None,
+    }
+}
+
+/// Resolve the `save_state`/`load_state` arguments to a [`StateOp`]. Exactly one
+/// of `slot` (1..=9, defaulting to 1 when both are absent) or `path` may be
+/// given; slots are resolved to `<save_dir>/<rom_stem>.state<N>` by the
+/// Frontend, which is the only side that knows save_dir. Pure and testable.
+fn parse_state_target(slot: Option<u64>, path: Option<&str>, load: bool) -> Result<StateOp, String> {
+    match (slot, path) {
+        (Some(_), Some(_)) => Err("give `slot` OR `path`, not both".to_string()),
+        (None, Some(p)) => {
+            let p = p.trim();
+            if p.is_empty() {
+                return Err("`path` must be a non-empty file path".to_string());
+            }
+            let pb = std::path::PathBuf::from(p);
+            Ok(if load { StateOp::Load(pb) } else { StateOp::Save(pb) })
+        }
+        (s, None) => {
+            let n = s.unwrap_or(1);
+            if !(1..=9).contains(&n) {
+                return Err(format!("`slot` must be 1..=9 (got {n})"));
+            }
+            let n = n as u8;
+            Ok(if load { StateOp::LoadSlot(n) } else { StateOp::SaveSlot(n) })
+        }
     }
 }
 
@@ -2496,7 +2637,7 @@ fn append_region_block(
 mod tests {
     use super::base64_encode;
     use super::{append_region_block, next_ai_id, normalize_addr, scaffold_rom_map};
-    use super::{parse_watch_format, RetroMcpServer};
+    use super::{parse_state_target, parse_watch_format, RetroMcpServer};
     use crate::debug::{DebugState, WatchFormat};
     use std::sync::{Arc, Mutex};
 
@@ -2710,6 +2851,56 @@ mod tests {
         let ok = srv.set_breakpoint(0x0400);
         assert_eq!(ok["added"], serde_json::json!(true));
         assert!(srv.debug.lock().unwrap().breakpoints.contains(&0x0400));
+    }
+
+    // ── save states ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_state_target_resolves_slots_paths_and_errors() {
+        use crate::debug::StateOp;
+        use std::path::PathBuf;
+        // Default: slot 1.
+        assert_eq!(parse_state_target(None, None, false), Ok(StateOp::SaveSlot(1)));
+        assert_eq!(parse_state_target(None, None, true), Ok(StateOp::LoadSlot(1)));
+        // Explicit slot.
+        assert_eq!(parse_state_target(Some(3), None, false), Ok(StateOp::SaveSlot(3)));
+        assert_eq!(parse_state_target(Some(9), None, true), Ok(StateOp::LoadSlot(9)));
+        // Explicit path.
+        assert_eq!(
+            parse_state_target(None, Some("/tmp/x.state"), false),
+            Ok(StateOp::Save(PathBuf::from("/tmp/x.state")))
+        );
+        assert_eq!(
+            parse_state_target(None, Some("/tmp/x.state"), true),
+            Ok(StateOp::Load(PathBuf::from("/tmp/x.state")))
+        );
+        // Errors: both, out-of-range slot, empty path.
+        assert!(parse_state_target(Some(1), Some("/tmp/x"), false).is_err());
+        assert!(parse_state_target(Some(0), None, false).is_err());
+        assert!(parse_state_target(Some(10), None, true).is_err());
+        assert!(parse_state_target(None, Some("  "), false).is_err());
+    }
+
+    #[test]
+    fn load_state_gated_save_state_validates_without_queueing() {
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        // load_state is a write tool: refused while locked, nothing queued.
+        let refused = srv.load_state(Some(1), None);
+        assert_eq!(
+            refused["error"].as_str(),
+            Some("writes are locked; call enable_writes first")
+        );
+        assert!(srv.debug.lock().unwrap().pending_state_op.is_none());
+        // save_state is not gated, but bad args error out before queueing.
+        let bad = srv.save_state(Some(42), None);
+        assert_eq!(bad["ok"], false);
+        assert!(bad["error"].as_str().unwrap().contains("slot"));
+        assert!(srv.debug.lock().unwrap().pending_state_op.is_none());
+        // Armed load_state with bad args also errors without queueing.
+        let _ = srv.enable_writes();
+        let bad2 = srv.load_state(Some(1), Some("/x"));
+        assert_eq!(bad2["ok"], false);
+        assert!(srv.debug.lock().unwrap().pending_state_op.is_none());
     }
 
     // ── ROM-map writeback ───────────────────────────────────────────────────

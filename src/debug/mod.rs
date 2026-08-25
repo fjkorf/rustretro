@@ -436,6 +436,32 @@ mod hex_u32 {
     }
 }
 
+/// A save/load-state request queued for the emulation thread. Core FFI
+/// (retro_serialize / retro_unserialize) may ONLY happen on the emu thread, so
+/// the UI/MCP threads set [`DebugState::pending_state_op`] and the Frontend
+/// drains it in `run_frame` — the same handoff pattern as `pending_bus_writes`
+/// / `pending_lua`. Slot variants are resolved to
+/// `<save_dir>/<rom_stem>.state<N>` by the Frontend (only it knows save_dir).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StateOp {
+    Save(std::path::PathBuf),
+    Load(std::path::PathBuf),
+    SaveSlot(u8),
+    LoadSlot(u8),
+}
+
+/// Completion record for a drained [`StateOp`] (the MCP thread polls
+/// [`DebugState::state_op_result`], mirroring `pending_lua_result`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateOpDone {
+    /// True for a load, false for a save.
+    pub loaded: bool,
+    /// The resolved on-disk state file.
+    pub path: std::path::PathBuf,
+    /// Size of the serialized state in bytes.
+    pub bytes: usize,
+}
+
 /// What the training-mode dummy (controller port 1) does each frame.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DummyMode {
@@ -643,6 +669,15 @@ pub struct DebugState {
     /// Result of the most recently drained `pending_lua` request: `Ok(output)`
     /// or `Err(message)`. The MCP thread polls this and clears it on read.
     pub pending_lua_result: Option<Result<String, String>>,
+
+    // --- Save states ---
+    /// Save/load-state request queued for the emulation thread (hotkeys, the
+    /// --load-state flag, and the MCP save_state/load_state tools all set this;
+    /// `Frontend::drain_state_op` resolves slots and performs the core FFI).
+    pub pending_state_op: Option<StateOp>,
+    /// Result of the most recently drained `pending_state_op`: `Ok(done)` or
+    /// `Err(message)`. The MCP thread polls this and clears it on read.
+    pub state_op_result: Option<Result<StateOpDone, String>>,
 }
 
 /// Maximum number of change events retained in `change_log`.
@@ -717,6 +752,8 @@ impl DebugState {
             nav: NavState::default(),
             pending_lua: None,
             pending_lua_result: None,
+            pending_state_op: None,
+            state_op_result: None,
         }
     }
 
