@@ -688,6 +688,27 @@ pub struct DebugState {
     /// Result of the most recently drained `pending_state_op`: `Ok(done)` or
     /// `Err(message)`. The MCP thread polls this and clears it on read.
     pub state_op_result: Option<Result<StateOpDone, String>>,
+    /// Sticky one-line description of the last state op ("saved …",
+    /// "load FAILED: …") for the State panel. Unlike `state_op_result` it is
+    /// never consumed, so the GUI can't race the MCP poller for it.
+    pub state_note: Option<String>,
+    /// Where slot save-state files live (published by the Frontend, which is
+    /// the only thing that knows `save_dir`); lets the State panel stat slot
+    /// files. Slot path = `state_dir/<rom_name>.state<N>`.
+    pub state_dir: Option<std::path::PathBuf>,
+
+    // --- Shadow bot GUI bridge ---
+    /// One-shot request to toggle the shadow bot (GUI panel → emu thread;
+    /// equivalent to Shift+F5, drained by `Frontend::drain_shadow_toggle`).
+    pub pending_shadow_toggle: bool,
+    /// Shadow bot status published by the Frontend: `None` = no model loaded
+    /// (`--shadow` absent), `Some(enabled)` otherwise.
+    pub shadow_on: Option<bool>,
+
+    // --- Help panel ---
+    /// Human-readable ACTIVE input bindings (label, mapping) published once at
+    /// startup from the resolved `InputConfig` — see `input_config::summary`.
+    pub keymap_lines: Vec<(String, String)>,
 }
 
 /// Maximum number of change events retained in `change_log`.
@@ -766,6 +787,11 @@ impl DebugState {
             pending_lua_result: None,
             pending_state_op: None,
             state_op_result: None,
+            state_note: None,
+            state_dir: None,
+            pending_shadow_toggle: false,
+            shadow_on: None,
+            keymap_lines: Vec::new(),
         }
     }
 

@@ -13,4 +13,6 @@ pub mod ram_search;
 pub mod vdp_registers;
 pub mod help;
 pub mod hex_tint;
+pub mod state;
+pub mod training;
 pub mod script_panel;

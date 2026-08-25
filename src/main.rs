@@ -157,7 +157,10 @@ fn main() -> Result<()> {
     eprintln!("RustRetro — Bevy libretro frontend");
     eprintln!("Core: {}", args.core);
     eprintln!("ROM:  {}", args.rom);
-    eprintln!("Press F12 to toggle debug overlay, Space to pause.");
+    for (group, binds) in KEYBINDINGS {
+        let line: Vec<String> = binds.iter().map(|(k, a)| format!("{k} {a}")).collect();
+        eprintln!("{group}: {}", line.join(" · "));
+    }
 
     // Input mapping: resolve config, honor --dump-keymap before anything else.
     let keymap_cfg = input_config::InputConfig::load(&args.keymap, &args.save_dir, &args.rom);
@@ -167,6 +170,9 @@ fn main() -> Result<()> {
     }
 
     let debug_state: SharedDebugState = Arc::new(Mutex::new(DebugState::new()));
+    // The Help panel shows the ACTIVE bindings (keymap.json / --keymap /
+    // default), not a hardcoded copy — publish the resolved summary once.
+    debug_state.lock().unwrap().keymap_lines = input_config::summary(&keymap_cfg);
 
     let mut frontend = Frontend::new(
         &args.core, &args.rom,
@@ -530,6 +536,34 @@ fn calibrate_wizard(
         cal.announced = false;
     }
 }
+
+/// The single source of truth for hotkey documentation, grouped for display.
+/// Rendered by the Help panel (❓ Help → Keybindings) and printed at startup —
+/// when you add or change a hotkey in `read_input` below, update this table
+/// in the same commit (there is no third copy to keep in sync).
+pub const KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
+    ("Debugger", &[
+        ("F12", "toggle debug overlay"),
+        ("Space", "pause / unpause emulation"),
+        ("B", "capture bookmark"),
+        ("F8", "tutorials window"),
+        ("F9", "litui panels preview (CPU/Log/Audio)"),
+        ("F10", "Lua script panel"),
+    ]),
+    ("Save states", &[
+        ("F6", "save state → slot 1 (Shift: slot 2)"),
+        ("F7", "load state ← slot 1 (Shift: slot 2)"),
+        ("--load-state N|path", "load at launch, after the first frame"),
+    ]),
+    ("Training & shadow", &[
+        ("F5", "toggle training mode (credits auto, timer held, refill)"),
+        ("F1", "cycle dummy: Free → Stand → Crouch → Jump → Block"),
+        ("F2", "reset positions"),
+        ("F3", "toggle health refill"),
+        ("F4", "finish round"),
+        ("Shift+F5", "toggle shadow bot (needs --shadow)"),
+    ]),
+];
 
 fn read_input(
     keys: Res<ButtonInput<KeyCode>>,

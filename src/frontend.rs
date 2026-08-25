@@ -110,6 +110,8 @@ impl Frontend {
             ds.sidecar_path = sidecar_path.clone();
             ds.rom_map_path = rom_map_path.clone();
             ds.rom_name = rom_stem.clone();
+            // Slot files live in save_dir; the State panel stats them via this.
+            ds.state_dir = Some(save_dir.clone());
             // Infer the ROM-map `system` slug from the core (None for multi-system
             // cores like FBNeo, which the scaffold then leaves blank).
             ds.rom_system =
@@ -493,7 +495,39 @@ impl Frontend {
                 )),
                 Err(e) => ds.log(format!("💾 State op failed: {e}")),
             }
+            // Sticky copy for the State panel (state_op_result is consumed by
+            // the MCP poller, so the GUI must not rely on reading it).
+            ds.state_note = Some(match &published {
+                Ok(done) => format!(
+                    "{verb} {} ({} bytes) @ frame {}",
+                    done.path.display(), done.bytes, self.frame_count
+                ),
+                Err(e) => format!(
+                    "{} {} FAILED: {e}",
+                    if is_load { "load" } else { "save" },
+                    path.display()
+                ),
+            });
             ds.state_op_result = Some(published);
+        }
+    }
+
+    /// Drain a GUI request to toggle the shadow bot (State/Training panel
+    /// button — the panel only has `DebugState`, not `&mut Frontend`) and
+    /// publish the current status back. Called at both `drain_state_op` sites
+    /// so the toggle works while paused too.
+    fn drain_shadow_toggle(&mut self) {
+        let want = self
+            .debug_state
+            .try_lock()
+            .map(|mut ds| std::mem::take(&mut ds.pending_shadow_toggle))
+            .unwrap_or(false);
+        if want {
+            self.toggle_shadow();
+        }
+        let on = self.shadow.as_ref().map(|s| s.enabled);
+        if let Ok(mut ds) = self.debug_state.try_lock() {
+            ds.shadow_on = on;
         }
     }
 
@@ -908,6 +942,7 @@ impl Frontend {
             // drain_state_op) — service save/load here so a paused session's
             // MCP/hotkey state ops don't hang until resume.
             self.drain_state_op();
+            self.drain_shadow_toggle();
             return Ok(false);
         }
 
@@ -934,6 +969,7 @@ impl Frontend {
         // a full refresh itself on load). See drain_state_op for the safety
         // argument (serialize/unserialize only between complete retro_run calls).
         self.drain_state_op();
+        self.drain_shadow_toggle();
 
         // --- Refresh bus-window snapshots (Sek bridge) ---
         self.refresh_bus_windows(None);
