@@ -6,6 +6,8 @@
 #   shadow/loop.sh                 # fit goat-vNEXT from recent v2 recordings, fight
 #   shadow/loop.sh --fit-only      # refit + report, don't launch the shadow
 #   shadow/loop.sh --model NAME    # skip fitting, fight an existing model
+#   shadow/loop.sh --me N --opp M  # matchup-filtered fit (per-matchup model,
+#                                  # named via shadow_train.asurabld slugs)
 #   shadow/loop.sh --push          # fit, then load the model into the running
 #                                  # app's NATIVE runner (Shift+F5 / 🎯 panel)
 #                                  # instead of fighting over MCP via play.py
@@ -30,13 +32,17 @@ PY=shadow/train/.venv/bin/python3
 FIT=1
 MODEL=""
 PUSH=0
+ME=""
+OPP=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fit-only) FIT=2; shift ;;
     --model) MODEL="$2"; FIT=0; shift 2 ;;
     --push) PUSH=1; shift ;;
-    *) echo "usage: shadow/loop.sh [--fit-only | --model NAME | --push]" >&2; exit 2 ;;
+    --me) ME="$2"; shift 2 ;;
+    --opp) OPP="$2"; shift 2 ;;
+    *) echo "usage: shadow/loop.sh [--fit-only | --model NAME | --push | --me N --opp M]" >&2; exit 2 ;;
   esac
 done
 
@@ -47,14 +53,24 @@ if [[ $FIT -ge 1 ]]; then
     head -c 4096 "$f" | grep -q '"block1"' && RECS+=("$f")
   done
   [[ ${#RECS[@]} -gt 0 ]] || { echo "no v2 recordings found" >&2; exit 1; }
+  # Matchup filters name the model by slug (goat-vs-rosemary); the legacy
+  # unfiltered fit keeps the goat-vN series.
+  FILTERS=()
+  PREFIX=goat
+  if [[ -n "$ME" || -n "$OPP" ]]; then
+    [[ -n "$ME" ]] && FILTERS+=(--char "$ME")
+    [[ -n "$OPP" ]] && FILTERS+=(--opp "$OPP")
+    PREFIX=$("$PY" -c "from shadow_train.asurabld import matchup_slug; print(matchup_slug(${ME:-None}, ${OPP:-None}))")
+  fi
   # next version number
   N=1
-  while [[ -d "shadow/models/goat-v$N" ]]; do N=$((N + 1)); done
-  MODEL="goat-v$N"
+  while [[ -d "shadow/models/$PREFIX-v$N" ]]; do N=$((N + 1)); done
+  MODEL="$PREFIX-v$N"
   echo "── fitting $MODEL from ${#RECS[@]} recording(s) ──"
+  printf '    %s\n' "${RECS[@]}"
   # shadow_train is `pip install -e`d into .venv (see shadow/train/pyproject.toml),
   # so `-m shadow_train` resolves without cd-ing into shadow/train first.
-  "$PY" -m shadow_train fit "${RECS[@]}" --out "shadow/models/$MODEL/"
+  "$PY" -m shadow_train fit "${RECS[@]}" ${FILTERS[@]+"${FILTERS[@]}"} --out "shadow/models/$MODEL/"
   echo
   "$PY" -m shadow_train report "shadow/models/$MODEL/"
   [[ $FIT -eq 2 ]] && exit 0

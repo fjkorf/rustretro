@@ -66,3 +66,31 @@ GROUND_Y = 216
 ROUND_START_X_LEFT = 84
 ROUND_START_X_RIGHT = 232
 ROUND_START_Y = GROUND_Y
+
+# ── roster (char id at CHAR_ID/+0x639) ──────────────────────────────────────
+# 8 playable characters (ids 0-7) + 2 bosses (0x08/0x09, per the cheat DB).
+# Names are filled in only where the id has been live-verified in-game; the
+# rest render as "c<N>" until a naming session pins them (pick each char once
+# while recording; the id lands in the rounds sidecar). Keep in lockstep with
+# the roster note in library/asurabld/asurabld.md.
+CHAR_NAMES: dict[int, str] = {
+    0: "yashaou",    # live: 1P read 0 while playing Yashaou
+    1: "goat",       # live: the user's main (goat-vs-rosemary arena)
+    7: "rosemary",   # live: canonical arena opponent
+}
+
+
+def char_name(char_id: int) -> str:
+    return CHAR_NAMES.get(char_id, f"c{char_id}")
+
+
+def matchup_slug(me: int | None, opp: int | None) -> str:
+    """Model-directory naming for matchup-filtered fits:
+    'goat-vs-rosemary', 'goat' (any opponent), 'any-vs-rosemary', or 'all'."""
+    if me is None and opp is None:
+        return "all"
+    if opp is None:
+        return char_name(me)
+    if me is None:
+        return f"any-vs-{char_name(opp)}"
+    return f"{char_name(me)}-vs-{char_name(opp)}"

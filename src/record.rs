@@ -113,10 +113,20 @@ pub struct FrameRecorder {
     out: BufWriter<File>,
     /// Where the jsonl is being written (for status display / stop messages).
     path: PathBuf,
+    /// Per-round summary sidecar (`<name>.rounds.jsonl`) — the cheap coverage
+    /// index the matchup tooling reads instead of parsing the full trace.
+    rounds_out: Option<BufWriter<File>>,
+    /// Play-style declaration for this whole recording ("rushdown", …),
+    /// echoed into the meta sidecar and every round summary.
+    style: Option<String>,
     frames: u64,
     round_id: u64,
     prev_controllable: bool,
     p1_block: Option<u8>,
+    // Per-round accumulators for the summary line (reset on the rising edge).
+    round_frames: u64,
+    round_p1_mass: u64,
+    round_chars: (u8, u8),
 }
 
 /// Read a guest 16-bit word big-endian (the 68k byte order) from a bus window
@@ -169,7 +179,13 @@ pub fn pack_mask(bits: &[bool; 12]) -> u16 {
 impl FrameRecorder {
     /// Open `path` for a fresh recording (truncates) and drop a `.meta.json`
     /// sidecar next to it. `game`/`core` are free-form provenance strings.
-    pub fn create(path: &Path, map: GameMap, game: &str, core: &str) -> std::io::Result<Self> {
+    pub fn create(
+        path: &Path,
+        map: GameMap,
+        game: &str,
+        core: &str,
+        style: Option<&str>,
+    ) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -179,6 +195,7 @@ impl FrameRecorder {
             "format": "jsonl-v2",
             "game": game,
             "core": core,
+            "style": style,
             "fps": 60,
             "blocks": {
                 "block1": format!("0x{:X}", map.block1),
@@ -191,15 +208,43 @@ impl FrameRecorder {
         });
         let meta_path: PathBuf = path.with_extension("meta.json");
         std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default()).ok();
+        let rounds_out = File::create(path.with_extension("rounds.jsonl"))
+            .ok()
+            .map(BufWriter::new);
         Ok(FrameRecorder {
             map,
             out: BufWriter::new(file),
             path: path.to_path_buf(),
+            rounds_out,
+            style: style.map(str::to_string),
             frames: 0,
             round_id: 0,
             prev_controllable: false,
             p1_block: None,
+            round_frames: 0,
+            round_p1_mass: 0,
+            round_chars: (0, 0),
         })
+    }
+
+    /// Append the finished (or aborted) round's summary to the rounds sidecar.
+    /// `demo` mirrors the trainer's filter exactly: a round with zero total
+    /// p1-input mass is attract-mode/CPU play, not a demonstration.
+    fn emit_round_summary(&mut self) {
+        let Some(out) = self.rounds_out.as_mut() else { return };
+        let line = serde_json::json!({
+            "round_id": self.round_id,
+            "block1_char": self.round_chars.0,
+            "block2_char": self.round_chars.1,
+            "p1_block": self.p1_block,
+            "frames": self.round_frames,
+            "p1_input_mass": self.round_p1_mass,
+            "demo": self.round_p1_mass == 0,
+            "style": self.style,
+        });
+        let _ = out.write_all(line.to_string().as_bytes());
+        let _ = out.write_all(b"\n");
+        let _ = out.flush(); // rounds are rare; keep the index crash-current
     }
 
     /// Append one frame. `p1_mask`/`p2_mask` are the authoritative 12-bit RETRO
@@ -237,6 +282,17 @@ impl FrameRecorder {
         if controllable && !self.prev_controllable {
             self.round_id += 1;
             self.p1_block = Some(if b1.x <= b2.x { 1 } else { 2 });
+            self.round_frames = 0;
+            self.round_p1_mass = 0;
+            self.round_chars = (b1.char_id, b2.char_id);
+        }
+        // A true->false edge ends one: index it (matchup, size, demo-ness).
+        if !controllable && self.prev_controllable {
+            self.emit_round_summary();
+        }
+        if controllable {
+            self.round_frames += 1;
+            self.round_p1_mass += p1_mask as u64;
         }
         self.prev_controllable = controllable;
 
@@ -270,8 +326,13 @@ impl FrameRecorder {
         &self.path
     }
 
-    /// Flush the buffer (call at shutdown).
+    /// Flush the buffer (call at shutdown). A round still in progress gets a
+    /// partial summary — stopping mid-round shouldn't lose its index entry.
     pub fn finish(&mut self) {
+        if self.prev_controllable {
+            self.emit_round_summary();
+            self.prev_controllable = false;
+        }
         let _ = self.out.flush();
     }
 }
@@ -307,7 +368,8 @@ mod tests {
         let ds = DebugState::new();
         let path = std::env::temp_dir().join(format!("shadow_rec_{}.jsonl", std::process::id()));
         {
-            let mut rec = FrameRecorder::create(&path, GameMap::default(), "test", "test").unwrap();
+            let mut rec =
+                FrameRecorder::create(&path, GameMap::default(), "test", "test", None).unwrap();
             rec.record(&ds, 0x081, 0x000);
             rec.record(&ds, 0x000, 0x040);
             assert_eq!(rec.frames_written(), 2);
@@ -328,7 +390,62 @@ mod tests {
         }
         let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(v0["p1_input"], 0x081);
+        // Gate never opened → the rounds index exists but holds no rounds.
+        let rounds = std::fs::read_to_string(path.with_extension("rounds.jsonl")).unwrap();
+        assert!(rounds.is_empty());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("meta.json"));
+        let _ = std::fs::remove_file(path.with_extension("rounds.jsonl"));
+    }
+
+    #[test]
+    fn recorder_emits_round_summaries_to_the_rounds_sidecar() {
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-test".into(),
+            addr: 0x400000,
+            len: 0x7000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let m = GameMap::default();
+        // Open the v2 gate: live healths + valid BCD clock (hop flags are 0).
+        assert!(ds.write_addr((m.block1 + 0x177) as usize, 1, 0xEF));
+        assert!(ds.write_addr((m.block2 + 0x177) as usize, 1, 0xEF));
+        assert!(ds.write_addr(m.round_timer as usize, 1, 0x90));
+        // Matchup: Goat (1) vs Rose Mary (7).
+        assert!(ds.write_addr((m.block1 + 0x639) as usize, 1, 1));
+        assert!(ds.write_addr((m.block2 + 0x639) as usize, 1, 7));
+
+        let path =
+            std::env::temp_dir().join(format!("shadow_rounds_{}.jsonl", std::process::id()));
+        {
+            let mut rec =
+                FrameRecorder::create(&path, m, "test", "test", Some("rushdown")).unwrap();
+            rec.record(&ds, 0x010, 0); // rising edge; input held
+            rec.record(&ds, 0x000, 0); // still live, idle
+            // Corrupt the clock → gate closes → falling edge indexes the round.
+            assert!(ds.write_addr(m.round_timer as usize, 1, 0xFF));
+            rec.record(&ds, 0x000, 0);
+            rec.finish();
+        }
+        let rounds = std::fs::read_to_string(path.with_extension("rounds.jsonl")).unwrap();
+        let lines: Vec<&str> = rounds.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one round summary: {rounds}");
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["round_id"], 1);
+        assert_eq!(v["block1_char"], 1);
+        assert_eq!(v["block2_char"], 7);
+        assert_eq!(v["p1_block"], 1);
+        assert_eq!(v["frames"], 2);
+        assert_eq!(v["p1_input_mass"], 0x10);
+        assert_eq!(v["demo"], false);
+        assert_eq!(v["style"], "rushdown");
+        // The meta sidecar carries the style declaration too.
+        let meta = std::fs::read_to_string(path.with_extension("meta.json")).unwrap();
+        assert!(meta.contains("\"style\": \"rushdown\""));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("meta.json"));
+        let _ = std::fs::remove_file(path.with_extension("rounds.jsonl"));
     }
 }

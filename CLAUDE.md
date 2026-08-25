@@ -79,6 +79,15 @@ unless a shadow was already enabled; `--shadow` startup loads stay
 enabled-and-fatal-on-error. The MCP `load_shadow` tool is the scripted twin
 (gated behind `enable_writes`).
 
+Matchups: models can be per-matchup — `shadow/loop.sh --me 1 --opp 7` fits a
+`goat-vs-rosemary-vN` (slugs from `shadow_train.asurabld.CHAR_NAMES`; ids in
+asurabld.md's roster table). `python -m shadow_train coverage` prints the
+matchup matrix (decisions per me×opp cell, demo-filtered). The recorder
+writes a `.rounds.jsonl` sidecar per recording (one summary line per round:
+matchup chars, frames, demo-ness, style) — the cheap index for coverage
+tooling; the panel's Record section takes an optional style tag ("rushdown",
+"zoning") stored in the sidecars and selectable at fit time.
+
 Training saves: the panel's Arena section lists `shadow/arenas/*.state`,
 loads one, captures the on-screen situation as a new named arena, or promotes
 one to `shadow/arenas/current.state` — the pointer loop.sh starts fights from

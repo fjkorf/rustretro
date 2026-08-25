@@ -183,7 +183,7 @@ fn main() -> Result<()> {
 
     // Enable per-frame trace recording if requested (both GUI and headless).
     if let Some(rec_path) = args.record.clone() {
-        frontend.set_recorder(rec_path);
+        frontend.set_recorder(rec_path, None);
     }
 
     // --shadow: load the kNN shadow-bot model and start it enabled (Shift+F5

@@ -13,6 +13,12 @@
   report <model-dir>
       Print the §7.6 coverage drill list stored in a fitted model's meta.json
       -- no recordings needed, just what's already on disk.
+
+  coverage [recordings...]
+      Print the MATCHUP coverage matrix (decisions per me-char x opp-char,
+      demo rounds excluded, exactly as fit would count them) plus a per-style
+      breakdown from the recording meta sidecars. Defaults to
+      shadow/recordings/*.jsonl (v2 only). The fill-the-gaps view.
 """
 
 import argparse
@@ -20,7 +26,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import dataset
+from . import asurabld, dataset
 from .dataset import ATTACK_CLASSES, MOVE_CLASSES, SCALAR_FEATURES, build
 from .evaluate import MIN_EXAMPLES, evaluate, print_report
 from .knn import KnnPolicy
@@ -48,7 +54,8 @@ def _label_counts(y, classes: list[str]) -> dict:
 
 
 def cmd_fit(args) -> None:
-    data = build(args.recordings, char_filter=args.char)
+    opp = getattr(args, "opp", None)  # absent in hand-built Namespaces (tests)
+    data = build(args.recordings, char_filter=args.char, opp_filter=opp)
     n_raw = len(data["X"])
     neutral_cap = getattr(args, "neutral_cap", dataset.NEUTRAL_CAP_RATIO)
     data = dataset.subsample_neutral(data, cap_ratio=neutral_cap)
@@ -68,6 +75,8 @@ def cmd_fit(args) -> None:
         "temperature": policy.temperature,
         "neutral_cap": neutral_cap,
         "char_filter": args.char,
+        "opp_filter": opp,
+        "matchup": asurabld.matchup_slug(args.char, opp),
         "source_files": [str(p) for p in args.recordings],
         "n_decisions": int(len(data["X"])),
         "n_rounds": int(len(set(data["rounds"]))),
@@ -83,7 +92,8 @@ def cmd_fit(args) -> None:
 
 
 def cmd_eval(args) -> None:
-    data = build(args.recordings, char_filter=args.char)
+    data = build(args.recordings, char_filter=args.char,
+                 opp_filter=getattr(args, "opp", None))
     print(f"decisions: {len(data['X'])} from {len(set(data['rounds']))} rounds "
           f"({data['X'].shape[1]} features)")
     report = evaluate(data, k=args.k, holdout_frac=args.holdout)
@@ -96,7 +106,7 @@ def cmd_report(args) -> None:
     print(f"model: {model_dir}")
     print(f"  source files: {', '.join(meta['source_files'])}")
     print(f"  fitted {meta['n_decisions']} decisions from {meta['n_rounds']} rounds "
-          f"(k={meta['k']}, char_filter={meta['char_filter']})")
+          f"(k={meta['k']}, matchup={meta.get('matchup', 'all')})")
     print(f"  created: {meta['created']}")
     print("\ncoverage (drill list — demonstrate more of anything flagged):")
     counts = meta["bucket_counts"]
@@ -106,6 +116,59 @@ def cmd_report(args) -> None:
         print(f"  {b:<9} {n:>6}{flag}")
     print("\nattack-label distribution:", meta["attack_label_counts"])
     print("move-label distribution:  ", meta["move_label_counts"])
+
+
+def _recording_style(p: Path) -> str | None:
+    """The style tag the recorder wrote into the .meta.json sidecar."""
+    mp = Path(str(p).removesuffix(".jsonl") + ".meta.json")
+    try:
+        return json.loads(mp.read_text()).get("style")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def cmd_coverage(args) -> None:
+    from collections import Counter
+
+    recs = args.recordings or sorted(Path("shadow/recordings").glob("*.jsonl"))
+    files = []
+    for p in recs:
+        try:
+            if '"block1"' in open(p).readline():
+                files.append(p)
+        except OSError:
+            pass
+    if not files:
+        raise SystemExit("no v2 recordings found")
+
+    per = Counter()          # (me, opp) -> decisions
+    per_style = Counter()    # (me, opp, style) -> decisions
+    for p in files:
+        style = _recording_style(p) or "(untagged)"
+        for d in dataset.load_decisions([p]):
+            per[(d.me_char, d.opp_char)] += 1
+            per_style[(d.me_char, d.opp_char, style)] += 1
+
+    mes = sorted({m for m, _ in per})
+    opps = sorted({o for _, o in per})
+    name = asurabld.char_name
+    print(f"matchup coverage — decisions per cell, demo rounds excluded "
+          f"({len(files)} recording(s))")
+    header = " " * 10 + "".join(f"{name(o):>10}" for o in opps)
+    print(header)
+    for m in mes:
+        row = f"{name(m):<10}"
+        for o in opps:
+            n = per.get((m, o), 0)
+            row += f"{n:>10}" if n else f"{'.':>10}"
+        print(row)
+    styles = {s for _, _, s in per_style}
+    if styles - {"(untagged)"}:
+        print("\nby style:")
+        for (m, o, st), n in sorted(per_style.items(), key=lambda kv: -kv[1]):
+            print(f"  {name(m)} vs {name(o):<10} {st:<12} {n:>7}")
+    print("\n(cells you have never demonstrated print as '.'; "
+          "unnamed characters print as c<N> — see asurabld.CHAR_NAMES)")
 
 
 def main():
@@ -119,6 +182,8 @@ def main():
                         help="output model directory, e.g. shadow/models/footee/")
     p_fit.add_argument("--char", type=int, default=None,
                         help="me character id filter (per-char models, SPEC §6)")
+    p_fit.add_argument("--opp", type=int, default=None,
+                        help="opponent character id filter (per-matchup models)")
     p_fit.add_argument("--k", type=int, default=15)
     p_fit.add_argument("--neutral-cap", type=float, default=dataset.NEUTRAL_CAP_RATIO,
                         help="cap idle (Neutral,None) decisions at this ratio x "
@@ -129,6 +194,8 @@ def main():
     p_eval.add_argument("recordings", **common)
     p_eval.add_argument("--char", type=int, default=None,
                          help="me character id filter (per-char models, SPEC §6)")
+    p_eval.add_argument("--opp", type=int, default=None,
+                         help="opponent character id filter (per-matchup models)")
     p_eval.add_argument("--k", type=int, default=15)
     p_eval.add_argument("--holdout", type=float, default=0.2)
     p_eval.set_defaults(func=cmd_eval)
@@ -136,6 +203,12 @@ def main():
     p_report = sub.add_parser("report", help="print the coverage drill list for a fitted model")
     p_report.add_argument("model_dir", type=Path)
     p_report.set_defaults(func=cmd_report)
+
+    p_cov = sub.add_parser("coverage",
+                           help="matchup coverage matrix across recordings")
+    p_cov.add_argument("recordings", nargs="*", type=Path,
+                       help="recordings to scan (default: shadow/recordings/*.jsonl)")
+    p_cov.set_defaults(func=cmd_coverage)
 
     args = ap.parse_args()
     args.func(args)

@@ -445,6 +445,21 @@ the title screen** — it needs a positive in-fight signal before training data
 is cut from recordings (open item; `$406485` and `$40FF67` were tested and are
 scratch, not flags).
 
+### Roster — character IDs (`+0x639`)
+
+8 playable (ids 0–7) + 2 bosses (0x08/0x09, cheat DB). Confirmed by live
+verification only; the rest await a naming session (pick each character once
+while recording — the id lands in the `.rounds.jsonl` sidecar). Hand-kept
+mirror: `CHAR_NAMES` in `shadow/train/shadow_train/asurabld.py` — update both.
+
+| id | name | evidence |
+|---|---|---|
+| 0 | Yashaou | live: 1P read 0 while playing Yashaou |
+| 1 | Goat | live: user's main (goat-vs-rosemary arena) |
+| 2–6 | ? | roster (web): Footee, Alice, Lightning, Zam-B, Taros — order unknown |
+| 7 | Rose Mary | live: canonical arena opponent |
+| 08/09 | bosses (S. Geist + ?) | cheat DB |
+
 ::: region kind=lookup_table id=system-control addr=0x400000-0x40655D label="match/system control bytes" confidence=confirmed
 From the pugsy cheat DB + FBNeo training-mode Lua, live-verified where noted:
 `$400000` write 00 = finish round now · `$400006` char-select timer (BCD) ·

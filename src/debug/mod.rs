@@ -466,8 +466,10 @@ pub struct StateOpDone {
 /// `Frontend::drain_record_ops` — same handoff as [`StateOp`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordControl {
-    /// Begin a fresh recording at this path (fails softly if already recording).
-    Start(std::path::PathBuf),
+    /// Begin a fresh recording at this path (fails softly if already
+    /// recording). `style` is a free-form play-style declaration ("rushdown",
+    /// "zoning", …) stored in the recording's sidecars for matchup tooling.
+    Start { path: std::path::PathBuf, style: Option<String> },
     /// Flush and close the active recording.
     Stop,
 }

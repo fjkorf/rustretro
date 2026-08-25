@@ -26,6 +26,8 @@ pub struct TrainingPanel {
     pending_current: Option<(PathBuf, SystemTime)>,
     /// Sticky result of the last make-current copy.
     arena_note: Option<String>,
+    /// Style tag for the next recording ("rushdown", "zoning", …; empty = untagged).
+    record_style: String,
 }
 
 const DUMMY_MODES: [(DummyMode, &str); 5] = [
@@ -140,6 +142,7 @@ impl TrainingPanel {
             arena_make_current: true,
             pending_current: None,
             arena_note: None,
+            record_style: String::new(),
         }
     }
 
@@ -331,10 +334,20 @@ impl TrainingPanel {
             None => {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("○ not recording").color(egui::Color32::DARK_GRAY));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.record_style)
+                            .desired_width(90.0)
+                            .hint_text("style tag"),
+                    )
+                    .on_hover_text("Play-style declaration for this recording (rushdown, zoning, …) — stored in the sidecars, selectable at fit time");
                     if ui.button("⏺ Start").clicked() {
                         let path = PathBuf::from(RECORDINGS_DIR)
                             .join(format!("session-{}.jsonl", utc_stamp()));
-                        state.pending_record = Some(RecordControl::Start(path));
+                        let style = self.record_style.trim();
+                        state.pending_record = Some(RecordControl::Start {
+                            path,
+                            style: (!style.is_empty()).then(|| style.to_string()),
+                        });
                     }
                 });
                 ui.label(

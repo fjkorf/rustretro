@@ -594,14 +594,14 @@ impl Frontend {
         };
         let mut note: Option<String> = None;
         match req {
-            Some(crate::debug::RecordControl::Start(path)) => {
+            Some(crate::debug::RecordControl::Start { path, style }) => {
                 if let Some(rec) = self.recorder.as_ref() {
                     note = Some(format!(
                         "already recording to {} — stop first",
                         rec.path().display()
                     ));
                 } else {
-                    self.set_recorder(path.clone());
+                    self.set_recorder(path.clone(), style);
                     note = Some(if self.recorder.is_some() {
                         format!("recording → {}", path.display())
                     } else {
@@ -641,7 +641,7 @@ impl Frontend {
     /// Enable per-frame trace recording to `path` (JSONL, `shadow/SPEC.md`).
     /// Uses the default Asura Blade actor map. Warns if no Work RAM bus window
     /// is mapped (the actor structs won't be readable without it).
-    pub fn set_recorder(&mut self, path: PathBuf) {
+    pub fn set_recorder(&mut self, path: PathBuf, style: Option<String>) {
         let has_work_ram = self
             .debug_state
             .lock()
@@ -660,6 +660,7 @@ impl Frontend {
             crate::record::GameMap::default(),
             "asurabld",
             "fbalpha2012",
+            style.as_deref(),
         ) {
             Ok(rec) => {
                 eprintln!("[record] tracing per-frame to {}", path.display());
