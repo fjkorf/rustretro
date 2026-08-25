@@ -29,3 +29,11 @@ cfg/
 .env.*
 shadow/train/.venv/
 *.state[1-9]
+
+# Machine/user-local artifacts
+keymap.json
+__pycache__/
+scripts/re/revenv/
+# Training data & derived models (goat-v2 stays tracked for the runner tests)
+shadow/recordings/
+shadow/models/
