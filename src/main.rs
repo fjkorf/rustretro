@@ -559,10 +559,32 @@ fn read_input(
     }
     emu.0.set_input(bits);
     emu.0.set_input2(bits2);
-    // Training-mode hotkeys (active only with --training).
+    // F5 toggles training mode at runtime (equivalent to launching with
+    // --training); the F1-F4 handlers below only respond while it's on.
+    if keys.just_pressed(F5) {
+        if let Ok(mut ds) = debug_state.0.lock() {
+            ds.training.enabled = !ds.training.enabled;
+            if ds.training.enabled {
+                ds.training.refill = true;
+                eprintln!(
+                    "[training] ON — credits auto, timer held, health refill. \
+                     F1 cycle dummy, F2 reset positions, F3 toggle refill, F4 finish round, F5 off."
+                );
+            } else {
+                eprintln!("[training] OFF (frozen values release next frame)");
+            }
+        }
+    }
+    // Training-mode hotkeys (F5 or --training to enable).
     if keys.just_pressed(F1) || keys.just_pressed(F2) || keys.just_pressed(F3) || keys.just_pressed(F4)
     {
         if let Ok(mut ds) = debug_state.0.lock() {
+            if !ds.training.enabled {
+                eprintln!(
+                    "[training] not enabled — press F5 or launch with --training \
+                     (F1-F4 are training-mode keys)"
+                );
+            }
             if ds.training.enabled {
                 use debug::DummyMode::*;
                 if keys.just_pressed(F1) {
