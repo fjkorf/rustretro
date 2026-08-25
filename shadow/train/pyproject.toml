@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shadow-train"
+version = "0.1.0"
+description = "Shadow AI trainer/runtime for the Asura Blade behavioral-cloning project (shadow/SPEC.md)."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+]
+
+[tool.setuptools]
+packages = ["shadow_train"]

@@ -24,95 +24,36 @@ import argparse
 import json
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 
-# shadow_train lives at shadow/train/shadow_train -- add its parent to the
-# path so `import shadow_train` works regardless of cwd, without needing an
-# installed package.
+# shadow_train is normally available via `pip install -e shadow/train` into
+# shadow/train/.venv (see shadow/train/pyproject.toml); fall back to adding
+# shadow/train/ to sys.path directly so an uninstalled checkout still works.
 _TRAIN_DIR = Path(__file__).resolve().parent / "train"
-if str(_TRAIN_DIR) not in sys.path:
-    sys.path.insert(0, str(_TRAIN_DIR))
+try:
+    import shadow_train  # noqa: F401
+except ImportError:
+    if str(_TRAIN_DIR) not in sys.path:
+        sys.path.insert(0, str(_TRAIN_DIR))
 
 from shadow_train import runtime as rt  # noqa: E402
 from shadow_train.knn import KnnPolicy  # noqa: E402
+from shadow_train.mcpclient import McpClient  # noqa: E402
 
 META_FILE = "meta.json"
 
+# Repo root = two parents up from this file (rustretro/shadow/play.py).
+# --model/--state may be given relative to the repo root (e.g. from
+# shadow/loop.sh) even when the cwd running this script is somewhere else.
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# ── MCP client (pattern: scripts/re/hold_fight.py) ──────────────────────────
-class McpClient:
-    def __init__(self, url: str, timeout: float = 15.0):
-        self.url = url
-        self.timeout = timeout
-        self.sid: str | None = None
-        self._req_id = 0
 
-    def _post(self, payload: dict) -> dict | None:
-        req = urllib.request.Request(
-            self.url, data=json.dumps(payload).encode(), method="POST"
-        )
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Accept", "application/json, text/event-stream")
-        if self.sid:
-            req.add_header("mcp-session-id", self.sid)
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            self.sid = resp.headers.get("mcp-session-id", self.sid)
-            body = resp.read().decode()
-        for line in body.splitlines():
-            if line.startswith("data:") and line[5:].strip():
-                return json.loads(line[5:].strip())
-        return None
-
-    def initialize(self) -> None:
-        self._post({
-            "jsonrpc": "2.0", "id": 0, "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05", "capabilities": {},
-                "clientInfo": {"name": "shadow-play", "version": "1"},
-            },
-        })
-        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
-
-    def call(self, tool: str, **args) -> dict:
-        self._req_id += 1
-        result = self._post({
-            "jsonrpc": "2.0", "id": self._req_id, "method": "tools/call",
-            "params": {"name": tool, "arguments": args},
-        })
-        content = result["result"]["content"][0]["text"]
-        return json.loads(content)
-
-    def read_memory(self, addr: int, length: int) -> bytes:
-        r = self.call("read_memory", addr=addr, len=length)
-        if "error" in r:
-            raise RuntimeError(f"read_memory(0x{addr:X}, {length}): {r['error']}")
-        return bytes.fromhex(r["hex"].replace(" ", ""))
-
-    def press_buttons(self, buttons: list[str], frames: int, port: int) -> dict:
-        return self.call("press_buttons", buttons=buttons, frames=frames, port=port)
-
-    def enable_writes(self) -> dict:
-        return self.call("enable_writes")
-
-    def write_memory(self, addr: int, length: int, value: int) -> dict:
-        return self.call("write_memory", addr=addr, len=length, value=value)
-
-    def load_state(self, spec: str) -> dict:
-        try:
-            slot = int(spec)
-            return self.call("load_state", slot=slot)
-        except ValueError:
-            return self.call("load_state", path=spec)
-
-    def pause(self) -> dict:
-        return self.call("pause")
-
-    def resume(self) -> dict:
-        return self.call("resume")
+def _resolve_repo_path(p: str) -> Path:
+    """Resolve a relative CLI path against REPO_ROOT rather than cwd."""
+    path = Path(p)
+    return path if path.is_absolute() else (REPO_ROOT / path)
 
 
 def read_tick(mcp: McpClient) -> rt.TickSnapshot:
@@ -137,7 +78,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=None, help="RNG seed for intent sampling")
     args = ap.parse_args()
 
-    model_dir = Path(args.model)
+    model_dir = _resolve_repo_path(args.model)
     policy = KnnPolicy.load(model_dir)
     policy.temperature = args.temperature
     meta = json.loads((model_dir / META_FILE).read_text())
@@ -152,14 +93,21 @@ def main() -> None:
         print("[drift-guard] OK: model calibration matches dataset.py exactly.")
 
     mcp_url = args.mcp_url or f"http://127.0.0.1:{args.port}/mcp"
-    mcp = McpClient(mcp_url)
-    mcp.initialize()
+    mcp = McpClient(mcp_url, client_name="shadow-play")
+    mcp.connect()
     print(f"[mcp] connected to {mcp_url}")
 
     if args.state:
         mcp.enable_writes()
-        r = mcp.load_state(args.state)
-        print(f"[mcp] load_state({args.state}) -> {r}")
+        # load_state itself distinguishes a save-state slot (int) from a
+        # path; only a path needs repo-root resolution.
+        try:
+            int(args.state)
+            state_spec = args.state
+        except ValueError:
+            state_spec = str(_resolve_repo_path(args.state))
+        r = mcp.load_state(state_spec)
+        print(f"[mcp] load_state({state_spec}) -> {r}")
 
     override = None if args.me_block == "auto" else ("block1" if args.me_block == "1" else "block2")
 
@@ -232,7 +180,7 @@ def main() -> None:
                 mask = rt.intent_to_mask(move, attack, s)
                 buttons = rt.mask_to_button_names(mask)
                 if not args.dry_run and buttons:
-                    mcp.press_buttons(buttons, frames=period_frames, port=1)
+                    mcp.press(buttons, frames=period_frames, port=1)
                 buffers.last_emitted_mask = mask if buttons else 0
 
             buffers.prev_opp = opp_now

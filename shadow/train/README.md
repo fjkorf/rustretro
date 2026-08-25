@@ -8,24 +8,40 @@ construction) → situation-bucket evaluation + coverage drill list (§7.4/§7.6
 ## Setup
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install numpy
+python3 -m venv .venv && .venv/bin/pip install -e .
 ```
+
+`pip install -e .` (via `pyproject.toml`) installs `shadow_train` into `.venv`
+in editable mode, so `.venv/bin/python3 -m shadow_train ...` and
+`import shadow_train` work from **any** working directory — not just from
+inside `shadow/train/` — and `shadow/play.py` (which lives one level up) can
+import it too. If you only ever ran `pip install numpy` in an older checkout,
+re-run `pip install -e .` once to pick this up (numpy is still pulled in as a
+dependency).
 
 ## Run
 
 ```sh
+# from the repo root (or anywhere — shadow_train is installed, not path-hacked):
+PY=shadow/train/.venv/bin/python3
+
 # build + round-holdout evaluate (§7.4 report + §7.6 coverage)
-.venv/bin/python3 -m shadow_train eval ../recordings/<session>.jsonl [more.jsonl ...] \
+"$PY" -m shadow_train eval shadow/recordings/<session>.jsonl [more.jsonl ...] \
     [--char 0]      # per-character model filter (me char id; Yashaou = 0)
     [--k 15] [--holdout 0.2]
 
 # fit on ALL of the given recordings (no holdout) and persist to disk
-.venv/bin/python3 -m shadow_train fit ../recordings/<session>.jsonl [more.jsonl ...] \
-    --out ../models/<name>/ [--char 0] [--k 15]
+"$PY" -m shadow_train fit shadow/recordings/<session>.jsonl [more.jsonl ...] \
+    --out shadow/models/<name>/ [--char 0] [--k 15]
 
 # print the coverage drill list for an already-fitted model (no recordings needed)
-.venv/bin/python3 -m shadow_train report ../models/<name>/
+"$PY" -m shadow_train report shadow/models/<name>/
 ```
+
+(If invoking from inside `shadow/train/` itself, as the commands looked
+before the package was installed, use `../recordings/...` / `../models/...`
+paths instead — both styles work now, since the paths are just argv strings
+resolved by argparse's `Path`, not by where the package is imported from.)
 
 Only jsonl-v2 recordings (recorder v2, 2026-08-24+) are accepted. The eval
 splits by round — never by frame — and reports per-bucket accuracy vs the

@@ -14,12 +14,16 @@ Subcommands:
   disasm <hexaddr> <len> [hexpc] disassemble ROM at addr (mark pc if given)
 """
 import json
+import os
 import struct
 import sys
 import time
-import urllib.request
 
 import capstone
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "..", "shadow", "train"))
+from shadow_train.mcpclient import McpClient  # noqa: E402
 
 SCRATCH = "."
 ROMDIR = "/Users/frankkorf/games/roms/asurabld"
@@ -27,34 +31,13 @@ PORT = 4011
 
 
 # ---------------------------------------------------------------- MCP client
-class Mcp:
+class Mcp(McpClient):
+    """execmap's Mcp -- constructed by port, eager-handshakes like before."""
+
     def __init__(self, port=PORT):
-        self.url = f"http://127.0.0.1:{port}/mcp"
-        self.sid = None
-        self._post({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
-            "protocolVersion": "2024-11-05", "capabilities": {},
-            "clientInfo": {"name": "execmap", "version": "0"}}})
-        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
-
-    def _post(self, payload):
-        req = urllib.request.Request(
-            self.url, data=json.dumps(payload).encode(), method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Accept", "application/json, text/event-stream")
-        if self.sid:
-            req.add_header("mcp-session-id", self.sid)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            self.sid = r.headers.get("mcp-session-id", self.sid)
-            body = r.read().decode()
-        for line in body.splitlines():
-            if line.startswith("data:") and line[5:].strip():
-                return json.loads(line[5:].strip())
-        return None
-
-    def call(self, tool, **kwargs):
-        resp = self._post({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                           "params": {"name": tool, "arguments": kwargs}})
-        return json.loads(resp["result"]["content"][0]["text"])
+        super().__init__(f"http://127.0.0.1:{port}/mcp", timeout=30.0,
+                          client_name="execmap")
+        self.connect()
 
 
 def rom_bytes():

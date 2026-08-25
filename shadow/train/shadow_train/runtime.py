@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import asurabld as gm
 from . import dataset
 from .__main__ import CALIBRATION_KEYS
 from .dataset import (
@@ -75,7 +76,8 @@ RETRO_BUTTON_NAMES = [
     "a", "x", "l", "r",
 ]
 
-# ── memory read plan (game addresses — library/asurabld/asurabld.md) ───────
+# ── memory read plan (game addresses — shadow_train.asurabld, mirroring
+# library/asurabld/asurabld.md) ─────────────────────────────────────────────
 # Batched so one tick needs 5 read_memory calls total (<6, per the harness
 # requirement): two big per-block reads (each block's own struct span also
 # happens to contain the OTHER block's "combo landing on me" counter — see
@@ -83,43 +85,43 @@ RETRO_BUTTON_NAMES = [
 # fall inside the neighboring block's 0xDB4 stride), one combined
 # match_end+abort read (they're close enough together to share one call),
 # and two small reads (round_over, round timer BCD).
-BLOCK1_ADDR = 0x403798
-BLOCK2_ADDR = 0x40454C
-COMBO_ON_B2_ADDR = 0x4041E7  # block1's combo landing on block2 -- inside block1's span
-COMBO_ON_B1_ADDR = 0x40470B  # block2's combo landing on block1 -- inside block2's span
+BLOCK1_ADDR = gm.BLOCK1
+BLOCK2_ADDR = gm.BLOCK2
+COMBO_ON_B2_ADDR = gm.COMBO_ON_B2  # block1's combo landing on block2 -- inside block1's span
+COMBO_ON_B1_ADDR = gm.COMBO_ON_B1  # block2's combo landing on block1 -- inside block2's span
 COMBO_ON_B2_OFFSET = COMBO_ON_B2_ADDR - BLOCK1_ADDR
 COMBO_ON_B1_OFFSET = COMBO_ON_B1_ADDR - BLOCK2_ADDR
 
 # fighter struct layout: (name, offset, size in bytes); all big-endian
 # (68k byte order, per record.rs's u16be/u8g helpers).
 FIGHTER_LAYOUT = [
-    ("timer", 0x00, 2),
-    ("anim", 0x12, 2),
-    ("action", 0x50, 2),
-    ("x", 0x54, 2),
-    ("y", 0x56, 2),
-    ("facing", 0x61, 1),
-    ("weapon", 0x65, 1),
-    ("health", 0x177, 1),
-    ("health2", 0x179, 1),
-    ("meter", 0x17B, 1),
-    ("meter_max", 0x17F, 1),
-    ("char_id", 0x639, 1),
+    ("timer", gm.TIMER, 2),
+    ("anim", gm.ANIM, 2),
+    ("action", gm.ACTION, 2),
+    ("x", gm.X, 2),
+    ("y", gm.Y, 2),
+    ("facing", gm.FACING, 1),
+    ("weapon", gm.WEAPON, 1),
+    ("health", gm.HEALTH, 1),
+    ("health2", gm.HEALTH2, 1),
+    ("meter", gm.METER, 1),
+    ("meter_max", gm.METER_MAX, 1),
+    ("char_id", gm.CHAR_ID, 1),
 ]
 _FIGHTER_END = max(off + size for _, off, size in FIGHTER_LAYOUT)
 
 BLOCK1_LEN = max(_FIGHTER_END, COMBO_ON_B2_OFFSET + 1)
 BLOCK2_LEN = max(_FIGHTER_END, COMBO_ON_B1_OFFSET + 1)
 
-MATCH_END_ADDR = 0x402A32
-ABORT_ADDR = 0x403678
+MATCH_END_ADDR = gm.MATCH_END
+ABORT_ADDR = gm.ABORT
 MATCH_END_ABORT_OFFSET = ABORT_ADDR - MATCH_END_ADDR
 MATCH_END_ABORT_LEN = MATCH_END_ABORT_OFFSET + 2  # abort is a u16
 
-ROUND_OVER_ADDR = 0x40646E
-ROUND_TIMER_ADDR = 0x40000A  # BCD seconds
+ROUND_OVER_ADDR = gm.ROUND_OVER
+ROUND_TIMER_ADDR = gm.ROUND_TIMER  # BCD seconds
 
-CREDITS_ADDR = 0x40655D  # startup-only (not part of the per-tick read plan)
+CREDITS_ADDR = gm.CREDITS  # startup-only (not part of the per-tick read plan)
 
 # (name, addr, len) -- the exact 5 reads issued each decision tick.
 READ_PLAN = [

@@ -39,10 +39,11 @@ if [[ $FIT -ge 1 ]]; then
   while [[ -d "shadow/models/goat-v$N" ]]; do N=$((N + 1)); done
   MODEL="goat-v$N"
   echo "── fitting $MODEL from ${#RECS[@]} recording(s) ──"
-  (cd shadow/train && .venv/bin/python3 -m shadow_train fit \
-      $(printf '../../%s ' "${RECS[@]}") --out "../models/$MODEL/")
+  # shadow_train is `pip install -e`d into .venv (see shadow/train/pyproject.toml),
+  # so `-m shadow_train` resolves without cd-ing into shadow/train first.
+  "$PY" -m shadow_train fit "${RECS[@]}" --out "shadow/models/$MODEL/"
   echo
-  (cd shadow/train && .venv/bin/python3 -m shadow_train report "../models/$MODEL/")
+  "$PY" -m shadow_train report "shadow/models/$MODEL/"
   [[ $FIT -eq 2 ]] && exit 0
 fi
 
