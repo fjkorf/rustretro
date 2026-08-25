@@ -3,8 +3,11 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::debug::DebugState;
-use crate::record::{char_name, matchup_slug};
+use crate::debug::{DebugState, Watch, WatchFormat};
+use crate::record::{
+    char_name, matchup_slug, opponent_for_stage_value, stage_value_for_opponent,
+    STAGE_SELECT_ADDR,
+};
 
 /// The matchup coverage grid: rows = your character, columns = the opponent,
 /// cells = how much demonstration data exists (from the `.rounds.jsonl`
@@ -36,6 +39,38 @@ const FRAMES_PER_DECISION: u64 = 8;
 /// Below this many (approximate) decisions a cell counts as sparse — enough
 /// for the kNN to answer, nowhere near enough to capture a matchup.
 const SPARSE_DECISIONS: u64 = 1000;
+
+/// The active force, if any: a frozen watch on the stage/opponent selector.
+fn current_force(state: &DebugState) -> Option<u8> {
+    state
+        .watches
+        .iter()
+        .find(|w| w.addr == STAGE_SELECT_ADDR as usize && w.frozen)
+        .and_then(|w| w.frozen_value)
+        .map(|v| v as u8)
+}
+
+/// Freeze the selector to `v` — the emu thread re-writes it every frame, so
+/// every upcoming fight is `v`'s home matchup until cleared. Same mechanism
+/// as the Watch panel's freeze checkbox (UI-local, no write gate).
+fn set_force(state: &mut DebugState, v: u8) {
+    clear_force(state);
+    state.watches.push(Watch {
+        addr: STAGE_SELECT_ADDR as usize,
+        label: format!("⚔ force {} fight", opponent_for_stage_value(v)
+            .map(char_name).unwrap_or_default()),
+        format: WatchFormat::Hex8,
+        frozen: true,
+        frozen_value: Some(v as u32),
+        track_changes: false,
+        current: None,
+        prev_value: None,
+    });
+}
+
+fn clear_force(state: &mut DebugState) {
+    state.watches.retain(|w| w.addr != STAGE_SELECT_ADDR as usize || !w.frozen);
+}
 
 fn scan_rounds() -> BTreeMap<(u8, u8), Cell> {
     let mut cells: BTreeMap<(u8, u8), Cell> = BTreeMap::new();
@@ -119,6 +154,24 @@ impl MatchupPanel {
         }
 
         ui.heading("🥊 Matchup coverage");
+
+        // Active forced matchup (frozen stage/opponent selector) indicator.
+        if let Some(v) = current_force(state) {
+            let who = opponent_for_stage_value(v)
+                .map(char_name)
+                .unwrap_or_else(|| format!("stage {v}"));
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("⚔ forcing every next fight: vs {who}"))
+                        .color(egui::Color32::from_rgb(230, 180, 90))
+                        .strong(),
+                );
+                if ui.small_button("✕ Clear").clicked() {
+                    clear_force(state);
+                }
+            });
+        }
+
         if self.cells.is_empty() {
             ui.label(
                 "No indexed rounds yet — recordings made from now on are indexed \
@@ -127,7 +180,8 @@ impl MatchupPanel {
             return;
         }
 
-        // Row/column domains: every char seen on either side.
+        // Rows: chars you've played. Columns: the full playable roster (the
+        // gaps are the point) plus any extra ids seen (bosses).
         let mes: Vec<u8> = {
             let mut v: Vec<u8> = self.cells.keys().map(|(m, _)| *m).collect();
             v.sort_unstable();
@@ -135,7 +189,8 @@ impl MatchupPanel {
             v
         };
         let opps: Vec<u8> = {
-            let mut v: Vec<u8> = self.cells.keys().map(|(_, o)| *o).collect();
+            let mut v: Vec<u8> = (0..=7).collect();
+            v.extend(self.cells.keys().map(|(_, o)| *o).filter(|o| *o > 7));
             v.sort_unstable();
             v.dedup();
             v
@@ -184,6 +239,25 @@ impl MatchupPanel {
             .small()
             .color(egui::Color32::DARK_GRAY),
         );
+
+        // Boss fights have no grid column until first fought — quick-force row.
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Bosses:").small());
+            for boss in [8u8, 9u8] {
+                let v = stage_value_for_opponent(boss).unwrap();
+                if current_force(state) == Some(v) {
+                    if ui.small_button(format!("✕ {}", char_name(boss))).clicked() {
+                        clear_force(state);
+                    }
+                } else if ui
+                    .small_button(format!("⚔ {}", char_name(boss)))
+                    .on_hover_text("Force the next fight against this boss")
+                    .clicked()
+                {
+                    set_force(state, v);
+                }
+            }
+        });
 
         // ── Selected-cell detail + actions ────────────────────────────
         let Some((m, o)) = self.selected else { return };
@@ -242,6 +316,39 @@ impl MatchupPanel {
                         .small()
                         .color(egui::Color32::DARK_GRAY),
                 );
+            }
+        });
+
+        // ── Force this matchup (freeze the stage/opponent selector) ───
+        ui.horizontal(|ui| {
+            match stage_value_for_opponent(o) {
+                Some(v) => {
+                    if current_force(state) == Some(v) {
+                        if ui.small_button("✕ Clear forced matchup").clicked() {
+                            clear_force(state);
+                        }
+                    } else if ui
+                        .small_button(format!("⚔ Force next fight vs {}", char_name(o)))
+                        .on_hover_text(
+                            "Freezes $40364D so the NEXT fight (after the current one \
+                             ends) is this opponent on their home stage — and every \
+                             fight after, until cleared. Pick your own character \
+                             normally; this only chooses the other side.",
+                        )
+                        .clicked()
+                    {
+                        set_force(state, v);
+                    }
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new(
+                            "footee's fight has no selector value — reach her via the ladder",
+                        )
+                        .small()
+                        .color(egui::Color32::DARK_GRAY),
+                    );
+                }
             }
         });
     }

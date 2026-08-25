@@ -191,6 +191,36 @@ pub fn matchup_slug(me: u8, opp: u8) -> String {
     format!("{}-vs-{}", char_name(me), char_name(opp))
 }
 
+/// The stage/opponent selector byte: freezing `$40364D` through the
+/// post-select map screen forces the next fight's venue AND its home
+/// character as the opponent (write-verified; see asurabld.md "Stages").
+pub const STAGE_SELECT_ADDR: u32 = 0x40364D;
+
+/// Selector value whose home character is `opp` — i.e. what to freeze
+/// [`STAGE_SELECT_ADDR`] to in order to fight `opp` next. Footee (3) has no
+/// selector value (her beach is only the default venue); 10+ overflow.
+/// Hand-kept mirror of the value→home-char table in asurabld.md.
+pub fn stage_value_for_opponent(opp: u8) -> Option<u8> {
+    match opp {
+        0 => Some(7), // yashaou's inferno (mirror-capable)
+        1 => Some(6), // goat's desert castle
+        2 => Some(2), // lightning's water cavern
+        4 => Some(3), // alice's shipwreck
+        5 => Some(4), // taros' foundry hall
+        6 => Some(1), // zam-b's dungeon
+        7 => Some(5), // rosemary's hall
+        8 => Some(8), // curfue
+        9 => Some(9), // s. geist
+        _ => None,    // 3 = footee: no selector value
+    }
+}
+
+/// Inverse of [`stage_value_for_opponent`]: which character a frozen
+/// selector value will summon.
+pub fn opponent_for_stage_value(v: u8) -> Option<u8> {
+    (0u8..=9).find(|&opp| stage_value_for_opponent(opp) == Some(v))
+}
+
 /// Pack a 12-button held state into the low 12 bits (RETRO_DEVICE_ID order).
 pub fn pack_mask(bits: &[bool; 12]) -> u16 {
     let mut m = 0u16;
@@ -422,6 +452,18 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("meta.json"));
         let _ = std::fs::remove_file(path.with_extension("rounds.jsonl"));
+    }
+
+    #[test]
+    fn stage_selector_mapping_inverts_cleanly() {
+        for opp in 0u8..=9 {
+            match stage_value_for_opponent(opp) {
+                Some(v) => assert_eq!(opponent_for_stage_value(v), Some(opp)),
+                None => assert_eq!(opp, 3, "only footee lacks a selector value"),
+            }
+        }
+        assert_eq!(opponent_for_stage_value(0), None); // 0 = unset
+        assert_eq!(opponent_for_stage_value(10), None); // overflow
     }
 
     #[test]

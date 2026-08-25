@@ -91,7 +91,10 @@ stored in the sidecars and selectable at fit time.
 
 The 🥊 Matchup panel renders that index as a coverage grid (≈decisions per
 me×opp cell, ✓ = fitted model, amber = sparse); clicking a cell offers its
-model, its `shadow/arenas/<slug>.state` arena, and the fit command for gaps.
+model, its `shadow/arenas/<slug>.state` arena, the fit command for gaps, and
+"⚔ Force next fight" — freezes `$40364D` (write-verified opponent+venue
+selector, asurabld.md "Stages") so every next fight is that matchup until
+cleared. Bosses get quick-force buttons; Footee has no selector value.
 Model SETS: loading a directory of model dirs (e.g. `shadow/models` via the
 panel's "Load ALL as set" or `load_shadow`) keeps the newest model per
 matchup key and auto-switches at every round start by reading both char ids
