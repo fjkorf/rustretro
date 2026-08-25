@@ -1,0 +1,94 @@
+{
+  "feature_names": [
+    "dist_x",
+    "dy",
+    "me_airborne",
+    "me_height",
+    "me_fwd_hold",
+    "me_back_hold",
+    "me_anim",
+    "me_timer",
+    "opp_airborne",
+    "opp_height",
+    "opp_anim",
+    "opp_timer",
+    "facing_sign",
+    "me_health",
+    "opp_health",
+    "health_lead",
+    "me_meter",
+    "opp_meter",
+    "me_hitstun",
+    "opp_hitstun",
+    "me_corner"
+  ],
+  "calibration": {
+    "GROUND_Y": 216,
+    "X_SCALE": 128.0,
+    "Y_SCALE": 128.0,
+    "TIMER_SCALE": 256.0,
+    "ANIM_SCALE": 64.0,
+    "CORNER_PX": 24,
+    "HEALTH_MAX": 239,
+    "SCREEN_W": 320,
+    "P": 8,
+    "K": 4,
+    "STALE": 3,
+    "SEGMENT_DECISIONS": 150,
+    "HITSTUN_RECENT_FRAMES": 20
+  },
+  "move_classes": [
+    "Neutral",
+    "Forward",
+    "Back",
+    "Up",
+    "Down",
+    "UpForward",
+    "UpBack",
+    "DownForward",
+    "DownBack"
+  ],
+  "attack_classes": [
+    "None",
+    "Light",
+    "Medium",
+    "Heavy",
+    "Launcher",
+    "Toss"
+  ],
+  "k": 15,
+  "temperature": 1.0,
+  "char_filter": null,
+  "source_files": [
+    "../recordings/session-2026-08-24-recorder-v2.jsonl",
+    "../recordings/session-2026-08-24-training-v1.jsonl"
+  ],
+  "n_decisions": 6415,
+  "n_rounds": 45,
+  "bucket_counts": {
+    "offense": 229,
+    "neutral": 1972,
+    "air": 867,
+    "defense": 112,
+    "corner": 3235
+  },
+  "move_label_counts": {
+    "Neutral": 5742,
+    "Forward": 288,
+    "Back": 120,
+    "Up": 9,
+    "Down": 53,
+    "UpForward": 72,
+    "UpBack": 19,
+    "DownForward": 85,
+    "DownBack": 27
+  },
+  "attack_label_counts": {
+    "None": 5888,
+    "Light": 323,
+    "Medium": 179,
+    "Launcher": 10,
+    "Toss": 15
+  },
+  "created": "2026-08-25T04:57:59.824180+00:00"
+}
