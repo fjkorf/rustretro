@@ -8,6 +8,8 @@ mod litui_pages;
 mod lua_engine;
 mod record;
 mod mcp;
+mod training;
+mod input_config;
 
 use anyhow::Result;
 use audio::AudioOutput;
@@ -55,6 +57,42 @@ struct Args {
     /// flag) as JSONL to this path — training data for the shadow project
     /// (schema: shadow/SPEC.md). Needs a Work RAM bus window (--bus-map).
     #[arg(long, value_name = "PATH")] record: Option<PathBuf>,
+    /// Log raw gamepad button names + stick values to stderr whenever they
+    /// change ("[pad] …") — for calibrating unmapped controllers.
+    #[arg(long)] pad_debug: bool,
+    /// Training mode (shadow PLAN Wave 2b): credits auto-topped-up, round
+    /// timer held, health refilled before KO, dummy presets on port 1.
+    /// Hotkeys: F1 cycle dummy, F2 reset positions, F3 toggle refill,
+    /// F4 finish round.
+    #[arg(long)] training: bool,
+    /// Input mapping file (see src/input_config.rs). Default search:
+    /// <save-dir>/<rom>.keymap.json, then <save-dir>/keymap.json, then the
+    /// built-in maps.
+    #[arg(long, value_name = "PATH")] keymap: Option<PathBuf>,
+    /// Print the active input mapping as JSON to stdout and exit — the
+    /// starting point for a hand-edited keymap file.
+    #[arg(long)] dump_keymap: bool,
+    /// Interactive controller calibration: prompts on stderr for each game
+    /// action, captures the next gamepad button press, writes
+    /// <save-dir>/keymap.json and exits. Esc skips a step.
+    #[arg(long)] calibrate: bool,
+    /// Start with audio muted (the stream still runs; unmute live from the
+    /// debugger's audio controls). --no-audio disables audio entirely.
+    #[arg(long)] mute: bool,
+    /// Load a save state right after boot: a slot number 1-9 (resolved to
+    /// <save-dir>/<rom>.state<N>) or an explicit state-file path. Applied on
+    /// the first emulated frame (saving is interactive: F6/Shift+F6 or the MCP
+    /// save_state tool).
+    #[arg(long, value_name = "PATH_OR_SLOT")] load_state: Option<String>,
+}
+
+/// Parse the --load-state argument: a bare 1-9 selects a slot; anything else
+/// is an explicit state-file path.
+fn parse_load_state(spec: &str) -> debug::StateOp {
+    match spec.trim().parse::<u8>() {
+        Ok(n @ 1..=9) => debug::StateOp::LoadSlot(n),
+        _ => debug::StateOp::Load(PathBuf::from(spec)),
+    }
 }
 
 // ─── Bevy resources ──────────────────────────────────────────────────────────
@@ -79,6 +117,10 @@ struct DebugOverlay(debug::window::DebugApp);
 
 #[derive(Resource)]
 struct AudioRes(AudioOutput);
+
+/// --pad-debug: log raw gamepad state changes from read_input.
+#[derive(Resource)]
+struct PadDebug(bool);
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
@@ -112,6 +154,13 @@ fn main() -> Result<()> {
     eprintln!("ROM:  {}", args.rom);
     eprintln!("Press F12 to toggle debug overlay, Space to pause.");
 
+    // Input mapping: resolve config, honor --dump-keymap before anything else.
+    let keymap_cfg = input_config::InputConfig::load(&args.keymap, &args.save_dir, &args.rom);
+    if args.dump_keymap {
+        println!("{}", serde_json::to_string_pretty(&keymap_cfg).unwrap());
+        return Ok(());
+    }
+
     let debug_state: SharedDebugState = Arc::new(Mutex::new(DebugState::new()));
 
     let mut frontend = Frontend::new(
@@ -126,10 +175,31 @@ fn main() -> Result<()> {
         frontend.set_recorder(rec_path);
     }
 
+    // --load-state: queue the load now; the Frontend drains it at the safe
+    // point right after the FIRST core.run (the core has warmed up one frame
+    // by then — retro_unserialize before any retro_run is not reliable across
+    // cores).
+    if let Some(spec) = &args.load_state {
+        let op = parse_load_state(spec);
+        debug_state.lock().unwrap().pending_state_op = Some(op);
+        eprintln!("[state] --load-state {spec}: queued, applied after the first frame");
+    }
+
     let w = frontend.video_width().max(320) * args.scale;
     let h = frontend.video_height().max(240) * args.scale;
+    // Core audio rate for the resampler (e.g. fbalpha2012: 32040 Hz).
+    let core_sample_rate = frontend.sample_rate();
 
     if args.debug { debug_state.lock().unwrap().debug_open = true; }
+    if args.training {
+        let mut ds = debug_state.lock().unwrap();
+        ds.training.enabled = true;
+        ds.training.refill = true;
+        eprintln!(
+            "[training] mode ON — credits auto, timer held, health refill. \
+             F1 cycle dummy, F2 reset positions, F3 toggle refill, F4 finish round."
+        );
+    }
 
     // Build the Lua scripting engine (main-thread NonSend resource). Load the
     // optional --script once at startup. A failure to load logs but does not
@@ -180,15 +250,25 @@ fn main() -> Result<()> {
         .add_plugins(EguiPlugin::default())
         .insert_non_send_resource(Emu(frontend))
         .insert_resource(DebugStateRes(debug_state.clone()))
-        .insert_resource(AudioRes(AudioOutput::new(!args.no_audio)))
+        .insert_resource(AudioRes({
+            let mut a = AudioOutput::new(!args.no_audio, core_sample_rate);
+            if args.mute {
+                a.set_mute(true);
+                eprintln!("[audio] starting muted (--mute)");
+            }
+            a
+        }))
         .insert_resource(WindowScale(args.scale))
+        .insert_resource(PadDebug(args.pad_debug))
+        .insert_resource(keymap_cfg)
+        .insert_resource(CalibrateState::new(args.calibrate, &args.save_dir))
         .insert_resource(DebugOverlay(debug::window::DebugApp::new(debug_state)))
         .insert_non_send_resource(LuaRes(lua_engine))
         .insert_resource(ScriptPanel::new())
         .init_resource::<LituiPages>()
         .init_resource::<TutorialPages>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (read_input, run_emulation, run_scripts, drain_lua_requests, sync_video, queue_audio, update_title).chain())
+        .add_systems(Update, (calibrate_wizard, read_input, run_emulation, run_scripts, drain_lua_requests, sync_video, queue_audio, update_title).chain())
         .add_systems(EguiPrimaryContextPass, (show_debug, show_script_panel, show_litui_pages, show_tutorial_pages))
         .run();
 
@@ -316,46 +396,181 @@ fn setup(
 
 // ─── Input ───────────────────────────────────────────────────────────────────
 
+/// Interactive controller calibration (--calibrate): prompts through the
+/// wizard steps on stderr, captures one gamepad button per game action,
+/// writes keymap.json, exits. Eliminates every "which physical button was
+/// that" ambiguity — the user answers by pressing, never by describing.
+#[derive(Resource)]
+struct CalibrateState {
+    active: bool,
+    step: usize,
+    announced: bool,
+    captured: std::collections::BTreeMap<GamepadButton, Vec<input_config::RetroButton>>,
+    out_path: PathBuf,
+}
+
+impl CalibrateState {
+    fn new(active: bool, save_dir: &std::path::Path) -> Self {
+        CalibrateState {
+            active,
+            step: 0,
+            announced: false,
+            captured: Default::default(),
+            out_path: input_config::InputConfig::global_path(save_dir),
+        }
+    }
+}
+
+/// (prompt, RETRO bits the captured button will emit)
+fn calibrate_steps() -> Vec<(&'static str, Vec<input_config::RetroButton>)> {
+    use input_config::RetroButton::*;
+    vec![
+        ("LIGHT attack", vec![B]),
+        ("MEDIUM attack", vec![A]),
+        ("HEAVY attack", vec![Y]),
+        ("WEAPON TOSS (chord: all three attacks)", vec![B, A, Y]),
+        ("LAUNCHER (chord: two attacks)", vec![B, A]),
+        ("COIN / select", vec![Select]),
+        ("START", vec![Start]),
+    ]
+}
+
+fn calibrate_wizard(
+    mut cal: ResMut<CalibrateState>,
+    pads: Query<&Gamepad>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cfg: ResMut<input_config::InputConfig>,
+) {
+    if !cal.active {
+        return;
+    }
+    let steps = calibrate_steps();
+    if cal.step >= steps.len() {
+        // Finish: keep keyboard maps + deadzone from the active config, use
+        // the captured gamepad map (plus lever passthrough) on both ports.
+        use input_config::RetroButton::{Down, Left, Right, Up};
+        let mut gp = cal.captured.clone();
+        for (b, d) in [
+            (GamepadButton::DPadUp, Up),
+            (GamepadButton::DPadDown, Down),
+            (GamepadButton::DPadLeft, Left),
+            (GamepadButton::DPadRight, Right),
+        ] {
+            gp.entry(b).or_insert_with(|| vec![d]);
+        }
+        for port in cfg.ports.iter_mut() {
+            port.gamepad = gp.clone();
+        }
+        let json = serde_json::to_string_pretty(&*cfg).unwrap();
+        match std::fs::write(&cal.out_path, &json) {
+            Ok(()) => eprintln!(
+                "[calibrate] wrote {} — relaunch (without --calibrate) to play",
+                cal.out_path.display()
+            ),
+            Err(e) => eprintln!("[calibrate] FAILED to write {}: {e}", cal.out_path.display()),
+        }
+        std::process::exit(0);
+    }
+    let (prompt, bits) = &steps[cal.step];
+    if !cal.announced {
+        eprintln!(
+            "[calibrate] step {}/{}: press the button for {prompt}  (Esc = skip)",
+            cal.step + 1,
+            steps.len()
+        );
+        cal.announced = true;
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        eprintln!("[calibrate] skipped");
+        cal.step += 1;
+        cal.announced = false;
+        return;
+    }
+    let Some(pad) = pads.iter().next() else { return };
+    let fresh: Option<GamepadButton> = pad
+        .get_just_pressed()
+        .copied()
+        .find(|b| {
+            !matches!(
+                b,
+                GamepadButton::DPadUp
+                    | GamepadButton::DPadDown
+                    | GamepadButton::DPadLeft
+                    | GamepadButton::DPadRight
+            )
+        });
+    if let Some(btn) = fresh {
+        if cal.captured.contains_key(&btn) {
+            eprintln!("[calibrate] {btn:?} is already assigned — press a different button");
+            return;
+        }
+        eprintln!("[calibrate]   {prompt} = {btn:?}");
+        let bits = bits.clone();
+        cal.captured.insert(btn, bits);
+        cal.step += 1;
+        cal.announced = false;
+    }
+}
+
 fn read_input(
     keys: Res<ButtonInput<KeyCode>>,
+    pads: Query<(Entity, &Gamepad)>,
     mut emu: NonSendMut<Emu>,
     debug_state: Res<DebugStateRes>,
     mut script_panel: ResMut<ScriptPanel>,
     mut litui: ResMut<LituiPages>,
     mut tutorials: ResMut<TutorialPages>,
+    pad_debug: Res<PadDebug>,
+    cfg: Res<input_config::InputConfig>,
+    mut last_pad_dbg: Local<String>,
 ) {
     use KeyCode::*;
-    // Order = RETRO_DEVICE_ID_JOYPAD: B Y Select Start Up Down Left Right A X L R.
-    let mut bits = [
-        keys.pressed(KeyZ),
-        keys.pressed(KeyA),
-        keys.pressed(ShiftLeft) || keys.pressed(ShiftRight),
-        keys.pressed(Enter),
-        keys.pressed(ArrowUp),
-        keys.pressed(ArrowDown),
-        keys.pressed(ArrowLeft),
-        keys.pressed(ArrowRight),
-        keys.pressed(KeyX),
-        keys.pressed(KeyS),
-        keys.pressed(KeyQ),
-        keys.pressed(KeyW),
-    ];
-    // P2 keymap — disjoint from P1's keys and the F*/Space/B hotkeys: IJKL move,
-    // G/H = B/Y, T/Y = A/X, U/O = L/R, N/M = Select/Start.
-    let mut bits2 = [
-        keys.pressed(KeyG),
-        keys.pressed(KeyH),
-        keys.pressed(KeyN),
-        keys.pressed(KeyM),
-        keys.pressed(KeyI),
-        keys.pressed(KeyK),
-        keys.pressed(KeyJ),
-        keys.pressed(KeyL),
-        keys.pressed(KeyT),
-        keys.pressed(KeyY),
-        keys.pressed(KeyU),
-        keys.pressed(KeyO),
-    ];
+    // Keyboard bindings per port, from the active keymap config.
+    let mut bits = input_config::key_bits(|k| keys.pressed(k), &cfg.ports[0]);
+    let mut bits2 = if cfg.ports.len() > 1 {
+        input_config::key_bits(|k| keys.pressed(k), &cfg.ports[1])
+    } else {
+        [false; 12]
+    };
+    // Fold physical gamepads: lowest entity id → slot 0, routed to ports via
+    // cfg.pad_order (keyboard still live — OR, not replace). Replugging
+    // mid-session can reorder pads; pad_order [1,0] swaps two pads.
+    let mut pad_list: Vec<_> = pads.iter().collect();
+    pad_list.sort_by_key(|(e, _)| *e);
+    for (slot, (_, pad)) in pad_list.iter().take(2).enumerate() {
+        let port = cfg.pad_order.get(slot).copied().unwrap_or(slot);
+        if port >= cfg.ports.len().min(2) {
+            continue;
+        }
+        let gb = input_config::pad_bits(
+            |b| pad.pressed(b),
+            pad.left_stick(),
+            &cfg.ports[port],
+            cfg.stick_deadzone,
+        );
+        let target = if port == 0 { &mut bits } else { &mut bits2 };
+        for i in 0..12 {
+            target[i] |= gb[i];
+        }
+    }
+    // --pad-debug: log the raw pressed set + stick when it changes, so unmapped
+    // controllers' button identities can be observed without a rebuild.
+    if pad_debug.0 {
+        if let Some((_, pad)) = pad_list.first() {
+            let cur = format!(
+                "{:?} stick={:.2},{:.2} dpad={:.2},{:.2}",
+                pad.get_pressed().collect::<Vec<_>>(),
+                pad.left_stick().x,
+                pad.left_stick().y,
+                pad.dpad().x,
+                pad.dpad().y
+            );
+            if *last_pad_dbg != cur {
+                eprintln!("[pad] {cur}");
+                *last_pad_dbg = cur;
+            }
+        }
+    }
     // OR in any MCP-injected input (press_buttons) so an agent — or the shadow bot
     // on P2 — can drive either port in windowed mode alongside the keyboard.
     if let Ok(mut ds) = debug_state.0.lock() {
@@ -368,6 +583,73 @@ fn read_input(
     }
     emu.0.set_input(bits);
     emu.0.set_input2(bits2);
+    // F5 toggles training mode at runtime (equivalent to launching with
+    // --training); the F1-F4 handlers below only respond while it's on.
+    if keys.just_pressed(F5) {
+        if let Ok(mut ds) = debug_state.0.lock() {
+            ds.training.enabled = !ds.training.enabled;
+            if ds.training.enabled {
+                ds.training.refill = true;
+                eprintln!(
+                    "[training] ON — credits auto, timer held, health refill. \
+                     F1 cycle dummy, F2 reset positions, F3 toggle refill, F4 finish round, F5 off."
+                );
+            } else {
+                eprintln!("[training] OFF (frozen values release next frame)");
+            }
+        }
+    }
+    // Training-mode hotkeys (F5 or --training to enable).
+    if keys.just_pressed(F1) || keys.just_pressed(F2) || keys.just_pressed(F3) || keys.just_pressed(F4)
+    {
+        if let Ok(mut ds) = debug_state.0.lock() {
+            if !ds.training.enabled {
+                eprintln!(
+                    "[training] not enabled — press F5 or launch with --training \
+                     (F1-F4 are training-mode keys)"
+                );
+            }
+            if ds.training.enabled {
+                use debug::DummyMode::*;
+                if keys.just_pressed(F1) {
+                    ds.training.dummy = match ds.training.dummy {
+                        Free => Stand,
+                        Stand => Crouch,
+                        Crouch => Jump,
+                        Jump => Block,
+                        Block => Free,
+                    };
+                    eprintln!("[training] dummy: {:?}", ds.training.dummy);
+                }
+                if keys.just_pressed(F2) {
+                    ds.training.reset_positions = true;
+                    eprintln!("[training] reset positions");
+                }
+                if keys.just_pressed(F3) {
+                    ds.training.refill = !ds.training.refill;
+                    eprintln!("[training] health refill: {}", ds.training.refill);
+                }
+                if keys.just_pressed(F4) {
+                    ds.training.finish_round = true;
+                    eprintln!("[training] finish round");
+                }
+            }
+        }
+    }
+    // Save-state hotkeys: F6 save / F7 load, slot 1 (Shift → slot 2). The op is
+    // queued here and performed by the emulation thread at its safe point.
+    if keys.just_pressed(F6) || keys.just_pressed(F7) {
+        let slot = if keys.pressed(ShiftLeft) || keys.pressed(ShiftRight) { 2u8 } else { 1u8 };
+        if let Ok(mut ds) = debug_state.0.lock() {
+            if keys.just_pressed(F6) {
+                ds.pending_state_op = Some(debug::StateOp::SaveSlot(slot));
+                eprintln!("[state] F6: save state → slot {slot} queued");
+            } else {
+                ds.pending_state_op = Some(debug::StateOp::LoadSlot(slot));
+                eprintln!("[state] F7: load state ← slot {slot} queued");
+            }
+        }
+    }
     if keys.just_pressed(F12) {
         let mut ds = debug_state.0.lock().unwrap();
         ds.debug_open = !ds.debug_open;
@@ -393,8 +675,29 @@ fn read_input(
 
 // ─── Emulation ───────────────────────────────────────────────────────────────
 
-fn run_emulation(mut emu: NonSendMut<Emu>) {
-    let _ = emu.0.run_frame();
+/// Pace emulation to the core's fps regardless of display refresh. Bevy's
+/// Update schedule runs at the panel rate (120 Hz on ProMotion), and calling
+/// run_frame unconditionally ran the game at 2x. Accumulate real time and run
+/// whole emulated frames as the budget allows; cap catch-up bursts so a long
+/// stall doesn't fast-forward.
+fn run_emulation(
+    mut emu: NonSendMut<Emu>,
+    mut acc: Local<Option<(std::time::Instant, f64)>>,
+) {
+    const MAX_BURST: u32 = 3;
+    let fps = emu.0.fps().max(1.0);
+    let frame = 1.0 / fps;
+    let now = std::time::Instant::now();
+    let (last, mut budget) = acc.unwrap_or((now, frame));
+    budget += now.duration_since(last).as_secs_f64();
+    let mut ran = 0;
+    while budget >= frame && ran < MAX_BURST {
+        let _ = emu.0.run_frame();
+        budget -= frame;
+        ran += 1;
+    }
+    budget = budget.min(frame * MAX_BURST as f64);
+    *acc = Some((now, budget));
 }
 
 // ─── Scripting ───────────────────────────────────────────────────────────────
@@ -530,6 +833,8 @@ fn sync_video(
 // ─── Audio ───────────────────────────────────────────────────────────────────
 
 fn queue_audio(mut emu: NonSendMut<Emu>, audio: Res<AudioRes>) {
+    // Track the core rate each frame (SET_SYSTEM_AV_INFO can change it).
+    audio.0.set_input_rate(emu.0.sample_rate());
     let samples = emu.0.drain_audio();
     audio.0.queue(&samples);
 }
@@ -640,6 +945,26 @@ fn sync_litui_pages(litui: &mut LituiPages, debug_state: &SharedDebugState, audi
 }
 
 // ─── Window title ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod load_state_arg_tests {
+    use super::parse_load_state;
+    use crate::debug::StateOp;
+    use std::path::PathBuf;
+
+    #[test]
+    fn bare_digit_is_slot_anything_else_is_path() {
+        assert_eq!(parse_load_state("1"), StateOp::LoadSlot(1));
+        assert_eq!(parse_load_state(" 9 "), StateOp::LoadSlot(9));
+        // 0 and >9 are not valid slots — treated as (odd) paths, not slots.
+        assert_eq!(parse_load_state("0"), StateOp::Load(PathBuf::from("0")));
+        assert_eq!(parse_load_state("12"), StateOp::Load(PathBuf::from("12")));
+        assert_eq!(
+            parse_load_state("/tmp/foo.state1"),
+            StateOp::Load(PathBuf::from("/tmp/foo.state1"))
+        );
+    }
+}
 
 fn update_title(emu: NonSend<Emu>, mut windows: Query<&mut Window>) {
     if emu.0.frame_count % 60 != 0 { return; }

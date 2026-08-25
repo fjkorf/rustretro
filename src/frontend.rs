@@ -27,6 +27,17 @@ pub struct Frontend {
     bus_bridge_ok: Option<bool>,
     /// Optional per-frame trace recorder (`--record`) for the shadow project.
     recorder: Option<crate::record::FrameRecorder>,
+    /// Where slot save-state files live (`<save_dir>/<rom_stem>.state<N>`).
+    save_dir: PathBuf,
+    /// ROM file stem used to name slot save-state files.
+    rom_stem: Option<String>,
+}
+
+/// Resolve the on-disk path of save-state slot `slot` (1..=9) for a ROM:
+/// `<save_dir>/<rom_stem>.state<N>` — the same sidecar naming convention as
+/// `.regions.json` / `.busmap.json`. Pure so it's unit-testable without a core.
+pub fn state_slot_path(save_dir: &std::path::Path, rom_stem: &str, slot: u8) -> PathBuf {
+    save_dir.join(format!("{rom_stem}.state{slot}"))
 }
 
 impl Frontend {
@@ -86,6 +97,8 @@ impl Frontend {
             busmap_path: busmap_path.clone(),
             bus_bridge_ok: None,
             recorder: None,
+            save_dir: save_dir.clone(),
+            rom_stem: rom_stem.clone(),
         };
 
         // Store sidecar path in debug state and try to load existing data
@@ -371,6 +384,115 @@ impl Frontend {
         }
     }
 
+    /// Resolve a [`StateOp`](crate::debug::StateOp) slot number to its file path.
+    fn slot_path(&self, slot: u8) -> PathBuf {
+        let stem = self.rom_stem.as_deref().unwrap_or("game");
+        state_slot_path(&self.save_dir, stem, slot)
+    }
+
+    /// Serialize the core and atomically write the state to `path` (.tmp+rename,
+    /// same discipline as the sidecar files). Returns the state size in bytes.
+    fn do_save_state(&self, path: &std::path::Path) -> Result<usize, String> {
+        let bytes = self
+            .core
+            .serialize()
+            .ok_or_else(|| "core refused to serialize (no save-state support?)".to_string())?;
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        std::fs::write(&tmp, &bytes)
+            .map_err(|e| format!("write {} failed: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| format!("rename to {} failed: {e}", path.display()))?;
+        Ok(bytes.len())
+    }
+
+    /// Read a state file and hand it to the core. Returns the state size.
+    fn do_load_state(&self, path: &std::path::Path) -> Result<usize, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("read {} failed: {e}", path.display()))?;
+        let expect = self.core.serialize_size();
+        if self.core.unserialize(&bytes) {
+            Ok(bytes.len())
+        } else {
+            Err(format!(
+                "core rejected the state ({} bytes; core expects {expect})",
+                bytes.len()
+            ))
+        }
+    }
+
+    /// Drain a queued save/load-state request (hotkeys / --load-state / MCP).
+    ///
+    /// SAFETY / PLACEMENT: retro_serialize and retro_unserialize must run on the
+    /// emu thread BETWEEN complete retro_run calls — never mid-frame. This is
+    /// called from two such points in `run_frame`: (a) right after `core.run()`
+    /// + `drain_bus_writes()` (so a save captures this frame's queued pokes,
+    /// and before `refresh_bus_windows` so a load's restored RAM is what gets
+    /// snapshotted), and (b) on the paused early-return path (the previous
+    /// frame is complete, so serialization is equally safe — without this an
+    /// MCP save/load while paused would hang until resume).
+    ///
+    /// After a successful LOAD it forces a full bus-window refresh
+    /// (`refresh_bus_windows(Some(0))`, ignoring per-window intervals) so the
+    /// debugger/recorder see the restored RAM immediately.
+    fn drain_state_op(&mut self) {
+        let op = match self.debug_state.try_lock() {
+            Ok(mut ds) => ds.pending_state_op.take(),
+            Err(_) => return,
+        };
+        let Some(op) = op else { return };
+
+        use crate::debug::StateOp;
+        let (is_load, path) = match op {
+            StateOp::Save(p) => (false, p),
+            StateOp::Load(p) => (true, p),
+            StateOp::SaveSlot(n) => (false, self.slot_path(n)),
+            StateOp::LoadSlot(n) => (true, self.slot_path(n)),
+        };
+
+        let result = if is_load {
+            self.do_load_state(&path)
+        } else {
+            self.do_save_state(&path)
+        };
+
+        if is_load && result.is_ok() {
+            // Snapshot ALL bus windows now so readers see the restored RAM
+            // this frame, not up to `interval` frames later.
+            self.refresh_bus_windows(Some(0));
+        }
+
+        let verb = if is_load { "loaded" } else { "saved" };
+        let published = match &result {
+            Ok(bytes) => {
+                eprintln!("[state] {verb} {} ({bytes} bytes)", path.display());
+                Ok(crate::debug::StateOpDone {
+                    loaded: is_load,
+                    path: path.clone(),
+                    bytes: *bytes,
+                })
+            }
+            Err(e) => {
+                eprintln!(
+                    "[state] {} {} FAILED: {e}",
+                    if is_load { "load" } else { "save" },
+                    path.display()
+                );
+                Err(e.clone())
+            }
+        };
+        if let Ok(mut ds) = self.debug_state.lock() {
+            match &published {
+                Ok(done) => ds.log(format!(
+                    "💾 State {verb}: {} ({} bytes)",
+                    done.path.display(),
+                    done.bytes
+                )),
+                Err(e) => ds.log(format!("💾 State op failed: {e}")),
+            }
+            ds.state_op_result = Some(published);
+        }
+    }
+
     /// Enable per-frame trace recording to `path` (JSONL, `shadow/SPEC.md`).
     /// Uses the default Asura Blade actor map. Warns if no Work RAM bus window
     /// is mapped (the actor structs won't be readable without it).
@@ -390,7 +512,7 @@ impl Frontend {
         }
         match crate::record::FrameRecorder::create(
             &path,
-            crate::record::ActorMap::default(),
+            crate::record::GameMap::default(),
             "asurabld",
             "fbalpha2012",
         ) {
@@ -757,7 +879,13 @@ impl Frontend {
             }
         };
 
-        if paused { return Ok(false); }
+        if paused {
+            // Between-frames is a safe serialization point too (see
+            // drain_state_op) — service save/load here so a paused session's
+            // MCP/hotkey state ops don't hang until resume.
+            self.drain_state_op();
+            return Ok(false);
+        }
 
         // --- Run emulation frame ---
         self.core
@@ -775,11 +903,26 @@ impl Frontend {
         // reads it back — i.e. the freeze actually sticks.
         self.drain_bus_writes();
 
+        // --- Save/load state (queued by hotkeys / --load-state / MCP) ---
+        // AFTER core.run + drain_bus_writes (a save captures this frame's
+        // settled state, including queued pokes) and BEFORE refresh_bus_windows
+        // (a load's restored RAM is what gets snapshotted; the drain also forces
+        // a full refresh itself on load). See drain_state_op for the safety
+        // argument (serialize/unserialize only between complete retro_run calls).
+        self.drain_state_op();
+
         // --- Refresh bus-window snapshots (Sek bridge) ---
         self.refresh_bus_windows(None);
 
         // --- Append this frame to the trace recorder (--record) ---
         self.record_frame();
+
+        // --- Training mode (--training): enforce sandbox + drive the dummy.
+        // After the snapshot refresh so reads see this frame; its bus writes
+        // drain next frame.
+        if let Ok(mut ds) = self.debug_state.try_lock() {
+            crate::training::tick(&mut ds, self.frame_count);
+        }
 
         // --- Capture bookmark if requested ---
         self.maybe_capture_bookmark();
@@ -1343,6 +1486,62 @@ fn sha1_hex(data: &[u8]) -> String {
         out.push_str(&format!("{word:08x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::state_slot_path;
+    use crate::debug::{DebugState, StateOp, StateOpDone};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn slot_path_follows_sidecar_convention() {
+        assert_eq!(
+            state_slot_path(Path::new("/saves"), "asurabld", 1),
+            PathBuf::from("/saves/asurabld.state1")
+        );
+        assert_eq!(
+            state_slot_path(Path::new("."), "mvsc", 9),
+            PathBuf::from("./mvsc.state9")
+        );
+    }
+
+    /// The UI/MCP → emu-thread handoff at DebugState level: queue an op, the
+    /// drain side takes it (queue is now empty — no double-execution), and the
+    /// published result is visible to (and cleared by) the requesting side.
+    #[test]
+    fn state_op_queue_handoff() {
+        let mut ds = DebugState::new();
+        assert!(ds.pending_state_op.is_none());
+
+        // Requesting side queues.
+        ds.pending_state_op = Some(StateOp::SaveSlot(2));
+
+        // Emu-thread drain takes exactly once.
+        let op = ds.pending_state_op.take();
+        assert_eq!(op, Some(StateOp::SaveSlot(2)));
+        assert!(ds.pending_state_op.is_none());
+
+        // Drain publishes the completion record.
+        let done = StateOpDone {
+            loaded: false,
+            path: PathBuf::from("/saves/asurabld.state2"),
+            bytes: 1234,
+        };
+        ds.state_op_result = Some(Ok(done.clone()));
+
+        // Requesting side polls and clears.
+        let got = ds.state_op_result.take();
+        assert_eq!(got, Some(Ok(done)));
+        assert!(ds.state_op_result.is_none());
+
+        // Explicit-path ops round-trip too.
+        ds.pending_state_op = Some(StateOp::Load(PathBuf::from("/tmp/x.state")));
+        assert_eq!(
+            ds.pending_state_op.take(),
+            Some(StateOp::Load(PathBuf::from("/tmp/x.state")))
+        );
+    }
 }
 
 #[cfg(test)]
