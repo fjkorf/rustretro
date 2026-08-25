@@ -195,8 +195,12 @@ fn main() -> Result<()> {
         let mut ds = debug_state.lock().unwrap();
         ds.training.enabled = true;
         ds.training.refill = true;
+        // Training sessions exist to poke RAM: arm the Lua write bindings too
+        // (memory.writebyte/writeword). Outside --training they stay locked
+        // until the MCP enable_writes tool arms them.
+        ds.lua_writes_enabled = true;
         eprintln!(
-            "[training] mode ON — credits auto, timer held, health refill. \
+            "[training] mode ON — credits auto, timer held, health refill, Lua writes armed. \
              F1 cycle dummy, F2 reset positions, F3 toggle refill, F4 finish round."
         );
     }

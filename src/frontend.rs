@@ -839,6 +839,8 @@ impl Frontend {
         let paused = {
             let mut ds = self.debug_state.lock().unwrap();
             ds.push_input(self.callback_context.input_state, self.frame_count);
+            // Mirror port 1 too so Lua `input.get(1)` has a cheap read.
+            ds.input_state2 = self.callback_context.input_state2;
             ds.frame_count = self.frame_count;
 
             if let Some(tf) = ds.trigger_frame {

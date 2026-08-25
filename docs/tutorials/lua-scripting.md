@@ -30,23 +30,71 @@ There are two ways in:
   from a fresh VM; **Clear VM** discards everything. The status line confirms how many
   `onframeend` callbacks registered.
 
-## The v1 API
+## The API
 
 Scripts run in a sandbox — only `table`, `string`, and `math` stdlibs; no `io`, `os`,
 or `package`, so a script can't touch your filesystem (the *host* reads the file, not
-Lua). Available globals (check `_RUSTRETRO_API >= 1` to feature-detect):
+Lua). Available globals (check `_RUSTRETRO_API >= 2` to feature-detect):
 
 ```text
 memory.read_u8(addr)        memory.read_u16_be(addr)    memory.read_u32_be(addr)
 memory.read_s16_be(addr)    memory.read_u16_le(addr)    memory.read_u32_le(addr)
-gui.drawBox(x1,y1,x2,y2, fill, line)     gui.drawText(x,y, str [, color])
+memory.writebyte(addr, v)   memory.writeword(addr, v)   -- gated, see below
+savestate.save(slot_or_path)             savestate.load(slot_or_path)
+input.set(port, mask_or_table)           input.get(port)
+gui.drawBox(x1,y1,x2,y2, fill, line)     gui.drawText(x,y, str [, color [, scale]])
+gui.text(x,y, str [, color [, scale]])   -- drawText + 1px drop shadow
 gui.drawLine(x1,y1,x2,y2, color)         gui.drawPixel(x,y, color)
 event.onframeend(function)               console.log(str)        emu.framecount()
 ```
 
 Colors are packed `0xRRGGBBAA` (`AA=0xFF` is opaque). Coordinates are in **game-pixel
 space** (e.g. 320×224), 1:1 with the framebuffer before upscaling. Genesis is
-big-endian — reach for the `_be` reads.
+big-endian — reach for the `_be` reads. The `writebyte`/`savestate`/`gui.text` names
+follow the FBNeo/FBA Lua conventions, so scripts from that ecosystem port naturally.
+
+### Memory writes (gated)
+
+`memory.writebyte(addr, v)` pokes one byte; `memory.writeword(addr, v)` pokes a
+16-bit word in **guest big-endian** order (high byte at `addr`, mirroring
+`read_u16_be` — `writeword(a, v)` then `read_u16_be(a)` round-trips). Writes route
+through the same path as the debugger's `write_memory`: bus-window addresses are
+pushed to the live 68k bus on the next frame drain.
+
+Writes are **off by default**: they raise an error naming the `lua_writes_enabled`
+gate. Launch with `--training` to arm them, or arm/lock at runtime with the MCP
+`enable_writes` / `disable_writes` tools.
+
+### Save states (queued)
+
+`savestate.save(3)` / `savestate.load(3)` use numbered slots 1-9
+(`<save_dir>/<rom>.stateN`); pass a string for an explicit file path. Ops are
+**queued** — applied on the next frame by the emulation thread — and return `true`
+when enqueued; if another op is still in flight you get an error (retry next
+frame). Loading is *not* behind the write gate: scripts are user-authored, and a
+state load carries the same trust as the save-state hotkeys.
+
+### Input injection
+
+`input.set(port, spec)` drives controller port 0 (P1) or 1 (P2). `spec` is either a
+12-bit mask (bit *i* = RETRO id *i*: 0=B 1=Y 2=Select 3=Start 4=Up 5=Down 6=Left
+7=Right 8=A 9=X 10=L 11=R) or a table of RETRO button names:
+
+```lua
+event.onframeend(function()
+  input.set(1, {right=true, b=true})   -- P2 walks right, mashing B
+end)
+```
+
+Each call holds the named buttons for **2 frames** and releases everything else, so
+a per-frame callback re-asserting a button reads as continuously held, and dropping
+it releases within 2 frames. `input.get(port)` returns the port's current 12-bit
+mask (the state fed to the core on the last input fold — keyboard/pad OR injected).
+
+### Legible labels
+
+`gui.text` is `gui.drawText` plus a 1px black drop shadow, for HUD labels that stay
+readable over bright game art.
 
 ## Walk through `examples/hitbox_demo.lua`
 

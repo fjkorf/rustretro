@@ -164,24 +164,35 @@ impl RetroMcpServer {
         }
     }
 
-    /// Arm the write tools for this session.
+    /// Arm the write tools for this session. Also arms the app-wide Lua
+    /// `memory.writebyte`/`memory.writeword` gate ([`DebugState::lua_writes_enabled`])
+    /// — one switch controls "may this app poke guest RAM", whichever door
+    /// (MCP write_memory or a Lua script) the poke comes through.
     fn enable_writes(&self) -> Value {
         self.writes_enabled.store(true, Ordering::SeqCst);
+        if let Ok(mut ds) = self.debug.lock() {
+            ds.lua_writes_enabled = true;
+        }
         json!({
             "ok": true,
             "writes_enabled": true,
-            "message": "Write tools ARMED. write_memory/freeze/set_breakpoint/run_to are now \
-                        active. Call disable_writes to re-lock.",
+            "message": "Write tools ARMED. write_memory/freeze/set_breakpoint/run_to and the Lua \
+                        memory.writebyte/writeword bindings are now active. Call disable_writes \
+                        to re-lock.",
         })
     }
 
-    /// Re-lock the write tools for this session.
+    /// Re-lock the write tools for this session (and the Lua write gate; note
+    /// this re-locks Lua writes even when `--training` armed them at launch).
     fn disable_writes(&self) -> Value {
         self.writes_enabled.store(false, Ordering::SeqCst);
+        if let Ok(mut ds) = self.debug.lock() {
+            ds.lua_writes_enabled = false;
+        }
         json!({
             "ok": true,
             "writes_enabled": false,
-            "message": "Write tools LOCKED.",
+            "message": "Write tools LOCKED (Lua memory writes too).",
         })
     }
 
@@ -2386,7 +2397,8 @@ fn fmt_addrs(addrs: &[u32]) -> Vec<String> {
 /// Map a controller button NAME to its `RETRO_DEVICE_ID_JOYPAD` index (the index
 /// into `DebugState.injected_input` / `Frontend.set_input`). Case-insensitive;
 /// accepts a few friendly aliases. Returns `None` for an unknown name.
-fn joypad_button_index(name: &str) -> Option<usize> {
+/// `pub(crate)`: the Lua `input.set` table form reuses the same name mapping.
+pub(crate) fn joypad_button_index(name: &str) -> Option<usize> {
     match name.trim().to_ascii_lowercase().as_str() {
         "b" => Some(0),
         "y" => Some(1),
