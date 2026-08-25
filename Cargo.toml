@@ -32,3 +32,19 @@ axum = "0.8"
 [profile.release]
 opt-level = 3
 lto = true
+
+# Fast edit-build-run loop (`cargo run --profile release-dev`). Deps stay fully
+# optimized (built once, then cached); the leaf crate skips the fat-LTO merge
+# that made every small release rebuild take ~6 minutes. Leaf opt-level is
+# perf-irrelevant here: emulation runs in prebuilt libretro dylibs and
+# rendering is in the (opt-3) bevy deps. Keep [profile.release] for shipping.
+[profile.release-dev]
+inherits = "release"
+lto = false
+incremental = true
+codegen-units = 256
+opt-level = 1
+
+[profile.release-dev.package."*"]
+opt-level = 3
+codegen-units = 16
