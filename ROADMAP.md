@@ -39,7 +39,9 @@ where it serves that goal. Status reflects the codebase as of the current branch
       0 regions → 64 KB System RAM, 1169 nonzero bytes). Unlocks Genesis + CPS2 work-RAM. Full
       VRAM/sprite/ROM still needs `SET_MEMORY_MAPS` or a hardcoded region table.
 - [ ] **`RETRO_ENVIRONMENT_GET_VARIABLE`** — real core-options support. Today it returns
-      false, so cores needing options can misbehave. Highest-leverage correctness fix.
+      false, so cores needing options can misbehave. Concretely motivated by Asura Blade DIPs
+      (free-play mode, 1-round matches, damage scaling per library/asurabld/asurabld.md).
+      Highest-leverage correctness fix.
 - [ ] **Mesen NES core fails to load** — `genesis_plus_gx`/`fceumm` load fine, but the Mesen
       libretro core exits silently during `retro_load_game` in RustRetro (no panic, no AV info).
       Investigate (likely a `need_fullpath` / system-dir / env-callback expectation). fceumm is the
@@ -50,16 +52,21 @@ where it serves that goal. Status reflects the codebase as of the current branch
       Keep the ones that document the protocol; cut the rest.
 - [ ] **Move `--test-capstone` / `--test-phase2`** out of `main.rs` into real `#[test]`s
       (currently `src/capstone_test.rs`, `src/phase2_test.rs` are scaffolds behind hidden flags).
+- [ ] **Per-game training Lua scripts** — the training-mode/drill layer is moving from built-in
+      presets to per-game scripts (`library/<game>/training.lua`) once savestate/memory-write/input
+      Lua bindings land, enabling community-authored drill flows (damage calibration, ditto-matches,
+      combo practice).
 
 ## Mid-term
 
 - [ ] **Z80 disassembly** — CPU panel already reads Z80 PC; extend the Disasm panel to Z80
       (second core in Genesis/arcade hardware).
-- [ ] **Multi-port input** — only joypad port 0 is wired; add port 1+ for 2-player titles.
-      Critical for fighting games (P2 inputs).
+- [x] ~~**Multi-port input**~~ — SHIPPED: P1/P2 wired (feature/shadow-live-grounding, PRs #22/#23).
+      Physical gamepad, keyboard, and MCP injection all fold into port 0/1 for 2-player titles.
 - [x] ~~**Memory watch / search**~~ — shipped (Watch panel, RAM Search, change tracking).
-- [ ] **Save states** — wire `retro_serialize` / `retro_unserialize`; foundation for rewind,
-      and the backing for Lua `savestate.*` (stubbed out of the v1 API today).
+- [ ] **Save states** — IN PROGRESS: `retro_serialize` / `retro_unserialize` wiring underway
+      (foundation for rewind, hot-start in the shadow-project arena workflow, and Lua `savestate.*`
+      API); retro_serialize binding committed, memory-write + input injection Lua bindings pending.
 
 ## Later / exploratory
 
