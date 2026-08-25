@@ -8,6 +8,7 @@ mod litui_pages;
 mod lua_engine;
 mod record;
 mod mcp;
+mod shadow_runner;
 mod training;
 mod input_config;
 
@@ -65,6 +66,10 @@ struct Args {
     /// Hotkeys: F1 cycle dummy, F2 reset positions, F3 toggle refill,
     /// F4 finish round.
     #[arg(long)] training: bool,
+    /// Shadow bot: a fitted kNN model directory (shadow/models/<name>/ with
+    /// cases.npz + meta.json). Loads at startup and drives controller port 1
+    /// (P2) in-process — no shadow/play.py needed. Shift+F5 toggles at runtime.
+    #[arg(long, value_name = "PATH")] shadow: Option<PathBuf>,
     /// Input mapping file (see src/input_config.rs). Default search:
     /// <save-dir>/<rom>.keymap.json, then <save-dir>/keymap.json, then the
     /// built-in maps.
@@ -173,6 +178,16 @@ fn main() -> Result<()> {
     // Enable per-frame trace recording if requested (both GUI and headless).
     if let Some(rec_path) = args.record.clone() {
         frontend.set_recorder(rec_path);
+    }
+
+    // --shadow: load the kNN shadow-bot model and start it enabled (Shift+F5
+    // toggles later; in headless there is no keyboard, so startup-enabled is
+    // the only sensible default). A malformed model is a hard startup error —
+    // a silently absent shadow would be worse than a loud one.
+    if let Some(dir) = &args.shadow {
+        let runner = shadow_runner::ShadowRunner::load(dir)
+            .map_err(|e| anyhow::anyhow!("--shadow {}: {e}", dir.display()))?;
+        frontend.set_shadow(runner);
     }
 
     // --load-state: queue the load now; the Frontend drains it at the safe
@@ -588,8 +603,11 @@ fn read_input(
     emu.0.set_input(bits);
     emu.0.set_input2(bits2);
     // F5 toggles training mode at runtime (equivalent to launching with
-    // --training); the F1-F4 handlers below only respond while it's on.
-    if keys.just_pressed(F5) {
+    // --training); Shift+F5 toggles the shadow bot (--shadow) instead. The
+    // F1-F4 handlers below only respond while training is on.
+    if keys.just_pressed(F5) && (keys.pressed(ShiftLeft) || keys.pressed(ShiftRight)) {
+        emu.0.toggle_shadow();
+    } else if keys.just_pressed(F5) {
         if let Ok(mut ds) = debug_state.0.lock() {
             ds.training.enabled = !ds.training.enabled;
             if ds.training.enabled {
