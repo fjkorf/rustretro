@@ -67,7 +67,17 @@ P2: IJKL + G/T/H, M=Start, N=coin. The Mayflash F300 fightstick must be in
 shadow/loop.sh              # fit goat-vNEXT from recent recordings, drill list, fight
 shadow/loop.sh --fit-only   # just fit + coverage report
 shadow/loop.sh --model NAME # fight an existing model
+shadow/loop.sh --push       # fit, then load into the running app's NATIVE
+                            # runner (MCP load_shadow; Shift+F5 to fight)
 ```
+
+The whole lifecycle is also driveable from the 🎯 Training panel: recorder
+start/stop (auto-named into `shadow/recordings/`), the loaded-model card with
+per-bucket coverage (sparse buckets ⚠ = the drill list), and a model picker
+that hot-loads any `shadow/models/*` dir. Runtime loads arrive DISABLED
+unless a shadow was already enabled; `--shadow` startup loads stay
+enabled-and-fatal-on-error. The MCP `load_shadow` tool is the scripted twin
+(gated behind `enable_writes`).
 
 Python side: `shadow_train` is `pip install -e`'d into `shadow/train/.venv`
 (works from any cwd): `python -m shadow_train fit|eval|report`. The deploy

@@ -295,7 +295,17 @@ struct MetaJson {
     calibration: Option<Calibration>,
     #[serde(default)]
     neutral_cap: Option<f64>,
+    // Fit-summary fields for the model card (absent in very old models).
+    #[serde(default)]
+    n_rounds: Option<u64>,
+    #[serde(default)]
+    created: Option<String>,
+    #[serde(default)]
+    bucket_counts: Option<std::collections::BTreeMap<String, u64>>,
 }
+
+/// Canonical bucket display order (matches the trainer's coverage report).
+const BUCKET_ORDER: [&str; 5] = ["defense", "offense", "air", "corner", "neutral"];
 
 // ── the kNN policy (mirror of knn.py, soft retrieval) ───────────────────────
 
@@ -616,6 +626,8 @@ impl HitstunTracker {
 pub struct ShadowRunner {
     model: KnnModel,
     cal: Calibration,
+    /// Identity card for the Training panel (published via `shadow_model`).
+    pub info: crate::debug::ShadowModelInfo,
     pub enabled: bool,
     rng: XorShift64,
     // Per-round buffers (runtime.RoundBuffers) — cleared on every gate edge.
@@ -681,7 +693,7 @@ impl ShadowRunner {
         }
         eprintln!(
             "[shadow] loaded {}: {} cases × {} dims, k={}, temperature={}, neutral_cap={} — \
-             driving port 1 (Shift+F5 toggles)",
+             drives port 1 when enabled (Shift+F5 / 🎯 Training panel)",
             dir.display(),
             model.n,
             model.dims,
@@ -689,9 +701,35 @@ impl ShadowRunner {
             model.temperature,
             meta.neutral_cap.map_or("?".into(), |v| v.to_string()),
         );
+        // Model card: canonical bucket order first, any unknown buckets after.
+        let mut buckets: Vec<(String, u64)> = Vec::new();
+        if let Some(counts) = &meta.bucket_counts {
+            for b in BUCKET_ORDER {
+                if let Some(n) = counts.get(b) {
+                    buckets.push((b.to_string(), *n));
+                }
+            }
+            for (b, n) in counts {
+                if !BUCKET_ORDER.contains(&b.as_str()) {
+                    buckets.push((b.clone(), *n));
+                }
+            }
+        }
+        let info = crate::debug::ShadowModelInfo {
+            name: dir
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string()),
+            cases: model.n,
+            rounds: meta.n_rounds,
+            created: meta.created.clone(),
+            buckets,
+        };
+
         Ok(ShadowRunner {
             model,
             cal,
+            info,
             enabled: true,
             rng: XorShift64::new(0),
             was_live: false,
@@ -978,6 +1016,17 @@ mod tests {
         assert_eq!(&entries["y_attack"].as_i64()[..8], &[0i64; 8]);
         assert_eq!(entries["k"].as_i64(), vec![15]);
         assert_eq!(entries["temperature"].as_f64(), vec![1.0]);
+
+        // Model card lifted from meta.json (Training panel display).
+        let runner = ShadowRunner::load(&goat_v2()).unwrap();
+        assert_eq!(runner.info.name, "goat-v2");
+        assert_eq!(runner.info.cases, 13405);
+        assert_eq!(runner.info.rounds, Some(112));
+        assert!(runner.info.created.as_deref().unwrap_or("").starts_with("2026-08-25"));
+        // Canonical bucket order, counts as fitted.
+        let names: Vec<&str> = runner.info.buckets.iter().map(|(b, _)| b.as_str()).collect();
+        assert_eq!(names, ["defense", "offense", "air", "corner", "neutral"]);
+        assert_eq!(runner.info.buckets[0].1, 183);
 
         let model = KnnModel::from_npz(entries).unwrap();
         assert_eq!(model.n, 13405);

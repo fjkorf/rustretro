@@ -462,6 +462,31 @@ pub struct StateOpDone {
     pub bytes: usize,
 }
 
+/// Recorder control one-shot (GUI → emu thread, drained by
+/// `Frontend::drain_record_ops` — same handoff as [`StateOp`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordControl {
+    /// Begin a fresh recording at this path (fails softly if already recording).
+    Start(std::path::PathBuf),
+    /// Flush and close the active recording.
+    Stop,
+}
+
+/// Identity + fit summary of the loaded shadow model, lifted from its
+/// `meta.json` at load time and published for the Training panel's model card.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShadowModelInfo {
+    /// Model directory basename ("goat-v2").
+    pub name: String,
+    /// Case count actually in cases.npz.
+    pub cases: usize,
+    pub rounds: Option<u64>,
+    /// Fit timestamp string as written by the trainer (ISO 8601).
+    pub created: Option<String>,
+    /// Fit-time per-bucket decision counts — the coverage/drill signal.
+    pub buckets: Vec<(String, u64)>,
+}
+
 /// What the training-mode dummy (controller port 1) does each frame.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DummyMode {
@@ -699,11 +724,33 @@ pub struct DebugState {
 
     // --- Shadow bot GUI bridge ---
     /// One-shot request to toggle the shadow bot (GUI panel → emu thread;
-    /// equivalent to Shift+F5, drained by `Frontend::drain_shadow_toggle`).
+    /// equivalent to Shift+F5, drained by `Frontend::drain_shadow_ops`).
     pub pending_shadow_toggle: bool,
     /// Shadow bot status published by the Frontend: `None` = no model loaded
     /// (`--shadow` absent), `Some(enabled)` otherwise.
     pub shadow_on: Option<bool>,
+    /// One-shot request to (re)load a shadow model directory at runtime.
+    /// Unlike the fatal `--shadow` startup path, a failed load here becomes a
+    /// `shadow_note` and the previous model (if any) keeps running.
+    pub pending_shadow_load: Option<std::path::PathBuf>,
+    /// The loaded model's identity card (published on set/load).
+    pub shadow_model: Option<ShadowModelInfo>,
+    /// Sticky one-line result of the last shadow load ("loaded goat-v3 …" /
+    /// "load FAILED: …") — GUI-facing, never consumed.
+    pub shadow_note: Option<String>,
+    /// Consumable twin of `shadow_note` for the MCP `load_shadow` roundtrip
+    /// (mirrors the `state_op_result` / `state_note` split).
+    pub shadow_load_result: Option<Result<String, String>>,
+
+    // --- Recorder GUI bridge ---
+    /// Recorder start/stop one-shot (drained by `Frontend::drain_record_ops`).
+    pub pending_record: Option<RecordControl>,
+    /// Active recording published every frame: (path, frames written so far).
+    /// `None` = not recording.
+    pub record_status: Option<(std::path::PathBuf, u64)>,
+    /// Sticky one-line result of the last start/stop ("recording …" /
+    /// "stopped — N frames").
+    pub record_note: Option<String>,
 
     // --- Help panel ---
     /// Human-readable ACTIVE input bindings (label, mapping) published once at
@@ -791,6 +838,13 @@ impl DebugState {
             state_dir: None,
             pending_shadow_toggle: false,
             shadow_on: None,
+            pending_shadow_load: None,
+            shadow_model: None,
+            shadow_note: None,
+            shadow_load_result: None,
+            pending_record: None,
+            record_status: None,
+            record_note: None,
             keymap_lines: Vec::new(),
         }
     }

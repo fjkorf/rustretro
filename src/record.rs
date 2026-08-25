@@ -111,6 +111,8 @@ struct Row {
 pub struct FrameRecorder {
     map: GameMap,
     out: BufWriter<File>,
+    /// Where the jsonl is being written (for status display / stop messages).
+    path: PathBuf,
     frames: u64,
     round_id: u64,
     prev_controllable: bool,
@@ -192,6 +194,7 @@ impl FrameRecorder {
         Ok(FrameRecorder {
             map,
             out: BufWriter::new(file),
+            path: path.to_path_buf(),
             frames: 0,
             round_id: 0,
             prev_controllable: false,
@@ -261,6 +264,10 @@ impl FrameRecorder {
 
     pub fn frames_written(&self) -> u64 {
         self.frames
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Flush the buffer (call at shutdown).

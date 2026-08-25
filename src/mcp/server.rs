@@ -1097,6 +1097,51 @@ impl RetroMcpServer {
         }
     }
 
+    /// `load_shadow`: (re)load a shadow-bot model directory at runtime (the
+    /// scripted twin of the Training panel's model picker — lets loop.sh push
+    /// a freshly fitted model into a running session). Same roundtrip shape
+    /// as `state_op_roundtrip` over `pending_shadow_load`/`shadow_load_result`.
+    /// The model arrives DISABLED unless a shadow was already enabled (a swap
+    /// keeps fighting); enabling stays with Shift+F5 / the Training panel.
+    /// GATED — an already-active shadow's behavior changes immediately.
+    fn load_shadow(&self, path: &str) -> Value {
+        if let Err(e) = self.check_writes_armed() {
+            return json!({ "error": e });
+        }
+        {
+            let mut ds = match self.debug.lock() {
+                Ok(g) => g,
+                Err(_) => return json!({ "ok": false, "error": "lock poisoned" }),
+            };
+            if ds.pending_shadow_load.is_some() {
+                return json!({ "ok": false, "error": "another shadow load is in flight" });
+            }
+            ds.shadow_load_result = None;
+            ds.pending_shadow_load = Some(std::path::PathBuf::from(path));
+        }
+        let deadline = Instant::now() + STATE_TIMEOUT;
+        loop {
+            std::thread::sleep(Duration::from_millis(8));
+            if let Ok(mut ds) = self.debug.lock() {
+                if let Some(res) = ds.shadow_load_result.take() {
+                    return match res {
+                        Ok(msg) => json!({ "ok": true, "message": msg }),
+                        Err(e) => json!({ "ok": false, "error": e }),
+                    };
+                }
+            }
+            if Instant::now() >= deadline {
+                if let Ok(mut ds) = self.debug.lock() {
+                    ds.pending_shadow_load = None;
+                }
+                return json!({
+                    "ok": false,
+                    "error": "timed out waiting for the emulation thread (is the app running?)"
+                });
+            }
+        }
+    }
+
     // ── gated write tools ──────────────────────────────────────────────────
 
     /// `write_memory`: poke `len` little-endian bytes of `value` at guest `addr`
@@ -1756,6 +1801,25 @@ impl RetroMcpServer {
                  {ok, path, bytes}.",
                 state_target_schema(),
             ),
+            Tool::new(
+                "load_shadow",
+                "(Re)load the in-app shadow bot from a model directory (e.g. \
+                 shadow/models/goat-v3) at runtime — validates cases.npz + meta.json and \
+                 swaps the model without relaunching. Arrives DISABLED unless a shadow was \
+                 already enabled (a swap keeps fighting); enabling is Shift+F5 or the \
+                 Training panel. REQUIRES enable_writes (an active shadow's behavior \
+                 changes immediately). Returns {ok, message}.",
+                {
+                    let schema = json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Model directory containing cases.npz + meta.json" }
+                        },
+                        "required": ["path"]
+                    });
+                    Arc::new(schema.as_object().unwrap().clone())
+                },
+            ),
             // ── write gate + gated write/action tools ──────────────────────
             Tool::new(
                 "enable_writes",
@@ -2240,6 +2304,14 @@ impl ServerHandler for RetroMcpServer {
                     } else {
                         this.load_state(slot, path)
                     };
+                    Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
+                }
+                "load_shadow" => {
+                    let path = args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ErrorData::invalid_params("missing `path`", None))?;
+                    let v = this.load_shadow(path);
                     Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
                 }
                 // ── write gate ──────────────────────────────────────────────

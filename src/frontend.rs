@@ -30,6 +30,10 @@ pub struct Frontend {
     /// Optional in-app shadow bot (`--shadow`): drives controller port 1 from
     /// a fitted kNN model, ticked from `run_frame` on the emu thread.
     shadow: Option<crate::shadow_runner::ShadowRunner>,
+    /// Set when the shadow model changed (set_shadow / runtime load) so
+    /// `drain_shadow_ops` republishes `shadow_model` once instead of cloning
+    /// the info card every frame.
+    shadow_info_dirty: bool,
     /// Where slot save-state files live (`<save_dir>/<rom_stem>.state<N>`).
     save_dir: PathBuf,
     /// ROM file stem used to name slot save-state files.
@@ -101,6 +105,7 @@ impl Frontend {
             bus_bridge_ok: None,
             recorder: None,
             shadow: None,
+            shadow_info_dirty: false,
             save_dir: save_dir.clone(),
             rom_stem: rom_stem.clone(),
         };
@@ -512,22 +517,124 @@ impl Frontend {
         }
     }
 
-    /// Drain a GUI request to toggle the shadow bot (State/Training panel
-    /// button — the panel only has `DebugState`, not `&mut Frontend`) and
-    /// publish the current status back. Called at both `drain_state_op` sites
-    /// so the toggle works while paused too.
-    fn drain_shadow_toggle(&mut self) {
-        let want = self
-            .debug_state
-            .try_lock()
-            .map(|mut ds| std::mem::take(&mut ds.pending_shadow_toggle))
-            .unwrap_or(false);
-        if want {
+    /// Drain GUI/MCP shadow requests (toggle + runtime model load — the panel
+    /// only has `DebugState`, not `&mut Frontend`) and publish status back.
+    /// Called at both `drain_state_op` sites so both work while paused too.
+    ///
+    /// Runtime load differs from the fatal `--shadow` startup path: a bad
+    /// model becomes a note and the previous model (if any) keeps running.
+    /// Enable policy on load: switching models preserves the current
+    /// enabled state (keep fighting); arming the FIRST model starts disabled
+    /// so a mid-round load doesn't grab port 1 unasked.
+    fn drain_shadow_ops(&mut self) {
+        let (load_req, want_toggle) = match self.debug_state.try_lock() {
+            Ok(mut ds) => (
+                ds.pending_shadow_load.take(),
+                std::mem::take(&mut ds.pending_shadow_toggle),
+            ),
+            Err(_) => return,
+        };
+
+        let mut load_result: Option<Result<String, String>> = None;
+        if let Some(dir) = load_req {
+            let prev_enabled = self.shadow.as_ref().map(|s| s.enabled);
+            match crate::shadow_runner::ShadowRunner::load(&dir) {
+                Ok(mut runner) => {
+                    runner.enabled = prev_enabled.unwrap_or(false);
+                    let msg = format!(
+                        "loaded {} ({} cases{}) — {}",
+                        runner.info.name,
+                        runner.info.cases,
+                        runner.info.rounds.map_or(String::new(), |r| format!(", {r} rounds")),
+                        if runner.enabled { "ACTIVE" } else { "press Enable / Shift+F5 to fight" },
+                    );
+                    self.shadow = Some(runner);
+                    self.shadow_info_dirty = true;
+                    load_result = Some(Ok(msg));
+                }
+                Err(e) => {
+                    load_result = Some(Err(format!("load {} FAILED: {e}", dir.display())));
+                }
+            }
+        }
+        if want_toggle {
             self.toggle_shadow();
         }
+
         let on = self.shadow.as_ref().map(|s| s.enabled);
+        let info = if self.shadow_info_dirty {
+            Some(self.shadow.as_ref().map(|s| s.info.clone()))
+        } else {
+            None
+        };
         if let Ok(mut ds) = self.debug_state.try_lock() {
             ds.shadow_on = on;
+            if let Some(model) = info {
+                ds.shadow_model = model;
+                self.shadow_info_dirty = false;
+            }
+            if let Some(res) = load_result {
+                let note = match &res {
+                    Ok(m) => m.clone(),
+                    Err(e) => e.clone(),
+                };
+                ds.log(format!("👤 Shadow: {note}"));
+                ds.shadow_note = Some(note);
+                ds.shadow_load_result = Some(res);
+            }
+        }
+    }
+
+    /// Drain GUI recorder start/stop requests and publish recording status
+    /// (path + frames) every call, so the panel's counter stays live.
+    fn drain_record_ops(&mut self) {
+        let req = match self.debug_state.try_lock() {
+            Ok(mut ds) => ds.pending_record.take(),
+            Err(_) => return,
+        };
+        let mut note: Option<String> = None;
+        match req {
+            Some(crate::debug::RecordControl::Start(path)) => {
+                if let Some(rec) = self.recorder.as_ref() {
+                    note = Some(format!(
+                        "already recording to {} — stop first",
+                        rec.path().display()
+                    ));
+                } else {
+                    self.set_recorder(path.clone());
+                    note = Some(if self.recorder.is_some() {
+                        format!("recording → {}", path.display())
+                    } else {
+                        // set_recorder printed the io error to stderr.
+                        format!("start FAILED: could not open {}", path.display())
+                    });
+                }
+            }
+            Some(crate::debug::RecordControl::Stop) => {
+                if let Some(mut rec) = self.recorder.take() {
+                    rec.finish();
+                    note = Some(format!(
+                        "stopped — {} frames → {}",
+                        rec.frames_written(),
+                        rec.path().display()
+                    ));
+                    eprintln!("[record] {}", note.as_deref().unwrap_or(""));
+                } else {
+                    note = Some("not recording".to_string());
+                }
+            }
+            None => {}
+        }
+        let status = self
+            .recorder
+            .as_ref()
+            .map(|r| (r.path().to_path_buf(), r.frames_written()));
+        if let Ok(mut ds) = self.debug_state.try_lock() {
+            ds.record_status = status;
+            if let Some(n) = note {
+                ds.log(format!("⏺ Record: {n}"));
+                ds.record_note = Some(n);
+            }
         }
     }
 
@@ -566,6 +673,7 @@ impl Frontend {
     /// Shift+F5 (→ [`toggle_shadow`](Self::toggle_shadow)) flips it later.
     pub fn set_shadow(&mut self, runner: crate::shadow_runner::ShadowRunner) {
         self.shadow = Some(runner);
+        self.shadow_info_dirty = true;
     }
 
     /// Shift+F5: toggle the shadow bot on/off. With no model loaded, prints a
@@ -942,7 +1050,8 @@ impl Frontend {
             // drain_state_op) — service save/load here so a paused session's
             // MCP/hotkey state ops don't hang until resume.
             self.drain_state_op();
-            self.drain_shadow_toggle();
+            self.drain_shadow_ops();
+            self.drain_record_ops();
             return Ok(false);
         }
 
@@ -969,7 +1078,8 @@ impl Frontend {
         // a full refresh itself on load). See drain_state_op for the safety
         // argument (serialize/unserialize only between complete retro_run calls).
         self.drain_state_op();
-        self.drain_shadow_toggle();
+        self.drain_shadow_ops();
+        self.drain_record_ops();
 
         // --- Refresh bus-window snapshots (Sek bridge) ---
         self.refresh_bus_windows(None);
