@@ -173,6 +173,65 @@ re-trusting the same wrong cheat-table numbers.
   paired snapshot-diff during controlled P1 movement (now that input control
   is confirmed working) rather than reusing the wrong-revision cheat table.
 
+## Controls verification (Controls phase, Wave W2)
+
+Prior session left `attack_chords` (`LP=y MP=x HP=l LK=b MK=a HK=r`) marked
+sourced-but-unverified. This session verified them two independent ways,
+against the same `sf2ce.zip` romset, headless on MCP port 4035 only.
+
+**1. Static proof (FBNeo source, read-only — not a code change in this repo).**
+FBNeo's libretro frontend (`src/burner/libretro/retro_input.cpp`) builds
+`RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS` from the driver's own
+`BurnInputInfo` table. `GameInpInit()` sets `bStreetFighterLayout = true`
+whenever a game has 3 punch + 3 kick buttons (`nPunchx3[0]==7 &&
+nKickx3[0]==7`) — true for CPS-1 SF2. Under that flag, the `"fire N"`
+digital-input switch (line ~2452) maps:
+
+| fire N | positional macro | RETRO id (RETROPAD_CLASSIC, our default — no core-options override) |
+|---|---|---|
+| 1 | 1ST_COL_TOP | Y |
+| 2 | 2ND_COL_TOP | X |
+| 3 | 3RD_COL_TOP | L (MODERN would give R instead — confirmed CLASSIC is the fallback when no core-option variable is set, `retro_input.cpp:3104`, and rustretro sets none) |
+| 4 | 1ST_COL_BOTTOM | B |
+| 5 | 2ND_COL_BOTTOM | A |
+| 6 | 3RD_COL_BOTTOM | R |
+
+`src/burn/drv/capcom/d_cps1.cpp`'s `Sf2InputList` (the actual sf2ce driver
+table) assigns fire1..6 to Weak Punch, Medium Punch, Strong Punch, Weak Kick,
+Medium Kick, Strong Kick in that exact order. Composing the two tables gives
+`LP=Y MP=X HP=L LK=B MK=A HK=R` — exactly what was already in the profile.
+This is not a "documented convention" citation; it is the actual code path
+this exact core+ROM combination runs.
+
+**2. Empirical proof (live screenshots).** Coined a game, fought into a real
+Ryu-vs-Ken match (`--headless --mcp-port 4035`). First attempt used the
+pause -> press_buttons -> step -> screenshot -> resume pattern from
+CLAUDE.md's Gotchas, and it did **not** work: `take_injected_input()`
+(`src/debug/mod.rs`) decrements/drains the per-button hold counter every
+headless-loop tick unconditionally (`src/main.rs` step (a0)), before the
+pause check inside `frontend::run_frame()` — so a press queued while paused
+is silently consumed by loop ticks that never actually run the core, and by
+the time `step` is called the hold counter has already reached zero. Screen
+shots taken this way were byte-identical before/after. Switched to the
+straightforward path instead: leave emulation running, `press_buttons([btn],
+frames=10, port=0)`, sleep ~90 ms (~5-6 frames), screenshot. Six shots
+(`y`,`x`,`l`,`b`,`a`,`r`) each showed a clearly different animation:
+`y`/`x`/`l` all extend an arm (punch), increasing in lean/reach from `y`
+(quick jab) to `l` (a full lunging body punch); `b`/`a`/`r` all extend a leg
+(kick) — `b` a small crouching low kick, `a` a forward crouching kick, `r` a
+dramatic jumping cross-up kick that visibly swapped which side of the screen
+Ryu/Ken were standing on (the most committed-looking of the six, consistent
+with it being the Strong Kick). Punch-group vs kick-group and the
+light-to-heavy intensity ordering within each group are unambiguous by eye.
+This confirms the *shape* of the mapping (3 punches, 3 kicks, increasing
+commitment) live; the exact button-to-strength letter assignment rests on
+the static proof above, since a single screenshot per button can't itself
+prove "this one is specifically Medium and not Light" without a frame-perfect
+hitbox/frame-data reference.
+
+Net: `attack_chords` moves from sourced-but-unverified to **verified** (both
+ways). The `_STATUS` field in `sf2ce.profile.json` was updated accordingly.
+
 ## No-leakage proof
 
 With `--game library/sf2ce` loaded (port 4035, this session's instance):

@@ -52,7 +52,7 @@ SLOT|PATH`, `--calibrate` (controller wizard → `keymap.json`), `--keymap`,
 | F5 | toggle training mode |
 | **Shift+F5** | toggle the native shadow (needs `--shadow`) |
 | F6 / F7 (+Shift = slot 2) | save / load state slot |
-| F8 / F10 | tutorials / Lua script panel |
+| F8 / F10 / F11 | tutorials / Lua script panel / controls (rebind) |
 | F12, Space | debugger, pause |
 
 The F12 debugger groups panels into regions: Canvas (Frame/Disasm/Hex/Tiles,
@@ -63,10 +63,9 @@ the layout and reopens closed panels; the sidecar is `rustretro_layout_v2.json`
 `src/main.rs` (rendered by the Help panel + printed at startup) — update it in
 the same commit as any hotkey change.
 
-Keyboard P1: arrows + Z/X/A/S (attacks L/M/·/·), Enter=Start, Shift=coin.
-P2: IJKL + G/T/H, M=Start, N=coin. The Mayflash F300 fightstick must be in
-**PS3-DInput + DPad** switch mode (mapping in `keymap.json`; recalibrate with
-`--calibrate`, inspect with `--pad-debug`).
+Default keyboard/pad bindings, the F11 Controls panel, the `--calibrate` wizard,
+`keymap.json`, and the Mayflash F300's required switch mode are all covered in
+`docs/tutorials/controls.md` — read that instead of hand-tracing `keymap.json`.
 
 ## The shadow loop
 
