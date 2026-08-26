@@ -1,0 +1,79 @@
+{
+  "family": "asurabld",
+  "port": "arcade",
+  "core": {
+    "library_name": "FB Alpha 2012",
+    "provenance_game": "asurabld",
+    "provenance_core": "fbalpha2012",
+    "button_names": { "coin": "select", "start": "start" }
+  },
+  "requires": { "memory_regions": true, "save_states": true },
+  "memory": {
+    "endianness": "big",
+    "blocks": { "block1": "0x403798", "block2": "0x40454C", "stride": "0xDB4" },
+    "fighter_fields": [
+      { "name": "timer", "off": "0x00", "size": 2 },
+      { "name": "anim", "off": "0x12", "size": 2 },
+      { "name": "action", "off": "0x50", "size": 2 },
+      { "name": "x", "off": "0x54", "size": 2 },
+      { "name": "y", "off": "0x56", "size": 2 },
+      { "name": "facing", "off": "0x61", "size": 1 },
+      { "name": "weapon", "off": "0x65", "size": 1 },
+      { "name": "health", "off": "0x177", "size": 1 },
+      { "name": "health2", "off": "0x179", "size": 1 },
+      { "name": "meter", "off": "0x17B", "size": 1 },
+      { "name": "meter_max", "off": "0x17F", "size": 1 },
+      { "name": "char_id", "off": "0x639", "size": 1 },
+      { "name": "wins", "off": "0xA4C", "size": 1 }
+    ],
+    "globals": {
+      "round_state": "0x400000",
+      "char_select": "0x400006",
+      "round_timer": "0x40000A",
+      "match_end": "0x402A32",
+      "abort": "0x403678",
+      "stage_select": "0x40364D",
+      "combo_on_b2": "0x4041E7",
+      "combo_on_b1": "0x40470B",
+      "round_over": "0x40646E",
+      "credits": "0x40655D",
+      "demo_flag": "0x4065D8"
+    }
+  },
+  "gate": [
+    { "kind": "word_zero", "global": "round_over" },
+    { "kind": "word_zero", "global": "abort" },
+    { "kind": "word_zero", "global": "match_end" },
+    { "kind": "health_in_range", "min": 1, "max": 239 },
+    { "kind": "bcd_valid_nonzero", "global": "round_timer" },
+    { "kind": "byte_zero", "global": "char_select" }
+  ],
+  "enforcement": {
+    "health_max": 239,
+    "refill_below": 64,
+    "timer_hold": [133, 3],
+    "credits_target": 9,
+    "credits_min": 5
+  },
+  "stage_select": {
+    "global": "stage_select",
+    "value_to_home_char": {
+      "1": 6, "2": 2, "3": 4, "4": 5, "5": 7, "6": 1, "7": 0, "8": 8, "9": 9
+    }
+  },
+  "calibration": {
+    "GROUND_Y": 216, "X_SCALE": 128.0, "Y_SCALE": 128.0,
+    "TIMER_SCALE": 256.0, "ANIM_SCALE": 64.0, "CORNER_PX": 24,
+    "HEALTH_MAX": 239, "SCREEN_W": 320, "P": 8, "K": 4, "STALE": 3,
+    "SEGMENT_DECISIONS": 150, "HITSTUN_RECENT_FRAMES": 20
+  },
+  "attack_chords": {
+    "Light": ["b"], "Medium": ["a"], "Heavy": ["y"],
+    "Launcher": ["b", "a"], "Toss": ["b", "a", "y"]
+  },
+  "positions": {
+    "round_start_x_left": 84,
+    "round_start_x_right": 232,
+    "round_start_y": 216
+  }
+}

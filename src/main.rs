@@ -1,5 +1,6 @@
 mod audio;
 mod capstone_test;
+mod profile;
 mod phase2_test;
 mod debug;
 mod frontend;
