@@ -316,6 +316,26 @@ impl GameProfile {
     }
 }
 
+/// RETRO joypad bit for a button name as used in `attack_chords` (the
+/// RETRO_DEVICE_ID order every mask in the codebase shares).
+pub fn retro_button_bit(name: &str) -> Option<u16> {
+    Some(match name {
+        "b" => 0,
+        "y" => 1,
+        "select" => 2,
+        "start" => 3,
+        "up" => 4,
+        "down" => 5,
+        "left" => 6,
+        "right" => 7,
+        "a" => 8,
+        "x" => 9,
+        "l" => 10,
+        "r" => 11,
+        _ => return None,
+    })
+}
+
 impl GateCond {
     pub fn global_name(&self) -> Option<&str> {
         match self {
