@@ -46,14 +46,68 @@ impl RetroButton {
     pub fn idx(self) -> usize {
         self as usize
     }
+
+    /// Parse the lowercase RETRO name used by profile `attack_chords` and
+    /// the MCP `press_buttons` tool ("b", "a", "start", ...).
+    pub fn from_retro_name(name: &str) -> Option<RetroButton> {
+        use RetroButton::*;
+        Some(match name {
+            "b" => B,
+            "y" => Y,
+            "select" => Select,
+            "start" => Start,
+            "up" => Up,
+            "down" => Down,
+            "left" => Left,
+            "right" => Right,
+            "a" => A,
+            "x" => X,
+            "l" => L,
+            "r" => R,
+            _ => return None,
+        })
+    }
+}
+
+/// One-or-more RETRO bits emitted by a single physical control. Serializes
+/// as a list; deserializes from a list OR a bare button name, so keymap v1
+/// files (whose keyboard values were single buttons) load unchanged.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct Chord(pub Vec<RetroButton>);
+
+impl<'de> Deserialize<'de> for Chord {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OneOrMany {
+            One(RetroButton),
+            Many(Vec<RetroButton>),
+        }
+        Ok(match OneOrMany::deserialize(d)? {
+            OneOrMany::One(b) => Chord(vec![b]),
+            OneOrMany::Many(v) => Chord(v),
+        })
+    }
+}
+
+impl From<RetroButton> for Chord {
+    fn from(b: RetroButton) -> Self {
+        Chord(vec![b])
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct PortMap {
-    /// One key → one RETRO bit (several keys may share a bit).
-    pub keyboard: BTreeMap<KeyCode, RetroButton>,
-    /// One physical button → one-or-more RETRO bits (chords).
-    pub gamepad: BTreeMap<GamepadButton, Vec<RetroButton>>,
+    /// Key → RETRO bits (chords allowed; several keys may share a bit).
+    pub keyboard: BTreeMap<KeyCode, Chord>,
+    /// Generic gamepad map: one physical button → one-or-more RETRO bits.
+    pub gamepad: BTreeMap<GamepadButton, Chord>,
+    /// Device-specific overrides keyed by the pad's reported NAME (e.g.
+    /// "Mayflash Arcade Fightstick F300"): a whole map replaces `gamepad`
+    /// for that device. Lets a fightstick and a normal pad coexist with
+    /// different layouts. Absent devices fall back to `gamepad`.
+    pub gamepad_by_device: BTreeMap<String, BTreeMap<GamepadButton, Chord>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Resource)]
@@ -77,24 +131,24 @@ impl Default for InputConfig {
         use GamepadButton as G;
         use KeyCode as K;
         use RetroButton::*;
-        let f300: BTreeMap<G, Vec<RetroButton>> = [
-            (G::South, vec![B]),
-            (G::West, vec![A]),
-            (G::North, vec![Y]),
-            (G::East, vec![X]),
-            (G::RightTrigger, vec![B, A, Y]), // weapon toss chord
-            (G::Mode, vec![B, A]),            // launcher chord
-            (G::LeftTrigger, vec![Select]),
-            (G::RightTrigger2, vec![Start]),
-            (G::LeftTrigger2, vec![Start]),
-            (G::DPadUp, vec![Up]),
-            (G::DPadDown, vec![Down]),
-            (G::DPadLeft, vec![Left]),
-            (G::DPadRight, vec![Right]),
+        let f300: BTreeMap<G, Chord> = [
+            (G::South, Chord(vec![B])),
+            (G::West, Chord(vec![A])),
+            (G::North, Chord(vec![Y])),
+            (G::East, Chord(vec![X])),
+            (G::RightTrigger, Chord(vec![B, A, Y])), // weapon toss chord
+            (G::Mode, Chord(vec![B, A])),            // launcher chord
+            (G::LeftTrigger, Chord(vec![Select])),
+            (G::RightTrigger2, Chord(vec![Start])),
+            (G::LeftTrigger2, Chord(vec![Start])),
+            (G::DPadUp, Chord(vec![Up])),
+            (G::DPadDown, Chord(vec![Down])),
+            (G::DPadLeft, Chord(vec![Left])),
+            (G::DPadRight, Chord(vec![Right])),
         ]
         .into_iter()
         .collect();
-        let p1_keys: BTreeMap<K, RetroButton> = [
+        let p1_keys: BTreeMap<K, Chord> = [
             (K::KeyZ, B),
             (K::KeyA, Y),
             (K::ShiftLeft, Select),
@@ -110,8 +164,9 @@ impl Default for InputConfig {
             (K::KeyW, R),
         ]
         .into_iter()
+        .map(|(k, b)| (k, Chord::from(b)))
         .collect();
-        let p2_keys: BTreeMap<K, RetroButton> = [
+        let p2_keys: BTreeMap<K, Chord> = [
             (K::KeyG, B),
             (K::KeyH, Y),
             (K::KeyN, Select),
@@ -126,13 +181,14 @@ impl Default for InputConfig {
             (K::KeyO, R),
         ]
         .into_iter()
+        .map(|(k, b)| (k, Chord::from(b)))
         .collect();
         InputConfig {
             stick_deadzone: 0.5,
             pad_order: vec![0, 1],
             ports: vec![
-                PortMap { keyboard: p1_keys, gamepad: f300.clone() },
-                PortMap { keyboard: p2_keys, gamepad: f300 },
+                PortMap { keyboard: p1_keys, gamepad: f300.clone(), gamepad_by_device: BTreeMap::new() },
+                PortMap { keyboard: p2_keys, gamepad: f300, gamepad_by_device: BTreeMap::new() },
             ],
         }
     }
@@ -193,10 +249,25 @@ pub fn pad_bits(
     port: &PortMap,
     deadzone: f32,
 ) -> [bool; 12] {
+    pad_bits_for_device(pressed, stick, port, deadzone, None)
+}
+
+/// Like [`pad_bits`], selecting a device-specific map by the pad's reported
+/// name when one exists (`gamepad_by_device`), else the generic `gamepad`.
+pub fn pad_bits_for_device(
+    pressed: impl Fn(GamepadButton) -> bool,
+    stick: Vec2,
+    port: &PortMap,
+    deadzone: f32,
+    device_name: Option<&str>,
+) -> [bool; 12] {
+    let map = device_name
+        .and_then(|n| port.gamepad_by_device.get(n))
+        .unwrap_or(&port.gamepad);
     let mut bits = [false; 12];
-    for (btn, ids) in &port.gamepad {
+    for (btn, chord) in map {
         if pressed(*btn) {
-            for id in ids {
+            for id in &chord.0 {
                 bits[id.idx()] = true;
             }
         }
@@ -211,9 +282,11 @@ pub fn pad_bits(
 /// Keyboard state → RETRO bits for one port.
 pub fn key_bits(pressed: impl Fn(KeyCode) -> bool, port: &PortMap) -> [bool; 12] {
     let mut bits = [false; 12];
-    for (key, id) in &port.keyboard {
+    for (key, chord) in &port.keyboard {
         if pressed(*key) {
-            bits[id.idx()] = true;
+            for id in &chord.0 {
+                bits[id.idx()] = true;
+            }
         }
     }
     bits
@@ -256,7 +329,7 @@ pub fn summary(cfg: &InputConfig) -> Vec<(String, String)> {
                 let keys: Vec<String> = port
                     .keyboard
                     .iter()
-                    .filter(|(_, b)| **b == btn)
+                    .filter(|(_, c)| c.0 == [btn])
                     .map(|(k, _)| key_name(*k))
                     .collect();
                 if !keys.is_empty() {
@@ -271,7 +344,7 @@ pub fn summary(cfg: &InputConfig) -> Vec<(String, String)> {
                 .iter()
                 .map(|(pad_btn, bits)| {
                     let chord: Vec<String> =
-                        bits.iter().map(|b| format!("{b:?}")).collect();
+                        bits.0.iter().map(|b| format!("{b:?}")).collect();
                     format!("{pad_btn:?}={}", chord.join("+"))
                 })
                 .collect();
@@ -356,4 +429,158 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn keymap_v1_single_button_values_still_parse() {
+        // v1 files wrote keyboard values as bare buttons; v2 is chord lists.
+        let cfg: InputConfig = serde_json::from_str(
+            r#"{"ports":[{"keyboard":{"KeyZ":"B","KeyX":["A","Y"]},"gamepad":{"South":["B"]}}]}"#,
+        )
+        .unwrap();
+        let p = &cfg.ports[0];
+        assert_eq!(p.keyboard[&KeyCode::KeyZ].0, vec![RetroButton::B]);
+        // and v2 keyboard CHORDS work end-to-end:
+        let bits = key_bits(|k| k == KeyCode::KeyX, p);
+        assert!(bits[8] && bits[1] && !bits[0]);
+    }
+
+    #[test]
+    fn device_specific_gamepad_map_overrides_generic() {
+        use GamepadButton as G;
+        let mut cfg = InputConfig::default();
+        let mut stick_map: BTreeMap<G, Chord> = BTreeMap::new();
+        stick_map.insert(G::South, Chord(vec![RetroButton::Y])); // swapped on the stick
+        cfg.ports[0]
+            .gamepad_by_device
+            .insert("TestStick".into(), stick_map);
+        let z = Vec2::ZERO;
+        let only_south = |b: G| b == G::South;
+        // Generic map: South = B.
+        let generic = pad_bits_for_device(only_south, z, &cfg.ports[0], 0.5, None);
+        assert!(generic[0] && !generic[1]);
+        // Named device: South = Y.
+        let dev = pad_bits_for_device(only_south, z, &cfg.ports[0], 0.5, Some("TestStick"));
+        assert!(dev[1] && !dev[0]);
+        // Unknown device name falls back to generic.
+        let unk = pad_bits_for_device(only_south, z, &cfg.ports[0], 0.5, Some("Nope"));
+        assert!(unk[0]);
+    }
+
+    #[test]
+    fn action_rows_for_asurabld_match_the_profile_vocabulary() {
+        crate::profile::init_for_tests();
+        let no_desc: [[Option<String>; 12]; 2] = Default::default();
+        let rows = action_rows(0, &no_desc);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Up", "Down", "Left", "Right", "Start", "Coin",
+             "Light", "Medium", "Heavy", "Launcher", "Toss"],
+        );
+        let toss = rows.iter().find(|r| r.name == "Toss").unwrap();
+        assert_eq!(toss.bits, vec![RetroButton::B, RetroButton::A, RetroButton::Y]);
+        assert_eq!(toss.source, ActionSource::Profile);
+        // With a core descriptor on an unprofiled button, it appears.
+        let mut desc: [[Option<String>; 12]; 2] = Default::default();
+        desc[0][RetroButton::X.idx()] = Some("Taunt".into());
+        let rows2 = action_rows(0, &desc);
+        let taunt = rows2.iter().find(|r| r.name == "Taunt").unwrap();
+        assert_eq!(taunt.bits, vec![RetroButton::X]);
+        assert_eq!(taunt.source, ActionSource::Descriptor);
+    }
+}
+
+
+// ── action vocabulary (the controls contract, docs/game-profiles.md) ────────
+//
+// One resolver produces the per-port ACTION list every human-facing surface
+// renders: the Controls panel, the calibration wizard, Help, and the Input
+// monitor. Name resolution chain per action: game-profile name (attack
+// classes/chords) → core-provided input descriptor → raw RETRO name.
+
+/// Where an action's display name came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionSource {
+    /// From the game profile (attack classes, coin/start, directions).
+    Profile,
+    /// From the core's RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS labels.
+    Descriptor,
+    /// Raw RETRO button name (no better information available).
+    Retro,
+}
+
+/// One row of the game's control vocabulary: a named action and the RETRO
+/// bits that perform it.
+#[derive(Clone, Debug)]
+pub struct ActionRow {
+    pub name: String,
+    pub bits: Vec<RetroButton>,
+    pub source: ActionSource,
+}
+
+/// Build the action vocabulary for `port` (0/1). `descriptors` is
+/// `DebugState::input_descriptors` (may be all-None: fbalpha2012 sends none).
+///
+/// Order: directions, Start, Coin, the profile's attack classes (in family
+/// order, skipping "None"), then any remaining RETRO id the core described
+/// that no prior row covers as a single button. Buttons neither profiled nor
+/// described are OMITTED — the core not naming them is evidence the game
+/// never reads them.
+pub fn action_rows(
+    port: usize,
+    descriptors: &[[Option<String>; 12]; 2],
+) -> Vec<ActionRow> {
+    use RetroButton::*;
+    let p = crate::profile::current();
+    let desc = &descriptors[port.min(1)];
+    let mut rows: Vec<ActionRow> = Vec::new();
+    let mut single_covered = [false; 12];
+
+    for (name, b) in [("Up", Up), ("Down", Down), ("Left", Left), ("Right", Right)] {
+        rows.push(ActionRow { name: name.into(), bits: vec![b], source: ActionSource::Retro });
+        single_covered[b.idx()] = true;
+    }
+    rows.push(ActionRow { name: "Start".into(), bits: vec![Start], source: ActionSource::Profile });
+    rows.push(ActionRow { name: "Coin".into(), bits: vec![Select], source: ActionSource::Profile });
+    single_covered[Start.idx()] = true;
+    single_covered[Select.idx()] = true;
+
+    // Profile attack classes, in family order.
+    for class in &p.family.attack_classes {
+        if class == "None" {
+            continue;
+        }
+        if let Some(chord) = p.port.attack_chords.get(class) {
+            let bits: Vec<RetroButton> = chord
+                .iter()
+                .filter_map(|n| RetroButton::from_retro_name(n))
+                .collect();
+            if bits.is_empty() {
+                continue;
+            }
+            if bits.len() == 1 {
+                single_covered[bits[0].idx()] = true;
+            }
+            rows.push(ActionRow { name: class.clone(), bits, source: ActionSource::Profile });
+        }
+    }
+
+    // Core-described leftovers (e.g. a 6th button the profile doesn't model).
+    const ALL: [RetroButton; 12] = [
+        RetroButton::B, RetroButton::Y, RetroButton::Select, RetroButton::Start,
+        RetroButton::Up, RetroButton::Down, RetroButton::Left, RetroButton::Right,
+        RetroButton::A, RetroButton::X, RetroButton::L, RetroButton::R,
+    ];
+    for b in ALL {
+        if !single_covered[b.idx()] {
+            if let Some(label) = &desc[b.idx()] {
+                rows.push(ActionRow {
+                    name: label.clone(),
+                    bits: vec![b],
+                    source: ActionSource::Descriptor,
+                });
+            }
+        }
+    }
+    rows
 }

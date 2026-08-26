@@ -1308,13 +1308,20 @@ impl CallbackContext {
                 | RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL
                 | RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY
                 | RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK
-                | RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS
                 | RETRO_ENVIRONMENT_SET_ROTATION
                 | RETRO_ENVIRONMENT_SET_GEOMETRY
                 | RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME
                 | RETRO_ENVIRONMENT_SET_SUBSYSTEM_INFO
                 | RETRO_ENVIRONMENT_SET_CONTROLLER_INFO
                 | RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS => true,
+                RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS => {
+                    if !data.is_null() {
+                        self.handle_set_input_descriptors(
+                            data as *const crate::libretro::RetroInputDescriptor,
+                        );
+                    }
+                    true
+                }
                 RETRO_ENVIRONMENT_SET_MEMORY_MAPS => {
                     if !data.is_null() {
                         self.handle_set_memory_maps(data as *const RetroMemoryMap);
@@ -1330,6 +1337,49 @@ impl CallbackContext {
                 | RETRO_ENVIRONMENT_GET_OVERSCAN
                 | RETRO_ENVIRONMENT_GET_USERNAME => false,
                 _ => false,
+            }
+        }
+    }
+
+    /// Capture the core's per-game button names (layer-3 vocabulary — e.g.
+    /// FBNeo sends "Weak attack" / "Jab Punch" per RETRO id per game). Stored
+    /// in DebugState for the action-vocabulary resolver; joypad ids 0-11 on
+    /// ports 0/1 only. The array is NULL-description-terminated.
+    fn handle_set_input_descriptors(
+        &mut self,
+        descs: *const crate::libretro::RetroInputDescriptor,
+    ) {
+        const RETRO_DEVICE_JOYPAD: u32 = 1;
+        let mut captured: Vec<(usize, usize, String)> = Vec::new();
+        unsafe {
+            let mut p = descs;
+            // Hard cap: a missing terminator must not walk off the end.
+            for _ in 0..256 {
+                if p.is_null() || (*p).description.is_null() {
+                    break;
+                }
+                let d = *p;
+                if d.device & 0xFF == RETRO_DEVICE_JOYPAD
+                    && d.port < 2
+                    && d.id < 12
+                {
+                    let label = std::ffi::CStr::from_ptr(d.description)
+                        .to_string_lossy()
+                        .into_owned();
+                    captured.push((d.port as usize, d.id as usize, label));
+                }
+                p = p.add(1);
+            }
+        }
+        if let Ok(mut ds) = self.debug_state.lock() {
+            // A fresh SET replaces the previous vocabulary wholesale.
+            ds.input_descriptors = Default::default();
+            let n = captured.len();
+            for (port, id, label) in captured {
+                ds.input_descriptors[port][id] = Some(label);
+            }
+            if n > 0 {
+                eprintln!("[input] core provided {n} input descriptors");
             }
         }
     }

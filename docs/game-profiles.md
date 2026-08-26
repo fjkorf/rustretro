@@ -51,3 +51,25 @@ Genre logic (feature formulas, kNN policy, decision cadence, dummy modes,
 matchup grid) is engine code. Game-specific *behavior* beyond the schema
 (overlays, scripted drills) goes in the per-game Lua script via API v3
 bindings — reading the profile, never restating it.
+
+## Controls contract (the Controls phase)
+
+Controls are a four-layer pipeline; only layer 1→2 is stored, everything
+else is resolved for display:
+
+1. **Physical → RETRO** lives in `keymap.json` (schema v2: keyboard values
+   are chord lists; `gamepad_by_device` keys whole maps by pad name with
+   `gamepad` as the generic fallback). The RETRO 12-bit mask remains the
+   wire format everywhere (recordings, shadow, Lua, MCP).
+2. **Action vocabulary** = `input_config::action_rows(port, descriptors)`:
+   directions + Start/Coin + the profile's attack classes (chords) + any
+   remaining button the core described. Name chain: profile → core
+   descriptor → raw RETRO. Buttons neither profiled nor described are
+   omitted (the core not naming them is evidence the game ignores them).
+3. **Core descriptors** are captured from
+   `RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS` into
+   `DebugState::input_descriptors` (FBNeo sends them per game;
+   fbalpha2012 sends none — the chain degrades gracefully).
+
+Every human-facing surface (Controls panel, calibration wizard, Help,
+Input monitor) renders action rows — never raw maps.

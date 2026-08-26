@@ -205,6 +205,17 @@ pub struct RetroMemoryDescriptor {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct RetroInputDescriptor {
+    pub port: u32,
+    pub device: u32,
+    pub index: u32,
+    pub id: u32,
+    /// NULL terminates the descriptor array.
+    pub description: *const std::os::raw::c_char,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct RetroMemoryMap {
     pub descriptors: *const RetroMemoryDescriptor,
     pub num_descriptors: u32,

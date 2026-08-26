@@ -503,7 +503,7 @@ fn calibrate_wizard(
             gp.entry(b).or_insert_with(|| vec![d]);
         }
         for port in cfg.ports.iter_mut() {
-            port.gamepad = gp.clone();
+            port.gamepad = gp.iter().map(|(b, v)| (*b, input_config::Chord(v.clone()))).collect();
         }
         let json = serde_json::to_string_pretty(&*cfg).unwrap();
         match std::fs::write(&cal.out_path, &json) {
