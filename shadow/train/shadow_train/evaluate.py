@@ -17,6 +17,9 @@ from .knn import KnnPolicy
 
 MIN_EXAMPLES = 25
 
+N_MOVE_CLASSES = len(MOVE_CLASSES)
+N_ATTACK_CLASSES = len(ATTACK_CLASSES)
+
 
 def split_by_round(data: dict, holdout_frac: float = 0.2, seed: int = 0):
     """Split unit = round_key, which after dataset._segment (task 1) is a
@@ -87,19 +90,19 @@ def evaluate(data: dict, k: int = 15, holdout_frac: float = 0.2, seed: int = 7,
             tm, ta = ym[test_idx][mask], ya[test_idx][mask]
             entry["move_acc"] = float((pred_m[mask] == tm).mean())
             entry["move_majority"] = float(
-                (tm == np.bincount(tm, minlength=9).argmax()).mean()
+                (tm == np.bincount(tm, minlength=N_MOVE_CLASSES).argmax()).mean()
             )
             entry["attack_acc"] = float((pred_a[mask] == ta).mean())
             entry["attack_majority"] = float(
-                (ta == np.bincount(ta, minlength=6).argmax()).mean()
+                (ta == np.bincount(ta, minlength=N_ATTACK_CLASSES).argmax()).mean()
             )
             entry["move_jsd"] = _js_distance(
-                np.bincount(samp_m[mask], minlength=9).astype(float),
-                np.bincount(tm, minlength=9).astype(float),
+                np.bincount(samp_m[mask], minlength=N_MOVE_CLASSES).astype(float),
+                np.bincount(tm, minlength=N_MOVE_CLASSES).astype(float),
             )
             entry["attack_jsd"] = _js_distance(
-                np.bincount(samp_a[mask], minlength=6).astype(float),
-                np.bincount(ta, minlength=6).astype(float),
+                np.bincount(samp_a[mask], minlength=N_ATTACK_CLASSES).astype(float),
+                np.bincount(ta, minlength=N_ATTACK_CLASSES).astype(float),
             )
         report["buckets"][b] = entry
     return report
@@ -127,9 +130,9 @@ def print_report(report: dict, data: dict):
         flag = "  <-- record more!" if n < MIN_EXAMPLES else ""
         print(f"  {b:<9} {n:>6}{flag}")
     # label distribution overall — sanity that chords/attacks appear
-    am = np.bincount(data["y_attack"], minlength=6)
+    am = np.bincount(data["y_attack"], minlength=N_ATTACK_CLASSES)
     print("\nattack-label distribution:",
           {ATTACK_CLASSES[i]: int(n) for i, n in enumerate(am) if n})
-    mm = np.bincount(data["y_move"], minlength=9)
+    mm = np.bincount(data["y_move"], minlength=N_MOVE_CLASSES)
     print("move-label distribution:  ",
           {MOVE_CLASSES[i]: int(n) for i, n in enumerate(mm) if n})

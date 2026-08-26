@@ -18,24 +18,71 @@
 //! recorder's composite (`src/record.rs`).
 
 use crate::debug::{DebugState, DummyMode};
+use crate::profile::GameProfile;
 
-const BLOCK1: u32 = 0x403798;
-const BLOCK2: u32 = 0x40454C;
-const HEALTH_OFF: u32 = 0x177; // byte pair at +0x177/+0x179, max 0xEF
-const X_OFF: u32 = 0x54;
-const Y_OFF: u32 = 0x56;
-const ROUND_TIMER: u32 = 0x40000A; // BCD seconds; subseconds at +1
-const ROUND_STATE: u32 = 0x400000; // write 0 = finish round now
-const CREDITS: u32 = 0x40655D;
-const ROUND_OVER: u32 = 0x40646E;
-const ABORT: u32 = 0x403678;
-const MATCH_END: u32 = 0x402A32;
+/// Values resolved from the loaded `GameProfile` once per `tick` call — kept
+/// as plain locals rather than a cached/static struct so the profile stays
+/// hot-swappable-in-theory and the hot path stays simple (small `Vec`/`BTreeMap`
+/// lookups on a handful of fields, once per emulated frame — cheap).
+struct Resolved {
+    block1: u32,
+    block2: u32,
+    health_off: u32,
+    health2_off: u32,
+    x_off: u32,
+    y_off: u32,
+    round_timer: u32,
+    round_state: u32,
+    credits: u32,
+    round_over: u32,
+    abort: u32,
+    match_end: u32,
 
-const HEALTH_MAX: u8 = 0xEF;
-const REFILL_BELOW: u8 = 0x40;
-/// Round-start X positions (left / right) used by position reset.
-const RESET_X: (u16, u16) = (84, 232);
-const GROUND_Y: u16 = 216;
+    health_max: u8,
+    refill_below: u8,
+    timer_hold: [u8; 2],
+    credits_target: u8,
+    credits_min: u8,
+    reset_x: (u16, u16),
+    ground_y: u16,
+}
+
+fn resolve(p: &GameProfile) -> Resolved {
+    let g = |name: &str| {
+        p.global(name)
+            .unwrap_or_else(|| panic!("profile missing global '{name}'"))
+    };
+    let field = |name: &str| {
+        p.field_off(name)
+            .unwrap_or_else(|| panic!("profile missing fighter field '{name}'"))
+            .0
+    };
+    Resolved {
+        block1: p.block1(),
+        block2: p.block2(),
+        health_off: field("health"),
+        health2_off: field("health2"),
+        x_off: field("x"),
+        y_off: field("y"),
+        round_timer: g("round_timer"),
+        round_state: g("round_state"),
+        credits: g("credits"),
+        round_over: g("round_over"),
+        abort: g("abort"),
+        match_end: g("match_end"),
+
+        health_max: p.port.enforcement.health_max,
+        refill_below: p.port.enforcement.refill_below,
+        timer_hold: p.port.enforcement.timer_hold,
+        credits_target: p.port.enforcement.credits_target,
+        credits_min: p.port.enforcement.credits_min,
+        reset_x: (
+            *p.port.positions.get("round_start_x_left").unwrap_or(&84) as u16,
+            *p.port.positions.get("round_start_x_right").unwrap_or(&232) as u16,
+        ),
+        ground_y: *p.port.positions.get("round_start_y").unwrap_or(&216) as u16,
+    }
+}
 
 fn rd8(ds: &DebugState, addr: u32) -> u8 {
     ds.read_addr(addr as usize, 1).unwrap_or(0) as u8
@@ -56,14 +103,14 @@ fn wr16be(ds: &mut DebugState, addr: u32, v: u16) {
 }
 
 /// Same composite in-fight gate as the recorder (record.rs).
-fn in_fight(ds: &DebugState) -> bool {
-    let t = rd8(ds, ROUND_TIMER);
-    let healthy = |b: u32| (1..=HEALTH_MAX).contains(&rd8(ds, b + HEALTH_OFF));
-    rd16be(ds, ROUND_OVER) == 0
-        && rd16be(ds, ABORT) == 0
-        && rd16be(ds, MATCH_END) == 0
-        && healthy(BLOCK1)
-        && healthy(BLOCK2)
+fn in_fight(ds: &DebugState, r: &Resolved) -> bool {
+    let t = rd8(ds, r.round_timer);
+    let healthy = |b: u32| (1..=r.health_max).contains(&rd8(ds, b + r.health_off));
+    rd16be(ds, r.round_over) == 0
+        && rd16be(ds, r.abort) == 0
+        && rd16be(ds, r.match_end) == 0
+        && healthy(r.block1)
+        && healthy(r.block2)
         && t != 0
         && (t >> 4) <= 9
         && (t & 0xF) <= 9
@@ -76,41 +123,42 @@ pub fn tick(ds: &mut DebugState, frame: u64) {
     if !ds.training.enabled {
         return;
     }
+    let r = resolve(crate::profile::current());
     // Credits top-up, checked once a second: Start must always work.
-    if frame % 60 == 0 && rd8(ds, CREDITS) < 5 {
-        wr8(ds, CREDITS, 9);
+    if frame % 60 == 0 && rd8(ds, r.credits) < r.credits_min {
+        wr8(ds, r.credits, r.credits_target);
     }
-    if !in_fight(ds) {
+    if !in_fight(ds, &r) {
         return;
     }
     // Hold the round clock.
-    wr8(ds, ROUND_TIMER, 0x85);
-    wr8(ds, ROUND_TIMER + 1, 0x03);
+    wr8(ds, r.round_timer, r.timer_hold[0]);
+    wr8(ds, r.round_timer + 1, r.timer_hold[1]);
     // Health refill: let damage show, never let anyone die.
     if ds.training.refill {
-        for base in [BLOCK1, BLOCK2] {
-            if rd8(ds, base + HEALTH_OFF) < REFILL_BELOW {
-                wr8(ds, base + HEALTH_OFF, HEALTH_MAX);
-                wr8(ds, base + HEALTH_OFF + 2, HEALTH_MAX);
+        for base in [r.block1, r.block2] {
+            if rd8(ds, base + r.health_off) < r.refill_below {
+                wr8(ds, base + r.health_off, r.health_max);
+                wr8(ds, base + r.health2_off, r.health_max);
             }
         }
     }
     // One-shots.
     if ds.training.reset_positions {
         ds.training.reset_positions = false;
-        let (b1x, b2x) = if rd16be(ds, BLOCK1 + X_OFF) <= rd16be(ds, BLOCK2 + X_OFF) {
-            RESET_X
+        let (b1x, b2x) = if rd16be(ds, r.block1 + r.x_off) <= rd16be(ds, r.block2 + r.x_off) {
+            r.reset_x
         } else {
-            (RESET_X.1, RESET_X.0)
+            (r.reset_x.1, r.reset_x.0)
         };
-        wr16be(ds, BLOCK1 + X_OFF, b1x);
-        wr16be(ds, BLOCK1 + Y_OFF, GROUND_Y);
-        wr16be(ds, BLOCK2 + X_OFF, b2x);
-        wr16be(ds, BLOCK2 + Y_OFF, GROUND_Y);
+        wr16be(ds, r.block1 + r.x_off, b1x);
+        wr16be(ds, r.block1 + r.y_off, r.ground_y);
+        wr16be(ds, r.block2 + r.x_off, b2x);
+        wr16be(ds, r.block2 + r.y_off, r.ground_y);
     }
     if ds.training.finish_round {
         ds.training.finish_round = false;
-        wr8(ds, ROUND_STATE, 0);
+        wr8(ds, r.round_state, 0);
     }
     // Dummy preset → port-1 injection (2-frame holds so they bridge to the
     // next GUI fold without latching).
@@ -132,8 +180,8 @@ pub fn tick(ds: &mut DebugState, frame: u64) {
             // Hold away from the other fighter. The dummy is port 1; without a
             // resolved port→block map, treat the RIGHT fighter as the dummy
             // (P2 side) — correct for freshly started VS rounds.
-            let x1 = rd16be(ds, BLOCK1 + X_OFF) as i32;
-            let x2 = rd16be(ds, BLOCK2 + X_OFF) as i32;
+            let x1 = rd16be(ds, r.block1 + r.x_off) as i32;
+            let x2 = rd16be(ds, r.block2 + r.x_off) as i32;
             let (dummy_x, other_x) = if x1 >= x2 { (x1, x2) } else { (x2, x1) };
             let mut b = [false; 12];
             if dummy_x >= other_x {
@@ -157,6 +205,7 @@ mod tests {
 
     #[test]
     fn tick_is_inert_when_disabled_or_out_of_fight() {
+        crate::profile::init_for_tests();
         let mut ds = DebugState::new();
         // disabled: nothing queued
         tick(&mut ds, 0);

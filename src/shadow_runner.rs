@@ -55,26 +55,85 @@ pub const SCALAR_FEATURES: [&str; 21] = [
 /// Soft-retrieval electorate size (knn.py `WIDE_K`).
 const WIDE_K: usize = 100;
 
-// RETRO joypad bit indices (dataset.py / src/mcp/server.rs order).
-const BIT_B: u16 = 0; // Light
-const BIT_Y: u16 = 1; // Heavy
+// RETRO joypad bit indices for MOVEMENT (dataset.py / src/mcp/server.rs
+// order). Only the directions are engine knowledge — attack buttons come
+// from the profile's `attack_chords` table, compiled at model load.
 const BIT_UP: u16 = 4;
 const BIT_DOWN: u16 = 5;
 const BIT_LEFT: u16 = 6;
 const BIT_RIGHT: u16 = 7;
-const BIT_A: u16 = 8; // Medium
 
-// Game addresses (library/asurabld/asurabld.md; same map as record.rs /
-// training.rs / shadow_train.runtime).
-const BLOCK1: u32 = 0x403798;
-const BLOCK2: u32 = 0x40454C;
-const COMBO_ON_B2: u32 = 0x4041E7; // block1's combo landing ON block2
-const COMBO_ON_B1: u32 = 0x40470B; // block2's combo landing ON block1
-const ROUND_OVER: u32 = 0x40646E;
-const ABORT: u32 = 0x403678;
-const MATCH_END: u32 = 0x402A32;
-const ROUND_TIMER: u32 = 0x40000A; // BCD seconds
-const CHAR_SELECT: u32 = 0x400006; // select countdown (gate v3: must be 0)
+// ── profile-resolved addresses (resolved ONCE at load; no per-frame maps) ───
+
+/// Fighter-block field offsets, lifted from `profile.fighter_fields`.
+#[derive(Clone, Copy)]
+struct FighterOffs {
+    timer: u32,
+    anim: u32,
+    x: u32,
+    y: u32,
+    facing: u32,
+    health: u32,
+    meter: u32,
+    meter_max: u32,
+    char_id: u32,
+}
+
+/// Every game address the runner reads, resolved from `profile::current()`
+/// once at [`ShadowRunner::load`]. The tick path only ever dereferences this
+/// struct — it never does name→address map lookups per frame.
+#[derive(Clone, Copy)]
+struct ResolvedAddrs {
+    block1: u32,
+    block2: u32,
+    /// block1's combo landing ON block2 / block2's combo landing ON block1.
+    combo_on_b2: u32,
+    combo_on_b1: u32,
+    round_over: u32,
+    abort: u32,
+    match_end: u32,
+    /// BCD seconds.
+    round_timer: u32,
+    /// Select countdown (gate v3: must be 0).
+    char_select: u32,
+    offs: FighterOffs,
+}
+
+impl ResolvedAddrs {
+    fn from_profile(p: &crate::profile::GameProfile) -> Result<ResolvedAddrs, String> {
+        let g = |name: &str| {
+            p.global(name)
+                .ok_or_else(|| format!("profile: shadow runner needs global '{name}'"))
+        };
+        let f = |name: &str| {
+            p.field_off(name)
+                .map(|(off, _size)| off)
+                .ok_or_else(|| format!("profile: shadow runner needs fighter field '{name}'"))
+        };
+        Ok(ResolvedAddrs {
+            block1: p.block1(),
+            block2: p.block2(),
+            combo_on_b2: g("combo_on_b2")?,
+            combo_on_b1: g("combo_on_b1")?,
+            round_over: g("round_over")?,
+            abort: g("abort")?,
+            match_end: g("match_end")?,
+            round_timer: g("round_timer")?,
+            char_select: g("char_select")?,
+            offs: FighterOffs {
+                timer: f("timer")?,
+                anim: f("anim")?,
+                x: f("x")?,
+                y: f("y")?,
+                facing: f("facing")?,
+                health: f("health")?,
+                meter: f("meter")?,
+                meter_max: f("meter_max")?,
+                char_id: f("char_id")?,
+            },
+        })
+    }
+}
 
 // ── minimal .npz reader (uncompressed zip of .npy, np.savez output) ─────────
 
@@ -292,6 +351,20 @@ impl Default for Calibration {
 #[derive(serde::Deserialize)]
 struct MetaJson {
     feature_names: Vec<String>,
+    /// Class vocabularies the model's heads were fitted with. meta.json is
+    /// authoritative for a LOADED model (docs/game-profiles.md rule 3);
+    /// absent (old models) they default to the canonical asurabld-era lists.
+    #[serde(default = "d_move_classes")]
+    move_classes: Vec<String>,
+    #[serde(default = "d_attack_classes")]
+    attack_classes: Vec<String>,
+    /// Provenance stamps: which game family / port the model was trained on.
+    /// family mismatch = hard error (wrong game's model); port mismatch =
+    /// warning (cross-port shadows are a supported experiment).
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    port: Option<String>,
     #[serde(default)]
     calibration: Option<Calibration>,
     #[serde(default)]
@@ -314,6 +387,13 @@ struct MetaJson {
 /// Canonical bucket display order (matches the trainer's coverage report).
 const BUCKET_ORDER: [&str; 5] = ["defense", "offense", "air", "corner", "neutral"];
 
+fn d_move_classes() -> Vec<String> {
+    MOVE_CLASSES.iter().map(|s| s.to_string()).collect()
+}
+fn d_attack_classes() -> Vec<String> {
+    ATTACK_CLASSES.iter().map(|s| s.to_string()).collect()
+}
+
 // ── the kNN policy (mirror of knn.py, soft retrieval) ───────────────────────
 
 pub struct KnnModel {
@@ -327,11 +407,21 @@ pub struct KnnModel {
     pub y_attack: Vec<u8>,
     pub k: usize,
     pub temperature: f64,
+    /// Head sizes — the lengths of the model's move/attack class lists
+    /// (meta.json). Nothing here hardcodes 9/6 (game-profiles.md rule 3).
+    pub n_move: usize,
+    pub n_attack: usize,
 }
 
 impl KnnModel {
-    /// Build from decoded npz entries, validating shapes.
-    pub fn from_npz(mut entries: HashMap<String, Npy>) -> Result<KnnModel, String> {
+    /// Build from decoded npz entries, validating shapes. `n_move`/`n_attack`
+    /// are the head sizes from the model's class lists; every label must fall
+    /// inside them.
+    pub fn from_npz(
+        mut entries: HashMap<String, Npy>,
+        n_move: usize,
+        n_attack: usize,
+    ) -> Result<KnnModel, String> {
         let mut need = |key: &str| -> Result<Npy, String> {
             entries.remove(key).ok_or_else(|| format!("cases.npz: missing array '{key}'"))
         };
@@ -377,16 +467,19 @@ impl KnnModel {
             x: x.as_f64(),
             mu: mu.as_f64(),
             sd: sd.as_f64(),
-            y_move: to_labels(&y_move, 9, "y_move")?,
-            y_attack: to_labels(&y_attack, 6, "y_attack")?,
+            y_move: to_labels(&y_move, n_move as i64, "y_move")?,
+            y_attack: to_labels(&y_attack, n_attack as i64, "y_attack")?,
             k: k as usize,
             temperature: temperature.as_f64()[0],
+            n_move,
+            n_attack,
         })
     }
 
-    /// knn.py `_weighted_neighbors` + `_vote`: probabilities for both heads.
+    /// knn.py `_weighted_neighbors` + `_vote`: probabilities for both heads,
+    /// sized `n_move` / `n_attack` from the model's own class lists.
     /// `q_raw` is the UNstandardized stacked feature vector (len == dims).
-    pub fn predict_proba(&self, q_raw: &[f64]) -> ([f64; 9], [f64; 6]) {
+    pub fn predict_proba(&self, q_raw: &[f64]) -> (Vec<f64>, Vec<f64>) {
         debug_assert_eq!(q_raw.len(), self.dims);
         // Standardize the query, then brute-force distances to all N cases.
         let q: Vec<f64> = (0..self.dims)
@@ -407,8 +500,8 @@ impl KnnModel {
         // sigma = the k-th neighbor's distance (min 1e-6).
         let sigma = near[self.k.min(wide) - 1].0.max(1e-6);
         // Per head: weighted class counts → temperature softmax over log-counts.
-        let mut cm = [0.0f64; 9];
-        let mut ca = [0.0f64; 6];
+        let mut cm = vec![0.0f64; self.n_move];
+        let mut ca = vec![0.0f64; self.n_attack];
         for &(d, i) in near.iter() {
             let w = (-(d / sigma) * (d / sigma)).exp();
             cm[self.y_move[i] as usize] += w;
@@ -419,8 +512,9 @@ impl KnnModel {
 }
 
 /// knn.py `_vote`: softmax(ln(counts + 1e-9) / T); T <= 0 → argmax one-hot.
-fn vote<const C: usize>(counts: &[f64; C], temperature: f64) -> [f64; C] {
-    let mut p = [0.0f64; C];
+/// Length follows `counts` (the head's class count).
+fn vote(counts: &[f64], temperature: f64) -> Vec<f64> {
+    let mut p = vec![0.0f64; counts.len()];
     if temperature <= 0.0 {
         p[argmax(counts)] = 1.0;
         return p;
@@ -496,11 +590,47 @@ impl XorShift64 {
 
 // ── intent → RETRO mask (SPEC §3c; mirror of runtime.intent_to_mask) ────────
 
-/// Move classes: 0 Neutral 1 Forward 2 Back 3 Up 4 Down 5 UpForward 6 UpBack
-/// 7 DownForward 8 DownBack. Attacks: 0 None 1 Light(B) 2 Medium(A)
-/// 3 Heavy(Y) 4 Launcher(B+A) 5 Toss(B+A+Y). `s` = facing sign
-/// (+1 → Forward is Right).
-pub fn intent_to_mask(move_class: usize, attack_class: usize, s: i32) -> u16 {
+/// True when `list` is the canonical 9-way movement vocabulary the engine's
+/// direction logic understands (0 Neutral 1 Forward 2 Back 3 Up 4 Down
+/// 5 UpForward 6 UpBack 7 DownForward 8 DownBack).
+fn move_classes_are_canonical(list: &[String]) -> bool {
+    list.len() == MOVE_CLASSES.len() && list.iter().zip(MOVE_CLASSES).all(|(a, b)| a == b)
+}
+
+/// Compile one RETRO button mask per attack class (in the model's
+/// `attack_classes` order) from the profile's `attack_chords` table
+/// (game-profiles.md rule 4: chords are data). "None" compiles to an empty
+/// mask; any other class must have a chord of known RETRO button names.
+pub fn compile_attack_masks(attack_classes: &[String]) -> Result<Vec<u16>, String> {
+    let prof = crate::profile::current();
+    attack_classes
+        .iter()
+        .map(|class| {
+            if class == "None" {
+                return Ok(0u16);
+            }
+            let chord = prof.port.attack_chords.get(class).ok_or_else(|| {
+                format!(
+                    "attack class '{class}' has no chord in the {} profile's attack_chords",
+                    prof.family.family
+                )
+            })?;
+            let mut m = 0u16;
+            for name in chord {
+                let bit = crate::profile::retro_button_bit(name).ok_or_else(|| {
+                    format!("attack chord for '{class}' names unknown RETRO button '{name}'")
+                })?;
+                m |= 1 << bit;
+            }
+            Ok(m)
+        })
+        .collect()
+}
+
+/// Directions are engine logic (`s` = facing sign, +1 → Forward is Right);
+/// the attack buttons come from `attack_masks` — the per-model table
+/// compiled by [`compile_attack_masks`] at load time.
+pub fn intent_to_mask(move_class: usize, attack_class: usize, s: i32, attack_masks: &[u16]) -> u16 {
     let mut m = 0u16;
     if matches!(move_class, 3 | 5 | 6) {
         m |= 1 << BIT_UP;
@@ -515,15 +645,7 @@ pub fn intent_to_mask(move_class: usize, attack_class: usize, s: i32) -> u16 {
     if matches!(move_class, 2 | 6 | 8) {
         m |= 1 << back;
     }
-    match attack_class {
-        1 => m |= 1 << BIT_B,
-        2 => m |= 1 << BIT_A,
-        3 => m |= 1 << BIT_Y,
-        4 => m |= (1 << BIT_B) | (1 << BIT_A),
-        5 => m |= (1 << BIT_B) | (1 << BIT_A) | (1 << BIT_Y),
-        _ => {}
-    }
-    m
+    m | attack_masks.get(attack_class).copied().unwrap_or(0)
 }
 
 // ── per-tick game state (mirror of runtime.parse_tick over read_addr) ───────
@@ -551,17 +673,17 @@ fn u8g(ds: &DebugState, addr: u32) -> u8 {
     ds.read_addr(addr as usize, 1).unwrap_or(0) as u8
 }
 
-fn read_fighter(ds: &DebugState, base: u32) -> Fighter {
+fn read_fighter(ds: &DebugState, base: u32, o: &FighterOffs) -> Fighter {
     Fighter {
-        timer: u16be(ds, base),
-        anim: u16be(ds, base + 0x12),
-        x: u16be(ds, base + 0x54),
-        y: u16be(ds, base + 0x56),
-        facing: u8g(ds, base + 0x61),
-        health: u8g(ds, base + 0x177),
-        meter: u8g(ds, base + 0x17B),
-        meter_max: u8g(ds, base + 0x17F),
-        char_id: u8g(ds, base + 0x639),
+        timer: u16be(ds, base + o.timer),
+        anim: u16be(ds, base + o.anim),
+        x: u16be(ds, base + o.x),
+        y: u16be(ds, base + o.y),
+        facing: u8g(ds, base + o.facing),
+        health: u8g(ds, base + o.health),
+        meter: u8g(ds, base + o.meter),
+        meter_max: u8g(ds, base + o.meter_max),
+        char_id: u8g(ds, base + o.char_id),
     }
 }
 
@@ -578,17 +700,17 @@ struct TickSnapshot {
     timer_bcd: u8,
 }
 
-fn read_tick(ds: &DebugState) -> TickSnapshot {
+fn read_tick(ds: &DebugState, a: &ResolvedAddrs) -> TickSnapshot {
     TickSnapshot {
-        block1: read_fighter(ds, BLOCK1),
-        block2: read_fighter(ds, BLOCK2),
-        char_sel: u8g(ds, CHAR_SELECT),
-        combo_on_b1: u8g(ds, COMBO_ON_B1),
-        combo_on_b2: u8g(ds, COMBO_ON_B2),
-        round_over: u16be(ds, ROUND_OVER),
-        abort: u16be(ds, ABORT),
-        match_end: u16be(ds, MATCH_END),
-        timer_bcd: u8g(ds, ROUND_TIMER),
+        block1: read_fighter(ds, a.block1, &a.offs),
+        block2: read_fighter(ds, a.block2, &a.offs),
+        char_sel: u8g(ds, a.char_select),
+        combo_on_b1: u8g(ds, a.combo_on_b1),
+        combo_on_b2: u8g(ds, a.combo_on_b2),
+        round_over: u16be(ds, a.round_over),
+        abort: u16be(ds, a.abort),
+        match_end: u16be(ds, a.match_end),
+        timer_bcd: u8g(ds, a.round_timer),
     }
 }
 
@@ -646,6 +768,13 @@ pub struct LoadedModel {
     cal: Calibration,
     /// Identity card for the Training panel (published via `shadow_model`).
     pub info: crate::debug::ShadowModelInfo,
+    /// The model's OWN class vocabularies (meta.json; canonical defaults for
+    /// old metas). Display lookups use these, not the crate-level consts.
+    move_classes: Vec<String>,
+    attack_classes: Vec<String>,
+    /// One RETRO button mask per attack class, compiled from the profile's
+    /// `attack_chords` at load ([`compile_attack_masks`]).
+    attack_masks: Vec<u16>,
     /// Matchup key from meta.json: (my char, opponent char); None = any.
     me: Option<u8>,
     opp: Option<u8>,
@@ -659,6 +788,8 @@ pub struct ShadowRunner {
     library: Vec<LoadedModel>,
     /// Index into `library` currently driving decisions.
     active: usize,
+    /// Game addresses, resolved from the profile once at load.
+    addrs: ResolvedAddrs,
     pub enabled: bool,
     rng: XorShift64,
     // Per-round buffers (runtime.RoundBuffers) — cleared on every gate edge.
@@ -694,6 +825,7 @@ impl ShadowRunner {
     /// ENABLED runner; errors are strings meant for a fatal `--shadow`
     /// startup message (runtime loads report them softly instead).
     pub fn load(dir: &Path) -> Result<ShadowRunner, String> {
+        let addrs = ResolvedAddrs::from_profile(crate::profile::current())?;
         let mut library: Vec<LoadedModel> = Vec::new();
         if dir.join("cases.npz").is_file() {
             library.push(Self::load_single(dir)?);
@@ -744,6 +876,7 @@ impl ShadowRunner {
         Ok(ShadowRunner {
             library,
             active,
+            addrs,
             enabled: true,
             rng: XorShift64::new(0),
             was_live: false,
@@ -803,17 +936,64 @@ impl ShadowRunner {
     /// Load one model directory: `<dir>/cases.npz` + `<dir>/meta.json`,
     /// validating the feature-name contract.
     fn load_single(dir: &Path) -> Result<LoadedModel, String> {
-        let npz_path = dir.join("cases.npz");
-        let bytes = std::fs::read(&npz_path)
-            .map_err(|e| format!("{}: {e}", npz_path.display()))?;
-        let model = KnnModel::from_npz(parse_npz(&bytes)?)?;
-
+        let prof = crate::profile::current();
         let meta_path = dir.join("meta.json");
         let meta: MetaJson = serde_json::from_str(
             &std::fs::read_to_string(&meta_path)
                 .map_err(|e| format!("{}: {e}", meta_path.display()))?,
         )
         .map_err(|e| format!("{}: {e}", meta_path.display()))?;
+
+        // Provenance: another FAMILY's model is the wrong game — hard error.
+        // Another PORT of the same family is a supported experiment — warn,
+        // and stamp the model card so the panel shows it.
+        if let Some(fam) = &meta.family {
+            if *fam != prof.family.family {
+                return Err(format!(
+                    "{}: model was trained for family '{fam}' but the loaded profile is \
+                     '{}' — refusing to drive the wrong game",
+                    meta_path.display(),
+                    prof.family.family
+                ));
+            }
+        }
+        let cross_port = meta
+            .port
+            .as_ref()
+            .filter(|p| **p != prof.port.port)
+            .cloned();
+        if let Some(mp) = &cross_port {
+            eprintln!(
+                "[shadow] {}: cross-port model (trained on port '{mp}', running '{}') — \
+                 supported experiment; calibration may differ",
+                dir.display(),
+                prof.port.port
+            );
+        }
+
+        // The 9-way movement vocabulary is engine logic (intent_to_mask's
+        // direction bits); a model with a different move list can't be driven.
+        if !move_classes_are_canonical(&meta.move_classes) {
+            return Err(format!(
+                "{}: move_classes {:?} != the canonical 9-way list {:?} — the runner's \
+                 direction logic only understands the latter",
+                meta_path.display(),
+                meta.move_classes,
+                MOVE_CLASSES
+            ));
+        }
+        // Attack chords are data: compile the model's attack classes into
+        // RETRO masks via the profile's attack_chords table.
+        let attack_masks = compile_attack_masks(&meta.attack_classes)?;
+
+        let npz_path = dir.join("cases.npz");
+        let bytes = std::fs::read(&npz_path)
+            .map_err(|e| format!("{}: {e}", npz_path.display()))?;
+        let model = KnnModel::from_npz(
+            parse_npz(&bytes)?,
+            meta.move_classes.len(),
+            meta.attack_classes.len(),
+        )?;
 
         if meta.feature_names[..] != SCALAR_FEATURES[..] {
             return Err(format!(
@@ -858,11 +1038,17 @@ impl ShadowRunner {
                 }
             }
         }
+        let mut name = dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        if let Some(mp) = &cross_port {
+            // Panel-visible cross-port stamp (the ShadowModelInfo card shows
+            // the name; there is no separate note field).
+            name = format!("{name} [cross-port: {mp}]");
+        }
         let info = crate::debug::ShadowModelInfo {
-            name: dir
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| dir.display().to_string()),
+            name,
             cases: model.n,
             rounds: meta.n_rounds,
             created: meta.created.clone(),
@@ -873,6 +1059,9 @@ impl ShadowRunner {
             model,
             cal,
             info,
+            move_classes: meta.move_classes,
+            attack_classes: meta.attack_classes,
+            attack_masks,
             me: meta.char_filter,
             opp: meta.opp_filter,
             created: meta.created.clone().unwrap_or_default(),
@@ -915,7 +1104,7 @@ impl ShadowRunner {
         if !self.enabled {
             return;
         }
-        let snap = read_tick(ds);
+        let snap = read_tick(ds, &self.addrs);
         let live = is_controllable(&snap, self.library[self.active].cal.HEALTH_MAX as u8);
 
         if !live {
@@ -1020,19 +1209,20 @@ impl ShadowRunner {
             let (pm, pa) = self.library[self.active].model.predict_proba(&q);
             let mv = self.rng.sample(&pm);
             let at = self.rng.sample(&pa);
-            let mask = intent_to_mask(mv, at, s);
+            let mask = intent_to_mask(mv, at, s, &self.library[self.active].attack_masks);
             self.latched_mask = mask;
             self.last_emitted_mask = mask;
             self.driving = true;
             if self.tick < 12 || self.tick % 75 == 0 {
+                let lm = &self.library[self.active];
                 eprintln!(
                     "[shadow] tick={:4} me=block{} dist_x={:+.3} s={:+} move={} attack={} mask={:#05x}",
                     self.tick,
                     if me_is_block1 { 1 } else { 2 },
                     scal[0],
                     s,
-                    MOVE_CLASSES[mv],
-                    ATTACK_CLASSES[at],
+                    lm.move_classes[mv],
+                    lm.attack_classes[at],
                     mask
                 );
             }
@@ -1044,6 +1234,10 @@ impl ShadowRunner {
     }
 }
 
+/// Canonical class vocabularies — the movement contract the engine's
+/// direction logic requires, and the DEFAULT lists for metas that predate
+/// per-model class lists. Display and sizing prefer the loaded model's own
+/// lists; these consts stay for external users.
 pub const MOVE_CLASSES: [&str; 9] = [
     "Neutral", "Forward", "Back", "Up", "Down", "UpForward", "UpBack", "DownForward", "DownBack",
 ];
@@ -1107,6 +1301,12 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    // Attack-button bits, for asserting what the asurabld chord table must
+    // compile to (Light=B, Medium=A, Heavy=Y).
+    const BIT_B: u16 = 0;
+    const BIT_Y: u16 = 1;
+    const BIT_A: u16 = 8;
+
     fn goat_v2() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shadow/models/goat-v2")
     }
@@ -1115,7 +1315,7 @@ mod tests {
         let bytes = std::fs::read(goat_v2().join("cases.npz")).expect(
             "shadow/models/goat-v2/cases.npz missing — the npz golden tests need the real model",
         );
-        KnnModel::from_npz(parse_npz(&bytes).unwrap()).unwrap()
+        KnnModel::from_npz(parse_npz(&bytes).unwrap(), 9, 6).unwrap()
     }
 
     fn approx(a: f64, b: f64, tol: f64) -> bool {
@@ -1131,6 +1331,7 @@ mod tests {
     ///   y_move[:8] = zeros, y_attack[:8] = zeros
     #[test]
     fn npz_reader_decodes_goat_v2() {
+        crate::profile::init_for_tests();
         let bytes = std::fs::read(goat_v2().join("cases.npz")).unwrap();
         let entries = parse_npz(&bytes).unwrap();
         let x = &entries["X"];
@@ -1169,11 +1370,12 @@ mod tests {
         assert_eq!(names, ["defense", "offense", "air", "corner", "neutral"]);
         assert_eq!(runner.info().buckets[0].1, 183);
 
-        let model = KnnModel::from_npz(entries).unwrap();
+        let model = KnnModel::from_npz(entries, 9, 6).unwrap();
         assert_eq!(model.n, 13405);
         assert_eq!(model.dims, 84);
         assert_eq!(model.k, 15);
         assert_eq!(model.temperature, 1.0);
+        assert_eq!((model.n_move, model.n_attack), (9, 6));
     }
 
     /// Golden vote values from the python policy (KnnPolicy.load + the same
@@ -1245,35 +1447,97 @@ mod tests {
         assert_eq!(p, [0.0, 1.0, 0.0]);
     }
 
-    /// SPEC §3c intent → RETRO bits, both facings, full class matrix.
+    /// SPEC §3c intent → RETRO bits, both facings, full class matrix —
+    /// through the compiled-chords path. The masks are pinned to the exact
+    /// values the pre-profile hardcoded match produced.
     #[test]
     fn intent_to_mask_matrix() {
+        crate::profile::init_for_tests();
+        let am = compile_attack_masks(&d_attack_classes()).unwrap();
         let b = |bit: u16| 1u16 << bit;
         // Directions, s = +1 (Forward = Right).
-        assert_eq!(intent_to_mask(0, 0, 1), 0);
-        assert_eq!(intent_to_mask(1, 0, 1), b(BIT_RIGHT));
-        assert_eq!(intent_to_mask(2, 0, 1), b(BIT_LEFT));
-        assert_eq!(intent_to_mask(3, 0, 1), b(BIT_UP));
-        assert_eq!(intent_to_mask(4, 0, 1), b(BIT_DOWN));
-        assert_eq!(intent_to_mask(5, 0, 1), b(BIT_UP) | b(BIT_RIGHT));
-        assert_eq!(intent_to_mask(6, 0, 1), b(BIT_UP) | b(BIT_LEFT));
-        assert_eq!(intent_to_mask(7, 0, 1), b(BIT_DOWN) | b(BIT_RIGHT));
-        assert_eq!(intent_to_mask(8, 0, 1), b(BIT_DOWN) | b(BIT_LEFT));
+        assert_eq!(intent_to_mask(0, 0, 1, &am), 0);
+        assert_eq!(intent_to_mask(1, 0, 1, &am), b(BIT_RIGHT));
+        assert_eq!(intent_to_mask(2, 0, 1, &am), b(BIT_LEFT));
+        assert_eq!(intent_to_mask(3, 0, 1, &am), b(BIT_UP));
+        assert_eq!(intent_to_mask(4, 0, 1, &am), b(BIT_DOWN));
+        assert_eq!(intent_to_mask(5, 0, 1, &am), b(BIT_UP) | b(BIT_RIGHT));
+        assert_eq!(intent_to_mask(6, 0, 1, &am), b(BIT_UP) | b(BIT_LEFT));
+        assert_eq!(intent_to_mask(7, 0, 1, &am), b(BIT_DOWN) | b(BIT_RIGHT));
+        assert_eq!(intent_to_mask(8, 0, 1, &am), b(BIT_DOWN) | b(BIT_LEFT));
         // Directions, s = -1 (Forward = Left).
-        assert_eq!(intent_to_mask(1, 0, -1), b(BIT_LEFT));
-        assert_eq!(intent_to_mask(2, 0, -1), b(BIT_RIGHT));
-        assert_eq!(intent_to_mask(5, 0, -1), b(BIT_UP) | b(BIT_LEFT));
-        assert_eq!(intent_to_mask(6, 0, -1), b(BIT_UP) | b(BIT_RIGHT));
-        assert_eq!(intent_to_mask(7, 0, -1), b(BIT_DOWN) | b(BIT_LEFT));
-        assert_eq!(intent_to_mask(8, 0, -1), b(BIT_DOWN) | b(BIT_RIGHT));
+        assert_eq!(intent_to_mask(1, 0, -1, &am), b(BIT_LEFT));
+        assert_eq!(intent_to_mask(2, 0, -1, &am), b(BIT_RIGHT));
+        assert_eq!(intent_to_mask(5, 0, -1, &am), b(BIT_UP) | b(BIT_LEFT));
+        assert_eq!(intent_to_mask(6, 0, -1, &am), b(BIT_UP) | b(BIT_RIGHT));
+        assert_eq!(intent_to_mask(7, 0, -1, &am), b(BIT_DOWN) | b(BIT_LEFT));
+        assert_eq!(intent_to_mask(8, 0, -1, &am), b(BIT_DOWN) | b(BIT_RIGHT));
         // Attacks: B=Light, A=Medium, Y=Heavy, Launcher={B,A}, Toss={B,A,Y}.
-        assert_eq!(intent_to_mask(0, 1, 1), b(BIT_B));
-        assert_eq!(intent_to_mask(0, 2, 1), b(BIT_A));
-        assert_eq!(intent_to_mask(0, 3, 1), b(BIT_Y));
-        assert_eq!(intent_to_mask(0, 4, 1), b(BIT_B) | b(BIT_A));
-        assert_eq!(intent_to_mask(0, 5, 1), b(BIT_B) | b(BIT_A) | b(BIT_Y));
+        assert_eq!(intent_to_mask(0, 1, 1, &am), b(BIT_B));
+        assert_eq!(intent_to_mask(0, 2, 1, &am), b(BIT_A));
+        assert_eq!(intent_to_mask(0, 3, 1, &am), b(BIT_Y));
+        assert_eq!(intent_to_mask(0, 4, 1, &am), b(BIT_B) | b(BIT_A));
+        assert_eq!(intent_to_mask(0, 5, 1, &am), b(BIT_B) | b(BIT_A) | b(BIT_Y));
         // Chord: DownForward + Heavy at s = -1.
-        assert_eq!(intent_to_mask(7, 3, -1), b(BIT_DOWN) | b(BIT_LEFT) | b(BIT_Y));
+        assert_eq!(intent_to_mask(7, 3, -1, &am), b(BIT_DOWN) | b(BIT_LEFT) | b(BIT_Y));
+    }
+
+    /// The asurabld profile's attack_chords table must compile to EXACTLY the
+    /// legacy hardcoded masks — this is the load-time table `decide` uses.
+    #[test]
+    fn chord_compilation_matches_legacy_masks() {
+        crate::profile::init_for_tests();
+        let b = |bit: u16| 1u16 << bit;
+        let masks = compile_attack_masks(&d_attack_classes()).unwrap();
+        assert_eq!(
+            masks,
+            vec![
+                0,                                   // None
+                b(BIT_B),                            // Light
+                b(BIT_A),                            // Medium
+                b(BIT_Y),                            // Heavy
+                b(BIT_B) | b(BIT_A),                 // Launcher
+                b(BIT_B) | b(BIT_A) | b(BIT_Y),      // Toss
+            ]
+        );
+        // Unknown class (no chord in the profile) is a load error, not a 0.
+        assert!(compile_attack_masks(&["Fireball".to_string()]).is_err());
+        // The canonical move list passes the load-time assertion; a foreign
+        // one does not.
+        assert!(move_classes_are_canonical(&d_move_classes()));
+        assert!(!move_classes_are_canonical(&["Neutral".to_string()]));
+    }
+
+    /// Head sizes follow the class lists, not compiled 9/6 constants: a
+    /// synthetic model with 4 attack classes yields a 4-wide attack head.
+    #[test]
+    fn head_sizes_follow_meta_class_lists() {
+        let mk = |shape: Vec<usize>, data: NpyData| Npy { shape, data };
+        let entries = |y_attack: Vec<i64>| -> HashMap<String, Npy> {
+            let mut e = HashMap::new();
+            e.insert("X".into(), mk(vec![4, 2], NpyData::F32(vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0])));
+            e.insert("mu".into(), mk(vec![2], NpyData::F32(vec![0.0, 0.0])));
+            e.insert("sd".into(), mk(vec![2], NpyData::F32(vec![1.0, 1.0])));
+            e.insert("y_move".into(), mk(vec![4], NpyData::I64(vec![0, 1, 2, 8])));
+            e.insert("y_attack".into(), mk(vec![4], NpyData::I64(y_attack)));
+            e.insert("k".into(), mk(vec![], NpyData::I64(vec![2])));
+            e.insert("temperature".into(), mk(vec![], NpyData::F64(vec![1.0])));
+            e
+        };
+        let m = KnnModel::from_npz(entries(vec![0, 1, 2, 3]), 9, 4).unwrap();
+        assert_eq!((m.n_move, m.n_attack), (9, 4));
+        let (pm, pa) = m.predict_proba(&[0.5, 0.5]);
+        assert_eq!(pm.len(), 9);
+        assert_eq!(pa.len(), 4);
+        for p in [&pm, &pa] {
+            assert!((p.iter().sum::<f64>() - 1.0).abs() < 1e-12, "distribution sums to 1");
+            assert!(p.iter().all(|&v| (0.0..=1.0).contains(&v)));
+        }
+        // A label outside the declared head is rejected at load.
+        let err = KnnModel::from_npz(entries(vec![0, 1, 2, 4]), 9, 4)
+            .err()
+            .expect("label 4 must be rejected under a 4-class attack head");
+        assert!(err.contains("out of range"), "{err}");
     }
 
     #[test]
@@ -1383,8 +1647,54 @@ mod tests {
         assert!(!is_controllable(&TickSnapshot { char_sel: 0x28, ..snap }, 0xEF));
     }
 
+    /// meta.json provenance: wrong family = hard error; same family on a
+    /// different port = accepted with a panel-visible cross-port stamp.
+    #[test]
+    fn provenance_family_errors_and_port_warns() {
+        crate::profile::init_for_tests();
+        let base = std::env::temp_dir().join(format!("shadow_prov_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let make = |name: &str, edit: &dyn Fn(&mut serde_json::Value)| -> PathBuf {
+            let d = base.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::copy(goat_v2().join("cases.npz"), d.join("cases.npz")).unwrap();
+            let mut meta: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(goat_v2().join("meta.json")).unwrap(),
+            )
+            .unwrap();
+            edit(&mut meta);
+            std::fs::write(d.join("meta.json"), meta.to_string()).unwrap();
+            d
+        };
+
+        // Wrong family: refused outright.
+        let wrong = make("wrong-family", &|m| {
+            m["family"] = serde_json::json!("sf2ce");
+        });
+        let err = ShadowRunner::load(&wrong).err().expect("family mismatch must fail");
+        assert!(err.contains("family 'sf2ce'"), "{err}");
+
+        // Same family, other port: loads, warns, stamps the model card name.
+        let cross = make("cross-port", &|m| {
+            m["family"] = serde_json::json!("asurabld");
+            m["port"] = serde_json::json!("console");
+        });
+        let runner = ShadowRunner::load(&cross).unwrap();
+        assert_eq!(runner.info().name, "cross-port [cross-port: console]");
+
+        // Matching stamps: loads with a clean name.
+        let exact = make("exact", &|m| {
+            m["family"] = serde_json::json!("asurabld");
+            m["port"] = serde_json::json!("arcade");
+        });
+        let runner = ShadowRunner::load(&exact).unwrap();
+        assert_eq!(runner.info().name, "exact");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn set_load_dedups_and_selects_per_matchup() {
+        crate::profile::init_for_tests();
         // Build a temp set from the tracked goat-v2 artifacts: a general
         // model plus a synthetic (me=1, opp=7) matchup model with the same
         // cases but an edited meta.

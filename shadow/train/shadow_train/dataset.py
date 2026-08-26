@@ -14,6 +14,15 @@ Pipeline per file:
      split units (file, round_id, seg_k) -- see _segment()
 
 Raw fields stay raw on disk; everything here is train-time (§5).
+
+Calibration constants and the move/attack class lists below are loaded from
+the game profile (`library/asurabld/asurabld.profile.json`'s `calibration`
+block and `library/asurabld/family.json`'s `move_classes`/`attack_classes`,
+via `shadow_train.profile`) rather than hand-kept here -- see
+docs/game-profiles.md. The module-level names are kept exactly as before
+(other code and `meta.json` writing reference them by name), and the JSON's
+numeric literals preserve the same int/float types the old hardcoded
+constants had, so a fit's output is unaffected by this indirection.
 """
 
 from __future__ import annotations
@@ -24,18 +33,23 @@ from pathlib import Path
 
 import numpy as np
 
+from . import profile as _profile
+
+_PROF = _profile.get()
+_CAL = _PROF.calibration
+
 # ── calibration constants (SPEC §1) ─────────────────────────────────────────
-GROUND_Y = 216
-X_SCALE = 128.0
-Y_SCALE = 128.0
-TIMER_SCALE = 256.0
-ANIM_SCALE = 64.0
-CORNER_PX = 24
-HEALTH_MAX = 0xEF
-P = 8          # decision period, frames (§4)
-K = 4          # stacked decision-step snapshots (§4)
-STALE = 3      # opponent observation delay, frames (§4)
-SCREEN_W = 320
+GROUND_Y = _CAL["GROUND_Y"]
+X_SCALE = _CAL["X_SCALE"]
+Y_SCALE = _CAL["Y_SCALE"]
+TIMER_SCALE = _CAL["TIMER_SCALE"]
+ANIM_SCALE = _CAL["ANIM_SCALE"]
+CORNER_PX = _CAL["CORNER_PX"]
+HEALTH_MAX = _CAL["HEALTH_MAX"]
+P = _CAL["P"]              # decision period, frames (§4)
+K = _CAL["K"]              # stacked decision-step snapshots (§4)
+STALE = _CAL["STALE"]      # opponent observation delay, frames (§4)
+SCREEN_W = _CAL["SCREEN_W"]
 
 # Task 1 (pseudo-round segmentation): training-mode sessions freeze the round
 # timer, so a single round_id can run tens of thousands of frames -- with only
@@ -61,7 +75,7 @@ SEGMENT_DECISIONS = 150
 # run: 7582 frames / ~126s in session-2026-08-24-training-v1.jsonl). 20 frames
 # (2.5x the P=8 decision period) sits cleanly in the gap between those two
 # populations.
-HITSTUN_RECENT_FRAMES = 20
+HITSTUN_RECENT_FRAMES = _CAL["HITSTUN_RECENT_FRAMES"]
 
 # RETRO mask bits
 BIT_B, BIT_Y, BIT_SELECT, BIT_START = 0, 1, 2, 3
@@ -69,11 +83,11 @@ BIT_UP, BIT_DOWN, BIT_LEFT, BIT_RIGHT = 4, 5, 6, 7
 BIT_A = 8
 ATTACK_BITS = (BIT_B, BIT_A, BIT_Y)  # Light, Medium, Heavy (§3c)
 
-MOVE_CLASSES = [
-    "Neutral", "Forward", "Back", "Up", "Down",
-    "UpForward", "UpBack", "DownForward", "DownBack",
-]
-ATTACK_CLASSES = ["None", "Light", "Medium", "Heavy", "Launcher", "Toss"]
+# Class lists (dataset/model head sizes): family.json's vocabulary, shared by
+# every port of this game family (docs/game-profiles.md rule 3 -- nothing may
+# hardcode 9 moves / 6 attacks; everything sizes from these lists' lengths).
+MOVE_CLASSES = list(_PROF.move_classes)
+ATTACK_CLASSES = list(_PROF.attack_classes)
 
 # scalar feature names, in vector order (§1a minus the categorical columns)
 SCALAR_FEATURES = [

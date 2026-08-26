@@ -35,6 +35,10 @@ use std::sync::{Arc, Mutex};
 struct Args {
     #[arg(long, value_name = "PATH")] core: String,
     #[arg(long, value_name = "PATH")] rom: String,
+    /// Game profile directory (family.json + <game>.profile.json). See
+    /// docs/game-profiles.md — loaded once at startup before anything else
+    /// touches game-specific memory knowledge.
+    #[arg(long, value_name = "DIR", default_value = "library/asurabld")] game: String,
     #[arg(long)] fullscreen: bool,
     #[arg(long, value_name = "PATH", default_value = ".")] save_dir: PathBuf,
     #[arg(long, value_name = "PATH", default_value = ".")] system_dir: PathBuf,
@@ -155,6 +159,16 @@ fn main() -> Result<()> {
     if !std::path::Path::new(&args.core).exists() { anyhow::bail!("Core not found: {}", args.core); }
     if !std::path::Path::new(&args.rom).exists()  { anyhow::bail!("ROM not found: {}", args.rom); }
 
+    // Load the game profile (docs/game-profiles.md) before anything else reads
+    // game-specific memory knowledge — record/training/frontend all resolve
+    // addresses via `profile::current()` from this point on. A malformed or
+    // missing profile is a hard startup error, same posture as --shadow.
+    let game_dir = PathBuf::from(&args.game);
+    profile::init(&game_dir).map_err(|e| {
+        anyhow::anyhow!("--game {}: failed to load game profile: {e}", game_dir.display())
+    })?;
+    eprintln!("[profile] loaded {} ({})", game_dir.display(), profile::current().port.port);
+
     eprintln!("RustRetro — Bevy libretro frontend");
     eprintln!("Core: {}", args.core);
     eprintln!("ROM:  {}", args.rom);
@@ -181,6 +195,26 @@ fn main() -> Result<()> {
         Arc::clone(&debug_state),
         args.bus_map.clone(),
     )?;
+
+    // Prerequisite advisory: this profile declares it needs memory regions
+    // (fighter blocks / globals live in Work RAM) but none are installed yet.
+    // Not fatal — a bus window can still arrive later via --bus-map or a Lua
+    // script — but a silent gate-always-closed session is a confusing failure
+    // mode, so warn loudly and by name.
+    if profile::current().port.requires.memory_regions {
+        let no_regions = debug_state
+            .lock()
+            .map(|ds| ds.memory_regions.is_empty())
+            .unwrap_or(false);
+        if no_regions {
+            eprintln!(
+                "[profile] WARNING: profile '{}' requires memory_regions but none are \
+                 installed yet (no --bus-map / core memory map found) — reads will return 0 \
+                 and the controllable gate will stay closed until a bus window is installed.",
+                profile::current().port.port
+            );
+        }
+    }
 
     // Enable per-frame trace recording if requested (both GUI and headless).
     if let Some(rec_path) = args.record.clone() {

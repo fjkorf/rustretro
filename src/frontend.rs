@@ -655,11 +655,12 @@ impl Frontend {
                  records will be zero-filled. Pass --bus-map with a Work RAM window."
             );
         }
+        let prof = crate::profile::current();
         match crate::record::FrameRecorder::create(
             &path,
             crate::record::GameMap::default(),
-            "asurabld",
-            "fbalpha2012",
+            &prof.port.core.provenance_game,
+            &prof.port.core.provenance_core,
             style.as_deref(),
         ) {
             Ok(rec) => {

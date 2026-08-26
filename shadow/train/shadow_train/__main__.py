@@ -32,17 +32,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import asurabld, dataset
+from . import profile as _profile
 from .dataset import ATTACK_CLASSES, MOVE_CLASSES, SCALAR_FEATURES, build
 from .evaluate import MIN_EXAMPLES, evaluate, print_report
 from .knn import KnnPolicy
 
 META_FILE = "meta.json"
 
-CALIBRATION_KEYS = [
-    "GROUND_Y", "X_SCALE", "Y_SCALE", "TIMER_SCALE", "ANIM_SCALE",
-    "CORNER_PX", "HEALTH_MAX", "SCREEN_W", "P", "K", "STALE",
-    "SEGMENT_DECISIONS", "HITSTUN_RECENT_FRAMES",
-]
+# Calibration key set: whatever the profile's `calibration` block names
+# (docs/game-profiles.md) -- dataset.py exports a module attribute of the
+# same name for each one. This used to be a hardcoded list mirroring
+# dataset.py's constants; now it's the profile's own key order (which is
+# where those constants come from), so a game/port with a different
+# calibration set doesn't need this file touched.
+CALIBRATION_KEYS = list(_profile.get().calibration.keys())
 
 
 def _bucket_counts(data: dict) -> dict:
@@ -71,11 +74,14 @@ def cmd_fit(args) -> None:
 
     out_dir = Path(args.out)
     policy.save(out_dir)
+    prof = _profile.get()
     meta = {
         "feature_names": SCALAR_FEATURES,
         "calibration": {name: getattr(dataset, name) for name in CALIBRATION_KEYS},
         "move_classes": MOVE_CLASSES,
         "attack_classes": ATTACK_CLASSES,
+        "family": prof.family,
+        "port": prof.port,
         "k": policy.k,
         "temperature": policy.temperature,
         "neutral_cap": neutral_cap,

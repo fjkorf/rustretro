@@ -12,6 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
+from . import dataset as _dataset
+
 CASES_FILE = "cases.npz"
 
 
@@ -90,10 +92,17 @@ class KnnPolicy:
 
     def predict_proba(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         idx, w = self._weighted_neighbors(x)
-        return self._vote(self.y_move[idx], w, 9), self._vote(self.y_attack[idx], w, 6)
+        n_move = len(_dataset.MOVE_CLASSES)
+        n_attack = len(_dataset.ATTACK_CLASSES)
+        return (
+            self._vote(self.y_move[idx], w, n_move),
+            self._vote(self.y_attack[idx], w, n_attack),
+        )
 
     def predict(self, x: np.ndarray, rng: np.random.Generator | None = None):
         pm, pa = self.predict_proba(x)
         if rng is None:  # deterministic eval: argmax
             return int(pm.argmax()), int(pa.argmax())
-        return int(rng.choice(9, p=pm)), int(rng.choice(6, p=pa))
+        n_move = len(_dataset.MOVE_CLASSES)
+        n_attack = len(_dataset.ATTACK_CLASSES)
+        return int(rng.choice(n_move, p=pm)), int(rng.choice(n_attack, p=pa))
