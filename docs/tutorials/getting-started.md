@@ -16,14 +16,14 @@ around the toolbar and the dock panels.
 1. Build the frontend once:
 
    ```bash
-   cargo build --release
+   cargo build --profile release-dev
    ```
 
 2. Launch a CPS2 fighter with the debug overlay open from the first frame. The
    `--debug` flag opens the dock workspace on startup:
 
    ```bash
-   cargo run --release -- \
+   ./target/release-dev/rustretro \
      --core ./mame2003_plus_libretro.dylib \
      --rom ./mvsc.zip \
      --debug

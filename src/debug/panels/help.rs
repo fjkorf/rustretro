@@ -84,6 +84,17 @@ impl HelpPanel {
             ui.heading("About");
             ui.label("RustRetro loads libretro cores (Genesis, CPS-2, NES) and provides first-class debugging facilities.");
             ui.label("Built with Bevy (rendering), egui (UI), and Capstone (disassembly).");
+            let profile = crate::profile::current();
+            ui.label(
+                egui::RichText::new(format!(
+                    "Loaded game profile: {} ({}) — {}",
+                    profile.family.title,
+                    profile.port.port,
+                    profile.dir.display(),
+                ))
+                .small()
+                .color(egui::Color32::DARK_GRAY),
+            );
         });
     }
 }

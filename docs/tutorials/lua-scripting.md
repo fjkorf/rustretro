@@ -18,7 +18,7 @@ There are two ways in:
 - **At launch**, with the `--script` flag:
 
   ```bash
-  cargo run --release -- \
+  ./target/release-dev/rustretro \
     --core ./genesis_plus_gx_libretro.dylib \
     --rom ./game.md \
     --debug \

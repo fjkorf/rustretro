@@ -1,0 +1,35 @@
+{
+  "_STATUS": "STUB — boot/probe profile only. NOTHING here is mapped: blocks, globals, gate, enforcement and chords are placeholders. The RE for this game has not happened. An empty gate list means controllable() is vacuously TRUE — do not record training data against this profile.",
+  "family": "mk2",
+  "port": "arcade",
+  "core": {
+    "library_name": "FinalBurn Neo",
+    "provenance_game": "mk2",
+    "provenance_core": "fbneo",
+    "button_names": { "coin": "select", "start": "start" }
+  },
+  "requires": { "memory_regions": false, "save_states": false },
+  "memory": {
+    "cpu": "tms34010",
+    "endianness": "little",
+    "blocks": { "block1": "0x0", "block2": "0x0", "stride": "0x0" },
+    "fighter_fields": [
+      { "name": "x", "off": "0x0", "size": 2 },
+      { "name": "y", "off": "0x0", "size": 2 },
+      { "name": "health", "off": "0x0", "size": 1 }
+    ],
+    "globals": {}
+  },
+  "gate": [],
+  "enforcement": {
+    "health_max": 255, "refill_below": 64,
+    "timer_hold": [153, 0], "credits_target": 9, "credits_min": 5
+  },
+  "calibration": {
+    "GROUND_Y": 0, "X_SCALE": 128.0, "Y_SCALE": 128.0,
+    "TIMER_SCALE": 256.0, "ANIM_SCALE": 64.0, "CORNER_PX": 24,
+    "HEALTH_MAX": 255, "SCREEN_W": 400, "P": 8, "K": 4, "STALE": 3,
+    "SEGMENT_DECISIONS": 150, "HITSTUN_RECENT_FRAMES": 20
+  },
+  "attack_chords": {}
+}

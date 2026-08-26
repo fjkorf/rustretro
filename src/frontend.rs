@@ -759,6 +759,12 @@ impl Frontend {
 
     /// Capture M68K and Z80 CPU state from the core (fbalpha2012-specific).
     fn capture_cpu_state(&self) {
+        // The Sek debug API exists in cores (FBNeo) for EVERY game, but only
+        // a 68k driver initializes its context — calling it under e.g. a
+        // TMS34010 driver segfaults. Gate on the profile's declared CPU.
+        if crate::profile::current().port.memory.cpu != "m68k" {
+            return;
+        }
         if let Ok(mut ds) = self.debug_state.try_lock() {
             let mut any_success = false;
 

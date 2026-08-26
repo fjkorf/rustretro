@@ -201,16 +201,9 @@ pub fn matchup_slug(me: u8, opp: u8) -> String {
 /// The stage/opponent selector byte: freezing `$40364D` through the
 /// post-select map screen forces the next fight's venue AND its home
 /// character as the opponent (write-verified; see asurabld.md "Stages").
-/// NOTE: `src/debug/panels/matchup.rs` (not owned by this pass) references
-/// this const directly, so it stays a `const` rather than a profile-backed
-/// fn for now; it matches `profile.port.stage_select.global`
-/// ("0x40364D" for asurabld) and should migrate to an accessor when that
-/// panel is touched.
-pub const STAGE_SELECT_ADDR: u32 = 0x40364D;
-
-/// Selector value whose home character is `opp` — i.e. what to freeze
-/// [`STAGE_SELECT_ADDR`] to in order to fight `opp` next. Resolved from the
-/// loaded profile's `stage_select.value_to_home_char` table.
+/// Selector value whose home character is `opp` — i.e. what to freeze the
+/// profile's stage-select global to in order to fight `opp` next. Resolved
+/// from the loaded profile's `stage_select.value_to_home_char` table.
 pub fn stage_value_for_opponent(opp: u8) -> Option<u8> {
     crate::profile::current().stage_value_for_opponent(opp)
 }

@@ -148,6 +148,12 @@ impl TrainingPanel {
 
     pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DebugState) {
         ui.heading("🎯 Training mode");
+        let profile = crate::profile::current();
+        ui.label(
+            egui::RichText::new(format!("{} ({})", profile.family.title, profile.port.port))
+                .small()
+                .color(egui::Color32::DARK_GRAY),
+        );
         ui.separator();
 
         let was_enabled = state.training.enabled;

@@ -111,6 +111,12 @@ pub struct Requires {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct MemoryMap {
+    /// Main CPU family: "m68k" (default) or "tms34010". Gates the per-frame
+    /// Sek debug capture — FBNeo exports the Sek symbols for EVERY game, so
+    /// calling them on a non-68k driver dereferences an uninitialized CPU
+    /// context and segfaults (probe-verified on mk2, 2026-08-26).
+    #[serde(default = "d_cpu")]
+    pub cpu: String,
     /// "big" (68k) or "little". The read helpers consult this instead of
     /// assuming 68k byte order.
     #[serde(default = "d_endianness")]
@@ -123,6 +129,9 @@ pub struct MemoryMap {
 }
 fn d_endianness() -> String {
     "big".into()
+}
+fn d_cpu() -> String {
+    "m68k".into()
 }
 
 #[derive(Deserialize, Debug, Clone)]
