@@ -1098,7 +1098,7 @@ impl LuaEngine {
 ///
 /// `rgba` is `[R, G, B, A]` per pixel, `width × height`. Boxes get a translucent
 /// fill (alpha from `fill`'s low byte) plus a solid 1px outline (`line`). Anything
-/// outside the buffer is clipped. Text is currently a TODO no-op (see below).
+/// outside the buffer is clipped. Text renders with the built-in 3×5 font.
 pub fn composite_into_rgba(cmds: &[DrawCmd], rgba: &mut [u8], width: u32, height: u32) {
     let w = width as i32;
     let h = height as i32;

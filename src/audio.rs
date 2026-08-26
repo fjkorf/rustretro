@@ -204,7 +204,8 @@ impl AudioOutput {
             Ok(s) => {
                 if let Err(e) = s.play() { eprintln!("[audio] play error: {e}"); }
                 // cpal::Stream is not Send on macOS CoreAudio — use unsafe wrapper.
-                struct SendStream(cpal::Stream);
+                // The field is never read — it exists to keep the stream alive.
+                struct SendStream(#[allow(dead_code)] cpal::Stream);
                 unsafe impl Send for SendStream {}
                 let wrapped = SendStream(s);
                 std::thread::spawn(move || {

@@ -1,8 +1,6 @@
 mod audio;
-mod capstone_test;
 mod core_log;
 mod profile;
-mod phase2_test;
 mod debug;
 mod frontend;
 mod libretro;
@@ -24,7 +22,7 @@ use clap::Parser;
 use debug::{DebugState, SharedDebugState};
 use debug::panels::script_panel::ScriptPanel;
 use frontend::Frontend;
-use litui_pages::{LituiPages, TutorialPages};
+use litui_pages::TutorialPages;
 use lua_engine::LuaEngine;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -46,8 +44,6 @@ struct Args {
     #[arg(long, value_name = "FACTOR", default_value = "3")] scale: u32,
     #[arg(long)] no_audio: bool,
     #[arg(long)] debug: bool,
-    #[arg(long)] test_capstone: bool,
-    #[arg(long)] test_phase2: bool,
     /// Optional Lua overlay script (loaded once at startup).
     #[arg(long, value_name = "PATH")] script: Option<PathBuf>,
     /// Expose the running app to a Claude session via an MCP server (AI Wave 1).
@@ -143,18 +139,6 @@ fn main() -> Result<()> {
     if args.headless && !args.mcp {
         args.mcp = true;
         eprintln!("[headless] --headless implies --mcp; enabling MCP server.");
-    }
-
-    // Run Capstone test if requested
-    if args.test_capstone {
-        capstone_test::run_capstone_tests();
-        return Ok(());
-    }
-
-    // Run Phase 2 test if requested
-    if args.test_phase2 {
-        phase2_test::run_phase2_tests();
-        return Ok(());
     }
 
     if !std::path::Path::new(&args.core).exists() { anyhow::bail!("Core not found: {}", args.core); }
@@ -326,11 +310,10 @@ fn main() -> Result<()> {
         .insert_resource(DebugOverlay(debug::window::DebugApp::new(debug_state)))
         .insert_non_send_resource(LuaRes(lua_engine))
         .insert_resource(ScriptPanel::new())
-        .init_resource::<LituiPages>()
         .init_resource::<TutorialPages>()
         .add_systems(Startup, setup)
         .add_systems(Update, (calibrate_wizard, read_input, run_emulation, run_scripts, drain_lua_requests, sync_video, queue_audio, update_title).chain())
-        .add_systems(EguiPrimaryContextPass, (show_debug, show_script_panel, show_litui_pages, show_tutorial_pages))
+        .add_systems(EguiPrimaryContextPass, (show_debug, show_script_panel, show_tutorial_pages))
         .run();
 
     Ok(())
@@ -350,7 +333,7 @@ fn main() -> Result<()> {
 /// write `DebugState`, which this loop services every frame.
 fn run_headless(
     mut frontend: Frontend,
-    mut lua_engine: LuaEngine,
+    lua_engine: LuaEngine,
     debug_state: SharedDebugState,
     args: &Args,
 ) -> Result<()> {
@@ -583,7 +566,6 @@ pub const KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
         ("Space", "pause / unpause emulation"),
         ("B", "capture bookmark"),
         ("F8", "tutorials window"),
-        ("F9", "litui panels preview (CPU/Log/Audio)"),
         ("F10", "Lua script panel"),
     ]),
     ("Save states", &[
@@ -607,7 +589,6 @@ fn read_input(
     mut emu: NonSendMut<Emu>,
     debug_state: Res<DebugStateRes>,
     mut script_panel: ResMut<ScriptPanel>,
-    mut litui: ResMut<LituiPages>,
     mut tutorials: ResMut<TutorialPages>,
     pad_debug: Res<PadDebug>,
     cfg: Res<input_config::InputConfig>,
@@ -756,9 +737,6 @@ fn read_input(
     }
     if keys.just_pressed(F10) {
         script_panel.open = !script_panel.open;
-    }
-    if keys.just_pressed(F9) {
-        litui.open = !litui.open;
     }
     if keys.just_pressed(F8) {
         tutorials.open = !tutorials.open;
@@ -955,27 +933,7 @@ fn show_debug(
     }
 }
 
-// ─── litui preview pages (Wave C) ────────────────────────────────────────────
-
-/// Render the three litui Markdown pages (CPU / Log / Audio) and run the
-/// live-resource binding. This is the Wave C deliverable: a per-frame projection
-/// of the shared `DebugState` into the macro-generated `AppState`, plus the Audio
-/// form round-trip (widget outputs → live `AudioOutput`). Gated by F9; a no-op
-/// when closed, so existing behaviour is unchanged.
-fn show_litui_pages(
-    mut ctx: EguiContexts,
-    debug_state: Res<DebugStateRes>,
-    mut audio: ResMut<AudioRes>,
-    mut litui: ResMut<LituiPages>,
-) {
-    if !litui.open {
-        return;
-    }
-    sync_litui_pages(&mut litui, &debug_state.0, &mut audio.0);
-    if let Ok(ctx) = ctx.ctx_mut() {
-        litui.md.show_all(ctx);
-    }
-}
+// ─── tutorial pages (litui) ─────────────────────────────────────────────────
 
 /// Wave D: render the in-app tutorials (Help → Tutorials). These are static
 /// litui document pages authored in `docs/tutorials/` — no live binding needed.
@@ -989,52 +947,6 @@ fn show_tutorial_pages(mut ctx: EguiContexts, mut tutorials: ResMut<TutorialPage
     }
 }
 
-/// The entire per-frame sync glue: DebugState values DOWN into the litui AppState,
-/// and Audio form widget outputs UP into the live AudioOutput. Kept in one small
-/// function (the "measure the sync glue" risk from the ROADMAP).
-fn sync_litui_pages(litui: &mut LituiPages, debug_state: &SharedDebugState, audio: &mut AudioOutput) {
-    let s = &mut litui.md.state;
-
-    // ── widget outputs UP: Audio form → live AudioOutput ──
-    audio.set_mute(s.mute);
-    audio.set_volume(s.volume as f32);
-
-    // ── values DOWN: DebugState / AudioOutput → [display] fields ──
-    let Ok(ds) = debug_state.lock() else { return };
-
-    s.d0 = format!("{:08X}", ds.m68k_d_regs[0]);
-    s.d1 = format!("{:08X}", ds.m68k_d_regs[1]);
-    s.d2 = format!("{:08X}", ds.m68k_d_regs[2]);
-    s.d3 = format!("{:08X}", ds.m68k_d_regs[3]);
-    s.d4 = format!("{:08X}", ds.m68k_d_regs[4]);
-    s.d5 = format!("{:08X}", ds.m68k_d_regs[5]);
-    s.d6 = format!("{:08X}", ds.m68k_d_regs[6]);
-    s.d7 = format!("{:08X}", ds.m68k_d_regs[7]);
-    s.a0 = format!("{:08X}", ds.m68k_a_regs[0]);
-    s.a1 = format!("{:08X}", ds.m68k_a_regs[1]);
-    s.a2 = format!("{:08X}", ds.m68k_a_regs[2]);
-    s.a3 = format!("{:08X}", ds.m68k_a_regs[3]);
-    s.a4 = format!("{:08X}", ds.m68k_a_regs[4]);
-    s.a5 = format!("{:08X}", ds.m68k_a_regs[5]);
-    s.a6 = format!("{:08X}", ds.m68k_a_regs[6]);
-    s.a7 = format!("{:08X}", ds.m68k_a_regs[7]);
-    s.pc = format!("{:08X}", ds.m68k_pc);
-    s.sr = format!("{:04X}", ds.m68k_sr);
-    s.z80_pc = format!("{:04X}", ds.z80_pc);
-    s.z80_bc = format!("{:04X}", ds.z80_bc);
-    s.z80_de = format!("{:04X}", ds.z80_de);
-    s.z80_hl = format!("{:04X}", ds.z80_hl);
-
-    // Log: last N event_log lines into the [log] Vec<String>.
-    const LOG_TAIL: usize = 200;
-    s.event_lines.clear();
-    let start = ds.event_log.len().saturating_sub(LOG_TAIL);
-    s.event_lines.extend(ds.event_log.iter().skip(start).cloned());
-
-    // Audio display fields.
-    s.volume_text = format!("{:.0}%", s.volume * 100.0);
-    s.sample_rate = format!("{:.0}", audio.sample_rate);
-}
 
 // ─── Window title ────────────────────────────────────────────────────────────
 

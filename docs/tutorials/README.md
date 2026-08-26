@@ -29,7 +29,6 @@ cross-links from there.
 
 ## Graphics & I/O
 - [Tiles & Frames](/docs/tutorials/tiles-and-frames.md) — the tile viewer and frame inspector.
-- [VDP Registers](/docs/tutorials/vdp-registers.md) — the Genesis VDP bitfield decoder (and its honest limit).
 - [Input & Triggers](/docs/tutorials/input-and-triggers.md) — input history and pause triggers for frame work.
 - [Audio](/docs/tutorials/audio.md) — volume and mute.
 
@@ -60,7 +59,6 @@ frontmatter, not a page):
 | `regions-heatmap-bookmarks.md` | `RegionsHeatmapBookmarks` |
 | `cpu-registers.md` | `CpuRegisters` |
 | `tiles-and-frames.md` | `TilesAndFrames` |
-| `vdp-registers.md` | `VdpRegisters` |
 | `input-and-triggers.md` | `InputAndTriggers` |
 | `audio.md` | `Audio` |
 | `lua-scripting.md` | `LuaScripting` |

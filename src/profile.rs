@@ -29,6 +29,9 @@ use serde::Deserialize;
 
 // ── family.json ─────────────────────────────────────────────────────────────
 
+// Some schema fields are contract surface read by the Python/Lua sides or
+// by serde validation only — not (yet) by Rust code. That is by design.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 pub struct Family {
     pub family: String,
@@ -41,6 +44,7 @@ pub struct Family {
     pub block: BlockStyle,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 pub struct RosterEntry {
     pub id: u8,
@@ -55,6 +59,7 @@ pub struct RosterEntry {
 
 /// How blocking works in this game family. `back_hold` (SF/Asura style) vs
 /// a dedicated held button (MK style, named by its attack class).
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct BlockStyle {
     #[serde(default = "d_block_style")]
@@ -89,6 +94,7 @@ pub struct PortProfile {
     pub positions: BTreeMap<String, u32>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 pub struct CoreInfo {
     #[serde(default)]
@@ -101,6 +107,7 @@ pub struct CoreInfo {
     pub button_names: BTreeMap<String, String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct Requires {
     #[serde(default)]
@@ -134,6 +141,7 @@ fn d_cpu() -> String {
     "m68k".into()
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 pub struct Blocks {
     pub block1: HexAddr,

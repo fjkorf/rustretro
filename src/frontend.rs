@@ -874,10 +874,6 @@ impl Frontend {
 
             // Populate VDP registers when a source becomes available.
             // (Currently a no-op: Genesis VDP regs are write-only and not exposed
-            // by the loaded cores — see debug/vdp_source.rs for the dead-end and routes.)
-            if let Some(vdp) = crate::debug::vdp_source::read_vdp_regs(&ds.memory_regions) {
-                ds.vdp_regs = vdp;
-            }
 
             // Fetch code bytes at PC for disassembly panel (256 bytes via SekFetchByte)
             if ds.m68k_pc > 0 {
@@ -1174,14 +1170,6 @@ impl Frontend {
         std::mem::take(&mut self.callback_context.pending_audio)
     }
 
-    pub fn shutdown(&self) {
-        // Save regions sidecar before shutting down
-        if let Some(ref path) = self.sidecar_path {
-            save_regions_sidecar(path, &self.debug_state);
-        }
-        let _ = self.core.unload_game();
-        let _ = self.core.deinit();
-    }
 }
 
 impl Drop for Frontend {

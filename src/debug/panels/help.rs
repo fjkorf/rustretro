@@ -54,7 +54,7 @@ impl HelpPanel {
             ui.label("• Canvas (center) — big things you look at: Frame, Disasm, Hex, Tiles");
             ui.label("• Live (top right) — glanceable readouts: Watch, CPU, Input");
             ui.label("• Control (bottom right) — things you operate: State, Training, Audio");
-            ui.label("• Tools (bottom) — on-demand: Search, Triggers, Regions, VDP, Log, Help");
+            ui.label("• Tools (bottom) — on-demand: Search, Triggers, Regions, Log, Help");
             ui.separator();
 
             ui.heading("Panels");
@@ -71,7 +71,6 @@ impl HelpPanel {
             ui.label("🔍 Search     Iterative RAM value narrowing");
             ui.label("⏸ Triggers   Frame-count and pixel-value pauses");
             ui.label("🗺 Regions    Bookmarks, PC heatmap, code regions");
-            ui.label("📺 VDP        Genesis VDP register decoder");
             ui.label("🧾 Log        Scrollable event log with filter");
             ui.separator();
 

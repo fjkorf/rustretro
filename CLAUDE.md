@@ -10,10 +10,10 @@ MK2 note: runs on the from-source FBNeo core (../FBNeo) with readable RAM +
 save states; `memory.cpu: "tms34010"` in its profile gates the Sek capture.
 The active project is **shadow**: a training mode + a behavioral-cloning
 opponent for Asura Blade (`shadow/PLAN.md`, `shadow/SPEC.md`). The literate
-ROM map `library/asurabld/asurabld.md` is the source of truth for all game
-addresses — copies are hand-kept in `src/record.rs`, `library/asurabld/
-training.lua`, and `shadow/train/shadow_train/asurabld.py`; change all four
-or none.
+ROM map `library/asurabld/asurabld.md` is the EVIDENCE doc (how each value
+was verified); the machine-readable extract is the profile JSON, which every
+side reads — address changes go to the profile (+ the .md's evidence), never
+into code.
 
 ## Build & test — use the fast profile
 
@@ -52,7 +52,7 @@ SLOT|PATH`, `--calibrate` (controller wizard → `keymap.json`), `--keymap`,
 | F5 | toggle training mode |
 | **Shift+F5** | toggle the native shadow (needs `--shadow`) |
 | F6 / F7 (+Shift = slot 2) | save / load state slot |
-| F8/F9/F10 | tutorials / litui / Lua script panel |
+| F8 / F10 | tutorials / Lua script panel |
 | F12, Space | debugger, pause |
 
 The F12 debugger groups panels into regions: Canvas (Frame/Disasm/Hex/Tiles,

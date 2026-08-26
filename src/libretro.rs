@@ -1,3 +1,7 @@
+// This is a libretro FFI catalog: constants/types/aliases follow the spec,
+// not our current usage. Dead-code warnings here are noise by construction.
+#![allow(dead_code)]
+
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_void};
 use std::path::Path;

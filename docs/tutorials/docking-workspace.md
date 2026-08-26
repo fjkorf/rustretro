@@ -15,7 +15,7 @@ save it, and use linked navigation to jump every address-aware panel at once.
 
 1. The dock lives below the toolbar. Each panel is a tab with an icon: **🖼 Frame**,
    **📋 Hex**, **🧩 Tiles**, **🕹 Input**, **🧾 Log**, **⏸ Triggers**, **🔧 CPU**,
-   **🔊 Audio**, **📜 Disasm**, **🗺 Regions**, **👁 Watch**, **🔍 Search**, **📺 VDP**,
+   **🔊 Audio**, **📜 Disasm**, **🗺 Regions**, **👁 Watch**, **🔍 Search**,
    **❓ Help**.
 
 2. **Drag a tab** by its title to move it. Drop it onto another region's edge to
