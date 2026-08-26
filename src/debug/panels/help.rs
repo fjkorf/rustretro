@@ -4,8 +4,14 @@ use crate::debug::DebugState;
 
 /// Help panel for the debug window. Keybindings render from the single
 /// `crate::KEYBINDINGS` table (defined next to the hotkey handler in main.rs)
-/// and the game-control rows from `DebugState::keymap_lines` (the ACTIVE
-/// resolved keymap) — nothing here is a hand-kept copy.
+/// and the game-control rows from `DebugState::keymap_lines`: ACTION-oriented
+/// lines (one per action per port — "P1 Toss (B+A+Y)" / "RightTrigger [pad]
+/// — no key") built once at startup by `input_config::summary` via reverse
+/// lookup against the active `InputConfig`. Nothing here is a hand-kept copy.
+///
+/// Limitation: `summary` runs before the core sends input descriptors, so
+/// action names here are profile+RETRO names only. The Controls panel is the
+/// live view (sees core descriptor names too).
 pub struct HelpPanel;
 
 impl HelpPanel {
@@ -35,7 +41,7 @@ impl HelpPanel {
                 ui.add_space(6.0);
             }
 
-            ui.heading("Game controls (active keymap)");
+            ui.heading("Game controls (action → binding)");
             if state.keymap_lines.is_empty() {
                 ui.label("No keymap loaded.");
             } else {
@@ -46,6 +52,14 @@ impl HelpPanel {
                     });
                 }
             }
+            ui.label(
+                egui::RichText::new(
+                    "Snapshot taken at startup from profile + raw RETRO names (core descriptors \
+                     arrive later); see the Controls panel for the live, descriptor-aware view.",
+                )
+                .small()
+                .color(egui::Color32::DARK_GRAY),
+            );
             ui.label("Custom bindings: keymap.json / --keymap PATH; run --calibrate for the wizard, --dump-keymap to inspect.");
             ui.separator();
 

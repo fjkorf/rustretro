@@ -292,15 +292,8 @@ pub fn key_bits(pressed: impl Fn(KeyCode) -> bool, port: &PortMap) -> [bool; 12]
     bits
 }
 
-/// All RETRO buttons in bit order (the enum has no iterator).
-const ALL_BUTTONS: [RetroButton; 12] = [
-    RetroButton::B, RetroButton::Y, RetroButton::Select, RetroButton::Start,
-    RetroButton::Up, RetroButton::Down, RetroButton::Left, RetroButton::Right,
-    RetroButton::A, RetroButton::X, RetroButton::L, RetroButton::R,
-];
-
 /// Shorten a Bevy KeyCode debug name for display ("KeyZ" → "Z", arrows → glyphs).
-fn key_name(k: KeyCode) -> String {
+pub fn key_name(k: KeyCode) -> String {
     let s = format!("{k:?}");
     match s.as_str() {
         "ArrowUp" => "↑".into(),
@@ -315,40 +308,58 @@ fn key_name(k: KeyCode) -> String {
     }
 }
 
-/// Human-readable lines describing the ACTIVE mapping (whatever `load`
-/// resolved — flag, sidecar, or default), for the Help panel's "Game
-/// controls" section. One `(label, mapping)` pair per port per device kind;
-/// empty maps are skipped.
+/// Sorted RETRO bit-index set for a chord, so two chords can be compared as
+/// sets regardless of the order their bits were listed/inserted in.
+fn bit_set(bits: &[RetroButton]) -> Vec<usize> {
+    let mut v: Vec<usize> = bits.iter().map(|b| b.idx()).collect();
+    v.sort_unstable();
+    v
+}
+
+/// Human-readable ACTION-oriented lines describing the ACTIVE mapping
+/// (whatever `InputConfig::load` resolved — flag, sidecar, or default), for
+/// the Help panel's "Game controls" section. One `(label, mapping)` pair per
+/// action per port:
+///   label   = "P{port} {action} ({RETRO bits joined by '+'})"
+///   mapping = "{pad bindings} — {key bindings}", each side reverse-looked-up
+///             against `cfg` by exact chord-bit-set match, or "no pad" /
+///             "no key" when nothing binds that exact chord.
+///
+/// Example (asurabld, default keymap): action "Toss" = B+A+Y is bound only
+/// on the F300's RightTrigger, no key reproduces the 3-button chord:
+///   ("P1 Toss (B+A+Y)", "RightTrigger [pad] — no key")
+///
+/// LIMITATION: this is called once at startup (`main.rs`:
+/// `ds.keymap_lines = input_config::summary(&keymap_cfg)`), before the core
+/// has sent `RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS` — so the action names
+/// come from `action_rows` run with *no* descriptors (profile + raw RETRO
+/// names only; a core-only extra button the profile doesn't model won't
+/// appear here). The Controls panel (owned separately) is the live view
+/// that also sees descriptor names.
 pub fn summary(cfg: &InputConfig) -> Vec<(String, String)> {
+    let no_desc: [[Option<String>; 12]; 2] = Default::default();
     let mut out = Vec::new();
-    for (port_idx, port) in cfg.ports.iter().enumerate() {
+    for (port_idx, port) in cfg.ports.iter().enumerate().take(2) {
         let pn = port_idx + 1;
-        if !port.keyboard.is_empty() {
-            let mut parts = Vec::new();
-            for btn in ALL_BUTTONS {
-                let keys: Vec<String> = port
-                    .keyboard
-                    .iter()
-                    .filter(|(_, c)| c.0 == [btn])
-                    .map(|(k, _)| key_name(*k))
-                    .collect();
-                if !keys.is_empty() {
-                    parts.push(format!("{btn:?}={}", keys.join("/")));
-                }
-            }
-            out.push((format!("P{pn} keyboard"), parts.join("  ")));
-        }
-        if !port.gamepad.is_empty() {
-            let parts: Vec<String> = port
+        for row in action_rows(port_idx, &no_desc) {
+            let wanted = bit_set(&row.bits);
+            let keys: Vec<String> = port
+                .keyboard
+                .iter()
+                .filter(|(_, c)| bit_set(&c.0) == wanted)
+                .map(|(k, _)| format!("{} [key]", key_name(*k)))
+                .collect();
+            let pads: Vec<String> = port
                 .gamepad
                 .iter()
-                .map(|(pad_btn, bits)| {
-                    let chord: Vec<String> =
-                        bits.0.iter().map(|b| format!("{b:?}")).collect();
-                    format!("{pad_btn:?}={}", chord.join("+"))
-                })
+                .filter(|(_, c)| bit_set(&c.0) == wanted)
+                .map(|(b, _)| format!("{b:?} [pad]"))
                 .collect();
-            out.push((format!("P{pn} pad"), parts.join("  ")));
+            let pad_part = if pads.is_empty() { "no pad".to_string() } else { pads.join("/") };
+            let key_part = if keys.is_empty() { "no key".to_string() } else { keys.join("/") };
+            let bits_str: Vec<String> = row.bits.iter().map(|b| format!("{b:?}")).collect();
+            let label = format!("P{pn} {} ({})", row.name, bits_str.join("+"));
+            out.push((label, format!("{pad_part} — {key_part}")));
         }
     }
     out
@@ -487,6 +498,33 @@ mod tests {
         let taunt = rows2.iter().find(|r| r.name == "Taunt").unwrap();
         assert_eq!(taunt.bits, vec![RetroButton::X]);
         assert_eq!(taunt.source, ActionSource::Descriptor);
+    }
+
+    #[test]
+    fn summary_is_action_oriented_with_reverse_lookup() {
+        crate::profile::init_for_tests();
+        let cfg = InputConfig::default();
+        let lines = summary(&cfg);
+        // One line per action per port; P1 has 11 actions (see the
+        // action_rows test above), so P1 alone contributes 11 lines.
+        let p1_lines: Vec<&(String, String)> =
+            lines.iter().filter(|(l, _)| l.starts_with("P1 ")).collect();
+        assert_eq!(p1_lines.len(), 11);
+
+        // Toss = B+A+Y is bound only to the F300's RightTrigger chord; no
+        // single key reproduces a 3-button chord.
+        let (label, mapping) = lines.iter().find(|(l, _)| l.contains("Toss")).unwrap();
+        assert_eq!(label, "P1 Toss (B+A+Y)");
+        assert_eq!(mapping, "RightTrigger [pad] — no key");
+
+        // Light = B is bound on both the key (Z) and the pad (South).
+        let (label, mapping) = lines.iter().find(|(l, _)| l.contains("Light")).unwrap();
+        assert_eq!(label, "P1 Light (B)");
+        assert_eq!(mapping, "South [pad] — Z [key]");
+
+        // Launcher = B+A: pad chord (Mode) but no key.
+        let (_, mapping) = lines.iter().find(|(l, _)| l.contains("Launcher")).unwrap();
+        assert_eq!(mapping, "Mode [pad] — no key");
     }
 }
 
