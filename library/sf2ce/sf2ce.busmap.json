@@ -1,0 +1,11 @@
+{
+  "windows": [
+    {
+      "name": "wram",
+      "addr": "0xFF0000",
+      "len": "0x10000",
+      "interval": 1,
+      "flags": 4
+    }
+  ]
+}

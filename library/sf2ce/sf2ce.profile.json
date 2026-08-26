@@ -1,0 +1,41 @@
+{
+  "_STATUS": "PARTIAL — game #2 profile-schema proof, C2/Wave-P3, live-tested on MCP port 4035 against the actual sf2ce.zip romset (FBNeo short name 'sf2ce'). VERIFIED this session (see sf2ce.md for the evidence trail): blocks.block1=0xFF83C6, block2=0xFF86C6, stride=0x300 (both bases decreased together during a live demo-mode combat exchange, exactly 0x300 apart); fighter_fields.health at off 0x00 (NOT +0x22 as the sourced sf2ceua cheat table claims for the USA revision — that address offset does not hold plausible health in this romset; the byte AT the struct base does, confirmed via before/after WRAM diff during visible damage: e.g. 148->124 and 144->80). health_max=144 is only approximately confirmed (one live read caught P2's base at exactly 144=0x90 early in a round; the literal round-start ceiling frame was never caught cleanly — headless runs uncapped/faster than real time and every attempt to catch the exact 'ROUND 1, full bars' instant raced past it). DISPROVEN this session, deliberately OMITTED rather than left in as fabricated data: the sf2ceua-sourced fighter_fields (state@0x03, x@0x06, y@0x0A, facing@0x12, char_id@0x288, wins@0x289) and globals (round_timer@0xFF8ABF, screen_left@0xFF8BD8) — char_id was directly tested (selected E.Honda, the field kept reading 0/Ryu) and round_timer was directly tested (value INCREASED after resuming instead of counting down) — both contradict the sourced offsets, most likely because those offsets come from the 'sf2ceua' (USA) cheat table while this romset is the base 'sf2ce' revision, and CPS1 revisions are known to shift absolute RAM struct placement. These need fresh empirical RE, not reuse of the sourced numbers — see sf2ce.md 'Unknown / next steps'. calibration.SCREEN_W=144 -> 384 IS verified (core's own retro_get_system_av_info log: base_width=384, base_height=224); all other calibration.* keys are placeholders copied from asurabld's shape only to satisfy the schema and are NOT verified — do not train against this profile. attack_chords are the standard documented FBNeo CPS1 6-button RETRO mapping (LP=y MP=x HP=l LK=b MK=a HK=r) but were NOT interactively verified (no button-to-hit correlation was attempted) — sourced-but-unverified. requires/core/roster-name plumbing (game.char_name, game.addr) were proven to load correctly and NOT leak asurabld data (see mission report). credits/round_state/match_end/abort: NO credible source found this session; correctly absent rather than fabricated. Gate is deliberately reduced to health_in_range only.",
+  "family": "sf2ce",
+  "port": "arcade",
+  "core": {
+    "library_name": "FB Alpha 2012",
+    "provenance_game": "sf2ce",
+    "provenance_core": "fbalpha2012",
+    "button_names": { "coin": "select", "start": "start" }
+  },
+  "requires": { "memory_regions": true, "save_states": true },
+  "memory": {
+    "cpu": "m68k",
+    "endianness": "big",
+    "blocks": { "block1": "0xFF83C6", "block2": "0xFF86C6", "stride": "0x300" },
+    "fighter_fields": [
+      { "name": "health", "off": "0x00", "size": 1 }
+    ],
+    "globals": {}
+  },
+  "gate": [
+    { "kind": "health_in_range", "min": 1, "max": 148 }
+  ],
+  "enforcement": {
+    "health_max": 144,
+    "refill_below": 64,
+    "timer_hold": [153, 0],
+    "credits_target": 9,
+    "credits_min": 5
+  },
+  "calibration": {
+    "GROUND_Y": 190, "X_SCALE": 128.0, "Y_SCALE": 128.0,
+    "TIMER_SCALE": 256.0, "ANIM_SCALE": 64.0, "CORNER_PX": 24,
+    "HEALTH_MAX": 144, "SCREEN_W": 384, "P": 8, "K": 4, "STALE": 3,
+    "SEGMENT_DECISIONS": 150, "HITSTUN_RECENT_FRAMES": 20
+  },
+  "attack_chords": {
+    "LP": ["y"], "MP": ["x"], "HP": ["l"],
+    "LK": ["b"], "MK": ["a"], "HK": ["r"]
+  }
+}

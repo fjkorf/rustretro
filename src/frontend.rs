@@ -1275,14 +1275,13 @@ impl CallbackContext {
                 RETRO_ENVIRONMENT_GET_VFS_INTERFACE => false,
                 RETRO_ENVIRONMENT_GET_LOG_INTERFACE => {
                     if !data.is_null() {
-                        unsafe extern "C" fn core_log(level: u32, msg: *const std::ffi::c_char) {
-                            let prefix = match level { 0=>"[CORE DBG]", 1=>"[CORE INF]", 2=>"[CORE WRN]", _=>"[CORE ERR]" };
-                            if !msg.is_null() {
-                                let s = std::ffi::CStr::from_ptr(msg).to_string_lossy();
-                                eprintln!("{} {}", prefix, s.trim_end());
-                            }
-                        }
-                        (*(data as *mut RetroLogCallback)).log = core_log as *const std::ffi::c_void;
+                        // retro_log_printf_t is C-variadic; stable Rust cannot
+                        // define one, so the entry point lives in src/log_shim.c
+                        // (vsnprintf into a fixed buffer) and calls back into
+                        // crate::core_log::rr_core_log_sink for prefixing +
+                        // rate limiting.
+                        (*(data as *mut RetroLogCallback)).log =
+                            crate::core_log::rr_core_log as *const std::ffi::c_void;
                         return true;
                     }
                     false

@@ -54,7 +54,7 @@ impl Default for LituiPages {
 
 // ─── Wave D: tutorials as in-app litui pages (Help → Tutorials) ──────────────
 //
-// The 14 task-oriented tutorial pages in `docs/tutorials/` are already authored
+// The 18 task-oriented tutorial pages in `docs/tutorials/` are already authored
 // in litui dialect (YAML `page:` frontmatter). This mounts them as a SECOND,
 // read-only litui app — no live binding needed, they are static document pages.
 // Shares the `_tutorials.md` parent for common styles. Gated by F8.
@@ -82,6 +82,10 @@ pub mod tutorials {
         "docs/tutorials/input-and-triggers.md",
         "docs/tutorials/audio.md",
         "docs/tutorials/lua-scripting.md",
+        "docs/tutorials/training-mode.md",
+        "docs/tutorials/shadow-loop.md",
+        "docs/tutorials/matchup-grid.md",
+        "docs/tutorials/porting-a-game.md",
     }
 }
 

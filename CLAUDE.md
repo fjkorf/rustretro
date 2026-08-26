@@ -1,6 +1,13 @@
 # RustRetro — working notes for Claude sessions
 
 RustRetro is a debugging-instrument-first libretro frontend (see ROADMAP.md).
+Per-game knowledge is DATA: `--game library/<game>` loads a two-tier profile
+(family.json + <game>.profile.json — see docs/game-profiles.md; asurabld is
+the complete reference, sf2ce a partial game-#2 seed, mk2 a boot stub).
+Rust, Python (`shadow_train.profile`), and Lua (`game.*` bindings, API v3)
+all read the same JSON — never hardcode a game address in code again.
+MK2 note: runs on the from-source FBNeo core (../FBNeo) with readable RAM +
+save states; `memory.cpu: "tms34010"` in its profile gates the Sek capture.
 The active project is **shadow**: a training mode + a behavioral-cloning
 opponent for Asura Blade (`shadow/PLAN.md`, `shadow/SPEC.md`). The literate
 ROM map `library/asurabld/asurabld.md` is the source of truth for all game

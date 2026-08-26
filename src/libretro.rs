@@ -172,11 +172,11 @@ pub type RetroAudioSampleFn = extern "C" fn(left: i16, right: i16);
 pub type RetroAudioSampleBatchFn = extern "C" fn(data: *const i16, frames: usize) -> usize;
 pub type RetroInputPollFn = extern "C" fn();
 pub type RetroInputStateFn = extern "C" fn(port: u32, device: u32, index: u32, id: u32) -> i16;
-pub type RetroCoreLogFn = unsafe extern "C" fn(level: u32, msg: *const std::ffi::c_char);
-
 #[repr(C)]
 pub struct RetroLogCallback {
-    pub log: *const c_void, // RetroCoreLogFn cast to *const c_void
+    // retro_log_printf_t (C-variadic: fn(level, fmt, ...)) cast to *const
+    // c_void. The actual function is rr_core_log in src/log_shim.c.
+    pub log: *const c_void,
 }
 
 #[repr(C)]

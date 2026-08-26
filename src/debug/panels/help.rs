@@ -77,7 +77,8 @@ impl HelpPanel {
 
             ui.heading("Tutorials");
             ui.label("Task-oriented walkthroughs live in docs/tutorials/ (one per feature).");
-            ui.label("Start with getting-started.md, then ram-search.md (find a health bar).");
+            ui.label("Training & shadow: training-mode.md, shadow-loop.md, matchup-grid.md, porting-a-game.md.");
+            ui.label("Debugger basics: start with getting-started.md, then ram-search.md (find a health bar).");
             ui.label("Press F8 to open them in-app: each is a litui page rendered as a Help → Tutorials screen.");
             ui.separator();
 
