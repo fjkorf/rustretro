@@ -28,6 +28,8 @@
 
 import argparse
 import json
+import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,8 +46,88 @@ META_FILE = "meta.json"
 # same name for each one. This used to be a hardcoded list mirroring
 # dataset.py's constants; now it's the profile's own key order (which is
 # where those constants come from), so a game/port with a different
-# calibration set doesn't need this file touched.
+# calibration set doesn't need this file touched. Refreshed by
+# _resolve_profile_for() below whenever fit-time auto-resolution swaps in a
+# different profile than whatever was loaded at import.
 CALIBRATION_KEYS = list(_profile.get().calibration.keys())
+
+
+def _resolve_profile_for(paths: list[Path], game_arg: str | None) -> None:
+    """Fit-time profile auto-resolution (footgun fix, see CLAUDE.md "The
+    shadow loop"). jsonl-v3 recordings are self-describing: each `.meta.json`
+    sidecar carries `family`/`port`/`profile_file` (RECORDER_V3.md §1.3). A
+    fit used to always label attacks/moves with whatever profile
+    RUSTRETRO_GAME_DIR happened to name (default asurabld) -- fine for
+    cross-family mistakes (dataset.py's family-mismatch guard aborts those),
+    silent for same-family/wrong-port ones (e.g. mk2 arcade loaded while
+    fitting mk2 Genesis recordings), since arcade and Genesis share one
+    family.json and the guard never looks at `port`.
+
+    Precedence: `--game` / RUSTRETRO_GAME_DIR is an explicit OVERRIDE -- if
+    given, it wins outright (a loud warning fires if it disagrees with what
+    the recordings' own sidecars say, but the override is still obeyed; the
+    family-mismatch guard remains the backstop for a badly wrong override).
+    Otherwise every v3 sidecar found among `paths` must agree on
+    (family, port); the resolved profile is `library/<family>/<profile_file
+    stem>`, loaded via the existing `--game`-path-segment mechanism (RECORDER_
+    V3.md §5.2), so `library/mk2/genesis.profile.json` resolves the same way
+    `--game library/mk2/genesis` would. v2 files (no sidecar) don't
+    participate -- this whole function no-ops when none of `paths` carries a
+    v3 sidecar, which is today's exact behavior (loaded profile / asurabld
+    default)."""
+    sidecars: dict[Path, tuple] = {}
+    for p in paths:
+        if p.name.endswith(".rounds.jsonl"):
+            continue
+        meta_path = Path(str(p).removesuffix(".jsonl") + ".meta.json")
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue  # v2, or a v3 file missing its sidecar -- not resolvable
+        if meta.get("format") != "jsonl-v3":
+            continue
+        sidecars[p] = (meta.get("family"), meta.get("port"), meta.get("profile_file"))
+
+    resolved = None
+    if sidecars:
+        uniq = set(sidecars.values())
+        if len(uniq) > 1:
+            detail = "; ".join(
+                f"{p.name} (family={fam!r} port={port!r})"
+                for p, (fam, port, _pf) in sorted(sidecars.items())
+            )
+            raise SystemExit(
+                "recordings disagree on profile (family/port) -- fit one "
+                f"profile at a time, or pass --game to force one: {detail}"
+            )
+        resolved = next(iter(uniq))  # (family, port, profile_file)
+
+    override = game_arg or os.environ.get("RUSTRETRO_GAME_DIR")
+    if override:
+        if resolved is not None:
+            fam, port, _pf = resolved
+            try:
+                ov_prof = _profile.load(Path(override))
+            except _profile.ProfileError as e:
+                raise SystemExit(f"--game {override}: {e}") from e
+            if (ov_prof.family, ov_prof.port) != (fam, port):
+                print(
+                    f"WARNING: --game/RUSTRETRO_GAME_DIR override "
+                    f"({ov_prof.family}/{ov_prof.port}) disagrees with the "
+                    f"recordings' own profile ({fam}/{port}) -- obeying the "
+                    "override because it is explicit",
+                    file=sys.stderr,
+                )
+        os.environ["RUSTRETRO_GAME_DIR"] = str(override)
+    elif resolved is not None:
+        fam, port, profile_file = resolved
+        stem = profile_file.removesuffix(".profile.json") if profile_file else port
+        os.environ["RUSTRETRO_GAME_DIR"] = str(_profile.REPO_ROOT / "library" / fam / stem)
+    # else: no v3 sidecars and no override -- leave the process default alone.
+
+    dataset.reload_profile()
+    global CALIBRATION_KEYS
+    CALIBRATION_KEYS = list(_profile.get().calibration.keys())
 
 
 def _bucket_counts(data: dict) -> dict:
@@ -63,6 +145,7 @@ def _label_counts(y, classes: list[str]) -> dict:
 
 def cmd_fit(args) -> None:
     opp = getattr(args, "opp", None)  # absent in hand-built Namespaces (tests)
+    _resolve_profile_for(args.recordings, getattr(args, "game", None))
     data = build(args.recordings, char_filter=args.char, opp_filter=opp)
     n_raw = len(data["X"])
     neutral_cap = getattr(args, "neutral_cap", dataset.NEUTRAL_CAP_RATIO)
@@ -108,6 +191,7 @@ def cmd_fit(args) -> None:
 
 
 def cmd_eval(args) -> None:
+    _resolve_profile_for(args.recordings, getattr(args, "game", None))
     data = build(args.recordings, char_filter=args.char,
                  opp_filter=getattr(args, "opp", None))
     print(f"decisions: {len(data['X'])} from {len(set(data['rounds']))} rounds "
@@ -147,6 +231,8 @@ def cmd_coverage(args) -> None:
     from collections import Counter
 
     from . import profile as game_profile
+    if args.recordings:
+        _resolve_profile_for(args.recordings, getattr(args, "game", None))
     fam = game_profile.get().family
     recs = args.recordings or sorted(Path("shadow/recordings").joinpath(fam).glob("*.jsonl"))
     files = []
@@ -191,6 +277,8 @@ def cmd_coverage(args) -> None:
 
 def cmd_index(args) -> None:
     from . import profile as game_profile
+    if args.recordings:
+        _resolve_profile_for(args.recordings, getattr(args, "game", None))
     prof = game_profile.get()
     fam = prof.family
     recs = args.recordings or sorted(Path("shadow/recordings").joinpath(fam).glob("*.jsonl"))
@@ -267,6 +355,10 @@ def main():
     p_fit.add_argument("--neutral-cap", type=float, default=dataset.NEUTRAL_CAP_RATIO,
                         help="cap idle (Neutral,None) decisions at this ratio x "
                              "active decisions; 0 disables (default %(default)s)")
+    p_fit.add_argument("--game", type=str, default=None,
+                        help="force this game/port profile (overrides the "
+                             "recordings' own v3 sidecars and RUSTRETRO_GAME_DIR; "
+                             "e.g. library/mk2/genesis)")
     p_fit.set_defaults(func=cmd_fit)
 
     p_eval = sub.add_parser("eval", help="build + round-holdout evaluate")
@@ -277,6 +369,8 @@ def main():
                          help="opponent character id filter (per-matchup models)")
     p_eval.add_argument("--k", type=int, default=15)
     p_eval.add_argument("--holdout", type=float, default=0.2)
+    p_eval.add_argument("--game", type=str, default=None,
+                         help="force this game/port profile (see fit --game)")
     p_eval.set_defaults(func=cmd_eval)
 
     p_report = sub.add_parser("report", help="print the coverage drill list for a fitted model")
@@ -287,6 +381,8 @@ def main():
                            help="matchup coverage matrix across recordings")
     p_cov.add_argument("recordings", nargs="*", type=Path,
                        help="recordings to scan (default: shadow/recordings/<family>/*.jsonl)")
+    p_cov.add_argument("--game", type=str, default=None,
+                       help="force this game/port profile (see fit --game)")
     p_cov.set_defaults(func=cmd_coverage)
 
     p_idx = sub.add_parser("index",
@@ -294,6 +390,8 @@ def main():
     p_idx.add_argument("recordings", nargs="*", type=Path)
     p_idx.add_argument("--force", action="store_true",
                        help="rewrite sidecars that already exist")
+    p_idx.add_argument("--game", type=str, default=None,
+                       help="force this game/port profile (see fit --game)")
     p_idx.set_defaults(func=cmd_index)
 
     args = ap.parse_args()
