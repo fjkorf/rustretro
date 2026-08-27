@@ -1,5 +1,5 @@
 {
-  "_STATUS": "STUB for memory RE — blocks, globals, gate, and enforcement are still placeholders; the memory-map RE for this game has not happened. An empty gate list means controllable() is vacuously TRUE — do not record training data against this profile. attack_chords, however, ARE now filled and verified this session (Controls phase, Wave W2), headless MCP port 4035, real mk2.zip romset, `--game library/mk2` with NO bus-map (matches this profile's requires.memory_regions=false). Verification: (1) static/definitive — FBNeo's own source (`src/burner/libretro/retro_input.cpp`) has an explicit special case for driver names 'mk'/'mk2'/'mk3'/'umk3' (comment: \"snes-like mapping seems more convenient than original arcade mapping\") that maps 'High Punch'->1ST_COL_TOP=Y, 'Low Punch'->1ST_COL_BOTTOM=B, 'High Kick'->2ND_COL_TOP=X, 'Low Kick'->2ND_COL_BOTTOM=A, 'Block'->3RD_COL_TOP=L (RETROPAD_CLASSIC is the default when no core-option overrides it, and rustretro sets none), 'Block 2'->3RD_COL_BOTTOM=R; this is the literal code path this core+ROM runs, not a convention citation. Family.json's attack_classes (HP/LP/HK/LK/Block) map to Y/B/X/A/L; the redundant 'Block 2' (R) is intentionally NOT modeled as a class — action_rows' core-descriptor fallback will surface it separately as a raw 'Block 2' row, which is the controls-contract's intended behavior for an extra button the profile doesn't claim. (2) empirical — 24 input descriptors logged at boot (`[input] core provided 24 input descriptors`, matches 12 buttons x 2 ports); coin verified live (CREDITS: 0 -> 1 -> 2 on repeated `select` presses, screenshot-confirmed, 'PRESS START' appearing at 2); HP(y) and LP(b) both produced a visually distinct arm-extending punch pose on P1 (Liu Kang) in a live Liu-Kang-vs-Sub-Zero/Jax fight, HK(x) produced a visually distinct rotated-body kicking pose (clearly not a punch) in the same fight. LK(a) and Block(l) were NOT independently screenshot-confirmed this session — CPU opponents in live combat proved too aggressive to reliably capture a clean neutral-state frame for the remaining two buttons within the session's time budget (headless real-time drift between tool calls repeatedly let CPU KO the idle P1 before the shot landed; a save-state/reload rig was attempted but the checkpoint itself kept landing mid-combat rather than at a clean full-health frame). LK/Block chords are therefore sourced-but-unverified-by-screenshot (though still backed by the same definitive FBNeo source read as HP/LP/HK). Next session: bank a save-state at the literal 'FIGHT!' frame (poll on health-bar-full + no HUD banner) before testing LK/Block, and prioritize an actual RE pass on the T-Unit/TMS34010 memory map (still all placeholders).",
+  "_STATUS": "Memory-RE pass done 2026-08-27 (headless FBNeo, MCP port 4036, real mk2.zip = rev L3.1; evidence log: mk2.md). VERIFIED (live, write-tested where stated): blocks/stride + char_id(+0x0) + health(+0xE, max 0xA1=161) [write-tested]; globals round_over 0xC360, screen_state 0xC37E, round_num 0xC35E, timer tens/ones 0xBD74/0xBD76 (read-verified vs drawn countdown), p1/p2 HUD health 0xBCA0/0xBC88 [write-tested], p1/p2 world X 0x6CBA/0x6CFC [write-tested teleports, screenshots], p1_screen_x 0x3E40 (derived, read-only). LIKELY (correlated twice, not write-verified): p1_facing 0xBE81. The gate list is fully live-verified against 46 labeled phase snapshots; known ~2s leak during the ROUND-N banner (inputs ignored there; recorder's zero-input filtering covers it), and timeout-draw behavior of round_over is untested. UNKNOWN/absent by honesty: player Y (jump height — extensive arc probes found only recomputed outputs; see mk2.md), authoritative round-timer store (digits/master/frame-counter all write-revert; timer_hold below is a NON-FUNCTIONAL placeholder), credits (live in T-Unit CMOS OUTSIDE the exposed region — credits_target/min below are placeholders; coin-up must go through the 'select' input), wins (fightcade's 0xC36A/C36C stayed 0 through CPU round wins — disproven for 1P play). Note: 'freeze' does not land on this core's fallback region (watch registers, value never written — verified); enforcement must use periodic write_memory, and a health refill must write ALL FOUR health bytes (both struct healths AND 0xBCA0/0xBC88 — independent damage accumulators). x lives at a 0x42-stride object array, NOT at the fighter-block stride, hence globals rather than fighter_fields; src/training.rs resolve() therefore no-ops for this game (recorder gate fully functional). attack_chords verified prior session (Wave W2): FBNeo retro_input.cpp mk-driver special case + live pose screenshots for HP/LP/HK; LK/Block source-backed.",
   "family": "mk2",
   "port": "arcade",
   "core": {
@@ -8,27 +8,45 @@
     "provenance_core": "fbneo",
     "button_names": { "coin": "select", "start": "start" }
   },
-  "requires": { "memory_regions": false, "save_states": false },
+  "requires": { "memory_regions": true, "save_states": true },
   "memory": {
     "cpu": "tms34010",
     "endianness": "little",
-    "blocks": { "block1": "0x0", "block2": "0x0", "stride": "0x0" },
+    "blocks": { "block1": "0xC050", "block2": "0xC1CA", "stride": "0x17A" },
     "fighter_fields": [
-      { "name": "x", "off": "0x0", "size": 2 },
-      { "name": "y", "off": "0x0", "size": 2 },
-      { "name": "health", "off": "0x0", "size": 1 }
+      { "name": "char_id", "off": "0x0", "size": 1 },
+      { "name": "health", "off": "0xE", "size": 1 }
     ],
-    "globals": {}
+    "globals": {
+      "round_over": "0xC360",
+      "screen_state": "0xC37E",
+      "round_num": "0xC35E",
+      "timer_tens": "0xBD74",
+      "timer_ones": "0xBD76",
+      "timer_master": "0xBC20",
+      "timer_frames": "0xD396",
+      "p1_health_hud": "0xBCA0",
+      "p2_health_hud": "0xBC88",
+      "p1_x": "0x6CBA",
+      "p2_x": "0x6CFC",
+      "p1_screen_x": "0x3E40",
+      "p1_facing": "0xBE81",
+      "credits_hud_ascii": "0x1704D"
+    }
   },
-  "gate": [],
+  "gate": [
+    { "kind": "word_zero", "global": "screen_state" },
+    { "kind": "byte_zero", "global": "round_over" },
+    { "kind": "health_in_range", "min": 1, "max": 161 }
+  ],
   "enforcement": {
-    "health_max": 255, "refill_below": 64,
-    "timer_hold": [153, 0], "credits_target": 9, "credits_min": 5
+    "health_max": 161, "refill_below": 64,
+    "timer_hold": [9, 9], "credits_target": 9, "credits_min": 5
   },
   "calibration": {
     "GROUND_Y": 0, "X_SCALE": 128.0, "Y_SCALE": 128.0,
     "TIMER_SCALE": 256.0, "ANIM_SCALE": 64.0, "CORNER_PX": 24,
-    "HEALTH_MAX": 255, "SCREEN_W": 400, "P": 8, "K": 4, "STALE": 3,
+    "HEALTH_MAX": 161, "SCREEN_W": 400, "P": 8, "K": 4, "STALE": 3,
     "SEGMENT_DECISIONS": 150, "HITSTUN_RECENT_FRAMES": 20
   },
   "attack_chords": {
