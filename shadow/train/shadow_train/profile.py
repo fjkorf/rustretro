@@ -100,6 +100,13 @@ class GameProfile:
     attack_chords: dict           # class name -> [button names]
     positions: dict                # name -> int
 
+    # RECORDER_V3.md §2 additions (all optional; absent = today's meaning).
+    record_globals: list = field(default_factory=list)     # [{"name":..,"size":..}, ...]
+    recorded_globals: list = field(default_factory=list)   # §1.2 rule 2 union, gate-order
+                                                             # first then record_globals order
+    hitstun_sources: Optional[dict] = None                  # block name -> global name
+    id_map: dict = field(default_factory=dict)              # raw char id (int) -> canonical id
+
     _char_by_id: dict = field(default_factory=dict, repr=False)
 
     # ── convenience accessors (mirror GameProfile's methods in profile.rs) ──
@@ -149,29 +156,99 @@ class GameProfile:
     def calibration_value(self, key: str):
         return self.calibration.get(key)
 
+    def canon_char_id(self, raw: int) -> int:
+        """Raw RAM char id -> canonical family.json roster id (RECORDER_V3.md
+        §6). Identity when `id_map` is absent or has no entry for `raw` --
+        mirrors `profile::GameProfile::canon_char_id` in src/profile.rs
+        exactly (same id_map, same fallback). The ONE Python call site is
+        `dataset._decisions_for_round`, building `Decision.me_char/opp_char`."""
+        return self.id_map.get(raw, raw)
+
+
+def _resolve_game_dir(game_dir: Path) -> tuple[Path, Path]:
+    """(family_dir, profile_path) for `game_dir`, mirroring
+    `profile::GameProfile::resolve_game_dir` in src/profile.rs verbatim
+    (RECORDER_V3.md §5.2) -- same three cases, same error text, so a
+    `--game` path behaves identically whichever loader reads it."""
+    if game_dir.is_dir():
+        fam_dir = game_dir
+        stem = fam_dir.name
+        default_path = fam_dir / f"{stem}.profile.json"
+        if default_path.is_file():
+            return fam_dir, default_path
+
+        candidates = sorted(fam_dir.glob("*.profile.json"))
+        if not candidates:
+            raise ProfileError(f"{fam_dir}: no *.profile.json found")
+        if len(candidates) == 1:
+            return fam_dir, candidates[0]
+
+        # file_stem("mk2.profile.json") is "mk2.profile" -- trim ".profile"
+        # so the suggestion names the port segment, not the raw stem.
+        stems = [p.name.removesuffix(".profile.json") for p in candidates]
+        raise ProfileError(
+            f"{fam_dir}: multiple port profiles and no {stem}.profile.json "
+            f"default — select one: --game {fam_dir}/{'|'.join(stems)}"
+        )
+
+    parent = game_dir.parent
+    if parent.is_dir():
+        selector = game_dir.name
+        direct = parent / f"{selector}.profile.json"
+        if direct.is_file():
+            return parent, direct
+
+        matches = []
+        all_candidates = sorted(parent.glob("*.profile.json"))
+        for c in all_candidates:
+            try:
+                obj = json.loads(c.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if obj.get("port") == selector:
+                matches.append(c)
+
+        if not matches:
+            stems = sorted(p.name.removesuffix(".profile.json") for p in all_candidates)
+            ports = []
+            for c in all_candidates:
+                try:
+                    ports.append(json.loads(c.read_text()).get("port"))
+                except (OSError, json.JSONDecodeError):
+                    pass
+            available = sorted(stems) + sorted(p for p in ports if p)
+            available_str = "/".join(available) if available else "none"
+            raise ProfileError(
+                f"{parent}: no port {selector!r} (no {selector}.profile.json and "
+                f"no profile with \"port\": \"{selector}\"); available: {available_str}"
+            )
+        if len(matches) == 1:
+            return parent, matches[0]
+        raise ProfileError(
+            f"{parent}: port {selector!r} is ambiguous: "
+            + ", ".join(m.name for m in matches)
+        )
+
+    raise ProfileError(f"--game {game_dir}: no such game directory")
+
 
 def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
-    """Parse family.json + <dir-name>.profile.json (falling back to the
-    single *.profile.json in the directory) and cross-validate them, exactly
-    like `profile::GameProfile::load` in src/profile.rs. Raises ProfileError
-    on any mismatch."""
+    """Parse family.json + the selected port profile (RECORDER_V3.md §5.2's
+    directory-or-port-segment resolution, see `_resolve_game_dir`) and
+    cross-validate them, exactly like `profile::GameProfile::load` in
+    src/profile.rs. Raises ProfileError on any mismatch."""
     if game_dir is None:
         game_dir = os.environ.get("RUSTRETRO_GAME_DIR") or DEFAULT_GAME_DIR
     game_dir = Path(game_dir)
 
-    fam_path = game_dir / "family.json"
+    fam_dir, prof_path = _resolve_game_dir(game_dir)
+
+    fam_path = fam_dir / "family.json"
     try:
         family_raw = json.loads(fam_path.read_text())
     except OSError as e:
         raise ProfileError(f"{fam_path}: {e}") from e
 
-    stem = game_dir.name
-    prof_path = game_dir / f"{stem}.profile.json"
-    if not prof_path.is_file():
-        candidates = sorted(game_dir.glob("*.profile.json"))
-        if not candidates:
-            raise ProfileError(f"{game_dir}: no *.profile.json found")
-        prof_path = candidates[0]
     try:
         port_raw = json.loads(prof_path.read_text())
     except OSError as e:
@@ -201,6 +278,41 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
         if g is not None and g not in globals_map:
             raise ProfileError(f"gate condition names unknown global {g!r}")
 
+    # §2.1 record_globals: extra per-frame sampled globals beyond gate conds.
+    record_globals = list(mem.get("record_globals", []))
+    for rg in record_globals:
+        if rg["name"] not in globals_map:
+            raise ProfileError(f"record_globals names unknown global {rg['name']!r}")
+
+    # §1.2 rule 2's recorded-globals union: gate-condition globals first (in
+    # gate order), then record_globals (in its own order), duplicates
+    # collapsed to their first position. This is what a v3 row's `globals`
+    # object actually contains, and what hitstun_sources is validated against.
+    gate_globals = [c["global"] for c in gate if c.get("global")]
+    recorded_globals = list(dict.fromkeys(
+        gate_globals + [rg["name"] for rg in record_globals]
+    ))
+
+    # §2.2 hitstun_sources: block name -> global whose recent change means
+    # hitstun. Both names must actually be recorded (else silently reading a
+    # global nobody samples).
+    hitstun_sources = port_raw.get("hitstun_sources")
+    if hitstun_sources:
+        for global_name in hitstun_sources.values():
+            if global_name not in recorded_globals:
+                raise ProfileError(
+                    f"hitstun_sources names unrecorded global {global_name!r}"
+                )
+
+    # §2.3 id_map: raw RAM char id (decimal-string JSON key) -> canonical
+    # family.json roster id. Values must resolve in the family roster.
+    id_map_raw = port_raw.get("id_map") or {}
+    id_map = {int(k): v for k, v in id_map_raw.items()}
+    roster_ids = {r["id"] for r in family_raw["roster"]}
+    for canonical_id in id_map.values():
+        if canonical_id not in roster_ids:
+            raise ProfileError(f"id_map maps to unknown roster id {canonical_id}")
+
     attack_classes = list(family_raw["attack_classes"])
     attack_chords = dict(port_raw.get("attack_chords", {}))
     for cls in attack_chords:
@@ -228,7 +340,7 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
         }
 
     return GameProfile(
-        dir=game_dir,
+        dir=fam_dir,
         family_raw=family_raw,
         port_raw=port_raw,
         family=family_raw["family"],
@@ -252,6 +364,10 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
         calibration=dict(port_raw.get("calibration", {})),
         attack_chords=attack_chords,
         positions=dict(port_raw.get("positions", {})),
+        record_globals=record_globals,
+        recorded_globals=recorded_globals,
+        hitstun_sources=dict(hitstun_sources) if hitstun_sources else None,
+        id_map=id_map,
         _char_by_id=char_by_id,
     )
 

@@ -204,5 +204,219 @@ class HeadSizeDerivationTest(unittest.TestCase):
             self.assertEqual(getattr(dataset, key), prof.calibration[key])
 
 
+def _minimal_port_json(port: str, **extra) -> str:
+    base = {
+        "family": "fam", "port": port,
+        "core": {"provenance_game": "fam", "provenance_core": "test"},
+        "memory": {
+            "blocks": {"block1": "0x0", "block2": "0x0", "stride": "0x0"},
+            "fighter_fields": [], "globals": {},
+        },
+        "gate": [],
+        "enforcement": {"health_max": 255, "refill_below": 1,
+                         "timer_hold": [0, 0], "credits_target": 0, "credits_min": 0},
+        "calibration": {}, "attack_chords": {},
+    }
+    base.update(extra)
+    return json.dumps(base)
+
+
+def _minimal_family_json(roster=None) -> str:
+    return json.dumps({
+        "family": "fam", "roster": roster or [], "move_classes": [], "attack_classes": [],
+    })
+
+
+class PathResolutionTest(unittest.TestCase):
+    """RECORDER_V3.md §5.2, mirrored from src/profile.rs's `resolve_game_dir`
+    tests -- same three cases (bare dir / port-segment path / neither)."""
+
+    def test_single_profile_fallback(self):
+        with tempfile.TemporaryDirectory() as d:
+            game_dir = Path(d) / "onlyone"
+            game_dir.mkdir()
+            (game_dir / "family.json").write_text(_minimal_family_json())
+            (game_dir / "weird_name.profile.json").write_text(_minimal_port_json("only"))
+            prof = profile.load(game_dir)
+            self.assertEqual(prof.port, "only")
+
+    def test_multiple_profiles_no_default_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            game_dir = Path(d) / "multi"
+            game_dir.mkdir()
+            (game_dir / "family.json").write_text(_minimal_family_json())
+            (game_dir / "a.profile.json").write_text(_minimal_port_json("a"))
+            (game_dir / "b.profile.json").write_text(_minimal_port_json("b"))
+            with self.assertRaises(profile.ProfileError) as ctx:
+                profile.load(game_dir)
+            self.assertIn("multiple port profiles", str(ctx.exception))
+
+    def test_port_segment_by_filename(self):
+        with tempfile.TemporaryDirectory() as d:
+            game_dir = Path(d) / "multi2"
+            game_dir.mkdir()
+            (game_dir / "family.json").write_text(_minimal_family_json())
+            (game_dir / "genesis.profile.json").write_text(_minimal_port_json("genesis"))
+            (game_dir / "arcade.profile.json").write_text(_minimal_port_json("arcade"))
+            prof = profile.load(game_dir / "genesis")
+            self.assertEqual(prof.port, "genesis")
+            self.assertEqual(prof.dir, game_dir)
+
+    def test_port_segment_by_field_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            game_dir = Path(d) / "multi3"
+            game_dir.mkdir()
+            (game_dir / "family.json").write_text(_minimal_family_json())
+            # filename doesn't match the selector -- must fall back to
+            # scanning each profile's own "port" field.
+            (game_dir / "multi3.profile.json").write_text(_minimal_port_json("v2"))
+            prof = profile.load(game_dir / "v2")
+            self.assertEqual(prof.port, "v2")
+
+    def test_port_segment_not_found_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            game_dir = Path(d) / "multi4"
+            game_dir.mkdir()
+            (game_dir / "family.json").write_text(_minimal_family_json())
+            (game_dir / "arcade.profile.json").write_text(_minimal_port_json("arcade"))
+            with self.assertRaises(profile.ProfileError) as ctx:
+                profile.load(game_dir / "nonexistent")
+            self.assertIn("no port 'nonexistent'", str(ctx.exception))
+
+    def test_port_segment_ambiguous_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            game_dir = Path(d) / "multi5"
+            game_dir.mkdir()
+            (game_dir / "family.json").write_text(_minimal_family_json())
+            (game_dir / "one.profile.json").write_text(_minimal_port_json("dup"))
+            (game_dir / "two.profile.json").write_text(_minimal_port_json("dup"))
+            with self.assertRaises(profile.ProfileError) as ctx:
+                profile.load(game_dir / "dup")
+            self.assertIn("ambiguous", str(ctx.exception))
+
+    def test_no_such_game_directory(self):
+        with self.assertRaises(profile.ProfileError) as ctx:
+            profile.load("/nonexistent/parent/child")
+        self.assertIn("no such game directory", str(ctx.exception))
+
+
+class SchemaAdditionsTest(unittest.TestCase):
+    """RECORDER_V3.md §2: record_globals / hitstun_sources / id_map --
+    tolerate absence, validate presence, mirrors src/profile.rs's own tests."""
+
+    def _load(self, d: Path, port_extra: dict, roster=None):
+        (d / "family.json").write_text(_minimal_family_json(roster))
+        (d / "fam.profile.json").write_text(_minimal_port_json("test", **port_extra))
+        return profile.load(d)
+
+    def test_absent_keys_are_identity(self):
+        with tempfile.TemporaryDirectory() as d:
+            prof = self._load(Path(d), {})
+            self.assertEqual(prof.canon_char_id(5), 5)
+            self.assertIsNone(prof.hitstun_sources)
+            self.assertEqual(prof.record_globals, [])
+
+    def test_id_map_present_and_mapped(self):
+        with tempfile.TemporaryDirectory() as d:
+            roster = [{"id": 0, "name": "a"}, {"id": 1, "name": "b"}, {"id": 2, "name": "c"}]
+            prof = self._load(Path(d), {"id_map": {"5": 0, "6": 1, "7": 2}}, roster)
+            self.assertEqual(prof.canon_char_id(5), 0)
+            self.assertEqual(prof.canon_char_id(6), 1)
+            self.assertEqual(prof.canon_char_id(99), 99)  # unmapped -> identity
+
+    def test_id_map_invalid_roster_id_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            roster = [{"id": 0, "name": "a"}]
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._load(Path(d), {"id_map": {"5": 99}}, roster)
+            self.assertIn("id_map maps to unknown roster id", str(ctx.exception))
+
+    def test_record_globals_valid(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "family.json").write_text(_minimal_family_json())
+            (d / "fam.profile.json").write_text(json.dumps({
+                "family": "fam", "port": "test",
+                "core": {"provenance_game": "fam", "provenance_core": "test"},
+                "memory": {
+                    "blocks": {"block1": "0x0", "block2": "0x0", "stride": "0x0"},
+                    "fighter_fields": [],
+                    "globals": {"combo": "0x1000", "demo": "0x2000"},
+                    "record_globals": [{"name": "combo", "size": 1},
+                                        {"name": "demo", "size": 2}],
+                },
+                "gate": [],
+                "enforcement": {"health_max": 255, "refill_below": 1,
+                                 "timer_hold": [0, 0], "credits_target": 0, "credits_min": 0},
+                "calibration": {}, "attack_chords": {},
+            }))
+            prof = profile.load(d)
+            self.assertEqual([rg["name"] for rg in prof.record_globals], ["combo", "demo"])
+
+    def test_record_globals_unknown_global_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "family.json").write_text(_minimal_family_json())
+            (d / "fam.profile.json").write_text(json.dumps({
+                "family": "fam", "port": "test",
+                "core": {"provenance_game": "fam", "provenance_core": "test"},
+                "memory": {
+                    "blocks": {"block1": "0x0", "block2": "0x0", "stride": "0x0"},
+                    "fighter_fields": [], "globals": {},
+                    "record_globals": [{"name": "nope", "size": 1}],
+                },
+                "gate": [],
+                "enforcement": {"health_max": 255, "refill_below": 1,
+                                 "timer_hold": [0, 0], "credits_target": 0, "credits_min": 0},
+                "calibration": {}, "attack_chords": {},
+            }))
+            with self.assertRaises(profile.ProfileError) as ctx:
+                profile.load(d)
+            self.assertIn("record_globals names unknown global", str(ctx.exception))
+
+    def test_hitstun_sources_valid(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "family.json").write_text(_minimal_family_json())
+            (d / "fam.profile.json").write_text(json.dumps({
+                "family": "fam", "port": "test",
+                "core": {"provenance_game": "fam", "provenance_core": "test"},
+                "memory": {
+                    "blocks": {"block1": "0x0", "block2": "0x0", "stride": "0x0"},
+                    "fighter_fields": [], "globals": {"combo1": "0x1", "combo2": "0x2"},
+                    "record_globals": [{"name": "combo1", "size": 1},
+                                        {"name": "combo2", "size": 1}],
+                },
+                "gate": [],
+                "enforcement": {"health_max": 255, "refill_below": 1,
+                                 "timer_hold": [0, 0], "credits_target": 0, "credits_min": 0},
+                "calibration": {}, "attack_chords": {},
+                "hitstun_sources": {"block1": "combo1", "block2": "combo2"},
+            }))
+            prof = profile.load(d)
+            self.assertEqual(prof.hitstun_sources, {"block1": "combo1", "block2": "combo2"})
+
+    def test_hitstun_sources_unrecorded_global_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "family.json").write_text(_minimal_family_json())
+            (d / "fam.profile.json").write_text(json.dumps({
+                "family": "fam", "port": "test",
+                "core": {"provenance_game": "fam", "provenance_core": "test"},
+                "memory": {
+                    "blocks": {"block1": "0x0", "block2": "0x0", "stride": "0x0"},
+                    "fighter_fields": [], "globals": {"combo1": "0x1"},
+                },
+                "gate": [],
+                "enforcement": {"health_max": 255, "refill_below": 1,
+                                 "timer_hold": [0, 0], "credits_target": 0, "credits_min": 0},
+                "calibration": {}, "attack_chords": {},
+                "hitstun_sources": {"block1": "combo1"},  # never gated or record_globals'd
+            }))
+            with self.assertRaises(profile.ProfileError) as ctx:
+                profile.load(d)
+            self.assertIn("hitstun_sources names unrecorded global", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
