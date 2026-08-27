@@ -249,8 +249,14 @@ paused arena state and the unpaused fight (the arena being saved mid-pause
 was, for once, useful). CAVEAT, recorded honestly: the address sits in
 what looks like render scratch (the PAUSED overlay), so another overlay
 could conceivably write it mid-fight — the failure mode is benign (gate
-closes, recorder skips frames), and no such flicker was observed in any
-tested phase. Two candidate pause bytes were tried and rejected first —
+closes, recorder skips frames). **Same-day follow-up (A5 toolkit smoke):
+that flicker WAS then observed — the flag briefly reads 1 during
+genuinely live play, most likely HITSTOP (freeze-frames on hits), not
+menu pause.** Consequence: the gate drops hitstop frames from recordings.
+Judged acceptable — game state is frozen during hitstop so those rows are
+near-duplicates, and held inputs bridge via surrounding frames — but if
+fits ever look input-starved around hits, revisit this condition first.
+Two candidate pause bytes were tried and rejected first —
 see Disproven & traps.
 
 **Final 4-condition gate:**

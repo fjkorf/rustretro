@@ -19,12 +19,23 @@ description: Launch a headless RustRetro instance and run a live memory-RE sessi
   `from shadow_train.mcpclient import McpClient; c = McpClient("http://127.0.0.1:4030/mcp")`,
   `c.call(tool, **kwargs)`. `run_lua` takes `script=...` → `{'ok','output'}`.
   Writes/load_state need `c.call("enable_writes")` first.
+- `shadow_train.re.Probe` is this protocol crib's EXECUTABLE counterpart —
+  `from shadow_train.re import Probe; p = Probe(4030)` wraps an `McpClient`
+  with the moves below (`rd8`/`rd16`/`wr8`, `snapshot`/`stable_snapshot`,
+  `screenshot`, `press`, `load`/`save`, `running` as the phase oracle) so a
+  session writes `p.running(addr)` instead of re-deriving the two-read
+  settle-and-compare each time. Module-level `diff`/`static_diff`/
+  `intersect_changes` are the pure byte-diffing kernels the Protocols below
+  name; `lua_macro(seq)` emits the menu-macro Lua source. Prefer it over
+  re-typing a fresh heredoc; drop to raw `McpClient` calls for anything
+  game-specific it doesn't cover.
 
 ## The laws (each one was paid for)
 
 1. **Verify the PHASE before interpreting reads.** Frames advancing? Really in a fight?
    `game.controllable()` plus a free-running byte (sub-second timer) as the running/paused
-   oracle — in-game pause can be invisible to the gate until a pause flag is mapped.
+   oracle (`Probe.running(oracle_addr)`) — in-game pause can be invisible to the gate until
+   a pause flag is mapped.
 2. **Write-tests beat correlation.** A candidate is only verified when writing it produces
    the predicted observable (teleport, label re-render, damage, driver decode). A write that
    "reverts" may be the written value being CONSUMED (MK2 Genesis timer) — check what the
@@ -38,14 +49,21 @@ description: Launch a headless RustRetro instance and run a live memory-RE sessi
 
 - **Static-diff**: snapshot a region twice per state (keep only bytes stable in both),
   diff stable-vs-stable across states. Finds config/flags; prunes animation noise.
+  `Probe.stable_snapshot()` takes the two-per-state pair; `re.static_diff(pair_a, pair_b)`
+  does the stable-in-both-AND-differing diff across states.
 - **Toggle-intersect**: same screen, cycle a setting N times, intersect the changed-sets.
   The setting byte survives; frame counters don't. Beware DERIVED echoes (rendered-label
   bytes) — only a write-test that provokes re-derivation identifies the source.
+  `re.intersect_changes([snap0, snap1, ...])` returns offsets that changed at every step.
 - **Controlled-motion intersect**: for positions, let the CPU walk (or inject a held
   direction), pause between snapshots, require monotone change in the walk direction.
+  `Probe.snapshot()` + `re.diff(a, b)` for the pairwise read.
 - **Tick-boundary intersect**: for timers/counters, diff exactly across the visible tick.
+  Same `re.diff` kernel, timed to straddle the tick.
 - **In-engine menu macros** (beats MCP round-trip latency every time): frame-scheduled
-  input via Lua —
+  input via Lua — `re.lua_macro(seq, port=0)` builds the source below from
+  `seq = [(at_frame, mask_or_button_names, hold_frames)]` (names or raw masks; see
+  `re.BUTTON_MASKS`) and returns it as a string to hand to `c.call("run_lua", script=...)`:
   ```lua
   local seq = {{at=5, mask=0x8, hold=3}, {at=90, mask=0x20, hold=3}}  -- start, down
   local f0 = emu.framecount(); local done = false
@@ -57,8 +75,9 @@ description: Launch a headless RustRetro instance and run a live memory-RE sessi
   end)
   ```
   Masks: b=0x1 y=0x2 select=0x4 start=0x8 up=0x10 down=0x20 left=0x40 right=0x80 a=0x100 x=0x200 l=0x400 r=0x800.
-- **Screenshots as eyes**: `c.screenshot(path)` (pause first for a stable frame), then view
-  the PNG. Menus often need a blink/fade allowance — step a few frames and reshoot.
+- **Screenshots as eyes**: `c.screenshot(path)` (or `Probe.screenshot(path)`, which pauses
+  first for a stable frame automatically), then view the PNG. Menus often need a
+  blink/fade allowance — step a few frames and reshoot.
 
 ## Known platform quirks
 

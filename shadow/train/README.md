@@ -69,6 +69,17 @@ labels and accuracies pinned at the majority baseline — that is the honest
 signal to record more focused demonstrations, not a modeling failure. The kNN
 earns its keep once buckets have real decision diversity.
 
+## Also in this package
+
+`shadow_train.mcpclient.McpClient` is the shared MCP HTTP client (initialize
+handshake, `tools/call`, `resources/read`) other scripts import instead of
+reimplementing. `shadow_train.re` builds on it with the live memory-RE
+session protocols (`Probe.rd8`/`wr8`, `snapshot`/`stable_snapshot`, the
+`running()` phase oracle, `diff`/`static_diff`/`intersect_changes`,
+`lua_macro`) — see `.claude/skills/re-probe/SKILL.md` for the protocol
+write-up and `library/mk2/mk2-genesis.md` "Session craft" for the gotchas
+it encodes.
+
 ## Not here yet (per PLAN)
 
 - The MLP that must beat this baseline (§7.1)
