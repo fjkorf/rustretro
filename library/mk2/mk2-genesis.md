@@ -42,6 +42,51 @@ and PC breakpoints/run-to.
 Multi-byte values are **little-endian** (verified: a 16-bit `write_memory`
 of `5000` read back as bytes `88 13`, i.e. LE `0x1388`).
 
+This doc was reorganized topically in a 2026-08-27 consolidation pass (no
+new RE — see git history for the original chronological write-up). Every
+address, value, and caveat below is preserved from that history; superseded
+values are kept as explicit "superseded:" notes rather than deleted.
+
+## Current truth — quick reference
+
+Final state of every verified address, after W1 + W2 and the three later
+correction passes (calibration, pad-mode pinning, pause-flag gate). Full
+evidence and evolution live in the topical sections below.
+
+| name | address | size | meaning | verification | date |
+|---|---|---|---|---|---|
+| P1 character id | `0xFFB5F0` block, `+0xE8` | u8 | character id (roster table below) | P1 constant `1` across 3 fresh-round dumps; cross-checked against P2 reads | 2026-08-27 |
+| P2 character id | `0xFFB6E0` block, `+0xE8` | u8 | character id | P2 read 3/9/7 matching on-screen bar names | 2026-08-27 |
+| P1 health | `0xFFB622` (block `+0x32`) | u8, max `0x78`=120 | health, authoritative | write-tested: forced low → DANGER; forced 0 → real KO/WINS | 2026-08-27 |
+| P1 health mirror | `0xFFB624` (block `+0x34`) | u8 | mirrors health in lockstep | observed only — NOT independently write-tested; write both together | 2026-08-27 |
+| P2 health | `0xFFB712` (block `+0x32`) | u8, max 120 | health, authoritative | write-tested | 2026-08-27 |
+| P2 health mirror | `0xFFB714` (block `+0x34`) | u8 | mirrors health | observed lockstep, not independently write-tested | 2026-08-27 |
+| P1 world X | `0xFFB6C8` (block `+0xD8`) | u16 LE | authoritative world/screen X | **write-verified teleport** (write 800 → full side-swap on screen) | 2026-08-27 |
+| P1 X fraction | `0xFFB5F0` block, `+0xDA` | u16 LE, presumed | subpixel/fraction word | not separately verified; write 0 alongside X | 2026-08-27 |
+| P2 world X | `0xFFB7B8` (block `+0xD8`) | u16 LE | world X | struct symmetry + decreasing-walk diff | 2026-08-27 |
+| P1 Y | `0xFFB6CC` (block `+0xDC`) | u16 LE | vertical position; **GROUND_Y = 110** (superseded: 121 — see Fighter structs) | write-verified levitate (forced 50 mid-air) | ground value corrected 2026-08-27 (orchestrator, real-play recalibration) |
+| P2 Y | `0xFFB7BC` (block `+0xDC`) | u16 LE | vertical position | struct symmetry | 2026-08-27 |
+| round timer, seconds | `0xFFAB97` | u8, BCD | **AUTHORITATIVE** round timer | write-verified twice (display-follow + forced timeout) — see Round timer for the disprove/re-verify history | 2026-08-27 |
+| timer sub-second | `0xFFAB96` | u8 | frame countdown within the current second; also the running/paused oracle | tick-pattern observation | 2026-08-27 |
+| menu_state | `0xFFB2CE` | u16 | gate discriminator: `0x9C01` on menu-family screens, `0x0000` in-fight | 32 non-fight + 17 in-fight snapshots, corroborated by `0xFFB302`/`0xFFB306`; read-only, not write-tested | 2026-08-27 |
+| round_over (LIKELY) | `0xFFB5E0` | u8 | match-decision flag: 0 live, 1 at KO through the WINS screen | 26 live samples across 3 matchups + 2 independent KO matches; NOT write-tested | 2026-08-27 |
+| pause_flag | `0xFFD7D3` (twin `0xFFDA53`) | u8 | 1 = in-game paused, 0 running/post-fight/attract | 3 pause cycles + phase sweep, stable-diff of paused vs. unpaused arena state | 2026-08-27 (orchestrator, consolidation pass) |
+| Port 1 pad-mode | `0xFFF9D1` | u8 | 1 = 6 BUTTON, 0 = ACTIVATOR/normal cycle | write-tested, 3 independent proofs (see Buttons & pad mode) | 2026-08-27 (orchestrator) |
+| Port 2 pad-mode | `0xFFF9D0` | u8 | same | write-tested | 2026-08-27 (orchestrator) |
+
+The controllable gate (final, 4 conditions — full evolution and rationale
+in Gate, below):
+
+```
+word_zero(menu_state)        # 0xFFB2CE
+byte_zero(round_over)        # 0xFFB5E0
+health_in_range(1, 120)      # health max is 120 (0x78)
+byte_zero(pause_flag)        # 0xFFD7D3 (twin 0xFFDA53)
+```
+
+Button table in 6-button mode (RETRO `b/y/r/l/a/x` → LP/HP/LK/HK/Block/Block2)
+is in Buttons & pad mode, below.
+
 ## Method
 
 1. **External candidates first.** Web search + WebFetch for Genesis Game
@@ -59,71 +104,39 @@ of `5000` read back as bytes `88 13`, i.e. LE `0x1388`).
    unrelated to game state — every diff below excludes or filters past
    that noise).
 4. **Write-tests for authority**: candidate found → `enable_writes` →
-   `write_memory` → screenshot / re-read. `enable_writes` is
-   **per-MCP-session**; a fresh Python process opening a new McpClient must
-   call it again or every `write_memory` silently returns
-   `{"error": "writes are locked"}` while `read_memory` keeps returning the
-   old value — this cost real time during the session (see Gotchas) and is
-   flagged here so it isn't relearned.
+   `write_memory` → screenshot / re-read.
 5. **A 2-human-controller rig for clean hit isolation.** Pressing `start`
    on controller port 1 mid-select converts P2 from CPU to a second human
    slot (both sides then pick a fighter and a normal "ROUND 1" starts).
    With P2 issuing no input, P1's attacks land on a stationary target,
    which is a far cleaner way to isolate "does this button deal damage and
    how much" than fighting the CPU's AI in real time. Caveat: P2 was
-   observed to still throw an unprompted jump-kick in one trial (see
-   Gotchas) — the human-join does not reliably disable P2's CPU AI, so
-   damage-based button tests were only trusted when P1's health stayed
-   flat across the test window.
+   observed to still throw an unprompted jump-kick in one trial — this
+   join path does **not** reliably disable P2's CPU AI, so damage-based
+   button tests via this rig were only trusted when P1's health stayed
+   flat across the test window. (Buttons & pad mode, below, uses a
+   different, more reliable join path for its own damage measurements.)
 
-**Probe gotchas (Genesis-MK2-specific):**
-- Headless pacing here ran close to real-time (~51 fps measured over a 5 s
-  window), NOT dramatically uncapped the way the task brief warned it might
-  be — `press_buttons(frames=N)` does not block for those N frames, it
-  queues input that drains over the *next* N frames of whatever real time
-  elapses in the background. Every multi-step menu script needs an
-  explicit `time.sleep()` after each `press_buttons` (0.15-2.5 s depending
-  on the transition) or the follow-up screenshot/read just re-observes the
-  pre-press frame.
-- `enable_writes` is per-session (see Method #4) — a fresh script/process
-  needs it again even if an earlier process already armed writes.
-- The pre-round "ROUND N" / "FIGHT!!" banner ignores input and freezes the
-  timer at 99 for **several real seconds** (longer than the arcade port's
-  ~2 s leak) before live combat starts; scripts that press an attack too
-  early land nothing.
-- The CPU is fast and aggressive from the first live frame: an idle P1 was
-  KO'd in as little as ~4-9 real seconds across several attempts. Bank a
-  save state at the *exact* "ROUND N, timer 99, full green bars" frame or
-  every later probe re-fights CPU aggression from scratch.
-- "PUSH START" printed over P2's name during a live 1P-vs-CPU round is a
-  **permanent 2P-join invitation overlay**, not a round-over indicator —
-  it is visible from the very first live frame of a fresh round. Do not
-  confuse it with the arcade port's win-declared state.
-- Joining P2 via `start` on port 1 does not deterministically hand P2 to
-  human control: after a long idle stretch, P2 (Reptile) was seen to throw
-  an unprompted jump-kick that knocked P1 down while nothing was pressed on
-  port 1. Treat 2P-rig damage tests as trustworthy only when the *other*
-  side's health stayed provably flat for the whole window.
-- `read_memory`/`write_memory` hex fields are hex STRINGS (e.g. `"78"` =
-  120 decimal) — several early probes in this session mis-read them as
-  decimal before catching the mistake; every value in this doc has been
-  re-derived correctly.
+Workflow gotchas hit while applying this method (pacing, `enable_writes`
+scope, menu timing, hex-string misreads, etc.) are consolidated in
+**Session craft**, below, rather than scattered across passes.
 
-## Fighter data — verified
+## Fighter structs, positions & roster
 
 Two per-player state blocks, **P1 = `0xFFB5F0`**, **P2 = `0xFFB6E0`**,
 stride **`0xF0`** (240 bytes).
 
 | offset in block | field | confirmed how |
 |---|---|---|
-| `+0xE8` | **character id** (u8; table below) | P1 read 1 (Liu Kang) constant across 3 independent fresh-round dumps (different P2 opponents each time). P2 read 3 with Baraka on screen, 9 with Reptile on screen (2-human rig), 7 with Rayden on screen (post-KO snapshot) — a clean 3-way comparison against small integer values, cross-checked so it isn't a coincidental match on any single sample. |
+| `+0xE8` | **character id** (u8; roster table below) | P1 read 1 (Liu Kang) constant across 3 independent fresh-round dumps (different P2 opponents each time). P2 read 3 with Baraka on screen, 9 with Reptile on screen (2-human rig), 7 with Rayden on screen (post-KO snapshot) — a clean 3-way comparison against small integer values, cross-checked so it isn't a coincidental match on any single sample. |
 | `+0x32` | **health** (u8, max **0x78 = 120**) | P1 `0xFFB622`, P2 `0xFFB712`. Write-tested on both sides: forcing a low value produces the on-screen "DANGER" warning early, and forcing `0` fires the real KO / `<NAME> WINS` screen (verified for P1 vs Baraka and P2 vs Reptile, two independent matches). Values persist across frames once written (authoritative, not a recomputed display value). |
 | `+0x34` | **health mirror** (u8) | `0xFFB624` (P1) / `0xFFB714` (P2). Tracks the primary health byte in lockstep in every sample taken (fresh-round full-120, mid-fight partial, post-KO 0). Not independently write-tested; write BOTH bytes together for enforcement, following the arcade port's own documented caution about independent dual health accumulators — this pairing is assumed, not proven, to behave the same way here. |
-| `+0xD8` | **world X** (u16 LE) | P1 `0xFFB6C8`, P2 `0xFFB7B8`. Found by letting the CPU provide controlled motion: with no input at all, the CPU opponent walks toward P1, so its X must decrease monotonically — four paused full-WRAM snapshots at 0.3 s intervals were intersected for strictly-decreasing u16s with walk-plausible deltas (~34/step), which produced exactly this offset INSIDE the fighter struct (plus display-list churn elsewhere, easily excluded). Cross-checked against a walk-right/walk-left P1 session (values rise walking right, drop on knockback, and the P1/P2 separation matches the on-screen gap). **VERIFIED BY TELEPORT**: writing 800 (P1 was at ~627, P2 at ~768) visibly relocated Liu Kang to the RIGHT of the opponent — full side-swap on screen, camera followed, the value stuck (798→803 as physics continued from the new spot). This is the authoritative store the W1 candidate `0xFFB18B` was not. The word at `+0xDA` moves in 0x4000-granularity steps and is almost certainly the subpixel/fraction word — write 0 alongside X for clean placement (not separately verified). |
-| `+0xDC` | **Y** (u16 LE) | P1 `0xFFB6CC`, P2 `0xFFB7BC`. Jump-arc method: sampling the P1 struct every ~0.06 s through an `up` tap gives a clean parabola `121 → 113 → 87 → 67 → 55 → 47 → 43 → 42 → 46 → 52` — ground is **121**, smaller = higher. **VERIFIED BY WRITE**: forcing 50 while standing visibly levitates the fighter mid-air (screenshot); the value holds (standing state applies no gravity). `+0xDE` is presumed the Y fraction, untested. |
+| `+0xD8` | **world X** (u16 LE) | P1 `0xFFB6C8`, P2 `0xFFB7B8`. Found by letting the CPU provide controlled motion: with no input at all, the CPU opponent walks toward P1, so its X must decrease monotonically — four paused full-WRAM snapshots at 0.3 s intervals were intersected for strictly-decreasing u16s with walk-plausible deltas (~34/step), which produced exactly this offset INSIDE the fighter struct (plus display-list churn elsewhere, easily excluded). Cross-checked against a walk-right/walk-left P1 session (values rise walking right, drop on knockback, and the P1/P2 separation matches the on-screen gap). **VERIFIED BY TELEPORT**: writing 800 (P1 was at ~627, P2 at ~768) visibly relocated Liu Kang to the RIGHT of the opponent — full side-swap on screen, camera followed, the value stuck (798→803 as physics continued from the new spot). This is the authoritative store the W1 candidate `0xFFB18B` was not (see Disproven & traps). The word at `+0xDA` moves in 0x4000-granularity steps and is almost certainly the subpixel/fraction word — write 0 alongside X for clean placement (not separately verified). |
+| `+0xDC` | **Y** (u16 LE) | P1 `0xFFB6CC`, P2 `0xFFB7BC`. Jump-arc method: sampling the P1 struct every ~0.06 s through an `up` tap gives a clean parabola `121 → 113 → 87 → 67 → 55 → 47 → 43 → 42 → 46 → 52` — ground read as **121** in that sample, smaller = higher. **VERIFIED BY WRITE**: forcing 50 while standing visibly levitates the fighter mid-air (screenshot); the value holds (standing state applies no gravity). `+0xDE` is presumed the Y fraction, untested. **Superseded — GROUND_Y is 110, not 121:** the W2 jump-parabola baseline above (121) was a single stepped `up`-tap sample from one stance/stage snapshot. A later real-play calibration session found both fighters standing at y=110 across a real fight (2904/~3100 P1 frames; P2 identical). With GROUND_Y=121, the airborne test (`GROUND_Y − y > 4`) flagged 99.7% of decisions "air" — clearly wrong — so GROUND_Y was corrected to **110** (2026-08-27, orchestrator). See Calibration for the downstream training-data effect. |
 
 Facing was not hunted this session (open). The disproven W1 X candidate
-`0xFFB18B` stays disproven — the real X is the struct field above.
+`0xFFB18B` stays disproven — the real X is the struct field above (full
+story in Disproven & traps).
 
 ### Roster — character IDs (block `+0xE8`)
 
@@ -143,15 +156,14 @@ were **not** independently re-verified on Genesis this session; treat the
 match as strong evidence the two ports share one id table, not as proof
 for every id.
 
-## Match-state globals
+## The round timer
 
-| address | name | semantics (observed) |
-|---|---|---|
-| `0xFFB5E0` | **match-decision flag / round_over** (u8, LIKELY) | `0` across 26 live-combat samples spanning 3 different matchups (Liu Kang vs Baraka / Rayden / Reptile) and a wide range of health values including near-death (as low as 25/120); becomes `1` at the moment a round is decided by KO and stays `1` through the "`<NAME>` WINS" screen, confirmed in 2 independent matches. Still **not write-tested**. The menu-phase discriminator gap flagged by W1 is now closed by `menu_state` (below). |
-| `0xFFB2CE` | **menu_state** (u16, the gate discriminator) | Reads `0x9C01` on intro, title, attract story screens, the dragon Start/Options menu, char select, the ladder screen, and the continue screen — in **every one of 32 non-fight WRAM snapshots** — and `0x0000` in **every one of 17 in-fight snapshots** spanning three stages (portal arena, Dead Pool, Living Forest) and all three fight modes (1P-vs-CPU, 2-human duel, attract demo), plus a 40-sample rapid poll during live combat (all zero). The neighbouring words `0xFFB302`/`0xFFB306` (`0xFFFF` in menus, `0` in fights) look like parts of the same menu-context structure and corroborate. Known residual: the draw-timeout **GAME OVER** screen reads `0` for ~9 s (with `round_over=0` and full healths) before attract sets `0x9C01` — the only observed gate window, static screen, zero p1_input. NOT write-tested (read-only discriminator). |
-| `0xFFAB97` | **round timer** (u8, BCD seconds, **AUTHORITATIVE — write-verified**) | See below. `0xFFAB96` is its sub-second frame countdown; `0xFFAB98` is always `0x00` in every sample (which makes the training loop's 2-byte `timer_hold` write `[0x99, 0x00]` safe). |
+`0xFFAB97` — **round timer** (u8, BCD seconds, **AUTHORITATIVE —
+write-verified**). `0xFFAB96` is its sub-second frame countdown; `0xFFAB98`
+is always `0x00` in every sample (which makes the training loop's 2-byte
+`timer_hold` write `[0x99, 0x00]` safe).
 
-### The round timer — FOUND (W1's disproof was a misread)
+### FOUND — W1's disproof was a misread
 
 W1 found the BCD pair **`0xFFAB97`** / `0xFFAB9C` tracking the drawn
 countdown, wrote `0x50` to both, read back `0x49`/`0x99` ~15 frames later
@@ -173,7 +185,16 @@ authoritative seconds store:
 0xFFAB97`, hold bytes `[0x99, 0x00]` (the second byte lands on the
 always-zero `0xFFAB98`).
 
+The full disprove-then-retract narrative (why this is worth remembering as
+a method lesson, not just a corrected fact) is preserved in Disproven &
+traps.
+
 ## The controllable gate
+
+The gate accreted from 3 conditions to 4 across the RE session; each
+condition was added to close a specific measured leak.
+
+**Original 3-condition gate:**
 
 ```
 word_zero(menu_state)        # 0xFFB2CE: kills title/menu/char-select/ladder/continue
@@ -181,35 +202,70 @@ byte_zero(round_over)        # 0xFFB5E0, LIKELY: kills the KO/WINS screen
 health_in_range(1, 120)      # kills 0-health (dead/menu-garbage) frames
 ```
 
-The W1 leak is measured and closed: with only the bottom two conditions,
-**16 of 38 non-fight snapshots leaked** (char select and the ladder read
-healths 120/120 with `round_over=0`; the attract story screens read 1/120;
-the dragon menu 16/117). `word_zero(menu_state)` kills every one of those
-16 while staying open in all 17 in-fight samples (including the attract
-demo fight and the pre-round "ROUND N" banner — the gate opens a few
-seconds before input is accepted, same benign banner window as the arcade
-port). The gate stays open during the game's own start-button pause in a
-2-human game (menu_state stays 0 there), and the one known residual leak
-is the ~9 s draw-timeout GAME OVER screen (see the globals table).
+- `0xFFB2CE` **menu_state** (u16, the gate discriminator): reads `0x9C01`
+  on intro, title, attract story screens, the dragon Start/Options menu,
+  char select, the ladder screen, and the continue screen — in **every one
+  of 32 non-fight WRAM snapshots** — and `0x0000` in **every one of 17
+  in-fight snapshots** spanning three stages (portal arena, Dead Pool,
+  Living Forest) and all three fight modes (1P-vs-CPU, 2-human duel,
+  attract demo), plus a 40-sample rapid poll during live combat (all
+  zero). The neighbouring words `0xFFB302`/`0xFFB306` (`0xFFFF` in menus,
+  `0` in fights) look like parts of the same menu-context structure and
+  corroborate. NOT write-tested (read-only discriminator).
+- `0xFFB5E0` **match-decision flag / round_over** (u8, LIKELY): `0` across
+  26 live-combat samples spanning 3 different matchups (Liu Kang vs
+  Baraka / Rayden / Reptile) and a wide range of health values including
+  near-death (as low as 25/120); becomes `1` at the moment a round is
+  decided by KO and stays `1` through the "`<NAME>` WINS" screen,
+  confirmed in 2 independent matches. Still **not write-tested**.
+- `health_in_range(1, 120)` kills 0-health/menu-garbage frames.
 
-**Disproven discriminator — do not readopt `0xFF098F`**: it read 0 in 13
-fight samples and nonzero in all 32 non-fight samples of the first capture
-batch, survived a 50-sample rapid poll during arena-stage combat — and
-then read a fluctuating **68** during a live Living Forest duel. It sits
-in the `0xFF09xx` sound-driver span; its "screen id"-looking values
-(96=title, 136=menu, 32=char select) are music-state, not game-phase.
+**Leak measurement that motivated `menu_state`:** with only the bottom two
+conditions, **16 of 38 non-fight snapshots leaked** (char select and the
+ladder read healths 120/120 with `round_over=0`; the attract story screens
+read 1/120; the dragon menu 16/117). `word_zero(menu_state)` kills every
+one of those 16 while staying open in all 17 in-fight samples (including
+the attract demo fight and the pre-round "ROUND N" banner — the gate opens
+a few seconds before input is accepted, same benign banner window as the
+arcade port). The gate stays open during the game's own start-button pause
+in a 2-human game (menu_state stays 0 there — this turned out to be a
+separate, unfixed leak; see pause_flag below). One known residual leak
+remains even with all 4 conditions: the ~9 s draw-timeout **GAME OVER**
+screen reads `0` for menu_state (with `round_over=0` and full healths)
+before attract sets `0x9C01` — see Open gaps.
 
-## Enforcement — what actually works
+A sound-driver byte (`0xFF098F`) was tried and rejected as a discriminator
+— see Disproven & traps.
 
-| lever | status |
-|---|---|
-| health refill | **Likely works** via `write_memory` to both `health` and `health_mirror` on the target side (`0xFFB622`+`0xFFB624` for P1, `0xFFB712`+`0xFFB714` for P2) — the primary byte is write-tested and authoritative; the mirror is written defensively by analogy with the arcade port's dual-accumulator finding, not because independent divergence was observed here. |
-| health_max | **120** (`0x78`) — round-start fill value, and the write-verified full-bar value. |
-| timer hold | **Functional** — `0xFFAB97` write-verified authoritative (above); hold bytes `[0x99, 0x00]`. |
-| position write | **Works** — X (`+0xD8`) and Y (`+0xDC`) both accept writes and visibly relocate the fighter (teleport/levitate verified); write the fraction word (`+0xDA`/`+0xDE`) to 0 alongside. |
-| credits | **N/A** — home-console cartridge, no coin/credit system; `start` joins/continues directly. |
+**Added condition — `pause_flag` (2026-08-27, orchestrator, consolidation
+pass):** headless playback verification found the committed arena state
+(`shadow/arenas/mk2/genesis-probe.state`) is saved **in-game PAUSED** — a
+frozen fight (timer stuck at BCD `0x98`, fighters inert) that the
+3-condition gate read as OPEN, because in-game pause is invisible to
+menu_state/round_over/health. **VERIFIED (3 pause cycles + phase sweep):**
+`0xFFD7D3` (twin copy `0xFFDA53`) is 1 during in-game pause and 0 in
+running fights, post-fight, and attract. Found by stable-diff between the
+paused arena state and the unpaused fight (the arena being saved mid-pause
+was, for once, useful). CAVEAT, recorded honestly: the address sits in
+what looks like render scratch (the PAUSED overlay), so another overlay
+could conceivably write it mid-fight — the failure mode is benign (gate
+closes, recorder skips frames), and no such flicker was observed in any
+tested phase. Two candidate pause bytes were tried and rejected first —
+see Disproven & traps.
 
-## Buttons — SOLVED (requires the game's 6-button setting)
+**Final 4-condition gate:**
+
+```
+word_zero(menu_state)        # 0xFFB2CE
+byte_zero(round_over)        # 0xFFB5E0
+health_in_range(1, 120)      # kills 0-health (dead/menu-garbage) frames
+byte_zero(pause_flag)        # 0xFFD7D3 (twin 0xFFDA53)
+```
+
+With this gate, the committed `genesis-probe.state` now correctly reads
+`controllable=false` until unpaused (P1 Start).
+
+## Buttons & pad mode — SOLVED (requires the game's 6-button setting)
 
 Two discoveries unlocked this:
 
@@ -229,11 +285,12 @@ Two discoveries unlocked this:
 2. **A clean dummy rig**: `press_buttons(port=1, buttons=['start'])`
    during a live 1P round fires "PLAYER TWO HAS ENTERED THE TOURNAMENT" →
    both players re-pick → a normal 2-human round where P2 stands
-   genuinely still (no CPU AI at all — W1's caveat about unprompted P2
-   attacks does not apply to this join path). All damage numbers below
-   were measured against that idle human dummy with spacing controlled by
-   writing P1's X (`p2x - 50` / `- 40` / `- 58`), which also avoids the
-   throw-range confound.
+   genuinely still (no CPU AI at all — the Method section's caveat about
+   unprompted P2 attacks under the OTHER 2-human join path does not apply
+   to this join path). All damage numbers below were measured against
+   that idle human dummy with spacing controlled by writing P1's X
+   (`p2x - 50` / `- 40` / `- 58`), which also avoids the throw-range
+   confound.
 
 ### 6-button mode classification (damage out of 120)
 
@@ -251,10 +308,75 @@ attacks with the defender holding a non-block button land in full (and the
 defender's own held attack often trades — held LP autorepeats jabs).
 
 `attack_chords`: `LP: ["b"], HP: ["y"], LK: ["r"], HK: ["l"],
-Block: ["a"]`. W1's `HK: ["a","r"]` entry described **3-button mode** (a
-different game configuration) and is superseded.
+Block: ["a"]`. An earlier W1 entry (`HK: ["a","r"]`) described **3-button
+mode** (a different game configuration) and is superseded.
 
-## Disproven / dead ends (don't re-chase these)
+### The pad-mode flags — pinned (2026-08-27, orchestrator)
+
+**VERIFIED (write-tested, driver-level):** the Extra Controls per-port pad
+type lives at `0xFFF9D1` (Port 1) / `0xFFF9D0` (Port 2): 1 = 6 BUTTON,
+0 = the ACTIVATOR/normal cycle. Found via same-screen WRAM diff across the
+menu's cycle button (the value cycles with Genesis A — RETRO `b` — NOT
+left/right; left/right only reveal the cursor). Three independent proofs:
+
+1. writing the byte re-renders the menu label live (the game polls it);
+2. with flag=1 a held RETRO `l` decodes into the pad-state bytes
+   `0xFFF9D5/D6/D8` (bit 0x20), with flag=0 the driver ignores the button
+   entirely;
+3. cold boot with the profile `pins` asserting both flags at 1 Hz gives
+   full 6-button decode with no menu visit.
+
+Nearby derived bytes (`0xFFF9D3/DE/E1/EC/ED`) are driver echoes — do not
+pin them. Two other "49/50" label-tracking bytes were tried and rejected
+as the source — see Disproven & traps.
+
+The `pins` profile key holds both flags for every session, so cold boots
+can no longer silently downgrade recordings to 3-button (which has no
+Block and would poison attack labels).
+
+## Calibration
+
+**GROUND_Y = 110, not 121** (2026-08-27, orchestrator, first real fit).
+Across a real play session both fighters stand at y=110 (2904/~3100 P1
+frames; P2 identical); the W2 jump-parabola baseline of 121 was measured
+from a different stance/stage snapshot (full story in Fighter structs,
+above). With 121 the airborne test (`GROUND_Y − y > 4`) marked 99.7% of
+decisions "air".
+
+**World X vs. screen X — the corner feature is unusable until stage
+bounds are RE'd**: `x` in the fighter struct is WORLD position, not
+screen position; world x runs ~500–800 vs `SCREEN_W=320`, putting everyone
+permanently "past the right edge" (87% corner bucket) under a naive
+screen-space corner check. `CORNER_PX`/`SCREEN_W` were removed from
+calibration so `me_corner` drops out via the availability table. OPEN:
+find per-stage world bounds (or a camera-x global to derive screen x).
+
+## Enforcement — what actually works
+
+| lever | status |
+|---|---|
+| health refill | **Likely works** via `write_memory` to both `health` and `health_mirror` on the target side (`0xFFB622`+`0xFFB624` for P1, `0xFFB712`+`0xFFB714` for P2) — the primary byte is write-tested and authoritative; the mirror is written defensively by analogy with the arcade port's dual-accumulator finding, not because independent divergence was observed here. |
+| health_max | **120** (`0x78`) — round-start fill value, and the write-verified full-bar value. |
+| timer hold | **Functional** — `0xFFAB97` write-verified authoritative (above); hold bytes `[0x99, 0x00]`. |
+| position write | **Works** — X (`+0xD8`) and Y (`+0xDC`) both accept writes and visibly relocate the fighter (teleport/levitate verified); write the fraction word (`+0xDA`/`+0xDE`) to 0 alongside. |
+| credits | **N/A** — home-console cartridge, no coin/credit system; `start` joins/continues directly. |
+
+## Open gaps
+
+1. **Facing** — not hunted; candidates likely near the X/Y fields.
+2. **Wins-per-player** — not investigated.
+3. **round_over (`0xFFB5E0`) write-test** — still correlation-only.
+4. Full roster id cross-check beyond the 4 ids exercised (1, 3, 7, 9).
+5. The ~9 s **GAME OVER gate window** (draw-timeout only) if it ever
+   matters in practice.
+6. **Per-stage world-X bounds** (or a camera-x global) needed before the
+   corner feature can be reintroduced (see Calibration).
+
+## Disproven & traps
+
+Preserved verbatim in substance — these are as useful as the confirmed
+addresses, either because the trap could recur or because the disprove
+(or, in one case, disprove-then-*retract*) teaches the method.
 
 - **Genesis Game Genie codes for this game** (`gamegenie.com`, e.g.
   `ALAA-AA9C` "P1 Infinite Health", `ABVT-BE64` "Infinite time"): decoded
@@ -294,15 +416,81 @@ different game configuration) and is superseded.
 - **`0xFFB18B`** (position candidate): `+90` after walking right, but a
   forced write of `5000` produced no visible teleport. Disproven — the
   real X is the struct field `+0xD8` (teleport-verified).
-- **`0xFF098F`** (gate discriminator candidate): survived 45 fight
-  snapshots and a 50-sample combat poll in two stages, then read nonzero
-  (68, fluctuating) during a live Living Forest fight — sound-driver
-  state, not game phase. Do not readopt.
-- ~~`0xFFAB97` / `0xFFAB9C` timer disproof~~ — **retracted**: `0xFFAB97`
-  IS the authoritative timer; W1's post-write read caught the written
-  value after one legitimate BCD tick. See "The round timer — FOUND".
+- **`0xFF098F`** (gate discriminator candidate): read 0 in 13 fight
+  samples and nonzero in all 32 non-fight samples of the first capture
+  batch, survived 45 fight snapshots total and a 50-sample rapid poll
+  during arena-stage combat in two stages — and then read a fluctuating
+  **68** during a live Living Forest duel/fight. It sits in the
+  `0xFF09xx` sound-driver span; its "screen id"-looking values (96=title,
+  136=menu, 32=char select) are music-state, not game-phase. Do not
+  readopt.
+- ~~`0xFFAB97` / `0xFFAB9C` timer disproof~~ — **retracted**. This is a
+  disprove-then-*re-verify* worth keeping in full: W1 wrote `0x50` to both
+  bytes, read back `0x49`/`0x99` ~15 frames later, and called the store
+  disproven. Re-examined with a coherent write test, that `0x49` was
+  simply the written value legitimately ticking down one BCD step (0x50 →
+  0x49 after one second) — writing `0x50` to `0xFFAB97` made the on-screen
+  timer display 50 and keep counting, and writing `0x02` ran the clock out
+  to a genuine timeout ending (a real GAME OVER screen in a 2-human draw).
+  `0xFFAB97` **is** the authoritative timer; the original disproof was a
+  misread of a correctly-ticking write, not a bad address. See The round
+  timer, above, for the current-truth version.
+- **`0xFF07A8`/`0xFF07AC`** (pause-flag candidates): track pause only
+  coincidentally in-fight — they read 62/60 and 43/44 across menus
+  (sound/animation counters, not flags). Disproven; the real pause flag is
+  `0xFFD7D3` (twin `0xFFDA53`), see The controllable gate.
+- **`0xFFB2AE`/`0xFFB2F4`** ("49/50" bytes): track the pad-mode menu
+  label's rendering and are DERIVED — a write-test showed no re-render.
+  Disproven as the pad-mode source; the real flags are `0xFFF9D1`/`0xFFF9D0`,
+  see Buttons & pad mode.
 
-## W2 probe gotchas (additions)
+## Session craft
+
+Workflow lessons from applying the Method above across two RE passes (W1,
+W2) plus a headless-playback-verification pass. Kept together here so
+future sessions don't relearn them.
+
+**Probe gotchas (Genesis-MK2-specific, W1/W2):**
+
+- Headless pacing here ran close to real-time (~51 fps measured over a 5 s
+  window), NOT dramatically uncapped — `press_buttons(frames=N)` does not
+  block for those N frames, it queues input that drains over the *next* N
+  frames of whatever real time elapses in the background. Every
+  multi-step menu script needs an explicit `time.sleep()` after each
+  `press_buttons` (0.15-2.5 s depending on the transition) or the
+  follow-up screenshot/read just re-observes the pre-press frame.
+  (Editorial note, 2026-08-27 consolidation pass: a `--pace` CLI flag now
+  exists — default `1.0`, paced to real-time; `0` or negative = uncapped
+  — so a session that wants deterministic, human-realistic timing no
+  longer has to fight the default uncapped-adjacent behavior described
+  here and below.)
+- `enable_writes` is per-session (Method #4) — a fresh script/process
+  needs it again even if an earlier process already armed writes.
+- The pre-round "ROUND N" / "FIGHT!!" banner ignores input and freezes the
+  timer at 99 for **several real seconds** (longer than the arcade port's
+  ~2 s leak) before live combat starts; scripts that press an attack too
+  early land nothing.
+- The CPU is fast and aggressive from the first live frame: an idle P1 was
+  KO'd in as little as ~4-9 real seconds across several attempts. Bank a
+  save state at the *exact* "ROUND N, timer 99, full green bars" frame or
+  every later probe re-fights CPU aggression from scratch.
+- "PUSH START" printed over P2's name during a live 1P-vs-CPU round is a
+  **permanent 2P-join invitation overlay**, not a round-over indicator —
+  it is visible from the very first live frame of a fresh round. Do not
+  confuse it with the arcade port's win-declared state.
+- Joining P2 via `start` on port 1 (Method #5's rig) does not
+  deterministically hand P2 to human control: after a long idle stretch,
+  P2 (Reptile) was seen to throw an unprompted jump-kick that knocked P1
+  down while nothing was pressed on port 1. Treat this 2P-rig's damage
+  tests as trustworthy only when the *other* side's health stayed
+  provably flat for the whole window. (Contrast with the button-testing
+  join path in Buttons & pad mode, which does not have this problem.)
+- `read_memory`/`write_memory` hex fields are hex STRINGS (e.g. `"78"` =
+  120 decimal) — several early probes in this session mis-read them as
+  decimal before catching the mistake; every value in this doc has been
+  re-derived correctly.
+
+**W2 probe gotchas (additions):**
 
 - **Screenshots right after `load_state` are stale**: RAM is restored
   immediately but `app://screen` still shows the last rendered frame until
@@ -321,81 +509,33 @@ different game configuration) and is superseded.
   first ~2 s after load — bank states a beat *after* the banner clears
   (verify with a walk-write X read-back) or sleep 2.5 s post-load.
 
-## What training-mode readiness still lacks
-
-1. **Facing** — not hunted; candidates likely near the X/Y fields.
-2. **Wins-per-player** — not investigated.
-3. **round_over (`0xFFB5E0`) write-test** — still correlation-only.
-4. Full roster id cross-check beyond the 4 ids exercised (1, 3, 7, 9).
-5. The ~9 s **GAME OVER gate window** (draw-timeout only) if it ever
-   matters in practice.
-
-## Session gotchas — headless playback verification (2026-08-27, orchestrator)
+**Session gotchas — headless playback verification (2026-08-27,
+orchestrator):**
 
 - **The committed arena state is saved in-game PAUSED.** Loading
-  `shadow/arenas/mk2/genesis-probe.state` gives a frozen fight (timer stuck at
-  BCD 0x98, fighters inert) that the gate reads as OPEN — in-game pause is
-  invisible to the 3-condition gate. One P1 Start press unpauses. OPEN ITEM:
-  find the pause flag in WRAM and add `byte_zero(pause)` to the gate — until
-  then the recorder happily records rows during pause and `game.controllable()`
-  lies there.
-- **Start is heavily overloaded**: P1 Start = pause toggle; P2 Start mid-fight
-  = join, which detours through P2 char select (fighter x reads 28/292 there —
-  those are select-screen values, not a crash). At uncapped headless speed this
-  flow is fragile; in windowed play at human speed it's the normal "controller
-  2 presses Start, picks a character" flow.
-- **Timer sub-second byte `0xFFAB96` is the reliable running/paused oracle**
-  (advances every frame when the game runs, static under pause) — use it, not
-  the gate, to decide whether the world is live.
+  `shadow/arenas/mk2/genesis-probe.state` gives a frozen fight (timer
+  stuck at BCD `0x98`, fighters inert) that the (then-)3-condition gate
+  read as OPEN — in-game pause was invisible to it. One P1 Start press
+  unpauses. **RESOLVED** — see The controllable gate: `0xFFD7D3`
+  `pause_flag` was found and added as the gate's 4th condition; the
+  committed state now correctly reads `controllable=false` until
+  unpaused.
+- **Start is heavily overloaded**: P1 Start = pause toggle; P2 Start
+  mid-fight = join, which detours through P2 char select (fighter x reads
+  28/292 there — those are select-screen values, not a crash). At
+  uncapped headless speed this flow is fragile; in windowed play at human
+  speed it's the normal "controller 2 presses Start, picks a character"
+  flow. (See the `--pace` note above — running a session at `--pace 1.0`
+  or lower narrows the gap between headless and windowed-human timing.)
+- **Timer sub-second byte `0xFFAB96` is the reliable running/paused
+  oracle** (advances every frame when the game runs, static under pause)
+  — use it, not the gate, to decide whether the world is live.
 - Verified this session: the generalized runner emits decisions on this
   profile (correct block2 anchoring, sensible masks) and port-2 injected
-  input lands in-game (the join itself proves it). Full 2-human shadow fight
-  is a windowed-play exercise.
+  input lands in-game (the join itself proves it). Full 2-human shadow
+  fight is a windowed-play exercise.
 
-## Calibration corrections from the first real fit (2026-08-27, orchestrator)
+## What training-mode readiness still lacks
 
-- **GROUND_Y = 110, not 121.** Across a real play session both fighters stand
-  at y=110 (2904/~3100 P1 frames; P2 identical); the W2 jump-parabola baseline
-  of 121 was measured from a different stance/stage snapshot. With 121 the
-  airborne test (GROUND_Y − y > 4) marked 99.7% of decisions "air".
-- **x is WORLD position, so the corner feature is unusable until stage bounds
-  are RE'd**: world x runs ~500–800 vs SCREEN_W=320, putting everyone
-  permanently "past the right edge" (87% corner bucket). CORNER_PX/SCREEN_W
-  removed from calibration so me_corner drops out via the availability table.
-  OPEN: find per-stage world bounds (or a camera-x global to derive screen x).
-
-## Pad-mode flags — pinned (2026-08-27, orchestrator)
-
-**VERIFIED (write-tested, driver-level):** the Extra Controls per-port pad
-type lives at `0xFFF9D1` (Port 1) / `0xFFF9D0` (Port 2): 1 = 6 BUTTON,
-0 = the ACTIVATOR/normal cycle. Found via same-screen WRAM diff across the
-menu's cycle button (the value cycles with Genesis A — RETRO `b` — NOT
-left/right; left/right only reveal the cursor). Three independent proofs:
-(1) writing the byte re-renders the menu label live (the game polls it);
-(2) with flag=1 a held RETRO `l` decodes into the pad-state bytes
-`0xFFF9D5/D6/D8` (bit 0x20), with flag=0 the driver ignores the button
-entirely; (3) cold boot with the profile `pins` asserting both flags at
-1 Hz gives full 6-button decode with no menu visit. Nearby derived bytes
-(`0xFFF9D3/DE/E1/EC/ED`) are driver echoes — do not pin them.
-Note: the 0xFFB2AE/0xFFB2F4 "49/50" bytes track the menu label rendering
-and are DERIVED (write-test showed no re-render) — disproven as sources.
-The `pins` profile key holds both flags for every session, so cold boots
-can no longer silently downgrade recordings to 3-button (which has no
-Block and would poison attack labels).
-
-## Pause flag — gate condition (2026-08-27, orchestrator, consolidation pass)
-
-**VERIFIED (3 pause cycles + phase sweep):** `0xFFD7D3` (twin copy
-`0xFFDA53`) is 1 during in-game pause and 0 in running fights, post-fight,
-and attract — added to the gate as `byte_zero(pause_flag)`, closing the
-"recorder records paused frames / controllable() lies under pause" gap.
-Found by stable-diff between the paused arena state and the unpaused fight
-(the arena being saved mid-pause was, for once, useful). CAVEAT, recorded
-honestly: the address sits in what looks like render scratch (the PAUSED
-overlay), so another overlay could conceivably write it mid-fight — the
-failure mode is benign (gate closes, recorder skips frames), and no such
-flicker was observed in any tested phase. DISPROVEN as pause flags:
-0xFF07A8/0xFF07AC track pause only coincidentally in-fight (they read
-62/60 and 43/44 across menus — sound/animation counters, not flags).
-Note the committed genesis-probe.state is itself paused: with this gate
-it now correctly reads controllable=false until unpaused (P1 Start).
+See Open gaps, above — kept as one canonical list rather than duplicated
+here.
