@@ -382,3 +382,20 @@ and are DERIVED (write-test showed no re-render) — disproven as sources.
 The `pins` profile key holds both flags for every session, so cold boots
 can no longer silently downgrade recordings to 3-button (which has no
 Block and would poison attack labels).
+
+## Pause flag — gate condition (2026-08-27, orchestrator, consolidation pass)
+
+**VERIFIED (3 pause cycles + phase sweep):** `0xFFD7D3` (twin copy
+`0xFFDA53`) is 1 during in-game pause and 0 in running fights, post-fight,
+and attract — added to the gate as `byte_zero(pause_flag)`, closing the
+"recorder records paused frames / controllable() lies under pause" gap.
+Found by stable-diff between the paused arena state and the unpaused fight
+(the arena being saved mid-pause was, for once, useful). CAVEAT, recorded
+honestly: the address sits in what looks like render scratch (the PAUSED
+overlay), so another overlay could conceivably write it mid-fight — the
+failure mode is benign (gate closes, recorder skips frames), and no such
+flicker was observed in any tested phase. DISPROVEN as pause flags:
+0xFF07A8/0xFF07AC track pause only coincidentally in-fight (they read
+62/60 and 43/44 across menus — sound/animation counters, not flags).
+Note the committed genesis-probe.state is itself paused: with this gate
+it now correctly reads controllable=false until unpaused (P1 Start).
