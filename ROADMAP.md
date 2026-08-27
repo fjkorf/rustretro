@@ -132,7 +132,7 @@ which *is* litui's event model. Keep `AppState` a dumb viewmodel; never let doma
 
 ### Sequenced execution plan — "tutorials working in litui"
 
-The target milestone for the integration phase: **the 15 tutorial pages already authored in
+The target milestone for the integration phase: **the tutorial pages (now 18) already authored in
 `docs/tutorials/` render as in-app litui screens (Help → Tutorials).** They are pure
 display/document content with no state round-trip, so they are the *lowest-risk first real
 litui surface* — a better first mount than a form. Everything below is bundled to reach that

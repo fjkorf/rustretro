@@ -310,10 +310,11 @@ fn main() -> Result<()> {
         .insert_resource(DebugOverlay(debug::window::DebugApp::new(debug_state)))
         .insert_non_send_resource(LuaRes(lua_engine))
         .insert_resource(ScriptPanel::new())
+        .insert_resource(debug::panels::controls::ControlsPanel::new())
         .init_resource::<TutorialPages>()
         .add_systems(Startup, setup)
         .add_systems(Update, (calibrate_wizard, read_input, run_emulation, run_scripts, drain_lua_requests, sync_video, queue_audio, update_title).chain())
-        .add_systems(EguiPrimaryContextPass, (show_debug, show_script_panel, show_tutorial_pages))
+        .add_systems(EguiPrimaryContextPass, (show_debug, show_script_panel, debug::panels::controls::show_controls_panel, show_tutorial_pages))
         .run();
 
     Ok(())
@@ -465,18 +466,62 @@ impl CalibrateState {
     }
 }
 
-/// (prompt, RETRO bits the captured button will emit)
-fn calibrate_steps() -> Vec<(&'static str, Vec<input_config::RetroButton>)> {
-    use input_config::RetroButton::*;
-    vec![
-        ("LIGHT attack", vec![B]),
-        ("MEDIUM attack", vec![A]),
-        ("HEAVY attack", vec![Y]),
-        ("WEAPON TOSS (chord: all three attacks)", vec![B, A, Y]),
-        ("LAUNCHER (chord: two attacks)", vec![B, A]),
-        ("COIN / select", vec![Select]),
-        ("START", vec![Start]),
-    ]
+/// (prompt, RETRO bits the captured button will emit) — generated from the
+/// action vocabulary (`input_config::action_rows`, docs/game-profiles.md
+/// "Controls contract") instead of hardcoded Asura Blade semantics, so a new
+/// game profile gets a working wizard for free. Descriptors aren't available
+/// pre-boot (the wizard runs at startup before the core sends any), so we
+/// pass an all-`None` descriptor table — `profile::current()` (profile::init
+/// already ran in `main`) supplies every name the wizard needs. Direction
+/// rows are skipped: the lever/dpad passthrough handles those, as before.
+fn calibrate_steps() -> Vec<(String, Vec<input_config::RetroButton>)> {
+    use input_config::RetroButton;
+    let descriptors: [[Option<String>; 12]; 2] = Default::default();
+    input_config::action_rows(0, &descriptors)
+        .into_iter()
+        .filter(|row| {
+            !(row.bits.len() == 1
+                && matches!(
+                    row.bits[0],
+                    RetroButton::Up | RetroButton::Down | RetroButton::Left | RetroButton::Right
+                ))
+        })
+        .map(|row| (row.name.to_uppercase(), row.bits))
+        .collect()
+}
+
+#[cfg(test)]
+mod calibrate_steps_tests {
+    use super::calibrate_steps;
+    use crate::input_config::RetroButton::*;
+
+    /// Resolver order is Start, Coin, then attack classes in family order
+    /// (family.json: Light, Medium, Heavy, Launcher, Toss) — differs from
+    /// the old hardcoded wizard's ORDER (attacks first), but the SET of
+    /// (name, bits) pairs must cover the exact same bits.
+    #[test]
+    fn asurabld_generated_steps_match_legacy_bit_set() {
+        crate::profile::init_for_tests();
+        let steps = calibrate_steps();
+        let got: Vec<(&str, Vec<crate::input_config::RetroButton>)> =
+            steps.iter().map(|(n, b)| (n.as_str(), b.clone())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("START", vec![Start]),
+                ("COIN", vec![Select]),
+                ("LIGHT", vec![B]),
+                ("MEDIUM", vec![A]),
+                ("HEAVY", vec![Y]),
+                ("LAUNCHER", vec![B, A]),
+                ("TOSS", vec![B, A, Y]),
+            ]
+        );
+        // Directions are never steps — the lever/dpad passthrough covers them.
+        for (name, _) in &steps {
+            assert!(!matches!(name.as_str(), "UP" | "DOWN" | "LEFT" | "RIGHT"));
+        }
+    }
 }
 
 fn calibrate_wizard(
@@ -503,7 +548,7 @@ fn calibrate_wizard(
             gp.entry(b).or_insert_with(|| vec![d]);
         }
         for port in cfg.ports.iter_mut() {
-            port.gamepad = gp.clone();
+            port.gamepad = gp.iter().map(|(b, v)| (*b, input_config::Chord(v.clone()))).collect();
         }
         let json = serde_json::to_string_pretty(&*cfg).unwrap();
         match std::fs::write(&cal.out_path, &json) {
@@ -567,6 +612,7 @@ pub const KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
         ("B", "capture bookmark"),
         ("F8", "tutorials window"),
         ("F10", "Lua script panel"),
+        ("F11", "controls panel (view + rebind)"),
     ]),
     ("Save states", &[
         ("F6", "save state → slot 1 (Shift: slot 2)"),
@@ -585,7 +631,7 @@ pub const KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
 
 fn read_input(
     keys: Res<ButtonInput<KeyCode>>,
-    pads: Query<(Entity, &Gamepad)>,
+    pads: Query<(Entity, &Gamepad, Option<&Name>)>,
     mut emu: NonSendMut<Emu>,
     debug_state: Res<DebugStateRes>,
     mut script_panel: ResMut<ScriptPanel>,
@@ -593,11 +639,27 @@ fn read_input(
     pad_debug: Res<PadDebug>,
     cfg: Res<input_config::InputConfig>,
     mut last_pad_dbg: Local<String>,
+    // `Option` because the Controls panel resource is inserted by the App
+    // builder (outside this function's ownership, per the Controls-phase
+    // task split) — this stays a no-op interlock until that insert_resource
+    // lands, then picks it up live with no further change here.
+    mut controls_panel: Option<ResMut<crate::debug::panels::controls::ControlsPanel>>,
 ) {
     use KeyCode::*;
+    // Capture-mode interlock (Controls panel, docs/game-profiles.md): while a
+    // rebind capture is armed, don't fold keyboard/gamepad into game input —
+    // a capture keypress must not also punch in-game. Hotkeys (F1-F12) below
+    // still run.
+    let capturing = controls_panel.as_deref().is_some_and(|p| p.capturing());
     // Keyboard bindings per port, from the active keymap config.
-    let mut bits = input_config::key_bits(|k| keys.pressed(k), &cfg.ports[0]);
-    let mut bits2 = if cfg.ports.len() > 1 {
+    let mut bits = if capturing {
+        [false; 12]
+    } else {
+        input_config::key_bits(|k| keys.pressed(k), &cfg.ports[0])
+    };
+    let mut bits2 = if capturing {
+        [false; 12]
+    } else if cfg.ports.len() > 1 {
         input_config::key_bits(|k| keys.pressed(k), &cfg.ports[1])
     } else {
         [false; 12]
@@ -606,27 +668,30 @@ fn read_input(
     // cfg.pad_order (keyboard still live — OR, not replace). Replugging
     // mid-session can reorder pads; pad_order [1,0] swaps two pads.
     let mut pad_list: Vec<_> = pads.iter().collect();
-    pad_list.sort_by_key(|(e, _)| *e);
-    for (slot, (_, pad)) in pad_list.iter().take(2).enumerate() {
-        let port = cfg.pad_order.get(slot).copied().unwrap_or(slot);
-        if port >= cfg.ports.len().min(2) {
-            continue;
-        }
-        let gb = input_config::pad_bits(
-            |b| pad.pressed(b),
-            pad.left_stick(),
-            &cfg.ports[port],
-            cfg.stick_deadzone,
-        );
-        let target = if port == 0 { &mut bits } else { &mut bits2 };
-        for i in 0..12 {
-            target[i] |= gb[i];
+    pad_list.sort_by_key(|(e, _, _)| *e);
+    if !capturing {
+        for (slot, (_, pad, name)) in pad_list.iter().take(2).enumerate() {
+            let port = cfg.pad_order.get(slot).copied().unwrap_or(slot);
+            if port >= cfg.ports.len().min(2) {
+                continue;
+            }
+            let gb = input_config::pad_bits_for_device(
+                |b| pad.pressed(b),
+                pad.left_stick(),
+                &cfg.ports[port],
+                cfg.stick_deadzone,
+                name.map(|n| n.as_str()),
+            );
+            let target = if port == 0 { &mut bits } else { &mut bits2 };
+            for i in 0..12 {
+                target[i] |= gb[i];
+            }
         }
     }
     // --pad-debug: log the raw pressed set + stick when it changes, so unmapped
     // controllers' button identities can be observed without a rebuild.
     if pad_debug.0 {
-        if let Some((_, pad)) = pad_list.first() {
+        if let Some((_, pad, _)) = pad_list.first() {
             let cur = format!(
                 "{:?} stick={:.2},{:.2} dpad={:.2},{:.2}",
                 pad.get_pressed().collect::<Vec<_>>(),
@@ -649,6 +714,11 @@ fn read_input(
         for i in 0..12 {
             bits[i] |= injected[i];
             bits2[i] |= injected2[i];
+        }
+        // Controls panel integration contract: mirror descriptors/save_dir/
+        // rom_stem while we already hold the DebugState lock.
+        if let Some(panel) = controls_panel.as_deref_mut() {
+            panel.sync_descriptors(&ds);
         }
     }
     emu.0.set_input(bits);
@@ -740,6 +810,11 @@ fn read_input(
     }
     if keys.just_pressed(F8) {
         tutorials.open = !tutorials.open;
+    }
+    if keys.just_pressed(F11) {
+        if let Some(panel) = controls_panel.as_deref_mut() {
+            panel.open = !panel.open;
+        }
     }
 }
 

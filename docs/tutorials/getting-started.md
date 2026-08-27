@@ -56,6 +56,7 @@ of using an instrument instead of a player.
 
 ## See also
 
+- [Controls](/docs/tutorials/controls.md) — set up keyboard/pad bindings before you play.
 - [The Docking Workspace](/docs/tutorials/docking-workspace.md) — rearrange and save your layout.
 - [RAM Search](/docs/tutorials/ram-search.md) — your first real hunt: the health bar.
 

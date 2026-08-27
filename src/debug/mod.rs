@@ -749,6 +749,12 @@ pub struct DebugState {
     /// "stopped — N frames").
     pub record_note: Option<String>,
 
+    // --- Input descriptors (core-provided per-game button names) ---
+    /// `input_descriptors[port][retro_id]` = the core's label for that button
+    /// in THIS game (RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS), e.g. FBNeo's
+    /// "Weak attack". Feeds the action-vocabulary resolver + Input monitor.
+    pub input_descriptors: [[Option<String>; 12]; 2],
+
     // --- Help panel ---
     /// Human-readable ACTIVE input bindings (label, mapping) published once at
     /// startup from the resolved `InputConfig` — see `input_config::summary`.
@@ -842,6 +848,7 @@ impl DebugState {
             record_status: None,
             record_note: None,
             keymap_lines: Vec::new(),
+            input_descriptors: Default::default(),
         }
     }
 

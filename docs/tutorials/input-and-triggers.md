@@ -52,6 +52,8 @@ timeline lets you read the inputs that got you there.
 
 ## See also
 
+- [Controls](/docs/tutorials/controls.md) — rebind which key/pad button fires which of
+  these 12 RETRO buttons.
 - [Tiles & Frames](/docs/tutorials/tiles-and-frames.md) — pick the pixel coordinates for a pixel trigger.
 - [Disassembly & Breakpoints](/docs/tutorials/disassembly-and-breakpoints.md) — once paused on the frame, step into the code.
 

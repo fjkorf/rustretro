@@ -1,7 +1,15 @@
 {
   "family": "mk2",
   "title": "Mortal Kombat II",
-  "roster": [],
+  "roster": [
+    { "id": 0, "name": "kunglao", "select_slot": 1 },
+    { "id": 1, "name": "liukang", "select_slot": 0 },
+    { "id": 3, "name": "baraka", "select_slot": null },
+    { "id": 4, "name": "kitana", "select_slot": null },
+    { "id": 7, "name": "raiden", "select_slot": null },
+    { "id": 9, "name": "reptile", "select_slot": null },
+    { "id": 11, "name": "jax", "select_slot": null }
+  ],
   "move_classes": [
     "Neutral", "Forward", "Back", "Up", "Down",
     "UpForward", "UpBack", "DownForward", "DownBack"

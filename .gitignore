@@ -37,6 +37,6 @@ scripts/re/revenv/
 # Training data & derived models (goat-v2 stays tracked for the runner tests)
 shadow/recordings/
 shadow/models/
-shadow/arenas/current.state
+shadow/arenas/*/current.state
 scratchpad/
 .DS_Store

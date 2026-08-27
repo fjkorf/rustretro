@@ -14,6 +14,7 @@ cross-links from there.
 
 ## Getting Started
 - [Getting Started](/docs/tutorials/getting-started.md) — launch with `--debug`, the toolbar, the dock panels.
+- [Controls](/docs/tutorials/controls.md) — the 🎛 Controls panel, the `--calibrate` wizard, and `keymap.json`.
 - [The Docking Workspace](/docs/tutorials/docking-workspace.md) — arrange panels, save/reset layout, linked navigation.
 
 ## Memory & Search
@@ -50,6 +51,7 @@ frontmatter, not a page):
 | File | litui `page: name` |
 |------|--------------------|
 | `getting-started.md` | `GettingStarted` (default) |
+| `controls.md` | `Controls` |
 | `docking-workspace.md` | `DockingWorkspace` |
 | `watch-and-freeze.md` | `WatchAndFreeze` |
 | `ram-search.md` | `RamSearch` |

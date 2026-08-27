@@ -18,7 +18,7 @@
 //!
 //! Golden-value unit tests below pin the npz reader and the vote math to
 //! numbers extracted from the Python implementation on the real
-//! `shadow/models/goat-v2` model.
+//! `shadow/models/asurabld/goat-v2` model.
 //!
 //! ## Wiring (design decision)
 //! The runner is owned by `Frontend` (`shadow: Option<ShadowRunner>`), not
@@ -947,8 +947,8 @@ impl ShadowRunner {
         // Provenance: another FAMILY's model is the wrong game — hard error.
         // Another PORT of the same family is a supported experiment — warn,
         // and stamp the model card so the panel shows it.
-        if let Some(fam) = &meta.family {
-            if *fam != prof.family.family {
+        match &meta.family {
+            Some(fam) if *fam != prof.family.family => {
                 return Err(format!(
                     "{}: model was trained for family '{fam}' but the loaded profile is \
                      '{}' — refusing to drive the wrong game",
@@ -956,6 +956,13 @@ impl ShadowRunner {
                     prof.family.family
                 ));
             }
+            Some(_) => {}
+            None => eprintln!(
+                "[shadow] WARNING: {} has no family stamp — cannot verify it matches \
+                 '{}'. Pre-stamp models are asurabld-era; restamp its meta.json.",
+                meta_path.display(),
+                prof.family.family
+            ),
         }
         let cross_port = meta
             .port
@@ -1308,12 +1315,12 @@ mod tests {
     const BIT_A: u16 = 8;
 
     fn goat_v2() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shadow/models/goat-v2")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shadow/models/asurabld/goat-v2")
     }
 
     fn load_goat_model() -> KnnModel {
         let bytes = std::fs::read(goat_v2().join("cases.npz")).expect(
-            "shadow/models/goat-v2/cases.npz missing — the npz golden tests need the real model",
+            "shadow/models/asurabld/goat-v2/cases.npz missing — the npz golden tests need the real model",
         );
         KnnModel::from_npz(parse_npz(&bytes).unwrap(), 9, 6).unwrap()
     }
@@ -1323,7 +1330,7 @@ mod tests {
     }
 
     /// Reference values extracted with shadow/train/.venv python:
-    ///   d = numpy.load('shadow/models/goat-v2/cases.npz')
+    ///   d = numpy.load('shadow/models/asurabld/goat-v2/cases.npz')
     ///   X float32 (13405, 84); mu/sd float32 (84,); y_* int64; k=15; T=1.0
     ///   X[0][:4]  = [ 0.09305416,  0.04422662, -0.3448887 , -0.28220278]
     ///   mu[:4]    = [ 0.8746433 , -0.89317596,  0.10630362,  0.05048781]

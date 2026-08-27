@@ -1,119 +1,268 @@
-//! Training mode v1 (shadow PLAN Wave 2b): an infinite, resettable practice
+//! Training mode (shadow PLAN Wave 2b): an infinite, resettable practice
 //! fight for demonstration recording.
 //!
-//! Enabled with `--training`. Each emulated frame, [`tick`] enforces:
-//! - **credits topped up** (`$40655D`) so Start always works,
-//! - **round timer held** at 85 seconds (`$40000A/B`, BCD) — no timeouts,
-//! - **health refill**: when either fighter drops below the threshold both
-//!   health bytes are rewritten to max, so damage/hitstun stay visible but
-//!   nobody is ever KO'd (toggle with F3),
+//! Enabled with `--training`/F5. Each emulated frame, [`tick`] applies every
+//! enforcement the loaded profile can support — **per-feature, not
+//! all-or-nothing**, so a partially-mapped game (MK2) gets health refill and
+//! the dummy while its unmapped enforcements (timer hold, credits, position
+//! reset) decline individually:
+//! - **credits topped up** so Start always works (`credits` global),
+//! - **round timer held** — no timeouts (`round_timer` global),
+//! - **health refill**: below the threshold every mapped health byte is
+//!   rewritten to max — fighter-block health/health2 plus any per-player HUD
+//!   accumulator globals (`p1_health_hud`/`p2_health_hud`; MK2 damages all
+//!   four independently) — so damage/hitstun stay visible but nobody is ever
+//!   KO'd (toggle with F3),
 //! - **dummy control**: a preset drives controller port 1 (F1 cycles
-//!   Free / Stand / Crouch / Jump / Block) — Block holds away from the
-//!   other fighter using the live block X positions,
-//! - **position reset** (F2) and **finish round now** (F4) one-shots.
+//!   Free / Stand / Crouch / Jump / Block) — Block holds away from the other
+//!   fighter using live X positions (fighter-field `x` or `p1_x`/`p2_x`
+//!   globals),
+//! - **position reset** (F2, needs X source + explicit `positions`) and
+//!   **finish round now** (F4, needs `round_state`) one-shots.
 //!
-//! All writes go through `DebugState::write_addr`, which routes bus-window
-//! addresses onto the live 68k bus via the Sek write queue. Addresses are the
-//! Asura Blade map (`library/asurabld/asurabld.md`); the gate mirrors the
-//! recorder's composite (`src/record.rs`).
+//! The in-fight gate is the profile's `gate` condition list — the SAME gate
+//! the recorder and Lua `game.controllable()` evaluate ([`eval_gate`], shared
+//! with `lua_engine`). A profile with no gate list (a stub) has no training
+//! at all; [`available`]/[`features`] tell the panel what to offer.
+//!
+//! All writes go through `DebugState::write_addr`: bus-window addresses queue
+//! onto the live 68k bus via the Sek write queue; direct-pointer regions
+//! (FBNeo System RAM fallback) are written in place. `freeze` does NOT land
+//! on the latter (mk2.md) — per-frame re-assertion here is the workaround.
 
 use crate::debug::{DebugState, DummyMode};
-use crate::profile::GameProfile;
+use crate::profile::{GameProfile, GateCond};
+
+/// Which training features the loaded profile supports — the panel uses this
+/// to disable individual controls with honest hints instead of hiding the
+/// whole mode behind one all-or-nothing message.
+pub struct Features {
+    pub refill: bool,
+    pub timer_hold: bool,
+    pub credits: bool,
+    pub position_reset: bool,
+    pub finish_round: bool,
+    pub block_dummy: bool,
+}
+
+impl Features {
+    /// Feature labels that are NOT mapped for this game (panel hint line).
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut m = Vec::new();
+        if !self.refill {
+            m.push("health refill");
+        }
+        if !self.timer_hold {
+            m.push("timer hold");
+        }
+        if !self.credits {
+            m.push("credits top-up");
+        }
+        if !self.position_reset {
+            m.push("position reset");
+        }
+        if !self.finish_round {
+            m.push("finish round");
+        }
+        if !self.block_dummy {
+            m.push("Block dummy");
+        }
+        m
+    }
+}
+
+/// One fighter's refill writes: `check` is the authoritative struct health
+/// consulted against the threshold; `addrs` is every byte rewritten to max
+/// (struct health, health2 if mapped, per-player HUD accumulator if mapped).
+struct RefillSide {
+    check: u32,
+    addrs: Vec<u32>,
+}
+
+struct Refill {
+    sides: [RefillSide; 2],
+    max: u8,
+    below: u8,
+}
+
+/// Resolved absolute X addresses for the two fighters (block field or globals).
+#[derive(Clone, Copy)]
+struct XPair {
+    p1: u32,
+    p2: u32,
+}
+
+struct Reset {
+    x: XPair,
+    left: u16,
+    right: u16,
+    /// (block1 y, block2 y, ground) — only when the profile maps Y.
+    y: Option<(u32, u32, u16)>,
+}
 
 /// Values resolved from the loaded `GameProfile` once per `tick` call — kept
 /// as plain locals rather than a cached/static struct so the profile stays
 /// hot-swappable-in-theory and the hot path stays simple (small `Vec`/`BTreeMap`
 /// lookups on a handful of fields, once per emulated frame — cheap).
 struct Resolved {
-    block1: u32,
-    block2: u32,
-    health_off: u32,
-    health2_off: u32,
-    x_off: u32,
-    y_off: u32,
-    round_timer: u32,
-    round_state: u32,
-    credits: u32,
-    round_over: u32,
-    abort: u32,
-    match_end: u32,
-
-    health_max: u8,
-    refill_below: u8,
-    timer_hold: [u8; 2],
-    credits_target: u8,
-    credits_min: u8,
-    reset_x: (u16, u16),
-    ground_y: u16,
+    little: bool,
+    refill: Option<Refill>,
+    timer: Option<(u32, [u8; 2])>,
+    credits: Option<(u32, u8, u8)>,
+    reset: Option<Reset>,
+    finish: Option<u32>,
+    x_pair: Option<XPair>,
+    /// For button-block families (MK): the held RETRO buttons that block,
+    /// resolved from `family.block.class` through `attack_chords`.
+    block_chord: Option<[bool; 12]>,
 }
 
-fn resolve(p: &GameProfile) -> Resolved {
-    let g = |name: &str| {
-        p.global(name)
-            .unwrap_or_else(|| panic!("profile missing global '{name}'"))
-    };
-    let field = |name: &str| {
-        p.field_off(name)
-            .unwrap_or_else(|| panic!("profile missing fighter field '{name}'"))
-            .0
-    };
-    Resolved {
-        block1: p.block1(),
-        block2: p.block2(),
-        health_off: field("health"),
-        health2_off: field("health2"),
-        x_off: field("x"),
-        y_off: field("y"),
-        round_timer: g("round_timer"),
-        round_state: g("round_state"),
-        credits: g("credits"),
-        round_over: g("round_over"),
-        abort: g("abort"),
-        match_end: g("match_end"),
-
-        health_max: p.port.enforcement.health_max,
-        refill_below: p.port.enforcement.refill_below,
-        timer_hold: p.port.enforcement.timer_hold,
-        credits_target: p.port.enforcement.credits_target,
-        credits_min: p.port.enforcement.credits_min,
-        reset_x: (
-            *p.port.positions.get("round_start_x_left").unwrap_or(&84) as u16,
-            *p.port.positions.get("round_start_x_right").unwrap_or(&232) as u16,
-        ),
-        ground_y: *p.port.positions.get("round_start_y").unwrap_or(&216) as u16,
+fn resolve(p: &GameProfile) -> Option<Resolved> {
+    // No gate list = no way to know when we're in a fight — training as a
+    // whole must no-op rather than enforce on menus (same class as the
+    // QA-found Record crash: stub profiles refuse softly).
+    if p.port.gate.is_empty() {
+        return None;
     }
+    let g = |name: &str| p.global(name);
+    let field = |name: &str| p.field_off(name).map(|(off, _)| off);
+    let e = &p.port.enforcement;
+
+    let x_pair = field("x")
+        .map(|off| XPair { p1: p.block1() + off, p2: p.block2() + off })
+        .or_else(|| Some(XPair { p1: g("p1_x")?, p2: g("p2_x")? }));
+
+    let refill = field("health").map(|off| {
+        let side = |base: u32, hud: &str| {
+            let mut addrs = vec![base + off];
+            if let Some(h2) = field("health2") {
+                addrs.push(base + h2);
+            }
+            if let Some(a) = g(hud) {
+                addrs.push(a);
+            }
+            RefillSide { check: base + off, addrs }
+        };
+        Refill {
+            sides: [side(p.block1(), "p1_health_hud"), side(p.block2(), "p2_health_hud")],
+            max: e.health_max,
+            below: e.refill_below,
+        }
+    });
+
+    let reset = (|| {
+        let x = x_pair?;
+        // Explicit positions required — no silent asurabld-shaped defaults
+        // teleporting an unmapped game to nonsense coordinates.
+        let left = *p.port.positions.get("round_start_x_left")? as u16;
+        let right = *p.port.positions.get("round_start_x_right")? as u16;
+        let y = (|| {
+            let off = field("y")?;
+            let ground = *p.port.positions.get("round_start_y")? as u16;
+            Some((p.block1() + off, p.block2() + off, ground))
+        })();
+        Some(Reset { x, left, right, y })
+    })();
+
+    let block_chord = if p.family.block.style == "button" {
+        p.family.block.class.as_deref().and_then(|class| {
+            let chord = p.port.attack_chords.get(class)?;
+            let mut bits = [false; 12];
+            for name in chord {
+                bits[crate::profile::retro_button_bit(name)? as usize] = true;
+            }
+            Some(bits)
+        })
+    } else {
+        None
+    };
+
+    Some(Resolved {
+        little: p.port.memory.endianness == "little",
+        refill,
+        timer: g("round_timer").map(|a| (a, e.timer_hold)),
+        credits: g("credits").map(|a| (a, e.credits_target, e.credits_min)),
+        reset,
+        finish: g("round_state"),
+        x_pair,
+        block_chord,
+    })
 }
 
 fn rd8(ds: &DebugState, addr: u32) -> u8 {
     ds.read_addr(addr as usize, 1).unwrap_or(0) as u8
 }
 
-fn rd16be(ds: &DebugState, addr: u32) -> u16 {
-    (ds.read_addr(addr as usize, 2).unwrap_or(0) as u16).swap_bytes()
+fn rd16(ds: &DebugState, addr: u32, little: bool) -> u16 {
+    let v = ds.read_addr(addr as usize, 2).unwrap_or(0) as u16;
+    if little { v } else { v.swap_bytes() }
 }
 
 fn wr8(ds: &mut DebugState, addr: u32, v: u8) {
     let _ = ds.write_addr(addr as usize, 1, v as u32);
 }
 
-fn wr16be(ds: &mut DebugState, addr: u32, v: u16) {
-    // write_addr takes little-endian value bytes to ascending addresses; the
-    // 68k stores big-endian, so swap so the guest reads `v`.
-    let _ = ds.write_addr(addr as usize, 2, v.swap_bytes() as u32);
+fn wr16(ds: &mut DebugState, addr: u32, v: u16, little: bool) {
+    // write_addr takes little-endian value bytes to ascending addresses; swap
+    // for big-endian guests (68k) so the guest reads `v`.
+    let v = if little { v } else { v.swap_bytes() };
+    let _ = ds.write_addr(addr as usize, 2, v as u32);
 }
 
-/// Same composite in-fight gate as the recorder (record.rs).
-fn in_fight(ds: &DebugState, r: &Resolved) -> bool {
-    let t = rd8(ds, r.round_timer);
-    let healthy = |b: u32| (1..=r.health_max).contains(&rd8(ds, b + r.health_off));
-    rd16be(ds, r.round_over) == 0
-        && rd16be(ds, r.abort) == 0
-        && rd16be(ds, r.match_end) == 0
-        && healthy(r.block1)
-        && healthy(r.block2)
-        && t != 0
-        && (t >> 4) <= 9
-        && (t & 0xF) <= 9
+/// Evaluate the loaded profile's controllable-gate condition list against the
+/// live snapshot — the ONE in-fight gate shared by training enforcement, the
+/// Lua `game.controllable()` binding, and (in spirit) the recorder's
+/// composite; a lua_engine unit test locks Lua and the recorder together.
+/// The condition vocabulary is closed (docs/game-profiles.md): byte_zero /
+/// word_zero / health_in_range / bcd_valid_nonzero. Reads go through the same
+/// `DebugState::read_addr` path as every other binding; out-of-map reads
+/// collapse to 0, matching the recorder's `unwrap_or(0)` semantics. 16-bit
+/// reads honor the profile's `memory.endianness` per the contract.
+pub(crate) fn eval_gate(ds: &DebugState, p: &GameProfile) -> bool {
+    let little = p.port.memory.endianness == "little";
+    // Profile load validates that every gate global resolves, so a miss here
+    // is impossible in practice; 0 keeps the closure total anyway.
+    let ga = |name: &str| p.global(name).unwrap_or(0);
+    p.port.gate.iter().all(|cond| match cond {
+        GateCond::ByteZero { global } => rd8(ds, ga(global)) == 0,
+        GateCond::WordZero { global } => rd16(ds, ga(global), little) == 0,
+        GateCond::HealthInRange { min, max } => {
+            let Some((off, _size)) = p.field_off("health") else {
+                return false;
+            };
+            let h1 = rd8(ds, p.block1().wrapping_add(off));
+            let h2 = rd8(ds, p.block2().wrapping_add(off));
+            (*min..=*max).contains(&h1) && (*min..=*max).contains(&h2)
+        }
+        GateCond::BcdValidNonzero { global } => {
+            let t = rd8(ds, ga(global));
+            t != 0 && (t >> 4) <= 9 && (t & 0xF) <= 9
+        }
+    })
+}
+
+/// Whether the loaded profile supports training at all (has an in-fight
+/// gate). Per-feature detail comes from [`features`].
+pub fn available() -> bool {
+    resolve(crate::profile::current()).is_some()
+}
+
+/// Per-feature availability for the loaded profile — `None` when training is
+/// unavailable entirely (no gate list).
+pub fn features() -> Option<Features> {
+    features_of(crate::profile::current())
+}
+
+fn features_of(p: &GameProfile) -> Option<Features> {
+    let r = resolve(p)?;
+    Some(Features {
+        refill: r.refill.is_some(),
+        timer_hold: r.timer.is_some(),
+        credits: r.credits.is_some(),
+        position_reset: r.reset.is_some(),
+        finish_round: r.finish.is_some(),
+        block_dummy: r.block_chord.is_some() || r.x_pair.is_some(),
+    })
 }
 
 /// Run one training-mode frame. Called from `Frontend::run_frame` after the
@@ -123,42 +272,74 @@ pub fn tick(ds: &mut DebugState, frame: u64) {
     if !ds.training.enabled {
         return;
     }
-    let r = resolve(crate::profile::current());
+    let p = crate::profile::current();
+    let Some(r) = resolve(p) else {
+        // Stub profile: no in-fight gate mapped — refuse softly, once.
+        ds.training.enabled = false;
+        ds.log("🎯 Training unavailable: this game's profile has no in-fight gate yet".into());
+        eprintln!("[training] unavailable: profile has no gate conditions (stub) — disabled");
+        return;
+    };
     // Credits top-up, checked once a second: Start must always work.
-    if frame % 60 == 0 && rd8(ds, r.credits) < r.credits_min {
-        wr8(ds, r.credits, r.credits_target);
+    if let Some((addr, target, min)) = r.credits {
+        if frame % 60 == 0 && rd8(ds, addr) < min {
+            wr8(ds, addr, target);
+        }
     }
-    if !in_fight(ds, &r) {
+    if !eval_gate(ds, p) {
         return;
     }
     // Hold the round clock.
-    wr8(ds, r.round_timer, r.timer_hold[0]);
-    wr8(ds, r.round_timer + 1, r.timer_hold[1]);
-    // Health refill: let damage show, never let anyone die.
+    if let Some((addr, hold)) = r.timer {
+        wr8(ds, addr, hold[0]);
+        wr8(ds, addr + 1, hold[1]);
+    }
+    // Health refill: let damage show, never let anyone die. Every mapped
+    // accumulator for the refilled fighter is rewritten (MK2's HUD pair
+    // tracks damage independently of the struct byte — mk2.md).
     if ds.training.refill {
-        for base in [r.block1, r.block2] {
-            if rd8(ds, base + r.health_off) < r.refill_below {
-                wr8(ds, base + r.health_off, r.health_max);
-                wr8(ds, base + r.health2_off, r.health_max);
+        if let Some(rf) = &r.refill {
+            let fired: Vec<(usize, u8, Vec<u32>)> = rf
+                .sides
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    let h = rd8(ds, s.check);
+                    (h < rf.below).then(|| (i, h, s.addrs.clone()))
+                })
+                .collect();
+            for (side, was, addrs) in fired {
+                for addr in addrs {
+                    wr8(ds, addr, rf.max);
+                }
+                ds.log(format!("🎯 refill: P{} {was} → {}", side + 1, rf.max));
             }
         }
     }
-    // One-shots.
+    // One-shots — each declines with a log line when its map is missing.
     if ds.training.reset_positions {
         ds.training.reset_positions = false;
-        let (b1x, b2x) = if rd16be(ds, r.block1 + r.x_off) <= rd16be(ds, r.block2 + r.x_off) {
-            r.reset_x
-        } else {
-            (r.reset_x.1, r.reset_x.0)
-        };
-        wr16be(ds, r.block1 + r.x_off, b1x);
-        wr16be(ds, r.block1 + r.y_off, r.ground_y);
-        wr16be(ds, r.block2 + r.x_off, b2x);
-        wr16be(ds, r.block2 + r.y_off, r.ground_y);
+        match &r.reset {
+            Some(rs) => {
+                let (x1, x2) = (rd16(ds, rs.x.p1, r.little), rd16(ds, rs.x.p2, r.little));
+                let (b1x, b2x) =
+                    if x1 <= x2 { (rs.left, rs.right) } else { (rs.right, rs.left) };
+                wr16(ds, rs.x.p1, b1x, r.little);
+                wr16(ds, rs.x.p2, b2x, r.little);
+                if let Some((y1, y2, ground)) = rs.y {
+                    wr16(ds, y1, ground, r.little);
+                    wr16(ds, y2, ground, r.little);
+                }
+            }
+            None => ds.log("🎯 Position reset: not mapped for this game".into()),
+        }
     }
     if ds.training.finish_round {
         ds.training.finish_round = false;
-        wr8(ds, r.round_state, 0);
+        match r.finish {
+            Some(addr) => wr8(ds, addr, 0),
+            None => ds.log("🎯 Finish round: not mapped for this game".into()),
+        }
     }
     // Dummy preset → port-1 injection (2-frame holds so they bridge to the
     // next GUI fold without latching).
@@ -176,21 +357,28 @@ pub fn tick(ds: &mut DebugState, frame: u64) {
             b[4] = (frame / 30) % 2 == 0;
             Some(b)
         }
-        DummyMode::Block => {
+        // Button-block families (MK): hold the block button(s), no spacing
+        // logic needed. Back-hold families fall through to the X comparison.
+        DummyMode::Block if r.block_chord.is_some() => r.block_chord,
+        DummyMode::Block => match r.x_pair {
             // Hold away from the other fighter. The dummy is port 1; without a
             // resolved port→block map, treat the RIGHT fighter as the dummy
             // (P2 side) — correct for freshly started VS rounds.
-            let x1 = rd16be(ds, r.block1 + r.x_off) as i32;
-            let x2 = rd16be(ds, r.block2 + r.x_off) as i32;
-            let (dummy_x, other_x) = if x1 >= x2 { (x1, x2) } else { (x2, x1) };
-            let mut b = [false; 12];
-            if dummy_x >= other_x {
-                b[7] = true; // opponent to the left → hold Right (away)
-            } else {
-                b[6] = true;
+            Some(xp) => {
+                let x1 = rd16(ds, xp.p1, r.little) as i32;
+                let x2 = rd16(ds, xp.p2, r.little) as i32;
+                let (dummy_x, other_x) = if x1 >= x2 { (x1, x2) } else { (x2, x1) };
+                let mut b = [false; 12];
+                if dummy_x >= other_x {
+                    b[7] = true; // opponent to the left → hold Right (away)
+                } else {
+                    b[6] = true;
+                }
+                Some(b)
             }
-            Some(b)
-        }
+            // No X source mapped: fall back to standing still.
+            None => Some([false; 12]),
+        },
     };
     if let Some(bits) = dummy_bits {
         for (i, on) in bits.iter().enumerate() {
@@ -202,6 +390,7 @@ pub fn tick(ds: &mut DebugState, frame: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn tick_is_inert_when_disabled_or_out_of_fight() {
@@ -217,5 +406,47 @@ mod tests {
         tick(&mut ds, 0);
         assert!(ds.pending_bus_writes.is_empty());
         assert_eq!(ds.injected_input2, [0u16; 12]);
+    }
+
+    #[test]
+    fn asurabld_supports_every_feature() {
+        let p = crate::profile::init_for_tests();
+        let f = features_of(p).expect("asurabld must be training-available");
+        assert!(f.refill && f.timer_hold && f.credits);
+        assert!(f.position_reset && f.finish_round && f.block_dummy);
+        assert!(f.missing().is_empty());
+    }
+
+    #[test]
+    fn mk2_degrades_per_feature() {
+        // MK2's map is partial by honesty (mk2.md): gate + health + world X
+        // exist; timer store, credits (CMOS), Y, and round_state don't.
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let f = features_of(&p).expect("mk2 must be training-available (has a gate)");
+        assert!(f.refill, "health field + HUD pair are mapped");
+        assert!(f.block_dummy, "p1_x/p2_x globals are mapped");
+        assert!(!f.timer_hold && !f.credits && !f.position_reset && !f.finish_round);
+        assert_eq!(
+            f.missing(),
+            vec!["timer hold", "credits top-up", "position reset", "finish round"]
+        );
+        // And the refill spec includes all four MK2 health bytes.
+        let r = resolve(&p).unwrap();
+        let rf = r.refill.unwrap();
+        let all: Vec<u32> = rf.sides.iter().flat_map(|s| s.addrs.iter().copied()).collect();
+        assert_eq!(all.len(), 4, "struct pair + HUD pair: {all:x?}");
+        // MK is button-block: the dummy must hold the Block chord (L), not
+        // walk backward.
+        let chord = r.block_chord.expect("mk2 dummy blocks with a button");
+        let held: Vec<usize> = chord.iter().enumerate().filter(|(_, on)| **on).map(|(i, _)| i).collect();
+        assert_eq!(held, vec![10], "Block = RETRO L");
+    }
+
+    #[test]
+    fn asurabld_blocks_by_holding_back_not_a_chord() {
+        let p = crate::profile::init_for_tests();
+        let r = resolve(p).unwrap();
+        assert!(r.block_chord.is_none(), "back_hold family must use X-relative block");
+        assert!(r.x_pair.is_some());
     }
 }

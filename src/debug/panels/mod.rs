@@ -16,3 +16,4 @@ pub mod matchup;
 pub mod state;
 pub mod training;
 pub mod script_panel;
+pub mod controls;
