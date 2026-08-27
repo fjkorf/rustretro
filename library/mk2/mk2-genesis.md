@@ -329,3 +329,25 @@ different game configuration) and is superseded.
 4. Full roster id cross-check beyond the 4 ids exercised (1, 3, 7, 9).
 5. The ~9 s **GAME OVER gate window** (draw-timeout only) if it ever
    matters in practice.
+
+## Session gotchas — headless playback verification (2026-08-27, orchestrator)
+
+- **The committed arena state is saved in-game PAUSED.** Loading
+  `shadow/arenas/mk2/genesis-probe.state` gives a frozen fight (timer stuck at
+  BCD 0x98, fighters inert) that the gate reads as OPEN — in-game pause is
+  invisible to the 3-condition gate. One P1 Start press unpauses. OPEN ITEM:
+  find the pause flag in WRAM and add `byte_zero(pause)` to the gate — until
+  then the recorder happily records rows during pause and `game.controllable()`
+  lies there.
+- **Start is heavily overloaded**: P1 Start = pause toggle; P2 Start mid-fight
+  = join, which detours through P2 char select (fighter x reads 28/292 there —
+  those are select-screen values, not a crash). At uncapped headless speed this
+  flow is fragile; in windowed play at human speed it's the normal "controller
+  2 presses Start, picks a character" flow.
+- **Timer sub-second byte `0xFFAB96` is the reliable running/paused oracle**
+  (advances every frame when the game runs, static under pause) — use it, not
+  the gate, to decide whether the world is live.
+- Verified this session: the generalized runner emits decisions on this
+  profile (correct block2 anchoring, sensible masks) and port-2 injected
+  input lands in-game (the join itself proves it). Full 2-human shadow fight
+  is a windowed-play exercise.
