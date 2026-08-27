@@ -50,25 +50,56 @@ import numpy as np
 
 from . import profile as _profile
 
-_PROF = _profile.get()
-_CAL = _PROF.calibration
-
 # ── calibration constants (SPEC §1) ─────────────────────────────────────────
 # Scaling constants may legitimately be ABSENT from a partial profile (their
 # features then drop out per the §4.2 availability table) — .get() with the
 # asurabld literals as inert defaults keeps this module importable under any
 # profile. Cadence constants (P/K/STALE) are fit-global and required.
-GROUND_Y = _CAL.get("GROUND_Y", 216)
-X_SCALE = _CAL.get("X_SCALE", 128.0)
-Y_SCALE = _CAL.get("Y_SCALE", 128.0)
-TIMER_SCALE = _CAL.get("TIMER_SCALE", 256.0)
-ANIM_SCALE = _CAL.get("ANIM_SCALE", 64.0)
-CORNER_PX = _CAL.get("CORNER_PX", 24)
-HEALTH_MAX = _CAL.get("HEALTH_MAX", 239)
-P = _CAL["P"]              # decision period, frames (§4)
-K = _CAL["K"]              # stacked decision-step snapshots (§4)
-STALE = _CAL["STALE"]      # opponent observation delay, frames (§4)
-SCREEN_W = _CAL.get("SCREEN_W", 320)
+#
+# All of the below are re-derived by reload_profile() rather than computed
+# once inline, so the CLI's fit-time auto-resolution (RECORDER_V3.md §4-note
+# — a fit's profile is resolved from its recordings' own v3 `.meta.json`
+# sidecars, not just whatever RUSTRETRO_GAME_DIR happened to be at process
+# start) can refresh them AFTER argv is parsed but BEFORE build() runs. See
+# `shadow_train.__main__._resolve_profile_for` — the only other caller.
+# MOVE_CLASSES/ATTACK_CLASSES are mutated IN PLACE (`[:] = ...`), never
+# rebound, so `from .dataset import MOVE_CLASSES, ATTACK_CLASSES` elsewhere
+# (__main__.py) keeps seeing the live list after a reload.
+MOVE_CLASSES: list = []
+ATTACK_CLASSES: list = []
+
+
+def reload_profile() -> None:
+    """Re-derive every profile-sourced module constant from whatever
+    `shadow_train.profile.get()` currently resolves to (RUSTRETRO_GAME_DIR
+    or the asurabld default). Called once below at import (today's exact
+    behavior) and again by the CLI after it auto-resolves a fit's profile
+    from its recordings' sidecars."""
+    global _PROF, _CAL, GROUND_Y, X_SCALE, Y_SCALE, TIMER_SCALE, ANIM_SCALE, \
+        CORNER_PX, HEALTH_MAX, P, K, STALE, SCREEN_W, HITSTUN_RECENT_FRAMES
+    _PROF = _profile.get()
+    _CAL = _PROF.calibration
+    GROUND_Y = _CAL.get("GROUND_Y", 216)
+    X_SCALE = _CAL.get("X_SCALE", 128.0)
+    Y_SCALE = _CAL.get("Y_SCALE", 128.0)
+    TIMER_SCALE = _CAL.get("TIMER_SCALE", 256.0)
+    ANIM_SCALE = _CAL.get("ANIM_SCALE", 64.0)
+    CORNER_PX = _CAL.get("CORNER_PX", 24)
+    HEALTH_MAX = _CAL.get("HEALTH_MAX", 239)
+    P = _CAL["P"]              # decision period, frames (§4)
+    K = _CAL["K"]              # stacked decision-step snapshots (§4)
+    STALE = _CAL["STALE"]      # opponent observation delay, frames (§4)
+    SCREEN_W = _CAL.get("SCREEN_W", 320)
+    HITSTUN_RECENT_FRAMES = _CAL["HITSTUN_RECENT_FRAMES"]
+    # Class lists (dataset/model head sizes): family.json's vocabulary, shared
+    # by every port of this game family (docs/game-profiles.md rule 3 --
+    # nothing may hardcode 9 moves / 6 attacks; everything sizes from these
+    # lists' lengths). Mutated in place -- see the module note above.
+    MOVE_CLASSES[:] = list(_PROF.move_classes)
+    ATTACK_CLASSES[:] = list(_PROF.attack_classes)
+
+
+reload_profile()
 
 # Task 1 (pseudo-round segmentation): training-mode sessions freeze the round
 # timer, so a single round_id can run tens of thousands of frames -- with only
@@ -94,19 +125,13 @@ SEGMENT_DECISIONS = 150
 # run: 7582 frames / ~126s in session-2026-08-24-training-v1.jsonl). 20 frames
 # (2.5x the P=8 decision period) sits cleanly in the gap between those two
 # populations.
-HITSTUN_RECENT_FRAMES = _CAL["HITSTUN_RECENT_FRAMES"]
+# (HITSTUN_RECENT_FRAMES itself is set by reload_profile() above.)
 
 # RETRO mask bits
 BIT_B, BIT_Y, BIT_SELECT, BIT_START = 0, 1, 2, 3
 BIT_UP, BIT_DOWN, BIT_LEFT, BIT_RIGHT = 4, 5, 6, 7
 BIT_A = 8
 ATTACK_BITS = (BIT_B, BIT_A, BIT_Y)  # Light, Medium, Heavy (§3c)
-
-# Class lists (dataset/model head sizes): family.json's vocabulary, shared by
-# every port of this game family (docs/game-profiles.md rule 3 -- nothing may
-# hardcode 9 moves / 6 attacks; everything sizes from these lists' lengths).
-MOVE_CLASSES = list(_PROF.move_classes)
-ATTACK_CLASSES = list(_PROF.attack_classes)
 
 # scalar feature names, in canonical vector order (§1a minus the categorical
 # columns). This is the FULL order RECORDER_V3.md §4.2 filters down per
@@ -621,8 +646,8 @@ def _decisions_from_file(path: Path) -> tuple[list[Decision], list[str], str]:
     if view.family is not None and view.family != prof.family:
         raise SystemExit(
             f"{path.name}: recorded for family '{view.family}' but the loaded "
-            f"profile is '{prof.family}' — set RUSTRETRO_GAME_DIR (e.g. "
-            f"library/{view.family}) and re-run"
+            f"profile is '{prof.family}' — pass --game library/{view.family} "
+            f"(or set RUSTRETRO_GAME_DIR) and re-run"
         )
     feats = scalar_features_for(view)
     decisions: list[Decision] = []

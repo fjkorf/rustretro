@@ -11,6 +11,7 @@ mod mcp;
 mod shadow_runner;
 mod training;
 mod input_config;
+mod gate;
 
 use anyhow::Result;
 use audio::AudioOutput;
@@ -55,6 +56,12 @@ struct Args {
     #[arg(long, value_name = "N", default_value = "4000")] mcp_port: u16,
     /// Run with no window — emulator + MCP server only (for AI/agent-driven sessions). Implies --mcp.
     #[arg(long)] headless: bool,
+    /// Headless wall-clock pacing multiplier (ignored in windowed mode, which
+    /// paces through Bevy/vsync instead). 1.0 (default) = real time at the
+    /// core's reported fps; 2.0 = double speed; 0 = uncapped, run as fast as
+    /// possible. Use for interactive MCP probing (menu nav, timed input
+    /// sequences) that needs a trustworthy clock.
+    #[arg(long, value_name = "MULT", default_value = "1.0")] pace: f64,
     /// Busmap sidecar of bus windows to snapshot via the core's exported CPU
     /// bus API (Sek bridge; see library/asurabld/asurabld.busmap.json).
     /// Defaults to <save-dir>/<rom>.busmap.json when present.
@@ -350,16 +357,41 @@ fn run_headless(
     use std::time::{Duration, Instant};
 
     let fps = frontend.fps().max(1.0);
-    let frame_dur = Duration::from_secs_f64(1.0 / fps);
+    let pace = args.pace;
+    // --pace 0 (or negative) means uncapped: run flat-out, no sleeping at all.
+    let uncapped = pace <= 0.0;
+    // Effective frame period: at pace 2.0 we want to *emit* frames twice as
+    // fast (half the wall-clock period), so divide by pace, not multiply.
+    let frame_dur = if uncapped { Duration::ZERO } else { Duration::from_secs_f64(1.0 / (fps * pace)) };
 
     eprintln!(
-        "[headless] running {fps:.0} fps, no window. MCP on http://127.0.0.1:{}/mcp. Ctrl-C to stop.",
+        "[headless] running {fps:.0} fps × pace {pace} — {}. MCP on http://127.0.0.1:{}/mcp. Ctrl-C to stop.",
+        if uncapped { "uncapped".to_string() } else { format!("{:.1} fps wall-clock", fps * pace) },
         args.mcp_port
     );
 
-    loop {
-        let start = Instant::now();
+    // Drift-corrected pacing: schedule each frame off a fixed `sched_start`
+    // anchor plus its frame index, rather than resetting a per-frame `start`
+    // timer and sleeping only *that frame's own* leftover budget (the old
+    // code: `start = Instant::now()`, then `sleep(frame_dur - start.elapsed())`
+    // at the bottom). That per-frame-reset scheme has no memory across
+    // frames: whenever one frame's own work (a lua callback, an MCP
+    // round-trip, a bus-window snapshot — CLAUDE.md notes those cost ~10ms)
+    // eats into or exceeds its 16.7ms budget, `checked_sub` comes back None,
+    // the sleep is skipped entirely for that frame, and the shortfall is
+    // simply forgotten — nothing later slows down to repay it. There was
+    // also no `--pace` knob and no minimum-sleep guard, so the only actual
+    // behaviors reachable were "best-effort sleep-to-16.7ms" or nothing,
+    // and any run with occasional over-budget frames drifts fast of nominal
+    // with no correction — consistent with the ~1.5-2x-realtime effective
+    // speed observed live. Anchoring each frame's deadline to
+    // `sched_start + frame_index * frame_dur` makes the target absolute:
+    // a late frame just means the next sleep is shorter (or skipped), and
+    // the schedule never drifts further than one frame's worth of slack.
+    let sched_start = Instant::now();
+    let mut frame_index: u64 = 0;
 
+    loop {
         // (a0) Fold any MCP-injected controller input for this frame (headless has
         //      no keyboard) so an agent can drive menus/moves via press_buttons.
         //      Both ports: P1 for the agent/user, P2 for the shadow bot / dummy.
@@ -408,12 +440,26 @@ fn run_headless(
             }
         }
 
-        // (d) Frame pacing: sleep the remainder of the frame budget. When the
-        //     core is paused, run_frame() returned early (cheap), so this still
-        //     paces the loop at ~fps — the agent keeps a responsive run_lua /
-        //     memory-read channel while paused.
-        if let Some(rem) = frame_dur.checked_sub(start.elapsed()) {
-            std::thread::sleep(rem);
+        // (d) Frame pacing: sleep until this frame's absolute deadline. When
+        //     the core is paused, run_frame() returned early (cheap), so this
+        //     still paces the loop at ~fps × pace — the agent keeps a
+        //     responsive run_lua / memory-read channel while paused.
+        frame_index += 1;
+        if !uncapped {
+            let deadline = sched_start + frame_dur.mul_f64(frame_index as f64);
+            let now = Instant::now();
+            if let Some(rem) = deadline.checked_duration_since(now) {
+                // Sub-millisecond sleeps are unreliable and waste OS calls at
+                // high --pace multipliers; only sleep once we're ahead by
+                // more than 1ms, otherwise fall straight into the next frame
+                // (the deadline stays absolute, so this doesn't accumulate).
+                if rem > Duration::from_millis(1) {
+                    std::thread::sleep(rem);
+                }
+            }
+            // else: we're behind schedule — run flat-out to catch back up;
+            // the fixed anchor means we can never fall more than one frame's
+            // worth of slack behind nominal pace.
         }
     }
 }

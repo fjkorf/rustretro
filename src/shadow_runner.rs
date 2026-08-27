@@ -1258,7 +1258,7 @@ impl ShadowRunner {
         // BCD-timer, menu/gate globals, whatever THIS game's gate list says),
         // so a sparse profile like MK2 Genesis's needs nothing this runner
         // doesn't already resolve for it.
-        let live = crate::training::eval_gate(ds, prof);
+        let live = crate::gate::eval_gate(ds, prof);
 
         if !live {
             // Off-gate: no injection, buffers cleared for the next round
@@ -1923,7 +1923,7 @@ mod tests {
         assert!(err.contains("'anim'"), "{err}");
     }
 
-    /// The runner's in-fight gate is `training::eval_gate` — the SAME
+    /// The runner's in-flight gate is `gate::eval_gate` — the SAME
     /// evaluator the recorder and Lua `game.controllable()` use, no private
     /// composite (RECORDER_V3.md §1.2 rule 3). End-to-end through a real
     /// `ShadowRunner::load`ed model against a synthetic asurabld memory
@@ -1975,7 +1975,7 @@ mod tests {
 
         // Open the gate (round_over -> 0): same eval_gate the recorder uses.
         wbig16(&mut ds, prof.global("round_over").unwrap(), 0);
-        assert!(crate::training::eval_gate(&ds, prof), "gate must now read open");
+        assert!(crate::gate::eval_gate(&ds, prof), "gate must now read open");
 
         // Drive enough ticks (P * K, plus headroom) for the anchor to
         // resolve and a full K-deep stack to produce a decision.

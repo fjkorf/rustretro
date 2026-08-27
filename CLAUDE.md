@@ -44,6 +44,13 @@ SLOT|PATH`, `--calibrate` (controller wizard → `keymap.json`), `--keymap`,
 `--dump-keymap`, `--pad-debug` (raw button names to stderr), `--mute`,
 `--no-audio`.
 
+A family with more than one port picks it with a path segment, e.g. Genesis
+MK2: `--game library/mk2/genesis --core
+../FBNeo/src/burner/libretro/fbneo_libretro.dylib --rom
+~/games/roms/genesis/md_mk2.zip` (arcade is `library/mk2`'s bare-dir default).
+A profile's `pins` key (session pins) rewrites declared RAM values every
+frame while loaded — MK2 Genesis uses it to hold the 6-button-mode flags.
+
 ### Hotkeys
 
 | Key | Action |
@@ -86,8 +93,8 @@ enabled-and-fatal-on-error. The MCP `load_shadow` tool is the scripted twin
 (gated behind `enable_writes`).
 
 Matchups: models can be per-matchup — `shadow/loop.sh --me 1 --opp 7` fits a
-`goat-vs-rosemary-vN` (slugs from `shadow_train.asurabld.CHAR_NAMES`; ids in
-asurabld.md's roster table). `python -m shadow_train coverage` prints the
+`goat-vs-rosemary-vN` (slugs from the family's own `family.json` roster; ids
+in asurabld.md's roster table). `python -m shadow_train coverage` prints the
 matchup matrix (decisions per me×opp cell, demo-filtered). The recorder
 writes a `.rounds.jsonl` sidecar per recording (one summary line per round:
 matchup chars, frames, demo-ness, style) — the cheap index for coverage
@@ -114,10 +121,14 @@ one to `shadow/arenas/current.state` — the pointer loop.sh starts fights from
 is gitignored; named arenas are committable.
 
 Python side: `shadow_train` is `pip install -e`'d into `shadow/train/.venv`
-(works from any cwd): `python -m shadow_train fit|eval|report`. The deploy
+(works from any cwd): `python -m shadow_train fit|eval|report`. `fit`/`eval`
+auto-resolve their game+port profile from the recordings' own v3
+`.meta.json` sidecars — no `RUSTRETRO_GAME_DIR` needed for a normal fit
+anymore; `--game PATH` (or `RUSTRETRO_GAME_DIR`) still works as an explicit
+override and warns loudly if it disagrees with the sidecars. The deploy
 alternatives are the native runner (Shift+F5, in-app) and `shadow/play.py`
 (over MCP; `--dry-run` observes safely against a live session). Recordings
-are jsonl-v2 (v1 files are rejected); training filters demo rounds by
+are jsonl-v2/v3 (v1 files are rejected); training filters demo rounds by
 zero-`p1_input`. The kNN uses a fit-time neutral cap + soft retrieval —
 without both, the shadow stands still (absorbing-state failure, documented
 in `shadow/train/shadow_train/dataset.py`).

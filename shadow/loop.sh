@@ -3,17 +3,23 @@
 # The shadow loop, one command: fit a fresh model from recent recordings,
 # print the coverage drill list, and send the shadow into the running game.
 #
-#   shadow/loop.sh                 # fit goat-vNEXT from recent v2 recordings, fight
+#   shadow/loop.sh                 # fit goat-vNEXT from recent recordings, fight
 #   shadow/loop.sh --fit-only      # refit + report, don't launch the shadow
 #   shadow/loop.sh --model NAME    # skip fitting, fight an existing model
 #   shadow/loop.sh --me N --opp M  # matchup-filtered fit (per-matchup model,
-#                                  # named via shadow_train.asurabld slugs)
+#                                  # named via the family's own roster slugs)
 #   shadow/loop.sh --push          # fit, then load the model into the running
 #                                  # app's NATIVE runner (Shift+F5 / 🎯 panel)
 #                                  # instead of fighting over MCP via play.py
 #
-# Assumes the game is already running with --mcp (default port 4025). The
-# arena state and port can be overridden via ARENA / PORT env vars.
+# Assumes the game is already running with --mcp (default port 4025 -- the
+# MCP network port; unrelated to a game's arcade/genesis PORT profile below).
+# The arena state and MCP port can be overridden via ARENA / PORT env vars.
+# FAMILY picks the data roots (shadow/{recordings,models,arenas}/$FAMILY/);
+# `shadow_train fit` itself needs no game/profile env var -- it auto-resolves
+# the right game+port profile from each recording's own v3 `.meta.json`
+# sidecar (see CLAUDE.md "The shadow loop"; --game overrides it if you ever
+# need to force one).
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -48,20 +54,22 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $FIT -ge 1 ]]; then
-  # jsonl-v2 recordings only (v1 files lack "block1"), newest 12.
+  # jsonl-v2/v3 recordings only (v1 attract-mode files lack "block1"), newest 12.
   RECS=()
   for f in $(ls -t "shadow/recordings/$FAMILY"/*.jsonl 2>/dev/null | head -12); do
     head -c 4096 "$f" | grep -q '"block1"' && RECS+=("$f")
   done
-  [[ ${#RECS[@]} -gt 0 ]] || { echo "no v2 recordings found" >&2; exit 1; }
+  [[ ${#RECS[@]} -gt 0 ]] || { echo "no v2/v3 recordings found" >&2; exit 1; }
   # Matchup filters name the model by slug (goat-vs-rosemary); the legacy
-  # unfiltered fit keeps the goat-vN series.
+  # unfiltered fit keeps the goat-vN series. Slugs come from the FAMILY's own
+  # roster (family.json), loaded directly by dir -- not the asurabld-only
+  # shadow_train.asurabld module, which import-fails under any other family.
   FILTERS=()
   PREFIX=goat
   if [[ -n "$ME" || -n "$OPP" ]]; then
     [[ -n "$ME" ]] && FILTERS+=(--char "$ME")
     [[ -n "$OPP" ]] && FILTERS+=(--opp "$OPP")
-    PREFIX=$("$PY" -c "from shadow_train.asurabld import matchup_slug; print(matchup_slug(${ME:-None}, ${OPP:-None}))")
+    PREFIX=$("$PY" -c "from shadow_train import profile; print(profile.get('library/$FAMILY').matchup_slug(${ME:-None}, ${OPP:-None}))")
   fi
   # next version number
   N=1
