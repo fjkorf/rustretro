@@ -1,0 +1,11 @@
+{
+  "family": "mk2",
+  "title": "Mortal Kombat II",
+  "roster": [],
+  "move_classes": [
+    "Neutral", "Forward", "Back", "Up", "Down",
+    "UpForward", "UpBack", "DownForward", "DownBack"
+  ],
+  "attack_classes": ["None", "HP", "LP", "HK", "LK", "Block"],
+  "block": { "style": "button", "class": "Block" }
+}

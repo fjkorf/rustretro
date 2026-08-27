@@ -44,21 +44,34 @@ pub struct GameMap {
     pub credits: u32,
 }
 
+impl GameMap {
+    /// Populate every field from the loaded `GameProfile`'s blocks + named
+    /// globals (see `docs/game-profiles.md`) — the data-driven replacement
+    /// for the old compiled constants.
+    pub fn from_profile(p: &crate::profile::GameProfile) -> GameMap {
+        let g = |name: &str| {
+            p.global(name)
+                .unwrap_or_else(|| panic!("profile missing global '{name}'"))
+        };
+        GameMap {
+            block1: p.block1(),
+            block2: p.block2(),
+            round_timer: g("round_timer"),
+            char_select: g("char_select"),
+            round_over: g("round_over"),
+            abort: g("abort"),
+            match_end: g("match_end"),
+            demo_flag: g("demo_flag"),
+            combo_on_b2: g("combo_on_b2"),
+            combo_on_b1: g("combo_on_b1"),
+            credits: g("credits"),
+        }
+    }
+}
+
 impl Default for GameMap {
     fn default() -> Self {
-        GameMap {
-            block1: 0x403798,
-            block2: 0x40454C, // block1 + 0x0DB4
-            round_timer: 0x40000A,
-            char_select: 0x400006,
-            round_over: 0x40646E,
-            abort: 0x403678,
-            match_end: 0x402A32,
-            demo_flag: 0x4065D8,
-            combo_on_b2: 0x4041E7,
-            combo_on_b1: 0x40470B,
-            credits: 0x40655D,
-        }
+        GameMap::from_profile(crate::profile::current())
     }
 }
 
@@ -173,60 +186,32 @@ fn timer_bcd_valid(t: u8) -> bool {
     t != 0 && (t >> 4) <= 9 && (t & 0xF) <= 9
 }
 
-/// Roster name for a char id (`+0x639`). Hand-kept mirror of `CHAR_NAMES` in
-/// `shadow_train/asurabld.py` and the roster table in `asurabld.md` — update
-/// all three together. Complete mapping live-verified 2026-08-25 (headless
-/// roster probe; see asurabld.md). Bosses/unknowns render as "c<N>".
+/// Roster name for a char id (`+0x639`), read from the loaded profile's
+/// `family.json` roster. Bosses/unknowns render as "c<N>".
 pub fn char_name(id: u8) -> String {
-    match id {
-        0 => "yashaou".into(),
-        1 => "goat".into(),
-        2 => "lightning".into(),
-        3 => "footee".into(),
-        4 => "alice".into(),
-        5 => "taros".into(),
-        6 => "zamb".into(),
-        7 => "rosemary".into(),
-        8 => "curfue".into(),
-        9 => "sgeist".into(),
-        n => format!("c{n}"),
-    }
+    crate::profile::current().char_name(id)
 }
 
 /// Matchup slug matching `shadow_train.asurabld.matchup_slug(me, opp)` —
 /// used to find per-matchup arenas (`shadow/arenas/<slug>.state`).
 pub fn matchup_slug(me: u8, opp: u8) -> String {
-    format!("{}-vs-{}", char_name(me), char_name(opp))
+    crate::profile::current().matchup_slug(me, opp)
 }
 
 /// The stage/opponent selector byte: freezing `$40364D` through the
 /// post-select map screen forces the next fight's venue AND its home
 /// character as the opponent (write-verified; see asurabld.md "Stages").
-pub const STAGE_SELECT_ADDR: u32 = 0x40364D;
-
-/// Selector value whose home character is `opp` — i.e. what to freeze
-/// [`STAGE_SELECT_ADDR`] to in order to fight `opp` next. Footee (3) has no
-/// selector value (her beach is only the default venue); 10+ overflow.
-/// Hand-kept mirror of the value→home-char table in asurabld.md.
+/// Selector value whose home character is `opp` — i.e. what to freeze the
+/// profile's stage-select global to in order to fight `opp` next. Resolved
+/// from the loaded profile's `stage_select.value_to_home_char` table.
 pub fn stage_value_for_opponent(opp: u8) -> Option<u8> {
-    match opp {
-        0 => Some(7), // yashaou's inferno (mirror-capable)
-        1 => Some(6), // goat's desert castle
-        2 => Some(2), // lightning's water cavern
-        4 => Some(3), // alice's shipwreck
-        5 => Some(4), // taros' foundry hall
-        6 => Some(1), // zam-b's dungeon
-        7 => Some(5), // rosemary's hall
-        8 => Some(8), // curfue
-        9 => Some(9), // s. geist
-        _ => None,    // 3 = footee: no selector value
-    }
+    crate::profile::current().stage_value_for_opponent(opp)
 }
 
 /// Inverse of [`stage_value_for_opponent`]: which character a frozen
 /// selector value will summon.
 pub fn opponent_for_stage_value(v: u8) -> Option<u8> {
-    (0u8..=9).find(|&opp| stage_value_for_opponent(opp) == Some(v))
+    crate::profile::current().opponent_for_stage_value(v)
 }
 
 /// Pack a 12-button held state into the low 12 bits (RETRO_DEVICE_ID order).
@@ -430,6 +415,7 @@ mod tests {
 
     #[test]
     fn recorder_writes_valid_jsonl_and_gates_closed_without_state() {
+        crate::profile::init_for_tests();
         // A bare DebugState has no regions, so all reads return 0: healths are
         // 0 and the timer is 0, so the v2 gate must be CLOSED (v1's gate was
         // true here — the broken-permissive bug this rewrite fixes).
@@ -468,6 +454,7 @@ mod tests {
 
     #[test]
     fn stage_selector_mapping_inverts_cleanly() {
+        crate::profile::init_for_tests();
         for opp in 0u8..=9 {
             match stage_value_for_opponent(opp) {
                 Some(v) => assert_eq!(opponent_for_stage_value(v), Some(opp)),
@@ -480,6 +467,7 @@ mod tests {
 
     #[test]
     fn recorder_emits_round_summaries_to_the_rounds_sidecar() {
+        crate::profile::init_for_tests();
         let mut ds = DebugState::new();
         assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
             name: "wram-test".into(),

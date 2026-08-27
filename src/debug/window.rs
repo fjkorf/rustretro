@@ -70,11 +70,6 @@ impl DebugApp {
                     if ui.button("⏭ Step").clicked() {
                         ds.step_one = true;
                     }
-                    // Frame-step: advances one instruction for now (same as Step until a
-                    // true run-to-next-frame mechanism exists).
-                    if ui.button("⏯ Step Frame").clicked() {
-                        ds.step_one = true;
-                    }
 
                     ui.separator();
 

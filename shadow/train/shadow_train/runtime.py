@@ -46,6 +46,7 @@ import numpy as np
 
 from . import asurabld as gm
 from . import dataset
+from . import profile as _profile
 from .__main__ import CALIBRATION_KEYS
 from .dataset import (
     ANIM_SCALE,
@@ -76,13 +77,15 @@ RETRO_BUTTON_NAMES = [
     "a", "x", "l", "r",
 ]
 
-# ── memory read plan (game addresses — shadow_train.asurabld, mirroring
-# library/asurabld/asurabld.md) ─────────────────────────────────────────────
+# ── memory read plan (addresses/offsets from the game profile --
+# library/asurabld/{family,asurabld.profile}.json via shadow_train.profile;
+# asurabld.md remains the literate evidence document for how each value was
+# verified) ──────────────────────────────────────────────────────────────
 # Batched so one tick needs 5 read_memory calls total (<6, per the harness
 # requirement): two big per-block reads (each block's own struct span also
 # happens to contain the OTHER block's "combo landing on me" counter — see
 # asurabld.md's note that the combo counters are cross-block addresses that
-# fall inside the neighboring block's 0xDB4 stride), one combined
+# fall inside the neighboring block's stride-byte span), one combined
 # match_end+abort read (they're close enough together to share one call),
 # and two small reads (round_over, round timer BCD).
 BLOCK1_ADDR = gm.BLOCK1
@@ -93,20 +96,16 @@ COMBO_ON_B2_OFFSET = COMBO_ON_B2_ADDR - BLOCK1_ADDR
 COMBO_ON_B1_OFFSET = COMBO_ON_B1_ADDR - BLOCK2_ADDR
 
 # fighter struct layout: (name, offset, size in bytes); all big-endian
-# (68k byte order, per record.rs's u16be/u8g helpers).
+# (68k byte order, per record.rs's u16be/u8g helpers). Offsets come straight
+# from the profile's `fighter_fields` (this is the same field subset the
+# read plan has always used -- notably NOT `wins`, which the profile also
+# carries but which decision features never read).
+_FIGHTER_FIELD_NAMES = [
+    "timer", "anim", "action", "x", "y", "facing", "weapon",
+    "health", "health2", "meter", "meter_max", "char_id",
+]
 FIGHTER_LAYOUT = [
-    ("timer", gm.TIMER, 2),
-    ("anim", gm.ANIM, 2),
-    ("action", gm.ACTION, 2),
-    ("x", gm.X, 2),
-    ("y", gm.Y, 2),
-    ("facing", gm.FACING, 1),
-    ("weapon", gm.WEAPON, 1),
-    ("health", gm.HEALTH, 1),
-    ("health2", gm.HEALTH2, 1),
-    ("meter", gm.METER, 1),
-    ("meter_max", gm.METER_MAX, 1),
-    ("char_id", gm.CHAR_ID, 1),
+    (name, *_profile.get().field_off(name)) for name in _FIGHTER_FIELD_NAMES
 ]
 _FIGHTER_END = max(off + size for _, off, size in FIGHTER_LAYOUT)
 

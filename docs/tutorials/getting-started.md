@@ -16,14 +16,14 @@ around the toolbar and the dock panels.
 1. Build the frontend once:
 
    ```bash
-   cargo build --release
+   cargo build --profile release-dev
    ```
 
 2. Launch a CPS2 fighter with the debug overlay open from the first frame. The
    `--debug` flag opens the dock workspace on startup:
 
    ```bash
-   cargo run --release -- \
+   ./target/release-dev/rustretro \
      --core ./mame2003_plus_libretro.dylib \
      --rom ./mvsc.zip \
      --debug
@@ -45,7 +45,7 @@ around the toolbar and the dock panels.
 5. The panels live in a draggable dock below the toolbar. The default layout puts
    **📜 Disasm** in the center, **🔧 CPU** top-right, **👁 Watch** / **🗺 Regions** below
    it, and a tabbed strip along the bottom (**📋 Hex**, **🖼 Frame**, **🧩 Tiles**,
-   **🕹 Input**, **🧾 Log**, **⏸ Triggers**, **🔊 Audio**, **🔍 Search**, **📺 VDP**, **❓ Help**).
+   **🕹 Input**, **🧾 Log**, **⏸ Triggers**, **🔊 Audio**, **🔍 Search**, **❓ Help**).
    Click any tab to bring its panel forward.
 
 ## Why it matters

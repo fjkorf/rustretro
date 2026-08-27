@@ -19,6 +19,8 @@
 //! memory.read_u32_le(addr)          -> integer  (little-endian)
 //! memory.writebyte(addr, v)                     (GATED, see below)
 //! memory.writeword(addr, v)                     (16-bit guest big-endian; GATED)
+//! memory.freeze(addr, v)                        (per-frame re-write via a frozen watch; GATED)
+//! memory.unfreeze(addr)                         (drop frozen watches at addr; GATED)
 //! savestate.save(slot_or_path)      -> true     (queued; slot 1-9 or path string)
 //! savestate.load(slot_or_path)      -> true     (queued)
 //! input.set(port, mask_or_table)                (port 0/1; 2-frame hold)
@@ -31,9 +33,40 @@
 //! event.onframeend(function)
 //! console.log(str)
 //! emu.framecount()                  -> integer
-//! _RUSTRETRO_API                    = 2  (version sentinel)
+//! emu.paused()                      -> bool
+//! game.controllable()               -> bool     (profile gate vs live memory)
+//! game.addr(name)                   -> integer|nil  (named global from the profile)
+//! game.block1() / game.block2()     -> integer  (fighter block base addresses)
+//! game.field_off(name)              -> integer|nil  (fighter-field offset)
+//! game.char_name(id)                -> string   (roster name; "c<N>" fallback)
+//! game.matchup_slug(me, opp)        -> string   ("goat-vs-rosemary")
+//! game.stage_value_for(opp)         -> integer|nil  (stage-selector value)
+//! game.calibration(key)             -> number|nil
+//! training.enabled()                -> bool     (native training mode on?)
+//! training.refill()                 -> bool     (native health refill on?)
+//! training.dummy()                  -> string   ("free"/"stand"/"crouch"/"jump"/"block")
+//! shadow.on()                       -> bool|nil (nil = no model loaded)
+//! shadow.model()                    -> string|nil  (loaded model name)
+//! shadow.toggle()                                (queue a shadow on/off toggle)
+//! record.active()                   -> bool
+//! record.path()                     -> string|nil
+//! record.frames()                   -> integer
+//! record.start(path [, style])      -> true     (queued; errors if already recording)
+//! record.stop()                     -> true     (queued)
+//! _RUSTRETRO_API                    = 3  (version sentinel)
 //! ```
 //! Colors are packed RGBA u32: `0xRRGGBBAA`.
+//!
+//! ## API v3: the profile boundary
+//! v3 adds the `game`/`training`/`shadow`/`record` tables plus `emu.paused`
+//! and `memory.freeze`/`unfreeze`. The design ruling (docs/game-profiles.md):
+//! **logic lives once, in Rust; Lua ASKS via bindings.** Scripts never carry
+//! raw addresses (`game.addr("round_timer")`, not `0x40000A`) and never
+//! re-implement the controllable gate or the enforcement trio — native
+//! training mode owns those; `game.controllable()` evaluates the loaded
+//! profile's gate condition list against live memory with the same semantics
+//! as `record.rs`'s recorder gate. (`record` was checked against every global
+//! this engine installs — no collision, so it keeps the natural name.)
 //!
 //! ## FBNeo/FBA naming
 //! The write/savestate/input/gui.text names follow the FBNeo Lua conventions
@@ -124,11 +157,7 @@ fn read1(dbg: &SharedDebugState, addr: u32) -> mlua::Result<u8> {
 fn write_guest(dbg: &SharedDebugState, addr: u32, len: usize, le_value: u32) -> mlua::Result<()> {
     let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
     if !ds.lua_writes_enabled {
-        return Err(mlua::Error::RuntimeError(
-            "memory write blocked: the lua_writes_enabled gate is OFF \
-             (launch with --training or arm it via the MCP enable_writes tool)"
-                .to_string(),
-        ));
+        return Err(writes_gate_error());
     }
     if !ds.write_addr(addr as usize, len, le_value) {
         return Err(mlua::Error::RuntimeError(format!(
@@ -136,6 +165,56 @@ fn write_guest(dbg: &SharedDebugState, addr: u32, len: usize, le_value: u32) -> 
         )));
     }
     Ok(())
+}
+
+/// The Lua error every gated mutation binding raises while
+/// [`DebugState::lua_writes_enabled`] is off. One shared constructor so
+/// `memory.writebyte`/`writeword`/`freeze`/`unfreeze` all name the gate the
+/// same way (scripts and tests match on the substring "lua_writes_enabled").
+fn writes_gate_error() -> mlua::Error {
+    mlua::Error::RuntimeError(
+        "memory write blocked: the lua_writes_enabled gate is OFF \
+         (launch with --training or arm it via the MCP enable_writes tool)"
+            .to_string(),
+    )
+}
+
+/// Evaluate the loaded profile's controllable-gate condition list against the
+/// live snapshot — the Lua-facing twin of `record.rs`'s `controllable`
+/// computation (`game.controllable()` must flip exactly when the recorder gate
+/// flips; a unit test below locks the two together). The condition vocabulary
+/// is closed (docs/game-profiles.md): byte_zero / word_zero / health_in_range
+/// / bcd_valid_nonzero. Reads go through the same `DebugState::read_addr` path
+/// as every other Lua read binding; out-of-map reads collapse to 0, matching
+/// the recorder's `unwrap_or(0)` semantics. 16-bit reads honor the profile's
+/// `memory.endianness` per the contract.
+fn eval_gate(ds: &crate::debug::DebugState, p: &crate::profile::GameProfile) -> bool {
+    use crate::profile::GateCond;
+    let big = p.port.memory.endianness != "little";
+    let rd8 = |a: u32| ds.read_addr(a as usize, 1).unwrap_or(0) as u8;
+    let rd16 = |a: u32| {
+        let v = ds.read_addr(a as usize, 2).unwrap_or(0) as u16;
+        if big { v.swap_bytes() } else { v }
+    };
+    // Profile load validates that every gate global resolves, so a miss here
+    // is impossible in practice; 0 keeps the closure total anyway.
+    let ga = |name: &str| p.global(name).unwrap_or(0);
+    p.port.gate.iter().all(|cond| match cond {
+        GateCond::ByteZero { global } => rd8(ga(global)) == 0,
+        GateCond::WordZero { global } => rd16(ga(global)) == 0,
+        GateCond::HealthInRange { min, max } => {
+            let Some((off, _size)) = p.field_off("health") else {
+                return false;
+            };
+            let h1 = rd8(p.block1().wrapping_add(off));
+            let h2 = rd8(p.block2().wrapping_add(off));
+            (*min..=*max).contains(&h1) && (*min..=*max).contains(&h2)
+        }
+        GateCond::BcdValidNonzero { global } => {
+            let t = rd8(ga(global));
+            t != 0 && (t >> 4) <= 9 && (t & 0xF) <= 9
+        }
+    })
 }
 
 /// Frames `input.set` holds each pressed button — the same 2-frame idiom as the
@@ -354,6 +433,52 @@ impl LuaEngine {
                 write_guest(&dbg, addr, 2, (v as u16).swap_bytes() as u32)
             })?;
             memory.set("writeword", f)?;
+        }
+
+        // freeze(addr, v) — pin a byte by installing a FROZEN watch (the emu
+        // thread re-writes frozen watches every frame, exactly the mechanism
+        // the Watch panel's freeze checkbox and the matchup panel's stage
+        // force use). GATED like writebyte: a freeze is a standing write.
+        // Replaces any existing frozen watch at the same address.
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, (addr, v): (u32, u32)| {
+                let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                if !ds.lua_writes_enabled {
+                    return Err(writes_gate_error());
+                }
+                ds.watches
+                    .retain(|w| w.addr != addr as usize || !w.frozen);
+                ds.watches.push(crate::debug::Watch {
+                    addr: addr as usize,
+                    label: "lua freeze".to_string(),
+                    format: crate::debug::WatchFormat::Hex8,
+                    frozen: true,
+                    frozen_value: Some(v & 0xFF),
+                    track_changes: false,
+                    current: None,
+                    prev_value: None,
+                });
+                Ok(())
+            })?;
+            memory.set("freeze", f)?;
+        }
+
+        // unfreeze(addr) — drop any frozen watch at addr (non-frozen watches
+        // there survive). GATED the same way: it mutates the standing-write
+        // set, so it is part of the same opt-in surface.
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, addr: u32| {
+                let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                if !ds.lua_writes_enabled {
+                    return Err(writes_gate_error());
+                }
+                ds.watches
+                    .retain(|w| w.addr != addr as usize || !w.frozen);
+                Ok(())
+            })?;
+            memory.set("unfreeze", f)?;
         }
 
         globals.set("memory", memory)?;
@@ -590,12 +715,272 @@ impl LuaEngine {
             emu.set("framecount", f)?;
         }
 
+        // paused() -> bool  (DebugState.paused — lets a script skip per-frame
+        // work, or detect frame-stepping, without polling framecount deltas)
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<bool> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(ds.paused)
+            })?;
+            emu.set("paused", f)?;
+        }
+
         globals.set("emu", emu)?;
 
+        // ── game.* ────────────────────────────────────────────────────────────
+        // The profile boundary (API v3): scripts ask the loaded GameProfile for
+        // addresses/names/values by NAME and ask the engine for the gate verdict
+        // — they never restate per-game knowledge. `profile::current()` is safe
+        // here: the profile is installed at startup before the engine exists.
+        // Accessors are called at INVOCATION time, not install time, so building
+        // an engine without a profile (some unit tests) stays legal as long as
+        // no game.* binding runs.
+        let game = lua.create_table()?;
+
+        // controllable() -> bool — the profile's gate condition list evaluated
+        // against live memory (see eval_gate; same semantics as the recorder).
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<bool> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(eval_gate(&ds, crate::profile::current()))
+            })?;
+            game.set("controllable", f)?;
+        }
+
+        // addr(name) -> integer|nil — named global from the profile memory map.
+        {
+            let f = lua.create_function(|_, name: String| -> mlua::Result<Option<u32>> {
+                Ok(crate::profile::current().global(&name))
+            })?;
+            game.set("addr", f)?;
+        }
+
+        // block1() / block2() -> integer — fighter block base addresses.
+        {
+            let f = lua.create_function(|_, ()| -> mlua::Result<u32> {
+                Ok(crate::profile::current().block1())
+            })?;
+            game.set("block1", f)?;
+            let f = lua.create_function(|_, ()| -> mlua::Result<u32> {
+                Ok(crate::profile::current().block2())
+            })?;
+            game.set("block2", f)?;
+        }
+
+        // field_off(name) -> integer|nil — fighter-field OFFSET only (add to
+        // block1()/block2() yourself; the size byte stays Rust-side).
+        {
+            let f = lua.create_function(|_, name: String| -> mlua::Result<Option<u32>> {
+                Ok(crate::profile::current().field_off(&name).map(|(off, _)| off))
+            })?;
+            game.set("field_off", f)?;
+        }
+
+        // char_name(id) -> string; matchup_slug(me, opp) -> string.
+        {
+            let f = lua.create_function(|_, id: u8| -> mlua::Result<String> {
+                Ok(crate::profile::current().char_name(id))
+            })?;
+            game.set("char_name", f)?;
+            let f = lua.create_function(|_, (me, opp): (u8, u8)| -> mlua::Result<String> {
+                Ok(crate::profile::current().matchup_slug(me, opp))
+            })?;
+            game.set("matchup_slug", f)?;
+        }
+
+        // stage_value_for(opp) -> integer|nil — selector value whose home
+        // matchup is `opp` (nil when the game has no selector or no value).
+        {
+            let f = lua.create_function(|_, opp: u8| -> mlua::Result<Option<u8>> {
+                Ok(crate::profile::current().stage_value_for_opponent(opp))
+            })?;
+            game.set("stage_value_for", f)?;
+        }
+
+        // calibration(key) -> number|nil — feature-scaling constants.
+        {
+            let f = lua.create_function(|_, key: String| -> mlua::Result<Option<f64>> {
+                Ok(crate::profile::current().calibration(&key))
+            })?;
+            game.set("calibration", f)?;
+        }
+
+        globals.set("game", game)?;
+
+        // ── training.* ────────────────────────────────────────────────────────
+        // Read-only view of the NATIVE training-mode control block (F5 / the
+        // Training panel / --training). Scripts ask these instead of keeping
+        // their own enforcement switches — src/training.rs owns enforcement.
+        let training = lua.create_table()?;
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<bool> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(ds.training.enabled)
+            })?;
+            training.set("enabled", f)?;
+        }
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<bool> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(ds.training.refill)
+            })?;
+            training.set("refill", f)?;
+        }
+        // dummy() -> "free"/"stand"/"crouch"/"jump"/"block" (DummyMode, lowercased).
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<String> {
+                use crate::debug::DummyMode;
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(match ds.training.dummy {
+                    DummyMode::Free => "free",
+                    DummyMode::Stand => "stand",
+                    DummyMode::Crouch => "crouch",
+                    DummyMode::Jump => "jump",
+                    DummyMode::Block => "block",
+                }
+                .to_string())
+            })?;
+            training.set("dummy", f)?;
+        }
+        globals.set("training", training)?;
+
+        // ── shadow.* ──────────────────────────────────────────────────────────
+        // Shadow-bot status + toggle, over the same GUI bridge fields the
+        // Training panel and Shift+F5 use (drained by Frontend::drain_shadow_ops).
+        let shadow = lua.create_table()?;
+
+        // on() -> bool|nil — nil means no model is loaded (--shadow absent).
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<Option<bool>> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(ds.shadow_on)
+            })?;
+            shadow.set("on", f)?;
+        }
+
+        // model() -> string|nil — the loaded model's directory basename.
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<Option<String>> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(ds.shadow_model.as_ref().map(|m| m.name.clone()))
+            })?;
+            shadow.set("model", f)?;
+        }
+
+        // toggle() — queue a shadow on/off flip (equivalent to Shift+F5; a
+        // no-op downstream when no model is loaded).
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| {
+                let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                ds.pending_shadow_toggle = true;
+                Ok(())
+            })?;
+            shadow.set("toggle", f)?;
+        }
+
+        globals.set("shadow", shadow)?;
+
+        // ── record.* ──────────────────────────────────────────────────────────
+        // Recorder status + start/stop over the recorder GUI bridge (drained by
+        // Frontend::drain_record_ops). No global-name collision: the engine's
+        // other globals are memory/savestate/input/gui/event/console/emu/game/
+        // training/shadow, so `record` keeps its natural name.
+        let record = lua.create_table()?;
+
+        // active() -> bool; path() -> string|nil; frames() -> integer — all
+        // published per-frame by the Frontend into record_status.
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<bool> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(ds.record_status.is_some())
+            })?;
+            record.set("active", f)?;
+        }
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<Option<String>> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(ds
+                    .record_status
+                    .as_ref()
+                    .map(|(p, _)| p.display().to_string()))
+            })?;
+            record.set("path", f)?;
+        }
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<u64> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(ds.record_status.as_ref().map_or(0, |(_, n)| *n))
+            })?;
+            record.set("frames", f)?;
+        }
+
+        // start(path [, style]) -> true — queue RecordControl::Start. Refused
+        // (Lua error) while a recording is active or a start/stop is already
+        // queued, mirroring the savestate "already queued" convention.
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(
+                move |_, (path, style): (String, Option<String>)| -> mlua::Result<bool> {
+                    let path = path.trim().to_string();
+                    if path.is_empty() {
+                        return Err(mlua::Error::RuntimeError(
+                            "record.start: path must be a non-empty string".to_string(),
+                        ));
+                    }
+                    let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                    if let Some((p, _)) = &ds.record_status {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "record.start: already recording to {} — record.stop() first",
+                            p.display()
+                        )));
+                    }
+                    if ds.pending_record.is_some() {
+                        return Err(mlua::Error::RuntimeError(
+                            "record.start: another start/stop is already queued (ops apply \
+                             on the next frame drain) — retry on a later frame"
+                                .to_string(),
+                        ));
+                    }
+                    ds.pending_record = Some(crate::debug::RecordControl::Start {
+                        path: std::path::PathBuf::from(path),
+                        style,
+                    });
+                    Ok(true)
+                },
+            )?;
+            record.set("start", f)?;
+        }
+
+        // stop() -> true — queue RecordControl::Stop (fails softly downstream
+        // when nothing is recording, matching the GUI stop button).
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<bool> {
+                let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                ds.pending_record = Some(crate::debug::RecordControl::Stop);
+                Ok(true)
+            })?;
+            record.set("stop", f)?;
+        }
+
+        globals.set("record", record)?;
+
         // ── version sentinel ──────────────────────────────────────────────────
-        // Scripts can check `if _RUSTRETRO_API >= 2 then … end` to feature-detect
-        // (2 added memory.write*, savestate.*, input.*, gui.text).
-        globals.set("_RUSTRETRO_API", 2u32)?;
+        // Scripts can check `if _RUSTRETRO_API >= 3 then … end` to feature-detect
+        // (2 added memory.write*, savestate.*, input.*, gui.text; 3 added the
+        // game/training/shadow/record tables, emu.paused, memory.freeze/unfreeze).
+        globals.set("_RUSTRETRO_API", 3u32)?;
 
         Ok(())
     }
@@ -713,7 +1098,7 @@ impl LuaEngine {
 ///
 /// `rgba` is `[R, G, B, A]` per pixel, `width × height`. Boxes get a translucent
 /// fill (alpha from `fill`'s low byte) plus a solid 1px outline (`line`). Anything
-/// outside the buffer is clipped. Text is currently a TODO no-op (see below).
+/// outside the buffer is clipped. Text renders with the built-in 3×5 font.
 pub fn composite_into_rgba(cmds: &[DrawCmd], rgba: &mut [u8], width: u32, height: u32) {
     let w = width as i32;
     let h = height as i32;
@@ -1240,6 +1625,247 @@ mod tests {
         assert_eq!(count_red(&with, 0xFF), pop, "glyph must render over shadow");
         assert!(dark(&with) > 0, "shadow must darken offset pixels");
         assert_eq!(dark(&without), 0, "drawText (no shadow) must not darken");
+    }
+
+    /// Engine + DebugState with a bus window wide enough to cover BOTH
+    /// asurabld fighter blocks and every gate global (0x400000..0x407000) and
+    /// the asurabld profile installed — the fixture for the game.* tests,
+    /// mirroring record.rs's `recorder_emits_round_summaries_to_the_rounds_sidecar`.
+    fn engine_with_profile_and_wram() -> (LuaEngine, SharedDebugState) {
+        crate::profile::init_for_tests();
+        let dbg: SharedDebugState = Arc::new(Mutex::new(DebugState::new()));
+        assert!(dbg.lock().unwrap().install_bus_window(BusWindowCfg {
+            name: "wram-test".into(),
+            addr: 0x400000,
+            len: 0x7000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let eng = LuaEngine::new(SharedDebugState::clone(&dbg)).unwrap();
+        (eng, dbg)
+    }
+
+    #[test]
+    fn game_controllable_flips_exactly_like_the_recorder_gate() {
+        let (eng, dbg) = engine_with_profile_and_wram();
+        let p = crate::profile::current();
+        let (health_off, _) = p.field_off("health").unwrap();
+        let timer = p.global("round_timer").unwrap() as usize;
+        let char_sel = p.global("char_select").unwrap() as usize;
+
+        // Fresh RAM: healths are 0 and the timer is 0 → gate CLOSED (the same
+        // state record.rs's recorder_writes_valid_jsonl test asserts closed).
+        assert_eq!(eng.eval_to_string("game.controllable()").unwrap(), "false");
+
+        // Open it exactly the way the recorder test opens the v3 gate: live
+        // healths + valid BCD clock (hop flags/char_select already 0).
+        {
+            let mut ds = dbg.lock().unwrap();
+            assert!(ds.write_addr((p.block1() + health_off) as usize, 1, 0xEF));
+            assert!(ds.write_addr((p.block2() + health_off) as usize, 1, 0xEF));
+            assert!(ds.write_addr(timer, 1, 0x90));
+        }
+        assert_eq!(eng.eval_to_string("game.controllable()").unwrap(), "true");
+
+        // Gate v3: a running char-select countdown closes it...
+        assert!(dbg.lock().unwrap().write_addr(char_sel, 1, 0x21));
+        assert_eq!(eng.eval_to_string("game.controllable()").unwrap(), "false");
+        // ...and its end re-opens it.
+        assert!(dbg.lock().unwrap().write_addr(char_sel, 1, 0));
+        assert_eq!(eng.eval_to_string("game.controllable()").unwrap(), "true");
+
+        // Menu-garbage clock (non-BCD) closes it, like timer_bcd_valid(0xFF).
+        assert!(dbg.lock().unwrap().write_addr(timer, 1, 0xFF));
+        assert_eq!(eng.eval_to_string("game.controllable()").unwrap(), "false");
+        assert!(dbg.lock().unwrap().write_addr(timer, 1, 0x85));
+        assert_eq!(eng.eval_to_string("game.controllable()").unwrap(), "true");
+
+        // A latched hop flag (word_zero condition) closes it.
+        let round_over = p.global("round_over").unwrap() as usize;
+        assert!(dbg.lock().unwrap().write_addr(round_over, 2, 0x0100)); // guest BE 0x0001
+        assert_eq!(eng.eval_to_string("game.controllable()").unwrap(), "false");
+
+        // A KO'd health (outside 1..=0xEF) closes it too.
+        assert!(dbg.lock().unwrap().write_addr(round_over, 2, 0));
+        assert!(dbg
+            .lock()
+            .unwrap()
+            .write_addr((p.block2() + health_off) as usize, 1, 0));
+        assert_eq!(eng.eval_to_string("game.controllable()").unwrap(), "false");
+    }
+
+    #[test]
+    fn game_profile_bindings_resolve_names_not_addresses() {
+        let (eng, _dbg) = engine_with_profile_and_wram();
+        let ck = |src: &str, want: &str| {
+            assert_eq!(eng.eval_to_string(src).unwrap(), want, "{src}");
+        };
+        ck("game.addr('credits')", &format!("{}", 0x40655D));
+        ck("game.addr('round_timer')", &format!("{}", 0x40000A));
+        ck("game.addr('no_such_global') == nil", "true");
+        ck("game.block1()", &format!("{}", 0x403798));
+        ck("game.block2()", &format!("{}", 0x40454C));
+        ck("game.field_off('health')", &format!("{}", 0x177));
+        ck("game.field_off('char_id')", &format!("{}", 0x639));
+        ck("game.field_off('no_such_field') == nil", "true");
+        ck("game.char_name(7)", "rosemary");
+        ck("game.char_name(1)", "goat");
+        ck("game.char_name(11)", "c11");
+        ck("game.matchup_slug(1, 7)", "goat-vs-rosemary");
+        ck("game.stage_value_for(7)", "5");
+        ck("game.stage_value_for(3) == nil", "true"); // footee has no selector
+        ck("game.calibration('GROUND_Y')", "216");
+        ck("game.calibration('no_such_key') == nil", "true");
+    }
+
+    #[test]
+    fn training_shadow_and_paused_bindings_mirror_debug_state() {
+        let (eng, dbg) = engine_with_ram();
+        // Defaults: training off/free, no shadow model, not paused.
+        assert_eq!(eng.eval_to_string("training.enabled()").unwrap(), "false");
+        assert_eq!(eng.eval_to_string("training.refill()").unwrap(), "false");
+        assert_eq!(eng.eval_to_string("training.dummy()").unwrap(), "free");
+        assert_eq!(eng.eval_to_string("shadow.on() == nil").unwrap(), "true");
+        assert_eq!(eng.eval_to_string("shadow.model() == nil").unwrap(), "true");
+        assert_eq!(eng.eval_to_string("emu.paused()").unwrap(), "false");
+
+        {
+            let mut ds = dbg.lock().unwrap();
+            ds.training.enabled = true;
+            ds.training.refill = true;
+            ds.training.dummy = crate::debug::DummyMode::Crouch;
+            ds.shadow_on = Some(false);
+            ds.shadow_model = Some(crate::debug::ShadowModelInfo {
+                name: "goat-v2".into(),
+                ..Default::default()
+            });
+            ds.paused = true;
+        }
+        assert_eq!(eng.eval_to_string("training.enabled()").unwrap(), "true");
+        assert_eq!(eng.eval_to_string("training.refill()").unwrap(), "true");
+        assert_eq!(eng.eval_to_string("training.dummy()").unwrap(), "crouch");
+        assert_eq!(eng.eval_to_string("shadow.on()").unwrap(), "false");
+        assert_eq!(eng.eval_to_string("shadow.model()").unwrap(), "goat-v2");
+        assert_eq!(eng.eval_to_string("emu.paused()").unwrap(), "true");
+
+        // toggle() queues the one-shot the Frontend drains (Shift+F5 twin).
+        assert!(!dbg.lock().unwrap().pending_shadow_toggle);
+        eng.eval_to_string("shadow.toggle()").unwrap();
+        assert!(dbg.lock().unwrap().pending_shadow_toggle);
+    }
+
+    #[test]
+    fn record_bindings_report_queue_and_refuse() {
+        use crate::debug::RecordControl;
+        let (eng, dbg) = engine_with_ram();
+        // Idle: no recording, zero frames, nil path.
+        assert_eq!(eng.eval_to_string("record.active()").unwrap(), "false");
+        assert_eq!(eng.eval_to_string("record.frames()").unwrap(), "0");
+        assert_eq!(eng.eval_to_string("record.path() == nil").unwrap(), "true");
+
+        // start(path, style) queues a Start with both fields.
+        assert_eq!(
+            eng.eval_to_string("record.start('/tmp/rr_rec.jsonl', 'rushdown')")
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            dbg.lock().unwrap().pending_record,
+            Some(RecordControl::Start {
+                path: std::path::PathBuf::from("/tmp/rr_rec.jsonl"),
+                style: Some("rushdown".into()),
+            })
+        );
+        // A second start while one is queued is refused; the queue is untouched.
+        let err = eng
+            .eval_to_string("record.start('/tmp/other.jsonl')")
+            .unwrap_err();
+        assert!(err.contains("already queued"), "{err}");
+        dbg.lock().unwrap().pending_record = None;
+
+        // With a live recording published, status reads through and start refuses.
+        dbg.lock().unwrap().record_status =
+            Some((std::path::PathBuf::from("/tmp/rr_rec.jsonl"), 42));
+        assert_eq!(eng.eval_to_string("record.active()").unwrap(), "true");
+        assert_eq!(eng.eval_to_string("record.frames()").unwrap(), "42");
+        assert_eq!(
+            eng.eval_to_string("record.path()").unwrap(),
+            "/tmp/rr_rec.jsonl"
+        );
+        let err = eng
+            .eval_to_string("record.start('/tmp/other.jsonl')")
+            .unwrap_err();
+        assert!(err.contains("already recording"), "{err}");
+
+        // stop() queues Stop; style-less start parses (style = None).
+        assert_eq!(eng.eval_to_string("record.stop()").unwrap(), "true");
+        assert_eq!(
+            dbg.lock().unwrap().pending_record.take(),
+            Some(RecordControl::Stop)
+        );
+        dbg.lock().unwrap().record_status = None;
+        eng.eval_to_string("record.start('/tmp/plain.jsonl')").unwrap();
+        assert!(matches!(
+            dbg.lock().unwrap().pending_record.take(),
+            Some(RecordControl::Start { style: None, .. })
+        ));
+        // Empty path refused.
+        assert!(eng.eval_to_string("record.start('  ')").is_err());
+    }
+
+    #[test]
+    fn memory_freeze_unfreeze_gated_and_manage_frozen_watches() {
+        let (eng, dbg) = engine_with_ram();
+        // Both are gated exactly like writebyte: the error names the gate.
+        for src in ["memory.freeze(0x400010, 0xAB)", "memory.unfreeze(0x400010)"] {
+            let err = eng.eval_to_string(src).unwrap_err();
+            assert!(err.contains("lua_writes_enabled"), "{src}: {err}");
+        }
+        assert!(dbg.lock().unwrap().watches.is_empty());
+
+        dbg.lock().unwrap().lua_writes_enabled = true;
+        eng.eval_to_string("memory.freeze(0x400010, 0xAB)").unwrap();
+        {
+            let ds = dbg.lock().unwrap();
+            assert_eq!(ds.watches.len(), 1);
+            let w = &ds.watches[0];
+            assert_eq!(w.addr, 0x400010);
+            assert!(w.frozen);
+            assert_eq!(w.frozen_value, Some(0xAB));
+            assert_eq!(w.label, "lua freeze");
+            assert!(matches!(w.format, crate::debug::WatchFormat::Hex8));
+            assert!(!w.track_changes);
+        }
+        // Re-freezing the same addr REPLACES (no duplicate frozen watches).
+        eng.eval_to_string("memory.freeze(0x400010, 0xCD)").unwrap();
+        {
+            let ds = dbg.lock().unwrap();
+            assert_eq!(ds.watches.len(), 1);
+            assert_eq!(ds.watches[0].frozen_value, Some(0xCD));
+        }
+        // A NON-frozen watch at the same addr survives unfreeze.
+        dbg.lock().unwrap().watches.push(crate::debug::Watch {
+            addr: 0x400010,
+            label: "plain watch".into(),
+            format: crate::debug::WatchFormat::U8,
+            frozen: false,
+            frozen_value: None,
+            track_changes: false,
+            current: None,
+            prev_value: None,
+        });
+        eng.eval_to_string("memory.unfreeze(0x400010)").unwrap();
+        {
+            let ds = dbg.lock().unwrap();
+            assert_eq!(ds.watches.len(), 1);
+            assert_eq!(ds.watches[0].label, "plain watch");
+        }
+    }
+
+    #[test]
+    fn api_sentinel_is_v3() {
+        let (eng, _dbg) = engine_with_ram();
+        assert_eq!(eng.eval_to_string("_RUSTRETRO_API").unwrap(), "3");
     }
 
     #[test]

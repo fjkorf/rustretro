@@ -11,7 +11,6 @@
 //!   * `&mut self, ui, ctx, &Arc<Mutex<DebugState>>`   (frame_inspector, tile_viewer)
 //!   * `&mut self, ui, ctx, &mut DebugState`           (regions)
 //!   * `&mut self, ui, &mut DebugState`                (watch, ram_search)
-//!   * `&mut self, ui, &[u8; 24]`                      (vdp_registers, reads ds.vdp_regs)
 //!   * `&mut self, ui`                                 (help)
 //!   * assoc fn  `ui, &mut DebugState`                 (disassembly)
 //!   * assoc fn  `ui, &mut AudioOutput`                (audio_controls)
@@ -42,7 +41,6 @@ use crate::debug::panels::{
     tile_viewer::TileViewer,
     training::TrainingPanel,
     triggers::Triggers,
-    vdp_registers::VdpRegisters,
     watch::WatchPanel,
 };
 
@@ -67,7 +65,6 @@ pub enum Tab {
     Regions,
     Watch,
     RamSearch,
-    VdpRegisters,
     Help,
     State,
     Training,
@@ -78,7 +75,7 @@ pub enum Tab {
 /// variant missing from a saved sidecar) and the toolbar Panels menu — adding
 /// a variant without extending this list is a compile-time-invisible bug, so
 /// the `default_layout_contains_all_tabs` test cross-checks it.
-pub const ALL_TABS: [Tab; 17] = [
+pub const ALL_TABS: [Tab; 16] = [
     Tab::FrameInspector,
     Tab::HexDump,
     Tab::TileViewer,
@@ -91,7 +88,6 @@ pub const ALL_TABS: [Tab; 17] = [
     Tab::Regions,
     Tab::Watch,
     Tab::RamSearch,
-    Tab::VdpRegisters,
     Tab::Help,
     Tab::State,
     Tab::Training,
@@ -113,7 +109,6 @@ impl Tab {
             Tab::Regions => "🗺 Regions",
             Tab::Watch => "👁 Watch",
             Tab::RamSearch => "🔍 Search",
-            Tab::VdpRegisters => "📺 VDP",
             Tab::Help => "❓ Help",
             Tab::State => "💾 State",
             Tab::Training => "🎯 Training",
@@ -136,7 +131,6 @@ pub struct Panels {
     pub regions_panel: RegionsPanel,
     pub watch_panel: WatchPanel,
     pub ram_search_panel: RamSearchPanel,
-    pub vdp_registers: VdpRegisters,
     pub help_panel: HelpPanel,
     pub state_panel: StatePanel,
     pub training_panel: TrainingPanel,
@@ -157,7 +151,6 @@ impl Panels {
             regions_panel: RegionsPanel::new(),
             watch_panel: WatchPanel::new(),
             ram_search_panel: RamSearchPanel::new(),
-            vdp_registers: VdpRegisters::new(),
             help_panel: HelpPanel::new(),
             state_panel: StatePanel::new(),
             training_panel: TrainingPanel::new(),
@@ -220,15 +213,6 @@ impl<'a> egui_dock::TabViewer for DockViewer<'a> {
             Tab::RamSearch => {
                 if let Ok(mut ds) = self.state.lock() {
                     self.panels.ram_search_panel.show(ui, &mut ds);
-                } else {
-                    ui.label("Error: Could not acquire debug state lock");
-                }
-            }
-
-            // shape: &mut self, ui, &[u8; 24]  (lock only to read vdp_regs)
-            Tab::VdpRegisters => {
-                if let Ok(ds) = self.state.lock() {
-                    self.panels.vdp_registers.show(ui, &ds.vdp_regs);
                 } else {
                     ui.label("Error: Could not acquire debug state lock");
                 }
@@ -339,8 +323,7 @@ pub fn default_layout() -> DockState<Tab> {
             Tab::RamSearch,
             Tab::Triggers,
             Tab::Regions,
-            Tab::VdpRegisters,
-            Tab::FrameLog,
+                    Tab::FrameLog,
             Tab::Help,
         ],
     );

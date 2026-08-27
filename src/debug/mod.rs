@@ -1,7 +1,6 @@
 pub mod panels;
 pub mod window;
 pub mod dock;
-pub mod vdp_source;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -245,6 +244,7 @@ pub struct MemoryRegion {
     pub flags: u64,             // RETRO_MEMDESC_* flags
     pub ptr: usize,             // host pointer (cast to *const u8 for reads)
     pub offset: usize,          // offset within ptr
+    #[allow(dead_code)] // libretro memory-descriptor mirror; spec field
     pub select: usize,          // address mask
     pub disconnect: usize,      // address disconnect mask
 }
@@ -576,11 +576,6 @@ pub struct DebugState {
     pub z80_de: u16,               // DE register pair
     pub z80_hl: u16,               // HL register pair
 
-    // --- VDP registers ---
-    /// Sega Genesis VDP registers $00–$17 (decoded by the VDP panel).
-    /// Source not yet wired from the core; displays zeros until populated.
-    pub vdp_regs: [u8; 24],
-
     // --- Frame counters ---
     pub frame_count: u64,
     pub video_frames: u64,
@@ -792,7 +787,6 @@ impl DebugState {
             z80_bc: 0,
             z80_de: 0,
             z80_hl: 0,
-            vdp_regs: [0u8; 24],
             frame_count: 0,
             video_frames: 0,
             video_real: 0,

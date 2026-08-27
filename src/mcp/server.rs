@@ -669,7 +669,9 @@ impl RetroMcpServer {
         }
     }
 
+
     /// Whether `source` selects the on-disk ROM FILE (whole cart or a named span).
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by the test suite
     fn is_rom_file_source(source: &str) -> bool {
         Self::rom_file_part(source).is_some()
     }

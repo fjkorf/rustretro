@@ -1,0 +1,25 @@
+{
+  "_STATUS": "Roster ids/names sourced from two independent, cross-checked community sources (kawaks/FBA cheat table sf2ceua.dat + fightcade-detectors sf2ce.inf character-select detector, which agree exactly with each other) — see sf2ce.md. LIVE-VERIFIED this session for ids 0/1 only: the char-select cursor defaults to '1P RYU' (id 0) and one press of right moved it to '1P E.HONDA' (id 1), confirming that adjacency; ids 2-11 are sourced-but-unverified beyond seeing their names appear correctly on-screen in demo/real fights (Ken, Chun-Li, Zangief, Balrog all observed). select_slot (char-select grid position) is NOT verified this session and is left null for every entry; do not treat it as real. attack_classes/block are sourced from the well-documented CPS1 6-button convention but NOT interactively verified (see profile _STATUS for attack_chords).",
+  "family": "sf2ce",
+  "title": "Street Fighter II': Champion Edition",
+  "roster": [
+    { "id": 0, "name": "ryu", "select_slot": null },
+    { "id": 1, "name": "ehonda", "select_slot": null },
+    { "id": 2, "name": "blanka", "select_slot": null },
+    { "id": 3, "name": "guile", "select_slot": null },
+    { "id": 4, "name": "ken", "select_slot": null },
+    { "id": 5, "name": "chunli", "select_slot": null },
+    { "id": 6, "name": "zangief", "select_slot": null },
+    { "id": 7, "name": "dhalsim", "select_slot": null },
+    { "id": 8, "name": "bison", "select_slot": null, "boss": true },
+    { "id": 9, "name": "sagat", "select_slot": null, "boss": true },
+    { "id": 10, "name": "balrog", "select_slot": null, "boss": true },
+    { "id": 11, "name": "vega", "select_slot": null, "boss": true }
+  ],
+  "move_classes": [
+    "Neutral", "Forward", "Back", "Up", "Down",
+    "UpForward", "UpBack", "DownForward", "DownBack"
+  ],
+  "attack_classes": ["None", "LP", "MP", "HP", "LK", "MK", "HK"],
+  "block": { "style": "back_hold" }
+}

@@ -655,11 +655,12 @@ impl Frontend {
                  records will be zero-filled. Pass --bus-map with a Work RAM window."
             );
         }
+        let prof = crate::profile::current();
         match crate::record::FrameRecorder::create(
             &path,
             crate::record::GameMap::default(),
-            "asurabld",
-            "fbalpha2012",
+            &prof.port.core.provenance_game,
+            &prof.port.core.provenance_core,
             style.as_deref(),
         ) {
             Ok(rec) => {
@@ -758,6 +759,12 @@ impl Frontend {
 
     /// Capture M68K and Z80 CPU state from the core (fbalpha2012-specific).
     fn capture_cpu_state(&self) {
+        // The Sek debug API exists in cores (FBNeo) for EVERY game, but only
+        // a 68k driver initializes its context — calling it under e.g. a
+        // TMS34010 driver segfaults. Gate on the profile's declared CPU.
+        if crate::profile::current().port.memory.cpu != "m68k" {
+            return;
+        }
         if let Ok(mut ds) = self.debug_state.try_lock() {
             let mut any_success = false;
 
@@ -867,10 +874,6 @@ impl Frontend {
 
             // Populate VDP registers when a source becomes available.
             // (Currently a no-op: Genesis VDP regs are write-only and not exposed
-            // by the loaded cores — see debug/vdp_source.rs for the dead-end and routes.)
-            if let Some(vdp) = crate::debug::vdp_source::read_vdp_regs(&ds.memory_regions) {
-                ds.vdp_regs = vdp;
-            }
 
             // Fetch code bytes at PC for disassembly panel (256 bytes via SekFetchByte)
             if ds.m68k_pc > 0 {
@@ -1167,14 +1170,6 @@ impl Frontend {
         std::mem::take(&mut self.callback_context.pending_audio)
     }
 
-    pub fn shutdown(&self) {
-        // Save regions sidecar before shutting down
-        if let Some(ref path) = self.sidecar_path {
-            save_regions_sidecar(path, &self.debug_state);
-        }
-        let _ = self.core.unload_game();
-        let _ = self.core.deinit();
-    }
 }
 
 impl Drop for Frontend {
@@ -1268,14 +1263,13 @@ impl CallbackContext {
                 RETRO_ENVIRONMENT_GET_VFS_INTERFACE => false,
                 RETRO_ENVIRONMENT_GET_LOG_INTERFACE => {
                     if !data.is_null() {
-                        unsafe extern "C" fn core_log(level: u32, msg: *const std::ffi::c_char) {
-                            let prefix = match level { 0=>"[CORE DBG]", 1=>"[CORE INF]", 2=>"[CORE WRN]", _=>"[CORE ERR]" };
-                            if !msg.is_null() {
-                                let s = std::ffi::CStr::from_ptr(msg).to_string_lossy();
-                                eprintln!("{} {}", prefix, s.trim_end());
-                            }
-                        }
-                        (*(data as *mut RetroLogCallback)).log = core_log as *const std::ffi::c_void;
+                        // retro_log_printf_t is C-variadic; stable Rust cannot
+                        // define one, so the entry point lives in src/log_shim.c
+                        // (vsnprintf into a fixed buffer) and calls back into
+                        // crate::core_log::rr_core_log_sink for prefixing +
+                        // rate limiting.
+                        (*(data as *mut RetroLogCallback)).log =
+                            crate::core_log::rr_core_log as *const std::ffi::c_void;
                         return true;
                     }
                     false

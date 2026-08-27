@@ -29,6 +29,10 @@ rmcp = { version = "1.7", features = ["server", "transport-streamable-http-serve
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 axum = "0.8"
 
+[build-dependencies]
+# Compiles src/log_shim.c — the varargs bridge for the libretro log interface.
+cc = "1"
+
 [profile.release]
 opt-level = 3
 lto = true

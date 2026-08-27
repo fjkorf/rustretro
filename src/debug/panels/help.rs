@@ -54,7 +54,7 @@ impl HelpPanel {
             ui.label("• Canvas (center) — big things you look at: Frame, Disasm, Hex, Tiles");
             ui.label("• Live (top right) — glanceable readouts: Watch, CPU, Input");
             ui.label("• Control (bottom right) — things you operate: State, Training, Audio");
-            ui.label("• Tools (bottom) — on-demand: Search, Triggers, Regions, VDP, Log, Help");
+            ui.label("• Tools (bottom) — on-demand: Search, Triggers, Regions, Log, Help");
             ui.separator();
 
             ui.heading("Panels");
@@ -71,19 +71,30 @@ impl HelpPanel {
             ui.label("🔍 Search     Iterative RAM value narrowing");
             ui.label("⏸ Triggers   Frame-count and pixel-value pauses");
             ui.label("🗺 Regions    Bookmarks, PC heatmap, code regions");
-            ui.label("📺 VDP        Genesis VDP register decoder");
             ui.label("🧾 Log        Scrollable event log with filter");
             ui.separator();
 
             ui.heading("Tutorials");
             ui.label("Task-oriented walkthroughs live in docs/tutorials/ (one per feature).");
-            ui.label("Start with getting-started.md, then ram-search.md (find a health bar).");
+            ui.label("Training & shadow: training-mode.md, shadow-loop.md, matchup-grid.md, porting-a-game.md.");
+            ui.label("Debugger basics: start with getting-started.md, then ram-search.md (find a health bar).");
             ui.label("Press F8 to open them in-app: each is a litui page rendered as a Help → Tutorials screen.");
             ui.separator();
 
             ui.heading("About");
             ui.label("RustRetro loads libretro cores (Genesis, CPS-2, NES) and provides first-class debugging facilities.");
             ui.label("Built with Bevy (rendering), egui (UI), and Capstone (disassembly).");
+            let profile = crate::profile::current();
+            ui.label(
+                egui::RichText::new(format!(
+                    "Loaded game profile: {} ({}) — {}",
+                    profile.family.title,
+                    profile.port.port,
+                    profile.dir.display(),
+                ))
+                .small()
+                .color(egui::Color32::DARK_GRAY),
+            );
         });
     }
 }

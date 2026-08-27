@@ -1,0 +1,22 @@
+{
+  "family": "asurabld",
+  "title": "Asura Blade: Sword of Dynasty",
+  "roster": [
+    { "id": 0, "name": "yashaou", "select_slot": 0 },
+    { "id": 1, "name": "goat", "select_slot": 3 },
+    { "id": 2, "name": "lightning", "select_slot": 6 },
+    { "id": 3, "name": "footee", "select_slot": 4 },
+    { "id": 4, "name": "alice", "select_slot": 7 },
+    { "id": 5, "name": "taros", "select_slot": 1 },
+    { "id": 6, "name": "zamb", "select_slot": 2 },
+    { "id": 7, "name": "rosemary", "select_slot": 5 },
+    { "id": 8, "name": "curfue", "select_slot": null, "boss": true },
+    { "id": 9, "name": "sgeist", "select_slot": null, "boss": true }
+  ],
+  "move_classes": [
+    "Neutral", "Forward", "Back", "Up", "Down",
+    "UpForward", "UpBack", "DownForward", "DownBack"
+  ],
+  "attack_classes": ["None", "Light", "Medium", "Heavy", "Launcher", "Toss"],
+  "block": { "style": "back_hold" }
+}

@@ -29,12 +29,17 @@ cross-links from there.
 
 ## Graphics & I/O
 - [Tiles & Frames](/docs/tutorials/tiles-and-frames.md) — the tile viewer and frame inspector.
-- [VDP Registers](/docs/tutorials/vdp-registers.md) — the Genesis VDP bitfield decoder (and its honest limit).
 - [Input & Triggers](/docs/tutorials/input-and-triggers.md) — input history and pause triggers for frame work.
 - [Audio](/docs/tutorials/audio.md) — volume and mute.
 
 ## Scripting
-- [Lua Scripting](/docs/tutorials/lua-scripting.md) — load a script, the v1 API, building a hitbox overlay.
+- [Lua Scripting](/docs/tutorials/lua-scripting.md) — load a script, the API v3 bindings, building a hitbox overlay.
+
+## Training & Shadow
+- [Training Mode](/docs/tutorials/training-mode.md) — the held-fight sandbox: hotkeys, the 🎯 panel, native enforcement.
+- [The Shadow Loop](/docs/tutorials/shadow-loop.md) — record → fit → fight a behavioral-cloning opponent.
+- [The Matchup Grid](/docs/tutorials/matchup-grid.md) — coverage across the roster, force a matchup, find the gaps.
+- [Porting a Game](/docs/tutorials/porting-a-game.md) — take a second fighting game from booting to a full training/shadow target.
 
 ## litui page map
 
@@ -54,8 +59,10 @@ frontmatter, not a page):
 | `regions-heatmap-bookmarks.md` | `RegionsHeatmapBookmarks` |
 | `cpu-registers.md` | `CpuRegisters` |
 | `tiles-and-frames.md` | `TilesAndFrames` |
-| `vdp-registers.md` | `VdpRegisters` |
 | `input-and-triggers.md` | `InputAndTriggers` |
 | `audio.md` | `Audio` |
 | `lua-scripting.md` | `LuaScripting` |
-</invoke>
+| `training-mode.md` | `TrainingMode` |
+| `shadow-loop.md` | `ShadowLoop` |
+| `matchup-grid.md` | `MatchupGrid` |
+| `porting-a-game.md` | `PortingAGame` |
