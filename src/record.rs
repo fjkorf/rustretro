@@ -247,10 +247,13 @@ impl FrameRecorder {
         }
         let file = File::create(path)?;
         // Provenance sidecar (SPEC §5).
+        let prof = crate::profile::current();
         let meta = serde_json::json!({
             "format": "jsonl-v2",
             "game": game,
             "core": core,
+            "family": prof.family.family,
+            "port": prof.port.port,
             "style": style,
             "fps": 60,
             "blocks": {
@@ -297,6 +300,7 @@ impl FrameRecorder {
             "p1_input_mass": self.round_p1_mass,
             "demo": self.round_p1_mass == 0,
             "style": self.style,
+            "family": crate::profile::current().family.family,
         });
         let _ = out.write_all(line.to_string().as_bytes());
         let _ = out.write_all(b"\n");

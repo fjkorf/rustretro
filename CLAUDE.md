@@ -35,8 +35,8 @@ for iteration. The dev binary is `target/release-dev/rustretro`.
   --bus-map library/asurabld/asurabld.busmap.json \
   --training --script library/asurabld/training.lua \
   --mcp --mcp-port 4025 \
-  --record shadow/recordings/session-$(date +%Y%m%d-%H%M).jsonl \
-  --shadow shadow/models/goat-v2 --scale 3
+  --record shadow/recordings/asurabld/session-$(date +%Y%m%d-%H%M).jsonl \
+  --shadow shadow/models/asurabld/goat-v2 --scale 3
 ```
 
 Notable flags: `--headless` (agent-driven, implies `--mcp`), `--load-state
@@ -80,7 +80,7 @@ shadow/loop.sh --push       # fit, then load into the running app's NATIVE
 The whole lifecycle is also driveable from the 🎯 Training panel: recorder
 start/stop (auto-named into `shadow/recordings/`), the loaded-model card with
 per-bucket coverage (sparse buckets ⚠ = the drill list), and a model picker
-that hot-loads any `shadow/models/*` dir. Runtime loads arrive DISABLED
+that hot-loads any model dir (data roots are PER-FAMILY: `shadow/models/<family>/`, same for recordings/arenas — one game's data never appears under another). Runtime loads arrive DISABLED
 unless a shadow was already enabled; `--shadow` startup loads stay
 enabled-and-fatal-on-error. The MCP `load_shadow` tool is the scripted twin
 (gated behind `enable_writes`).
@@ -109,7 +109,8 @@ matchup key and auto-switches at every round start by reading both char ids
 Training saves: the panel's Arena section lists `shadow/arenas/*.state`,
 loads one, captures the on-screen situation as a new named arena, or promotes
 one to `shadow/arenas/current.state` — the pointer loop.sh starts fights from
-(fallback: ARENA env → current.state → goat-vs-rosemary.state). current.state
+(fallback: ARENA env → current.state → goat-vs-rosemary.state, under
+`shadow/arenas/<family>/`; loop.sh takes FAMILY env, default asurabld). current.state
 is gitignored; named arenas are committable.
 
 Python side: `shadow_train` is `pip install -e`'d into `shadow/train/.venv`

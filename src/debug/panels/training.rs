@@ -38,11 +38,19 @@ const DUMMY_MODES: [(DummyMode, &str); 5] = [
     (DummyMode::Block, "Block (hold away)"),
 ];
 
-/// Where `loop.sh` fits models to / recordings come from, relative to the
-/// launch cwd (the repo root by convention — same assumption loop.sh makes).
-const MODELS_DIR: &str = "shadow/models";
-const RECORDINGS_DIR: &str = "shadow/recordings";
-const ARENAS_DIR: &str = "shadow/arenas";
+/// Shadow data roots are PER-FAMILY (`shadow/<kind>/<family>/`) so one
+/// game's models/recordings/arenas never appear under another (QA-found:
+/// MK2's panel offered goat's brain). Relative to the launch cwd (repo
+/// root by convention — same assumption loop.sh makes).
+fn models_dir() -> PathBuf {
+    PathBuf::from("shadow/models").join(&crate::profile::current().family.family)
+}
+fn recordings_dir() -> PathBuf {
+    PathBuf::from("shadow/recordings").join(&crate::profile::current().family.family)
+}
+fn arenas_dir() -> PathBuf {
+    PathBuf::from("shadow/arenas").join(&crate::profile::current().family.family)
+}
 /// The active training save: loop.sh starts fights from this if it exists
 /// (ARENA env still wins). Machine-local — gitignored, unlike named arenas.
 const CURRENT_ARENA: &str = "current";
@@ -80,7 +88,7 @@ fn utc_stamp() -> String {
 
 fn scan_models() -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(MODELS_DIR) {
+    if let Ok(entries) = std::fs::read_dir(models_dir()) {
         for e in entries.flatten() {
             let path = e.path();
             if path.is_dir() && path.join("cases.npz").is_file() {
@@ -108,7 +116,7 @@ fn age_str(mtime: SystemTime) -> String {
 /// `shadow/arenas/*.state`, `current` first, then alphabetical.
 fn scan_arenas() -> Vec<(String, PathBuf, String)> {
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(ARENAS_DIR) {
+    if let Ok(entries) = std::fs::read_dir(arenas_dir()) {
         for e in entries.flatten() {
             let path = e.path();
             if path.extension().and_then(|s| s.to_str()) != Some("state") {
@@ -245,7 +253,7 @@ impl TrainingPanel {
 
         if self.arenas.is_empty() {
             ui.label(
-                egui::RichText::new(format!("No arenas under {ARENAS_DIR}/ yet."))
+                egui::RichText::new(format!("No arenas under {}/ yet.", arenas_dir().display()))
                     .color(egui::Color32::DARK_GRAY),
             );
         }
@@ -282,7 +290,7 @@ impl TrainingPanel {
             let name = self.arena_name.trim().trim_end_matches(".state").to_string();
             let ok = !name.is_empty() && !name.contains('/') && name != CURRENT_ARENA;
             if ui.add_enabled(ok, egui::Button::new("💾 Save arena")).clicked() {
-                let path = PathBuf::from(ARENAS_DIR).join(format!("{name}.state"));
+                let path = arenas_dir().join(format!("{name}.state"));
                 state.pending_state_op = Some(StateOp::Save(path.clone()));
                 if self.arena_make_current {
                     // 1s slack so coarse fs mtime granularity can't round the
@@ -314,7 +322,7 @@ impl TrainingPanel {
     /// Copy a named arena over `current.state` (copy, not symlink: portable,
     /// and re-saving the named arena later doesn't silently retarget current).
     fn make_current(&mut self, src: &PathBuf) {
-        let dst = PathBuf::from(ARENAS_DIR).join(format!("{CURRENT_ARENA}.state"));
+        let dst = arenas_dir().join(format!("{CURRENT_ARENA}.state"));
         self.arena_note = Some(match std::fs::copy(src, &dst) {
             Ok(_) => format!(
                 "current ← {}",
@@ -359,7 +367,7 @@ impl TrainingPanel {
                     )
                     .on_hover_text("Play-style declaration for this recording (rushdown, zoning, …) — stored in the sidecars, selectable at fit time");
                     if ui.button("⏺ Start").clicked() {
-                        let path = PathBuf::from(RECORDINGS_DIR)
+                        let path = recordings_dir()
                             .join(format!("session-{}.jsonl", utc_stamp()));
                         let style = self.record_style.trim();
                         state.pending_record = Some(RecordControl::Start {
@@ -470,7 +478,7 @@ impl TrainingPanel {
             .default_open(false)
             .show(ui, |ui| {
                 if self.models.is_empty() {
-                    ui.label(format!("Nothing under {MODELS_DIR}/ — run shadow/loop.sh --fit-only."));
+                    ui.label(format!("Nothing under {}/ — run shadow/loop.sh --fit-only.", models_dir().display()));
                 } else if ui
                     .small_button("Load ALL as set")
                     .on_hover_text(
@@ -479,7 +487,7 @@ impl TrainingPanel {
                     )
                     .clicked()
                 {
-                    state.pending_shadow_load = Some(PathBuf::from(MODELS_DIR));
+                    state.pending_shadow_load = Some(models_dir());
                 }
                 for (name, path) in &self.models {
                     ui.horizontal(|ui| {

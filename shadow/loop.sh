@@ -19,13 +19,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PORT="${PORT:-4025}"
+FAMILY="${FAMILY:-asurabld}"   # shadow data roots are per-family
 # Arena resolution: ARENA env wins; else the current-arena pointer (set from
 # the 🎯 Training panel's Arena section); else the committed canonical one.
 if [[ -z "${ARENA:-}" ]]; then
-  if [[ -f shadow/arenas/current.state ]]; then
-    ARENA=shadow/arenas/current.state
+  if [[ -f shadow/arenas/$FAMILY/current.state ]]; then
+    ARENA=shadow/arenas/$FAMILY/current.state
   else
-    ARENA=shadow/arenas/goat-vs-rosemary.state
+    ARENA=shadow/arenas/$FAMILY/goat-vs-rosemary.state
   fi
 fi
 PY=shadow/train/.venv/bin/python3
@@ -49,7 +50,7 @@ done
 if [[ $FIT -ge 1 ]]; then
   # jsonl-v2 recordings only (v1 files lack "block1"), newest 12.
   RECS=()
-  for f in $(ls -t shadow/recordings/*.jsonl 2>/dev/null | head -12); do
+  for f in $(ls -t "shadow/recordings/$FAMILY"/*.jsonl 2>/dev/null | head -12); do
     head -c 4096 "$f" | grep -q '"block1"' && RECS+=("$f")
   done
   [[ ${#RECS[@]} -gt 0 ]] || { echo "no v2 recordings found" >&2; exit 1; }
@@ -64,15 +65,15 @@ if [[ $FIT -ge 1 ]]; then
   fi
   # next version number
   N=1
-  while [[ -d "shadow/models/$PREFIX-v$N" ]]; do N=$((N + 1)); done
+  while [[ -d "shadow/models/$FAMILY/$PREFIX-v$N" ]]; do N=$((N + 1)); done
   MODEL="$PREFIX-v$N"
   echo "── fitting $MODEL from ${#RECS[@]} recording(s) ──"
   printf '    %s\n' "${RECS[@]}"
   # shadow_train is `pip install -e`d into .venv (see shadow/train/pyproject.toml),
   # so `-m shadow_train` resolves without cd-ing into shadow/train first.
-  "$PY" -m shadow_train fit "${RECS[@]}" ${FILTERS[@]+"${FILTERS[@]}"} --out "shadow/models/$MODEL/"
+  "$PY" -m shadow_train fit "${RECS[@]}" ${FILTERS[@]+"${FILTERS[@]}"} --out "shadow/models/$FAMILY/$MODEL/"
   echo
-  "$PY" -m shadow_train report "shadow/models/$MODEL/"
+  "$PY" -m shadow_train report "shadow/models/$FAMILY/$MODEL/"
   [[ $FIT -eq 2 ]] && exit 0
 fi
 
@@ -85,7 +86,7 @@ if [[ $PUSH -eq 1 ]]; then
   # an active one swaps brains at the next round start.
   echo
   echo "── pushing $MODEL (as part of the shadow/models set) on port $PORT ──"
-  "$PY" -u - "$(pwd)/shadow/models" "$PORT" <<'PYEOF'
+  "$PY" -u - "$(pwd)/shadow/models/$FAMILY" "$PORT" <<'PYEOF'
 import sys
 from shadow_train.mcpclient import McpClient
 path, port = sys.argv[1], sys.argv[2]
@@ -101,5 +102,5 @@ fi
 
 echo
 echo "── the shadow ($MODEL) enters — Ctrl-C to stop it ──"
-exec "$PY" -u shadow/play.py --model "shadow/models/$MODEL" \
+exec "$PY" -u shadow/play.py --model "shadow/models/$FAMILY/$MODEL" \
     --state "$ARENA" --port "$PORT"

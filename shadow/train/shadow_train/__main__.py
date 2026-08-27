@@ -18,7 +18,7 @@
       Print the MATCHUP coverage matrix (decisions per me-char x opp-char,
       demo rounds excluded, exactly as fit would count them) plus a per-style
       breakdown from the recording meta sidecars. Defaults to
-      shadow/recordings/*.jsonl (v2 only). The fill-the-gaps view.
+      shadow/recordings/<family>/*.jsonl (v2 only). The fill-the-gaps view.
 
   index [recordings...] [--force]
       Backfill .rounds.jsonl sidecars (the per-round matchup index the app's
@@ -141,7 +141,9 @@ def _recording_style(p: Path) -> str | None:
 def cmd_coverage(args) -> None:
     from collections import Counter
 
-    recs = args.recordings or sorted(Path("shadow/recordings").glob("*.jsonl"))
+    from . import profile as game_profile
+    fam = game_profile.get().family
+    recs = args.recordings or sorted(Path("shadow/recordings").joinpath(fam).glob("*.jsonl"))
     files = []
     for p in recs:
         try:
@@ -183,7 +185,9 @@ def cmd_coverage(args) -> None:
 
 
 def cmd_index(args) -> None:
-    recs = args.recordings or sorted(Path("shadow/recordings").glob("*.jsonl"))
+    from . import profile as game_profile
+    fam = game_profile.get().family
+    recs = args.recordings or sorted(Path("shadow/recordings").joinpath(fam).glob("*.jsonl"))
     done = skipped = 0
     for p in recs:
         if str(p).endswith(".rounds.jsonl"):
@@ -268,7 +272,7 @@ def main():
     p_cov = sub.add_parser("coverage",
                            help="matchup coverage matrix across recordings")
     p_cov.add_argument("recordings", nargs="*", type=Path,
-                       help="recordings to scan (default: shadow/recordings/*.jsonl)")
+                       help="recordings to scan (default: shadow/recordings/<family>/*.jsonl)")
     p_cov.set_defaults(func=cmd_coverage)
 
     p_idx = sub.add_parser("index",

@@ -29,9 +29,15 @@ struct Cell {
     styles: BTreeMap<String, u64>,
 }
 
-const RECORDINGS_DIR: &str = "shadow/recordings";
-const MODELS_DIR: &str = "shadow/models";
-const ARENAS_DIR: &str = "shadow/arenas";
+fn recordings_dir() -> PathBuf {
+    PathBuf::from("shadow/recordings").join(&crate::profile::current().family.family)
+}
+fn models_dir() -> PathBuf {
+    PathBuf::from("shadow/models").join(&crate::profile::current().family.family)
+}
+fn arenas_dir() -> PathBuf {
+    PathBuf::from("shadow/arenas").join(&crate::profile::current().family.family)
+}
 const REFRESH_SECS: f64 = 3.0;
 /// Decisions ≈ live frames / P (the 8-frame decision cadence).
 const FRAMES_PER_DECISION: u64 = 8;
@@ -81,7 +87,7 @@ fn clear_force(state: &mut DebugState, addr: u32) {
 
 fn scan_rounds() -> BTreeMap<(u8, u8), Cell> {
     let mut cells: BTreeMap<(u8, u8), Cell> = BTreeMap::new();
-    let Ok(entries) = std::fs::read_dir(RECORDINGS_DIR) else { return cells };
+    let Ok(entries) = std::fs::read_dir(recordings_dir()) else { return cells };
     for e in entries.flatten() {
         let path = e.path();
         if !path.to_string_lossy().ends_with(".rounds.jsonl") {
@@ -112,7 +118,7 @@ fn scan_rounds() -> BTreeMap<(u8, u8), Cell> {
 
 fn scan_model_keys() -> BTreeMap<(Option<u8>, Option<u8>), (String, PathBuf, String)> {
     let mut best: BTreeMap<(Option<u8>, Option<u8>), (String, PathBuf, String)> = BTreeMap::new();
-    let Ok(entries) = std::fs::read_dir(MODELS_DIR) else { return best };
+    let Ok(entries) = std::fs::read_dir(models_dir()) else { return best };
     for e in entries.flatten() {
         let path = e.path();
         let meta_path = path.join("meta.json");
@@ -340,7 +346,7 @@ impl MatchupPanel {
                     );
                 }
             }
-            let arena = PathBuf::from(ARENAS_DIR).join(format!("{slug}.state"));
+            let arena = arenas_dir().join(format!("{slug}.state"));
             if arena.is_file() {
                 if ui.small_button("Load arena").clicked() {
                     state.pending_state_op = Some(crate::debug::StateOp::Load(arena));
