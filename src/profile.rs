@@ -178,9 +178,25 @@ pub struct Blocks {
 #[derive(Deserialize, Debug, Clone)]
 pub struct FieldSpec {
     pub name: String,
-    pub off: HexAddr,
+    /// Offset from the fighter block base — the common case. Exactly one of
+    /// `off` / `globals` must be present (validated at load).
+    #[serde(default)]
+    pub off: Option<HexAddr>,
+    /// Global-sourced variant: a per-block pair of named globals, for values
+    /// that live OUTSIDE the fighter structs (MK2 arcade's world X sits in a
+    /// separate object array — `p1_x`/`p2_x` globals). Consumers see a normal
+    /// named field either way.
+    #[serde(default)]
+    pub globals: Option<BlockGlobals>,
     /// 1 or 2 bytes (guest order per `endianness`).
     pub size: u8,
+}
+
+/// The per-block global names backing a global-sourced fighter field.
+#[derive(Deserialize, Debug, Clone)]
+pub struct BlockGlobals {
+    pub block1: String,
+    pub block2: String,
 }
 
 /// Entry in `memory.record_globals`: a global name and read size for per-frame sampling.
@@ -316,6 +332,35 @@ impl GameProfile {
                         global_name
                     ));
                 }
+            }
+        }
+
+        // Validate fighter fields: exactly one source, and globals resolve.
+        for f in &port.memory.fighter_fields {
+            match (&f.off, &f.globals) {
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "fighter field '{}' has both off and globals — pick one",
+                        f.name
+                    ));
+                }
+                (None, None) => {
+                    return Err(format!(
+                        "fighter field '{}' needs off or globals",
+                        f.name
+                    ));
+                }
+                (None, Some(g)) => {
+                    for gname in [&g.block1, &g.block2] {
+                        if !port.memory.globals.contains_key(gname) {
+                            return Err(format!(
+                                "fighter field '{}' names unknown global '{gname}'",
+                                f.name
+                            ));
+                        }
+                    }
+                }
+                (Some(_), None) => {}
             }
         }
 
@@ -554,13 +599,30 @@ impl GameProfile {
         self.port.memory.blocks.block2.0
     }
 
+    /// Offset + size for an OFFSET-based fighter field. Returns None for
+    /// global-sourced fields (callers that need those use [`field_addr`],
+    /// or fall back to the per-player globals themselves — training's
+    /// x_pair pattern).
     pub fn field_off(&self, name: &str) -> Option<(u32, u8)> {
         self.port
             .memory
             .fighter_fields
             .iter()
             .find(|f| f.name == name)
-            .map(|f| (f.off.0, f.size))
+            .and_then(|f| f.off.as_ref().map(|o| (o.0, f.size)))
+    }
+
+    /// ABSOLUTE address + size of a fighter field for one block (1 or 2),
+    /// resolving both variants: block base + offset, or the per-block global.
+    pub fn field_addr(&self, block: u8, name: &str) -> Option<(u32, u8)> {
+        let f = self.port.memory.fighter_fields.iter().find(|f| f.name == name)?;
+        let base = if block == 1 { self.block1() } else { self.block2() };
+        if let Some(off) = &f.off {
+            return Some((base.wrapping_add(off.0), f.size));
+        }
+        let g = f.globals.as_ref()?;
+        let gname = if block == 1 { &g.block1 } else { &g.block2 };
+        Some((self.global(gname)?, f.size))
     }
 
     pub fn char_name(&self, id: u8) -> String {
