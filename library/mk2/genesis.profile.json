@@ -1,0 +1,42 @@
+{
+  "_STATUS": "Memory-RE pass 2026-08-27 (headless FBNeo Megadrive driver, MCP port 4032, ROM = Mortal Kombat II (World)(1994)(Acclaim), CRC a9e013d8; evidence log: mk2-genesis.md). VERIFIED (live, write-tested): fighter struct block1=0xFFB5F0 (P1) / block2=0xFFB6E0 (P2), stride 0xF0; char_id at block+0xE8 (u8) confirmed for Liu Kang=1 (constant P1 across 3 fresh-round samples) and P2 = Baraka=3 / Reptile=9 / Rayden=7 — these are the IDENTICAL numeric ids already in family.json's roster, so no cross-port id_map is needed for the characters checked (0,1,3,7,9 not independently re-verified beyond what's listed; no divergence observed). health at block+0x32 (u8, max 0x78=120): P1 0xFFB622 and P2 0xFFB712 both write-tested — forcing a low value produces the on-screen DANGER state and forcing 0 fires the real KO/WINS screen (verified for both P1 and P2, two independent matches). A mirrored companion byte at block+0x34 (0xFFB624 / 0xFFB714) tracks the primary health in lockstep in every sample; write BOTH bytes per side for enforcement (mirrors arcade's own dual-accumulator caution — the pairing itself is not independently write-tested here, only observed to move together). Endianness little (verified via a 16-bit write/read-back round-trip). LIKELY (correlated, not write-tested): match-decision flag 0xFFB5E0 (u8) — 0 across 26 live-combat samples spanning 3 different matchups and a range of health values (including near-death), 1 at KO in 2 independent matches and stays 1 through the win screen; NOT checked against char-select/title/attract, so (unlike arcade's screen_state) this profile's gate may false-positive during menus — open gap. Attack buttons: RETRO 'a' and RETRO 'r' both throw a visually-identical raised-leg kick that connects and deals 15-24 damage (verified twice against a stationary target via P2-human-join 2P mode); NOT classified as HP/LP/HK/LK (indistinguishable in captured frames, folded into one 'Kick' entry with both buttons pending disambiguation). RETRO 'b' showed a punch-looking pose in one uncontrolled trial but landed no measurable damage in a range-controlled trial (inconclusive — may simply be shorter-range than the kick and whiffed). RETRO x/y/l produced no visible effect in any trial (possibly unmapped in this core's current 3-button-vs-6-button pad mode; genesis core reported only generic 'P1 Button A/B/C/X/Y/Z' input descriptors, no game-specific labels to cross-check against). Block is UNVERIFIED — every hold-and-wait trial happened to catch a window where the CPU never actually attacked, so neither confirms nor disproves any candidate; do not trust attack_chords.Block below. NOT FOUND / disproven: authoritative round timer (two BCD-shaped read candidates, 0xFFAB97 and 0xFFAB9C, track the drawn countdown for a few hundred ms but drift/partially-revert under write — same disproven-store pattern the arcade port hit; timer_hold below is a non-functional placeholder); world/screen X position (one weak correlational candidate, 0xFFB18B, moved +90 after a walk but a forced-teleport write test produced no visible on-screen jump — DISPROVEN, not included); facing; wins-per-player; a screen_state-equivalent menu/char-select discriminator (none found — see gate caveat above). External-candidate research: decoded this game's own Genesis Game Genie codes (gamegenie.com; own from-scratch 40-bit codec, byte-exact against the algorithm's published worked example) but every code (P1/P2 infinite health, infinite time, etc.) patches ROM CODE (opcodes like BRA.S/MOVEQ/NOP at e.g. 0x0080E2/0x0080EC), not a RAM data address, and this core exposes no ROM region to trace operands from; two M68K breakpoints planted at those exact addresses never fired live during real combat, most likely because the GG codes target the USA release and this ROM is the World revision (CRC a9e013d8) with a different code layout — dead end, documented so it isn't retried. A RetroAchievements 'Mortal Kombat II' memory-map forum thread was found and initially looked authoritative but is the WRONG GAME (the unrelated 8-bit NES/Famicom Hummer Team bootleg, not this Genesis cartridge) — flagged prominently in the evidence doc so it is never re-adopted. No usable Genesis-specific PAR/GameShark RAM dump exists for this title (only a Game Gear MK2 dump was found, a different platform/memory map).",
+  "family": "mk2",
+  "port": "genesis",
+  "core": {
+    "library_name": "FinalBurn Neo",
+    "provenance_game": "md_mk2",
+    "provenance_core": "fbneo",
+    "button_names": { "start": "start" }
+  },
+  "requires": { "memory_regions": true, "save_states": true },
+  "memory": {
+    "cpu": "m68k",
+    "endianness": "little",
+    "blocks": { "block1": "0xFFB5F0", "block2": "0xFFB6E0", "stride": "0xF0" },
+    "fighter_fields": [
+      { "name": "char_id", "off": "0xE8", "size": 1 },
+      { "name": "health", "off": "0x32", "size": 1 },
+      { "name": "health_mirror", "off": "0x34", "size": 1 }
+    ],
+    "globals": {
+      "round_over": "0xFFB5E0"
+    }
+  },
+  "gate": [
+    { "kind": "byte_zero", "global": "round_over" },
+    { "kind": "health_in_range", "min": 1, "max": 120 }
+  ],
+  "enforcement": {
+    "health_max": 120, "refill_below": 90,
+    "timer_hold": [9, 9], "credits_target": 0, "credits_min": 0
+  },
+  "calibration": {
+    "GROUND_Y": 0, "X_SCALE": 128.0, "Y_SCALE": 128.0,
+    "TIMER_SCALE": 256.0, "ANIM_SCALE": 64.0, "CORNER_PX": 24,
+    "HEALTH_MAX": 120, "SCREEN_W": 320, "P": 8, "K": 4, "STALE": 3,
+    "SEGMENT_DECISIONS": 150, "HITSTUN_RECENT_FRAMES": 20
+  },
+  "attack_chords": {
+    "HK": ["a", "r"], "LK": [], "HP": [], "LP": [], "Block": []
+  }
+}
