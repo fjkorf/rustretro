@@ -92,6 +92,14 @@ pub struct PortProfile {
     pub attack_chords: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub positions: BTreeMap<String, u32>,
+    /// Where hitstun evidence lives: block name ("block1"/"block2") -> the global
+    /// whose recent change indicates hitstun for that block's fighter.
+    #[serde(default)]
+    pub hitstun_sources: Option<BTreeMap<String, String>>,
+    /// Raw RAM char id -> canonical roster id. Absent map or absent key = identity.
+    /// Keys are decimal strings (JSON object constraint). Values must exist in family roster.
+    #[serde(default)]
+    pub id_map: Option<BTreeMap<String, u8>>,
 }
 
 #[allow(dead_code)]
@@ -133,6 +141,10 @@ pub struct MemoryMap {
     /// Named global addresses ("round_timer" -> 0x40000A). Gate conditions
     /// and code refer to globals by NAME, never by raw address.
     pub globals: BTreeMap<String, HexAddr>,
+    /// Extra per-frame sampled globals beyond those in gate conditions.
+    /// Each entry names a global and specifies its read size (1 or 2 bytes).
+    #[serde(default)]
+    pub record_globals: Vec<RecordGlobal>,
 }
 fn d_endianness() -> String {
     "big".into()
@@ -153,6 +165,15 @@ pub struct Blocks {
 pub struct FieldSpec {
     pub name: String,
     pub off: HexAddr,
+    /// 1 or 2 bytes (guest order per `endianness`).
+    pub size: u8,
+}
+
+/// Entry in `memory.record_globals`: a global name and read size for per-frame sampling.
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
+pub struct RecordGlobal {
+    pub name: String,
     /// 1 or 2 bytes (guest order per `endianness`).
     pub size: u8,
 }
@@ -226,30 +247,27 @@ pub struct GameProfile {
 }
 
 impl GameProfile {
+    /// Load a game profile from a path. The path may be:
+    /// 1. A directory containing family.json + port profile(s):
+    ///    - tries `<dirname>.profile.json` first (legacy default)
+    ///    - else the single `*.profile.json` in the directory
+    ///    - errors if none found or multiple without a default
+    /// 2. A path like `dir/port_selector` (dir exists, file does not):
+    ///    - family dir = parent
+    ///    - tries `<parent>/<port_selector>.profile.json`
+    ///    - else scans for a profile with `"port": "<port_selector>"`
+    ///    - exactly one match wins; else error
     pub fn load(dir: &Path) -> Result<GameProfile, String> {
-        let fam_path = dir.join("family.json");
+        // Determine family dir and profile path.
+        let (fam_dir, prof_path) = Self::resolve_game_dir(dir)?;
+
+        let fam_path = fam_dir.join("family.json");
         let family: Family = serde_json::from_str(
             &std::fs::read_to_string(&fam_path)
                 .map_err(|e| format!("{}: {e}", fam_path.display()))?,
         )
         .map_err(|e| format!("{}: {e}", fam_path.display()))?;
 
-        // Port profile: <dirname>.profile.json, else the single *.profile.json.
-        let stem = dir.file_name().map(|s| s.to_string_lossy().into_owned());
-        let mut prof_path = stem
-            .as_deref()
-            .map(|s| dir.join(format!("{s}.profile.json")))
-            .filter(|p| p.is_file());
-        if prof_path.is_none() {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                prof_path = entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .find(|p| p.to_string_lossy().ends_with(".profile.json"));
-            }
-        }
-        let prof_path = prof_path
-            .ok_or_else(|| format!("{}: no *.profile.json found", dir.display()))?;
         let port: PortProfile = serde_json::from_str(
             &std::fs::read_to_string(&prof_path)
                 .map_err(|e| format!("{}: {e}", prof_path.display()))?,
@@ -262,6 +280,40 @@ impl GameProfile {
                 port.family, family.family
             ));
         }
+
+        // Validate record_globals names exist in globals.
+        for rg in &port.memory.record_globals {
+            if !port.memory.globals.contains_key(&rg.name) {
+                return Err(format!("record_globals names unknown global '{}'", rg.name));
+            }
+        }
+
+        // Validate hitstun_sources names appear in the recorded-globals union.
+        if let Some(hs) = &port.hitstun_sources {
+            let recorded_names: Vec<&str> = port.gate
+                .iter()
+                .filter_map(|c| c.global_name())
+                .chain(port.memory.record_globals.iter().map(|rg| rg.name.as_str()))
+                .collect();
+            for global_name in hs.values() {
+                if !recorded_names.iter().any(|n| *n == global_name) {
+                    return Err(format!(
+                        "hitstun_sources names unrecorded global '{}'",
+                        global_name
+                    ));
+                }
+            }
+        }
+
+        // Validate id_map values exist in family roster.
+        if let Some(im) = &port.id_map {
+            for canonical_id in im.values() {
+                if !family.roster.iter().any(|r| r.id == *canonical_id) {
+                    return Err(format!("id_map maps to unknown roster id {}", canonical_id));
+                }
+            }
+        }
+
         // Every gate/stage global must resolve; every chord class must exist.
         for cond in &port.gate {
             if let Some(g) = cond.global_name() {
@@ -275,7 +327,196 @@ impl GameProfile {
                 return Err(format!("attack_chords names unknown class '{class}'"));
             }
         }
-        Ok(GameProfile { dir: dir.to_path_buf(), family, port })
+        Ok(GameProfile { dir: fam_dir, family, port })
+    }
+
+    /// Resolve a game path to (family_dir, profile_path).
+    ///
+    /// Handles both directory and port-selector cases per the §5.2 contract:
+    /// 1. `dir` is a directory → family dir = dir; profile = <dirname>.profile.json or single *.profile.json
+    /// 2. `dir` is not a directory but parent is → family dir = parent; selector = basename;
+    ///    try <parent>/<basename>.profile.json, then scan for matching "port" field
+    /// 3. Neither → error
+    fn resolve_game_dir(input: &Path) -> Result<(PathBuf, PathBuf), String> {
+        if input.is_dir() {
+            // Case 1: dir is a directory.
+            let fam_dir = input.to_path_buf();
+            let stem = fam_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned());
+
+            // Try <dirname>.profile.json first.
+            let default_path = stem
+                .as_deref()
+                .map(|s| fam_dir.join(format!("{s}.profile.json")));
+            if let Some(path) = default_path {
+                if path.is_file() {
+                    return Ok((fam_dir, path));
+                }
+            }
+
+            // Try single *.profile.json.
+            let profiles: Vec<PathBuf> = std::fs::read_dir(&fam_dir)
+                .ok()
+                .and_then(|entries| {
+                    let found: Vec<PathBuf> = entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.to_string_lossy().ends_with(".profile.json"))
+                        .collect();
+                    if found.is_empty() { None } else { Some(found) }
+                })
+                .unwrap_or_default();
+
+            if profiles.is_empty() {
+                return Err(format!("{}: no *.profile.json found", fam_dir.display()));
+            }
+            if profiles.len() == 1 {
+                return Ok((fam_dir, profiles[0].clone()));
+            }
+
+            // Multiple profiles, no default → error with suggestion.
+            let stems: Vec<String> = profiles
+                .iter()
+                .filter_map(|p| {
+                    // file_stem on "mk2.profile.json" is "mk2.profile" — trim
+                    // the ".profile" so the suggestion names the port segment.
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.trim_end_matches(".profile").to_string())
+                })
+                .collect();
+            return Err(format!(
+                "{}: multiple port profiles and no {}.profile.json default — select one: --game {}/{}",
+                fam_dir.display(),
+                stem.as_deref().unwrap_or(""),
+                fam_dir.display(),
+                stems.join("|")
+            ));
+        }
+
+        // Case 2: not a directory; check if parent is a directory.
+        if let Some(parent) = input.parent() {
+            if parent.is_dir() {
+                let fam_dir = parent.to_path_buf();
+                let selector = input
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .ok_or_else(|| format!("--game {}: invalid path", input.display()))?;
+
+                // Try <parent>/<selector>.profile.json.
+                let default_path = fam_dir.join(format!("{}.profile.json", selector));
+                if default_path.is_file() {
+                    return Ok((fam_dir, default_path));
+                }
+
+                // Scan for matching "port" field.
+                let profiles: Vec<(PathBuf, String)> = std::fs::read_dir(&fam_dir)
+                    .ok()
+                    .and_then(|entries| {
+                        let mut matches = Vec::new();
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.to_string_lossy().ends_with(".profile.json") {
+                                if let Ok(content) = std::fs::read_to_string(&path) {
+                                    if let Ok(obj) =
+                                        serde_json::from_str::<serde_json::Value>(&content)
+                                    {
+                                        if let Some(port_val) = obj.get("port") {
+                                            if let Some(port_str) = port_val.as_str() {
+                                                if port_str == selector {
+                                                    matches.push((
+                                                        path.clone(),
+                                                        port_str.to_string(),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if matches.is_empty() {
+                            None
+                        } else {
+                            Some(matches)
+                        }
+                    })
+                    .unwrap_or_default();
+
+                if profiles.is_empty() {
+                    // Collect available profiles for the error message.
+                    let available: Vec<String> = std::fs::read_dir(&fam_dir)
+                        .ok()
+                        .and_then(|entries| {
+                            let mut stems = Vec::new();
+                            let mut ports = Vec::new();
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.to_string_lossy().ends_with(".profile.json") {
+                                    if let Some(stem) = path.file_stem() {
+                                        stems.push(
+                                            stem.to_string_lossy()
+                                                .trim_end_matches(".profile")
+                                                .to_string(),
+                                        );
+                                    }
+                                    if let Ok(content) = std::fs::read_to_string(&path) {
+                                        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(
+                                            &content,
+                                        ) {
+                                            if let Some(port_val) = obj.get("port") {
+                                                if let Some(port_str) = port_val.as_str() {
+                                                    ports.push(port_str.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            stems.sort();
+                            ports.sort();
+                            stems.extend(ports);
+                            if stems.is_empty() {
+                                None
+                            } else {
+                                Some(stems)
+                            }
+                        })
+                        .unwrap_or_default();
+
+                    let available_str = if available.is_empty() {
+                        "none".to_string()
+                    } else {
+                        available.join("/")
+                    };
+
+                    return Err(format!(
+                        "{}: no port '{}' (no {}.profile.json and no profile with \"port\": \"{}\"); available: {}",
+                        fam_dir.display(), selector, selector, selector, available_str
+                    ));
+                }
+
+                if profiles.len() == 1 {
+                    return Ok((fam_dir, profiles[0].0.clone()));
+                }
+
+                // Ambiguous: multiple matches.
+                let files: Vec<String> = profiles
+                    .iter()
+                    .map(|(p, _)| p.file_name().unwrap().to_string_lossy().to_string())
+                    .collect();
+                return Err(format!(
+                    "{}: port '{}' is ambiguous: {}",
+                    fam_dir.display(),
+                    selector,
+                    files.join(", ")
+                ));
+            }
+        }
+
+        // Case 3: neither conditions met.
+        Err(format!("--game {}: no such game directory", input.display()))
     }
 
     // ── convenience accessors (the API call sites use) ──────────────────
@@ -330,6 +571,17 @@ impl GameProfile {
 
     pub fn calibration(&self, key: &str) -> Option<f64> {
         self.port.calibration.get(key).copied()
+    }
+
+    /// Translate a raw RAM char id to its canonical roster id.
+    /// If no id_map is present or the raw id is not in the map, returns identity (raw).
+    #[allow(dead_code)]
+    pub fn canon_char_id(&self, raw: u8) -> u8 {
+        self.port
+            .id_map
+            .as_ref()
+            .and_then(|m| m.get(&raw.to_string()).copied())
+            .unwrap_or(raw)
     }
 }
 
@@ -398,6 +650,25 @@ pub fn init_for_tests() -> &'static GameProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    /// Create a unique temp directory path for tests. The caller is responsible for cleanup.
+    fn make_test_dir(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join("rustretro_tests");
+        let _ = fs::create_dir_all(&base);
+        let path = base.join(format!(
+            "{}_{}_{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&path); // Clean up if it exists
+        fs::create_dir_all(&path).ok();
+        path
+    }
 
     #[test]
     fn shipped_asurabld_profile_parses_and_matches_the_old_constants() {
@@ -431,5 +702,310 @@ mod tests {
         assert_eq!(p.port.enforcement.health_max, 0xEF);
         assert_eq!(p.port.enforcement.timer_hold, [0x85, 0x03]);
         assert_eq!(p.calibration("GROUND_Y"), Some(216.0));
+    }
+
+    #[test]
+    fn path_resolution_default_directory_with_matching_stem() {
+        // Test case 1: dir exists, <dirname>.profile.json exists → use it
+        let tmpbase = make_test_dir("path_resolution_default");
+        let game_dir = tmpbase.join("mygame");
+        fs::create_dir(&game_dir).unwrap();
+
+        // Create family.json
+        let family_json = r#"{"family":"test","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        // Create mygame.profile.json (default via stem)
+        let port_json = r#"{"family":"test","port":"default","core":{"library_name":"","provenance_game":"test","provenance_core":"test"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("mygame.profile.json"), port_json).unwrap();
+
+        let result = GameProfile::load(&game_dir);
+        assert!(result.is_ok());
+        let profile = result.unwrap();
+        assert_eq!(profile.family.family, "test");
+        assert_eq!(profile.port.port, "default");
+    }
+
+    #[test]
+    fn path_resolution_single_profile_fallback() {
+        // Test case 1b: dir exists, no <dirname>.profile.json, single *.profile.json → use it
+        let tmpbase = make_test_dir("path_resolution_single");
+        let game_dir = tmpbase.join("gameX");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"test2","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        // Only one profile with a different name
+        let port_json = r#"{"family":"test2","port":"only","core":{"library_name":"","provenance_game":"test2","provenance_core":"test2"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("other.profile.json"), port_json).unwrap();
+
+        let result = GameProfile::load(&game_dir);
+        assert!(result.is_ok());
+        let profile = result.unwrap();
+        assert_eq!(profile.port.port, "only");
+    }
+
+    #[test]
+    fn path_resolution_multiple_profiles_error() {
+        // Test case 1c: dir exists, multiple *.profile.json, no default → error
+        let tmpbase = make_test_dir("path_resolution_multiple");
+        let game_dir = tmpbase.join("ambiguous");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"test3","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let port_json_a = r#"{"family":"test3","port":"arcade","core":{"library_name":"","provenance_game":"test3","provenance_core":"test3"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("arcade.profile.json"), port_json_a).unwrap();
+
+        let port_json_g = r#"{"family":"test3","port":"genesis","core":{"library_name":"","provenance_game":"test3","provenance_core":"test3"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("genesis.profile.json"), port_json_g).unwrap();
+
+        let result = GameProfile::load(&game_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("multiple port profiles"));
+        assert!(err.contains("arcade") || err.contains("genesis"));
+    }
+
+    #[test]
+    fn path_resolution_port_segment_by_filename() {
+        // Test case 2a: dir/selector path where selector.profile.json exists
+        let tmpbase = make_test_dir("path_resolution_port_segment");
+        let game_dir = tmpbase.join("mk2");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"mk2","roster":[{"id":0,"name":"test"}],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let port_json_mk2 = r#"{"family":"mk2","port":"arcade","core":{"library_name":"","provenance_game":"mk2","provenance_core":"fbneo"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":161,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("mk2.profile.json"), port_json_mk2).unwrap();
+
+        let port_json_gen = r#"{"family":"mk2","port":"genesis","core":{"library_name":"","provenance_game":"mk2","provenance_core":"genesis_plus"},"memory":{"blocks":{"block1":"0xFF8000","block2":"0xFF8200","stride":"0x200"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":161,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("genesis.profile.json"), port_json_gen)
+            .unwrap();
+
+        // Load via selector path
+        let selector_path = tmpbase.join("mk2/genesis");
+        let result = GameProfile::load(&selector_path);
+        assert!(result.is_ok());
+        let profile = result.unwrap();
+        assert_eq!(profile.port.port, "genesis");
+    }
+
+    #[test]
+    fn path_resolution_port_segment_by_field_match() {
+        // Test case 2b: dir/selector where selector matches a "port" field value
+        let tmpbase = make_test_dir("path_resolution_port_field");
+        let game_dir = tmpbase.join("mk2");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"mk2","roster":[{"id":0,"name":"test"}],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        // File named differently but port="arcade"
+        let port_json_default = r#"{"family":"mk2","port":"arcade","core":{"library_name":"","provenance_game":"mk2","provenance_core":"fbneo"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":161,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("mk2.profile.json"), port_json_default).unwrap();
+
+        // File named port_v2 but port="v2"
+        let port_json_v2 = r#"{"family":"mk2","port":"v2","core":{"library_name":"","provenance_game":"mk2","provenance_core":"fbneo"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":161,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("port_v2.profile.json"), port_json_v2).unwrap();
+
+        // Try to load via --game mk2/v2 (should match the port field, not filename)
+        let selector_path = tmpbase.join("mk2/v2");
+        let result = GameProfile::load(&selector_path);
+        assert!(result.is_ok());
+        let profile = result.unwrap();
+        assert_eq!(profile.port.port, "v2");
+    }
+
+    #[test]
+    fn path_resolution_port_segment_ambiguous_error() {
+        // Test case 2d: multiple profiles with the same port field value → error
+        let tmpbase = make_test_dir("path_resolution_ambiguous");
+        let game_dir = tmpbase.join("bad");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"bad","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let port_json_1 = r#"{"family":"bad","port":"dup","core":{"library_name":"","provenance_game":"bad","provenance_core":"bad"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("first.profile.json"), port_json_1).unwrap();
+
+        let port_json_2 = r#"{"family":"bad","port":"dup","core":{"library_name":"","provenance_game":"bad","provenance_core":"bad"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("second.profile.json"), port_json_2).unwrap();
+
+        let selector_path = tmpbase.join("bad/dup");
+        let result = GameProfile::load(&selector_path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("ambiguous"));
+    }
+
+    #[test]
+    fn path_resolution_port_segment_not_found_error() {
+        // Test case 2c: selector doesn't match any profile → error
+        let tmpbase = make_test_dir("path_resolution_not_found");
+        let game_dir = tmpbase.join("mk2");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"mk2","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let port_json = r#"{"family":"mk2","port":"arcade","core":{"library_name":"","provenance_game":"mk2","provenance_core":"fbneo"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":161,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("mk2.profile.json"), port_json).unwrap();
+
+        let selector_path = tmpbase.join("mk2/nonexistent");
+        let result = GameProfile::load(&selector_path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("no port 'nonexistent'"));
+    }
+
+    #[test]
+    fn id_map_present_and_mapped() {
+        // canon_char_id with a present id_map entry
+        let tmpbase = make_test_dir("id_map_present");
+        let game_dir = tmpbase.join("mapped");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"mapped","roster":[{"id":0,"name":"a"},{"id":1,"name":"b"},{"id":2,"name":"c"}],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let port_json = r#"{"family":"mapped","port":"test","core":{"library_name":"","provenance_game":"mapped","provenance_core":"test"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{},"id_map":{"5":0,"6":1,"7":2}}"#;
+        fs::write(game_dir.join("mapped.profile.json"), port_json).unwrap();
+
+        let profile = GameProfile::load(&game_dir).unwrap();
+        assert_eq!(profile.canon_char_id(5), 0);
+        assert_eq!(profile.canon_char_id(6), 1);
+        assert_eq!(profile.canon_char_id(7), 2);
+    }
+
+    #[test]
+    fn id_map_absent_uses_identity() {
+        // canon_char_id with no id_map → identity
+        let tmpbase = make_test_dir("id_map_absent");
+        let game_dir = tmpbase.join("nomapped");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"nomapped","roster":[{"id":0,"name":"a"},{"id":5,"name":"b"}],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let port_json = r#"{"family":"nomapped","port":"test","core":{"library_name":"","provenance_game":"nomapped","provenance_core":"test"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("nomapped.profile.json"), port_json).unwrap();
+
+        let profile = GameProfile::load(&game_dir).unwrap();
+        assert_eq!(profile.canon_char_id(5), 5);
+        assert_eq!(profile.canon_char_id(0), 0);
+    }
+
+    #[test]
+    fn id_map_unmapped_key_uses_identity() {
+        // canon_char_id with id_map present but key missing → identity
+        let tmpbase = make_test_dir("id_map_unmapped");
+        let game_dir = tmpbase.join("partial");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"partial","roster":[{"id":0,"name":"a"},{"id":1,"name":"b"},{"id":5,"name":"c"}],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let port_json = r#"{"family":"partial","port":"test","core":{"library_name":"","provenance_game":"partial","provenance_core":"test"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{},"id_map":{"5":0}}"#;
+        fs::write(game_dir.join("partial.profile.json"), port_json).unwrap();
+
+        let profile = GameProfile::load(&game_dir).unwrap();
+        assert_eq!(profile.canon_char_id(5), 0); // mapped
+        assert_eq!(profile.canon_char_id(99), 99); // unmapped → identity
+    }
+
+    #[test]
+    fn record_globals_valid() {
+        // record_globals with valid globals
+        let tmpbase = make_test_dir("record_globals_valid");
+        let game_dir = tmpbase.join("recorded");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"recorded","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let port_json = r#"{"family":"recorded","port":"test","core":{"library_name":"","provenance_game":"recorded","provenance_core":"test"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{"combo":"0x1000","demo":"0x2000"},"record_globals":[{"name":"combo","size":1},{"name":"demo","size":2}]},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("recorded.profile.json"), port_json).unwrap();
+
+        let result = GameProfile::load(&game_dir);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn record_globals_invalid_global_name() {
+        // record_globals with an unknown global → error
+        let tmpbase = make_test_dir("record_globals_invalid");
+        let game_dir = tmpbase.join("badrecord");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"badrecord","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let port_json = r#"{"family":"badrecord","port":"test","core":{"library_name":"","provenance_game":"badrecord","provenance_core":"test"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{"known":"0x1000"},"record_globals":[{"name":"unknown","size":1}]},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("badrecord.profile.json"), port_json).unwrap();
+
+        let result = GameProfile::load(&game_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("record_globals names unknown global"));
+    }
+
+    #[test]
+    fn hitstun_sources_valid() {
+        // hitstun_sources with valid recorded globals
+        let tmpbase = make_test_dir("hitstun_sources_valid");
+        let game_dir = tmpbase.join("hitstun");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"hitstun","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let port_json = r#"{"family":"hitstun","port":"test","core":{"library_name":"","provenance_game":"hitstun","provenance_core":"test"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{"combo_b1":"0x1000","combo_b2":"0x2000"},"record_globals":[{"name":"combo_b1","size":1},{"name":"combo_b2","size":1}]},"gate":[{"kind":"byte_zero","global":"combo_b1"}],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{},"hitstun_sources":{"block1":"combo_b1","block2":"combo_b2"}}"#;
+        fs::write(game_dir.join("hitstun.profile.json"), port_json).unwrap();
+
+        let result = GameProfile::load(&game_dir);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn hitstun_sources_unrecorded_global() {
+        // hitstun_sources references a global not in the recorded union → error
+        let tmpbase = make_test_dir("hitstun_sources_unrecorded");
+        let game_dir = tmpbase.join("badhitstun");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"badhitstun","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let port_json = r#"{"family":"badhitstun","port":"test","core":{"library_name":"","provenance_game":"badhitstun","provenance_core":"test"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{"combo_b1":"0x1000","unrecorded":"0x3000"}},"gate":[{"kind":"byte_zero","global":"combo_b1"}],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{},"hitstun_sources":{"block1":"unrecorded"}}"#;
+        fs::write(game_dir.join("badhitstun.profile.json"), port_json).unwrap();
+
+        let result = GameProfile::load(&game_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("hitstun_sources names unrecorded global"));
+    }
+
+    #[test]
+    fn id_map_invalid_roster_id() {
+        // id_map references a non-existent roster id → error
+        let tmpbase = make_test_dir("id_map_invalid_roster");
+        let game_dir = tmpbase.join("badidmap");
+        fs::create_dir(&game_dir).unwrap();
+
+        let family_json = r#"{"family":"badidmap","roster":[{"id":0,"name":"a"},{"id":1,"name":"b"}],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let port_json = r#"{"family":"badidmap","port":"test","core":{"library_name":"","provenance_game":"badidmap","provenance_core":"test"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{},"id_map":{"5":99}}"#;
+        fs::write(game_dir.join("badidmap.profile.json"), port_json).unwrap();
+
+        let result = GameProfile::load(&game_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("id_map maps to unknown roster id"));
     }
 }
