@@ -24,7 +24,9 @@
       { "name": "meter", "off": "0x17B", "size": 1 },
       { "name": "meter_max", "off": "0x17F", "size": 1 },
       { "name": "char_id", "off": "0x639", "size": 1 },
-      { "name": "wins", "off": "0xA4C", "size": 1 }
+      { "name": "wins", "off": "0xA4C", "size": 1 },
+      { "name": "opp_right_hold", "off": "0x28", "size": 2 },
+      { "name": "opp_left_hold", "off": "0x2A", "size": 2 }
     ],
     "globals": {
       "round_state": "0x400000",
@@ -38,8 +40,15 @@
       "round_over": "0x40646E",
       "credits": "0x40655D",
       "demo_flag": "0x4065D8"
-    }
+    },
+    "record_globals": [
+      { "name": "combo_on_b2", "size": 1 },
+      { "name": "combo_on_b1", "size": 1 },
+      { "name": "demo_flag", "size": 2 },
+      { "name": "credits", "size": 1 }
+    ]
   },
+  "hitstun_sources": { "block1": "combo_on_b1", "block2": "combo_on_b2" },
   "gate": [
     { "kind": "word_zero", "global": "round_over" },
     { "kind": "word_zero", "global": "abort" },
