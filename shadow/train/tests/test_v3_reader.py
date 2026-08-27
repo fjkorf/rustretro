@@ -85,6 +85,22 @@ class SparseFamilyHonestDegradationTest(unittest.TestCase):
     self-describing v3 path, not the no-sidecar profile-fallback branch the
     G2 test above uses."""
 
+    def setUp(self):
+        # The fixture's sidecar declares family "mk2"; the family-mismatch
+        # guard aborts fits whose loaded profile disagrees, so pin it here.
+        import os
+        self._env = os.environ.get("RUSTRETRO_GAME_DIR")
+        os.environ["RUSTRETRO_GAME_DIR"] = str(
+            Path(__file__).resolve().parents[3] / "library" / "mk2"
+        )
+
+    def tearDown(self):
+        import os
+        if self._env is None:
+            os.environ.pop("RUSTRETRO_GAME_DIR", None)
+        else:
+            os.environ["RUSTRETRO_GAME_DIR"] = self._env
+
     def _write_recording(self, d: Path) -> Path:
         rows = []
         n_frames = dataset.P * (dataset.K + 1 + 20)  # comfortably >= the stack minimum

@@ -31,7 +31,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import asurabld, dataset
+from . import dataset
 from . import profile as _profile
 from .dataset import ATTACK_CLASSES, MOVE_CLASSES, SCALAR_FEATURES, build
 from .evaluate import MIN_EXAMPLES, evaluate, print_report
@@ -92,7 +92,7 @@ def cmd_fit(args) -> None:
         "neutral_cap": neutral_cap,
         "char_filter": args.char,
         "opp_filter": opp,
-        "matchup": asurabld.matchup_slug(args.char, opp),
+        "matchup": prof.matchup_slug(args.char, opp),
         "source_files": [str(p) for p in args.recordings],
         "n_decisions": int(len(data["X"])),
         "n_rounds": int(len(set(data["rounds"]))),
@@ -169,7 +169,7 @@ def cmd_coverage(args) -> None:
 
     mes = sorted({m for m, _ in per})
     opps = sorted({o for _, o in per})
-    name = asurabld.char_name
+    name = _profile.get().char_name
     print(f"matchup coverage — decisions per cell, demo rounds excluded "
           f"({len(files)} recording(s))")
     header = " " * 10 + "".join(f"{name(o):>10}" for o in opps)

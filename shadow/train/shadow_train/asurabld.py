@@ -31,6 +31,15 @@ from . import profile as _profile
 
 _P = _profile.get()
 
+# This module is the asurabld constants veneer — importing it under any other
+# loaded profile would resolve garbage (or crash on unmapped fields below).
+# Fail loud and early instead.
+if _P.family != "asurabld":
+    raise ImportError(
+        f"shadow_train.asurabld requires the asurabld profile "
+        f"(loaded: '{_P.family}' — check RUSTRETRO_GAME_DIR)"
+    )
+
 # ── fighter allocation blocks ───────────────────────────────────────────────
 # Two fighter blocks, STRIDE bytes apart; which one is "P1"/"the human"
 # varies by mode and round -- anchor at round start via X (see asurabld.md's

@@ -162,6 +162,7 @@ class _RecordingView:
     calibration: dict             # this recording's own scaling constants
     hitstun_map: dict | None      # block name -> global name, or None (unavailable)
     port: str
+    family: str | None = None     # v3 sidecar's family; None = trust the profile
 
 
 def _detect_version(path: Path) -> str:
@@ -242,6 +243,7 @@ def _view_for(path: Path, version: str, prof) -> _RecordingView:
                 else None
             ),
             port=prof.port,
+            family=None,
         )
 
     meta = _load_meta_sidecar(path)
@@ -252,6 +254,7 @@ def _view_for(path: Path, version: str, prof) -> _RecordingView:
             calibration=prof.calibration,
             hitstun_map=hitstun_default,
             port=prof.port,
+            family=None,
         )
 
     recorded = {g["name"] for g in meta.get("globals_recorded", [])}
@@ -266,6 +269,7 @@ def _view_for(path: Path, version: str, prof) -> _RecordingView:
         calibration=dict(meta.get("calibration", {})),
         hitstun_map=hitstun_map,
         port=meta.get("port", prof.port),
+        family=meta.get("family"),
     )
 
 
@@ -599,7 +603,17 @@ def _decisions_from_file(path: Path) -> tuple[list[Decision], list[str], str]:
     """One file's (decisions, its resolved feature-name list, its port) --
     the per-file unit both load_decisions() and build() are built from."""
     version = _detect_version(path)
-    view = _view_for(path, version, _profile.get())
+    prof = _profile.get()
+    view = _view_for(path, version, prof)
+    # Attack labels and class vocabularies come from the ACTIVE profile
+    # (chords/family.json are not in the sidecar) — fitting another family's
+    # recording would silently mislabel every attack. Abort instead.
+    if view.family is not None and view.family != prof.family:
+        raise SystemExit(
+            f"{path.name}: recorded for family '{view.family}' but the loaded "
+            f"profile is '{prof.family}' — set RUSTRETRO_GAME_DIR (e.g. "
+            f"library/{view.family}) and re-run"
+        )
     feats = scalar_features_for(view)
     decisions: list[Decision] = []
     for round_key, rows in _rounds(path):
