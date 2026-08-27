@@ -351,3 +351,15 @@ different game configuration) and is superseded.
   profile (correct block2 anchoring, sensible masks) and port-2 injected
   input lands in-game (the join itself proves it). Full 2-human shadow fight
   is a windowed-play exercise.
+
+## Calibration corrections from the first real fit (2026-08-27, orchestrator)
+
+- **GROUND_Y = 110, not 121.** Across a real play session both fighters stand
+  at y=110 (2904/~3100 P1 frames; P2 identical); the W2 jump-parabola baseline
+  of 121 was measured from a different stance/stage snapshot. With 121 the
+  airborne test (GROUND_Y − y > 4) marked 99.7% of decisions "air".
+- **x is WORLD position, so the corner feature is unusable until stage bounds
+  are RE'd**: world x runs ~500–800 vs SCREEN_W=320, putting everyone
+  permanently "past the right edge" (87% corner bucket). CORNER_PX/SCREEN_W
+  removed from calibration so me_corner drops out via the availability table.
+  OPEN: find per-stage world bounds (or a camera-x global to derive screen x).

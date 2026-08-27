@@ -54,17 +54,21 @@ _PROF = _profile.get()
 _CAL = _PROF.calibration
 
 # ── calibration constants (SPEC §1) ─────────────────────────────────────────
-GROUND_Y = _CAL["GROUND_Y"]
-X_SCALE = _CAL["X_SCALE"]
-Y_SCALE = _CAL["Y_SCALE"]
-TIMER_SCALE = _CAL["TIMER_SCALE"]
-ANIM_SCALE = _CAL["ANIM_SCALE"]
-CORNER_PX = _CAL["CORNER_PX"]
-HEALTH_MAX = _CAL["HEALTH_MAX"]
+# Scaling constants may legitimately be ABSENT from a partial profile (their
+# features then drop out per the §4.2 availability table) — .get() with the
+# asurabld literals as inert defaults keeps this module importable under any
+# profile. Cadence constants (P/K/STALE) are fit-global and required.
+GROUND_Y = _CAL.get("GROUND_Y", 216)
+X_SCALE = _CAL.get("X_SCALE", 128.0)
+Y_SCALE = _CAL.get("Y_SCALE", 128.0)
+TIMER_SCALE = _CAL.get("TIMER_SCALE", 256.0)
+ANIM_SCALE = _CAL.get("ANIM_SCALE", 64.0)
+CORNER_PX = _CAL.get("CORNER_PX", 24)
+HEALTH_MAX = _CAL.get("HEALTH_MAX", 239)
 P = _CAL["P"]              # decision period, frames (§4)
 K = _CAL["K"]              # stacked decision-step snapshots (§4)
 STALE = _CAL["STALE"]      # opponent observation delay, frames (§4)
-SCREEN_W = _CAL["SCREEN_W"]
+SCREEN_W = _CAL.get("SCREEN_W", 320)
 
 # Task 1 (pseudo-round segmentation): training-mode sessions freeze the round
 # timer, so a single round_id can run tens of thousands of frames -- with only
@@ -230,7 +234,11 @@ def _view_for(path: Path, version: str, prof) -> _RecordingView:
     self-describing, honest degradation from that sidecar's own fighter_
     fields/calibration/recorded-globals. v3 without a sidecar: the legacy
     fallback (item 2) -- trust the loaded profile fully, exactly like v2."""
-    hitstun_default = prof.hitstun_sources or _LEGACY_HITSTUN_SOURCES
+    # The legacy constant predates profiles carrying hitstun_sources and is
+    # asurabld's combo counters — never a valid default for another family.
+    hitstun_default = prof.hitstun_sources or (
+        _LEGACY_HITSTUN_SOURCES if prof.family == "asurabld" else None
+    )
 
     if version == "v2":
         return _RecordingView(
@@ -239,7 +247,8 @@ def _view_for(path: Path, version: str, prof) -> _RecordingView:
             calibration=prof.calibration,
             hitstun_map=(
                 hitstun_default
-                if all(g in _V2_RECORDED_GLOBALS for g in hitstun_default.values())
+                if hitstun_default is not None
+                and all(g in _V2_RECORDED_GLOBALS for g in hitstun_default.values())
                 else None
             ),
             port=prof.port,
@@ -260,7 +269,8 @@ def _view_for(path: Path, version: str, prof) -> _RecordingView:
     recorded = {g["name"] for g in meta.get("globals_recorded", [])}
     hitstun_map = (
         hitstun_default
-        if all(g in recorded for g in hitstun_default.values())
+        if hitstun_default is not None
+        and all(g in recorded for g in hitstun_default.values())
         else None
     )
     return _RecordingView(
@@ -622,6 +632,17 @@ def _decisions_from_file(path: Path) -> tuple[list[Decision], list[str], str]:
 
 
 def _load_decisions_with_meta(paths: list[Path]):
+    # `session-*.jsonl` globs inevitably also match the `.rounds.jsonl`
+    # summary sidecars the recorder writes next to every recording — those
+    # are per-round index lines, not frame traces. Skip them, loudly.
+    skipped = [p for p in paths if p.name.endswith(".rounds.jsonl")]
+    if skipped:
+        print(f"skipping {len(skipped)} rounds-sidecar file(s): "
+              + ", ".join(p.name for p in skipped))
+    paths = [p for p in paths if not p.name.endswith(".rounds.jsonl")]
+    if not paths:
+        raise SystemExit("no recordings left after skipping rounds sidecars — "
+                         "pass the main .jsonl trace files")
     decisions: list[Decision] = []
     feature_sets: dict = {}
     ports: list[str] = []

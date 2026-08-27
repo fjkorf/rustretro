@@ -1,47 +1,113 @@
 {
-  "_STATUS": "Memory-RE passes 2026-08-27 (W1) + 2026-08-27 (W2), headless FBNeo Megadrive driver, MCP port 4032, ROM = Mortal Kombat II (World)(1994)(Acclaim), CRC a9e013d8; evidence log: mk2-genesis.md. VERIFIED (live, write-tested): fighter struct block1=0xFFB5F0 (P1) / block2=0xFFB6E0 (P2), stride 0xF0; char_id at +0xE8 (u8; ids identical to family.json roster for 1/3/7/9); health at +0x32 (u8, max 0x78=120, write-tested both sides, KO fires) with lockstep mirror at +0x34 (write both). NEW (W2): world X at +0xD8 (u16, P1 0xFFB6C8 / P2 0xFFB7B8) — found by CPU-walk monotone snapshot diff, VERIFIED BY TELEPORT (writing 800 visibly side-swapped P1 past the opponent; write sticks and physics continues from the new position; the likely subpixel word sits at +0xDA, not profiled). Y at +0xDC (u16, P1 0xFFB6CC) — clean parabola on jump (ground=121, smaller=higher), VERIFIED BY WRITE (Y=50 visibly levitates the fighter). ROUND TIMER: 0xFFAB97 (u8 BCD seconds) IS AUTHORITATIVE — the W1 'disproof' was a misread (their post-write 0x49 was the written 0x50 legitimately ticking once): writing 0x50 makes the DISPLAYED timer show 50 and keep counting; writing 0x02 times the round out to the real GAME OVER; 0xFFAB96 is the sub-second frame counter, 0xFFAB98 is always 0x00 (so the 2-byte timer_hold write [0x99,0x00] is safe); 0xFFAB9C/0xFFABA0 are display-side mirrors, not stores. GATE: menu_state 0xFFB2CE (u16) — 0x9C01 on intro/title/attract/dragon-menu/char-select/ladder/continue in EVERY sample (32 nonfight snapshots), 0x0000 in every in-fight sample (17 snapshots across 3 stages, 1P-vs-CPU + 2-human + attract-demo modes, 40-sample rapid poll during live combat all zero) -> word_zero(menu_state) is the third gate condition; residual known leak: the rare draw-timeout GAME OVER screen reads menu_state=0 for ~9s with full healths and round_over=0 (static screen, zero p1_input, harmless; flips to 0x9C01 when attract resumes). Candidate 0xFF098F from earlier in the session was DISPROVEN (reads 68/nonzero during a live Living Forest fight — sound-driver-adjacent, do not readopt). round_over 0xFFB5E0 kept (correlated: 0 in 26+ live samples, 1 at KO through the WINS screen; still not write-tested). BUTTONS (6-BUTTON MODE, see below): damage-tested against an idle human P2 (2-human rig; join = press start on port 1 during a 1P fight) with X-teleport-controlled spacing: LP=b (6 dmg jab), HP=y (18 dmg close / 9 at range), LK=r (20 standing / 15 close knee), HK=l (24 roundhouse / 15 close knee), Block=a (0 dmg at every range; holding it cuts an incoming 24-dmg roundhouse to 6 chip on BOTH sides). RETRO x is a SECOND Block (same chip test passes); RETRO y is double-bound by the core's md_mk2 mapping (tap=HP fires, hold=engages Block) — chords below use taps for attacks so this is safe, but never HOLD y expecting only HP. MODE CAVEAT: these chords require the game's 6-BUTTON pad setting (dragon menu > Options > Extra Controls > Port1/Port2 = '6 BUTTON'); the game boots in a mode where only b/a/r act (b=LP 6, a=mid kick 20, r=roundhouse 24, NO block button at all) and the setting is menu-only (no SRAM) — but SAVE STATES CARRY IT, and shadow/arenas/mk2/genesis-probe.state was re-captured in 6-button mode (Liu Kang vs Baraka, live round 1, timer 99, full health), so state-anchored flows inherit the right mode. FBNeo mapping source: src/burner/libretro/retro_input.cpp md_mk2 branch (MD A/B/C/X/Y/Z -> RETRO b/a/r/y/x/l). STILL OPEN: facing, wins-per-player, full roster id cross-check beyond ids 1/3/7/9; round_over write-test; the GAME OVER 9s gate window.",
-  "family": "mk2",
-  "port": "genesis",
-  "core": {
-    "library_name": "FinalBurn Neo",
-    "provenance_game": "md_mk2",
-    "provenance_core": "fbneo",
-    "button_names": { "start": "start" }
-  },
-  "requires": { "memory_regions": true, "save_states": true },
-  "memory": {
-    "cpu": "m68k",
-    "endianness": "little",
-    "blocks": { "block1": "0xFFB5F0", "block2": "0xFFB6E0", "stride": "0xF0" },
-    "fighter_fields": [
-      { "name": "char_id", "off": "0xE8", "size": 1 },
-      { "name": "health", "off": "0x32", "size": 1 },
-      { "name": "health2", "off": "0x34", "size": 1 },
-      { "name": "x", "off": "0xD8", "size": 2 },
-      { "name": "y", "off": "0xDC", "size": 2 }
-    ],
-    "globals": {
-      "round_over": "0xFFB5E0",
-      "menu_state": "0xFFB2CE",
-      "round_timer": "0xFFAB97"
-    }
-  },
-  "gate": [
-    { "kind": "word_zero", "global": "menu_state" },
-    { "kind": "byte_zero", "global": "round_over" },
-    { "kind": "health_in_range", "min": 1, "max": 120 }
-  ],
-  "enforcement": {
-    "health_max": 120, "refill_below": 90,
-    "timer_hold": [153, 0], "credits_target": 0, "credits_min": 0
-  },
-  "calibration": {
-    "GROUND_Y": 121, "X_SCALE": 128.0, "Y_SCALE": 128.0,
-    "TIMER_SCALE": 256.0, "ANIM_SCALE": 64.0, "CORNER_PX": 24,
-    "HEALTH_MAX": 120, "SCREEN_W": 320, "P": 8, "K": 4, "STALE": 3,
-    "SEGMENT_DECISIONS": 150, "HITSTUN_RECENT_FRAMES": 20
-  },
-  "attack_chords": {
-    "HK": ["l"], "LK": ["r"], "HP": ["y"], "LP": ["b"], "Block": ["a"]
+ "_STATUS": "Memory-RE passes 2026-08-27 (W1) + 2026-08-27 (W2), headless FBNeo Megadrive driver, MCP port 4032, ROM = Mortal Kombat II (World)(1994)(Acclaim), CRC a9e013d8; evidence log: mk2-genesis.md. VERIFIED (live, write-tested): fighter struct block1=0xFFB5F0 (P1) / block2=0xFFB6E0 (P2), stride 0xF0; char_id at +0xE8 (u8; ids identical to family.json roster for 1/3/7/9); health at +0x32 (u8, max 0x78=120, write-tested both sides, KO fires) with lockstep mirror at +0x34 (write both). NEW (W2): world X at +0xD8 (u16, P1 0xFFB6C8 / P2 0xFFB7B8) \u2014 found by CPU-walk monotone snapshot diff, VERIFIED BY TELEPORT (writing 800 visibly side-swapped P1 past the opponent; write sticks and physics continues from the new position; the likely subpixel word sits at +0xDA, not profiled). Y at +0xDC (u16, P1 0xFFB6CC) \u2014 clean parabola on jump (ground=121, smaller=higher), VERIFIED BY WRITE (Y=50 visibly levitates the fighter). ROUND TIMER: 0xFFAB97 (u8 BCD seconds) IS AUTHORITATIVE \u2014 the W1 'disproof' was a misread (their post-write 0x49 was the written 0x50 legitimately ticking once): writing 0x50 makes the DISPLAYED timer show 50 and keep counting; writing 0x02 times the round out to the real GAME OVER; 0xFFAB96 is the sub-second frame counter, 0xFFAB98 is always 0x00 (so the 2-byte timer_hold write [0x99,0x00] is safe); 0xFFAB9C/0xFFABA0 are display-side mirrors, not stores. GATE: menu_state 0xFFB2CE (u16) \u2014 0x9C01 on intro/title/attract/dragon-menu/char-select/ladder/continue in EVERY sample (32 nonfight snapshots), 0x0000 in every in-fight sample (17 snapshots across 3 stages, 1P-vs-CPU + 2-human + attract-demo modes, 40-sample rapid poll during live combat all zero) -> word_zero(menu_state) is the third gate condition; residual known leak: the rare draw-timeout GAME OVER screen reads menu_state=0 for ~9s with full healths and round_over=0 (static screen, zero p1_input, harmless; flips to 0x9C01 when attract resumes). Candidate 0xFF098F from earlier in the session was DISPROVEN (reads 68/nonzero during a live Living Forest fight \u2014 sound-driver-adjacent, do not readopt). round_over 0xFFB5E0 kept (correlated: 0 in 26+ live samples, 1 at KO through the WINS screen; still not write-tested). BUTTONS (6-BUTTON MODE, see below): damage-tested against an idle human P2 (2-human rig; join = press start on port 1 during a 1P fight) with X-teleport-controlled spacing: LP=b (6 dmg jab), HP=y (18 dmg close / 9 at range), LK=r (20 standing / 15 close knee), HK=l (24 roundhouse / 15 close knee), Block=a (0 dmg at every range; holding it cuts an incoming 24-dmg roundhouse to 6 chip on BOTH sides). RETRO x is a SECOND Block (same chip test passes); RETRO y is double-bound by the core's md_mk2 mapping (tap=HP fires, hold=engages Block) \u2014 chords below use taps for attacks so this is safe, but never HOLD y expecting only HP. MODE CAVEAT: these chords require the game's 6-BUTTON pad setting (dragon menu > Options > Extra Controls > Port1/Port2 = '6 BUTTON'); the game boots in a mode where only b/a/r act (b=LP 6, a=mid kick 20, r=roundhouse 24, NO block button at all) and the setting is menu-only (no SRAM) \u2014 but SAVE STATES CARRY IT, and shadow/arenas/mk2/genesis-probe.state was re-captured in 6-button mode (Liu Kang vs Baraka, live round 1, timer 99, full health), so state-anchored flows inherit the right mode. FBNeo mapping source: src/burner/libretro/retro_input.cpp md_mk2 branch (MD A/B/C/X/Y/Z -> RETRO b/a/r/y/x/l). STILL OPEN: facing, wins-per-player, full roster id cross-check beyond ids 1/3/7/9; round_over write-test; the GAME OVER 9s gate window.",
+ "family": "mk2",
+ "port": "genesis",
+ "core": {
+  "library_name": "FinalBurn Neo",
+  "provenance_game": "md_mk2",
+  "provenance_core": "fbneo",
+  "button_names": {
+   "start": "start"
   }
+ },
+ "requires": {
+  "memory_regions": true,
+  "save_states": true
+ },
+ "memory": {
+  "cpu": "m68k",
+  "endianness": "little",
+  "blocks": {
+   "block1": "0xFFB5F0",
+   "block2": "0xFFB6E0",
+   "stride": "0xF0"
+  },
+  "fighter_fields": [
+   {
+    "name": "char_id",
+    "off": "0xE8",
+    "size": 1
+   },
+   {
+    "name": "health",
+    "off": "0x32",
+    "size": 1
+   },
+   {
+    "name": "health2",
+    "off": "0x34",
+    "size": 1
+   },
+   {
+    "name": "x",
+    "off": "0xD8",
+    "size": 2
+   },
+   {
+    "name": "y",
+    "off": "0xDC",
+    "size": 2
+   }
+  ],
+  "globals": {
+   "round_over": "0xFFB5E0",
+   "menu_state": "0xFFB2CE",
+   "round_timer": "0xFFAB97"
+  }
+ },
+ "gate": [
+  {
+   "kind": "word_zero",
+   "global": "menu_state"
+  },
+  {
+   "kind": "byte_zero",
+   "global": "round_over"
+  },
+  {
+   "kind": "health_in_range",
+   "min": 1,
+   "max": 120
+  }
+ ],
+ "enforcement": {
+  "health_max": 120,
+  "refill_below": 90,
+  "timer_hold": [
+   153,
+   0
+  ],
+  "credits_target": 0,
+  "credits_min": 0
+ },
+ "calibration": {
+  "GROUND_Y": 110,
+  "X_SCALE": 128.0,
+  "Y_SCALE": 128.0,
+  "TIMER_SCALE": 256.0,
+  "ANIM_SCALE": 64.0,
+  "HEALTH_MAX": 120,
+  "P": 8,
+  "K": 4,
+  "STALE": 3,
+  "SEGMENT_DECISIONS": 150,
+  "HITSTUN_RECENT_FRAMES": 20
+ },
+ "attack_chords": {
+  "HK": [
+   "l"
+  ],
+  "LK": [
+   "r"
+  ],
+  "HP": [
+   "y"
+  ],
+  "LP": [
+   "b"
+  ],
+  "Block": [
+   "a"
+  ]
+ }
 }
