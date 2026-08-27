@@ -266,8 +266,13 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
     block2_addr = _parse_addr(blocks["block2"])
     stride_val = _parse_addr(blocks["stride"])
 
+    # A field is either offset-based ({"off": ...}) or GLOBAL-sourced
+    # ({"globals": {"block1": ..., "block2": ...}} — MK2 arcade's world X;
+    # RECORDER_V3 §2.5). Offset None marks the global variant; every current
+    # Python consumer needs only the NAME (availability) — the recorder
+    # resolves addresses on the Rust side and rows carry the values.
     fighter_fields = {
-        f["name"]: (_parse_addr(f["off"]), int(f["size"]))
+        f["name"]: (_parse_addr(f["off"]) if "off" in f else None, int(f["size"]))
         for f in mem["fighter_fields"]
     }
     globals_map = {name: _parse_addr(addr) for name, addr in mem["globals"].items()}

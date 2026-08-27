@@ -86,8 +86,11 @@ struct RunnerAddrs {
     block1: u32,
     block2: u32,
     little: bool,
-    /// `x` fighter-field offset — universally required (see module comment).
-    x_off: u32,
+    /// Absolute per-block `x` addresses — universally required (see module
+    /// comment). Resolved via `field_addr`, so both the block-offset and the
+    /// global-sourced variants (MK2 arcade's p1_x/p2_x) work.
+    x1: u32,
+    x2: u32,
     /// `char_id` fighter-field offset, if the profile maps one (matchup-set
     /// switching; absent = the runner never switches models mid-set).
     char_id_off: Option<u32>,
@@ -95,16 +98,19 @@ struct RunnerAddrs {
 
 impl RunnerAddrs {
     fn from_profile(p: &crate::profile::GameProfile) -> Result<RunnerAddrs, String> {
-        let (x_off, _size) = p.field_off("x").ok_or_else(|| {
+        let err = || {
             "profile: shadow runner needs fighter field 'x' (dist_x + the round-start \
              anchor probe — required by every fitted model)"
                 .to_string()
-        })?;
+        };
+        let (x1, _size) = p.field_addr(1, "x").ok_or_else(err)?;
+        let (x2, _size) = p.field_addr(2, "x").ok_or_else(err)?;
         Ok(RunnerAddrs {
             block1: p.block1(),
             block2: p.block2(),
             little: p.port.memory.endianness == "little",
-            x_off,
+            x1,
+            x2,
             char_id_off: p.field_off("char_id").map(|(off, _)| off),
         })
     }
@@ -801,13 +807,13 @@ fn u8g(ds: &DebugState, addr: u32) -> u8 {
 /// model's [`FeatureAddrs`] resolved — absent fields read as 0 (never
 /// consulted by [`build_scalars`] unless the model's `feature_names` asked
 /// for them).
-fn read_fighter(ds: &DebugState, base: u32, ra: &RunnerAddrs, o: &FighterOffs) -> Fighter {
+fn read_fighter(ds: &DebugState, base: u32, x_addr: u32, ra: &RunnerAddrs, o: &FighterOffs) -> Fighter {
     let opt16 = |off: Option<u32>| off.map(|o| rd16(ds, base + o, ra.little)).unwrap_or(0);
     let opt8 = |off: Option<u32>| off.map(|o| u8g(ds, base + o)).unwrap_or(0);
     Fighter {
         timer: opt16(o.timer),
         anim: opt16(o.anim),
-        x: rd16(ds, base + ra.x_off, ra.little),
+        x: rd16(ds, x_addr, ra.little),
         y: opt16(o.y),
         facing: opt8(o.facing),
         health: opt8(o.health),
@@ -832,8 +838,8 @@ fn read_tick(ds: &DebugState, ra: &RunnerAddrs, fa: &FeatureAddrs) -> TickSnapsh
         .map(|(g1, g2)| (u8g(ds, g1), u8g(ds, g2)))
         .unwrap_or((0, 0));
     TickSnapshot {
-        block1: read_fighter(ds, ra.block1, ra, &fa.offs),
-        block2: read_fighter(ds, ra.block2, ra, &fa.offs),
+        block1: read_fighter(ds, ra.block1, ra.x1, ra, &fa.offs),
+        block2: read_fighter(ds, ra.block2, ra.x2, ra, &fa.offs),
         combo_on_b1,
         combo_on_b2,
     }
@@ -842,7 +848,7 @@ fn read_tick(ds: &DebugState, ra: &RunnerAddrs, fa: &FeatureAddrs) -> TickSnapsh
 /// Read just the two `x` values — used for the round-anchor probe before any
 /// model's [`FeatureAddrs`] is consulted (x is universal; see [`RunnerAddrs`]).
 fn read_x_pair(ds: &DebugState, ra: &RunnerAddrs) -> (u16, u16) {
-    (rd16(ds, ra.block1 + ra.x_off, ra.little), rd16(ds, ra.block2 + ra.x_off, ra.little))
+    (rd16(ds, ra.x1, ra.little), rd16(ds, ra.x2, ra.little))
 }
 
 /// Read the two `char_id` values, if the profile maps one.

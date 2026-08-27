@@ -38,9 +38,10 @@ use crate::debug::DebugState;
 use crate::profile::{GameProfile, GateCond};
 
 /// One pre-resolved row slot: the profile name, its JSON key (pre-escaped,
-/// quotes included), where to read, and how much. For fighter fields `addr`
-/// is the offset within a block; for globals it is absolute. `size` 2 reads
-/// a u16 in the profile's guest byte order, anything else a u8.
+/// quotes included), where to read (ABSOLUTE guest address — fighter-field
+/// slots are resolved per block at create time, covering both the offset and
+/// global-sourced variants), and how much. `size` 2 reads a u16 in the
+/// profile's guest byte order, anything else a u8.
 struct Slot {
     name: String,
     key: String,
@@ -194,8 +195,11 @@ pub struct FrameRecorder {
     /// tests can record against a profile that is not the process one).
     profile: GameProfile,
     little: bool,
-    /// Fighter fields in profile order (`addr` = offset within a block).
-    fields: Vec<Slot>,
+    /// Fighter fields in profile order, per block (`addr` = ABSOLUTE — block
+    /// base + offset, or the per-block global for global-sourced fields).
+    /// Same names/order in both; only addresses differ.
+    fields1: Vec<Slot>,
+    fields2: Vec<Slot>,
     /// The recorded-globals union in §1.2-rule-2 order (`addr` absolute).
     globals: Vec<Slot>,
     /// Index into `fields` of `x` (the round-start anchor) and `char_id`
@@ -239,18 +243,24 @@ impl FrameRecorder {
             std::fs::create_dir_all(parent).ok();
         }
         let file = File::create(path)?;
-        let fields: Vec<Slot> = profile
-            .port
-            .memory
-            .fighter_fields
-            .iter()
-            .map(|f| Slot {
-                name: f.name.clone(),
-                key: json_key(&f.name),
-                addr: f.off.0,
-                size: f.size,
-            })
-            .collect();
+        // ABSOLUTE per-block addresses, resolved once — covers both field
+        // variants (block offset, or per-block globals like MK2 arcade's
+        // world X). Profile load validated that every field resolves.
+        let slots = |block: u8| -> Vec<Slot> {
+            profile
+                .port
+                .memory
+                .fighter_fields
+                .iter()
+                .map(|f| {
+                    let (addr, size) = profile
+                        .field_addr(block, &f.name)
+                        .expect("profile load validates fighter fields");
+                    Slot { name: f.name.clone(), key: json_key(&f.name), addr, size }
+                })
+                .collect()
+        };
+        let (fields1, fields2) = (slots(1), slots(2));
         let globals = recorded_globals(profile);
         let field_idx =
             |name: &str| profile.port.memory.fighter_fields.iter().position(|f| f.name == name);
@@ -292,11 +302,21 @@ impl FrameRecorder {
                 "stride": format!("0x{:X}", blocks.stride.0),
             },
             "fighter_fields": profile.port.memory.fighter_fields.iter().map(|f| {
-                serde_json::json!({
-                    "name": f.name,
-                    "off": format!("0x{:X}", f.off.0),
-                    "size": f.size,
-                })
+                match (&f.off, &f.globals) {
+                    (Some(off), _) => serde_json::json!({
+                        "name": f.name,
+                        "off": format!("0x{:X}", off.0),
+                        "size": f.size,
+                    }),
+                    // Global-sourced field (RECORDER_V3 §2.5): snapshot the
+                    // per-block global names instead of an offset.
+                    (None, Some(g)) => serde_json::json!({
+                        "name": f.name,
+                        "globals": {"block1": g.block1, "block2": g.block2},
+                        "size": f.size,
+                    }),
+                    (None, None) => unreachable!("profile load validates fighter fields"),
+                }
             }).collect::<Vec<_>>(),
             "globals_recorded": globals.iter().map(|s| {
                 serde_json::json!({"name": s.name, "size": if s.size == 2 { 2 } else { 1 }})
@@ -313,7 +333,8 @@ impl FrameRecorder {
         Ok(FrameRecorder {
             profile: profile.clone(),
             little: profile.port.memory.endianness == "little",
-            fields,
+            fields1,
+            fields2,
             globals,
             x_idx,
             char_idx,
@@ -369,15 +390,14 @@ impl FrameRecorder {
     /// the input port is not in a bus window). Everything else is read from
     /// the live snapshot through the profile's map.
     pub fn record(&mut self, ds: &DebugState, p1_mask: u16, p2_mask: u16) {
-        let (base1, base2) = (self.profile.block1(), self.profile.block2());
-        let read_block = |base: u32| -> Vec<u64> {
-            self.fields
+        let read_block = |slots: &[Slot]| -> Vec<u64> {
+            slots
                 .iter()
-                .map(|f| read_sized(ds, base.wrapping_add(f.addr), f.size, self.little))
+                .map(|f| read_sized(ds, f.addr, f.size, self.little))
                 .collect()
         };
-        let b1 = read_block(base1);
-        let b2 = read_block(base2);
+        let b1 = read_block(&self.fields1);
+        let b2 = read_block(&self.fields2);
         let gvals: Vec<u64> = self
             .globals
             .iter()
@@ -411,7 +431,7 @@ impl FrameRecorder {
 
         // Hand-built row with the fixed v3 key order — deterministic bytes
         // (two recorders on identical state must emit identical lines).
-        let mut line = String::with_capacity(96 + 24 * (2 * self.fields.len() + self.globals.len()));
+        let mut line = String::with_capacity(96 + 24 * (2 * self.fields1.len() + self.globals.len()));
         let _ = write!(
             line,
             "{{\"v\":3,\"frame\":{},\"round_id\":{},\"controllable\":{},\"p1_block\":",
@@ -425,7 +445,7 @@ impl FrameRecorder {
         }
         for (name, vals) in [("block1", &b1), ("block2", &b2)] {
             let _ = write!(line, ",\"{name}\":{{");
-            for (i, (f, v)) in self.fields.iter().zip(vals.iter()).enumerate() {
+            for (i, (f, v)) in self.fields1.iter().zip(vals.iter()).enumerate() {
                 let _ = write!(line, "{}{}:{v}", if i > 0 { "," } else { "" }, f.key);
             }
             line.push('}');
@@ -670,8 +690,9 @@ mod tests {
         for block in ["block1", "block2"] {
             let keys: Vec<&str> = v[block].as_object().unwrap().keys().map(|k| k.as_str()).collect();
             // Exactly the profile's fighter_fields, in profile order — no
-            // zero-filled asurabld fields.
-            assert_eq!(keys, vec!["char_id", "health"], "{block} carries only mapped fields");
+            // zero-filled asurabld fields. `x` is GLOBAL-SOURCED (p1_x/p2_x,
+            // §2.5) yet appears as a normal named field.
+            assert_eq!(keys, vec!["char_id", "health", "x"], "{block} carries only mapped fields");
         }
         assert!(v["block1"]["y"].is_null(), "unmapped field must be ABSENT");
         assert_eq!(v["block1"]["health"], 100);
@@ -679,19 +700,24 @@ mod tests {
         assert_eq!(gkeys, vec!["round_over", "screen_state"]); // set (Value maps sort)
         // Serialized order is gate order: word-read screen_state, then round_over.
         assert!(text.contains("\"globals\":{\"screen_state\":0,\"round_over\":0}"));
-        assert!(text.contains("\"block1\":{\"char_id\":7,\"health\":100}"));
+        assert!(text.contains("\"block1\":{\"char_id\":7,\"health\":100,\"x\":0}"));
         assert_eq!(v["controllable"], true);
-        assert_eq!(v["p1_block"], 1, "no x field → fixed-slot anchor");
-        // Meta declares the fixed-slot honesty + mk2 provenance.
+        assert_eq!(v["p1_block"], 1, "equal x (both unwritten) → block1 anchors as P1");
+        // Meta declares the smaller-x anchor (x is mapped, via globals) +
+        // mk2 provenance; the global-sourced field snapshots its names.
         let meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path.with_extension("meta.json")).unwrap())
                 .unwrap();
         assert_eq!(meta["format"], "jsonl-v3");
-        assert_eq!(meta["anchor"], "fixed_slots");
+        assert_eq!(meta["anchor"], "smaller_x");
         assert_eq!(meta["family"], "mk2");
         assert_eq!(meta["port"], "arcade");
         assert_eq!(meta["profile_file"], "mk2.profile.json");
-        assert_eq!(meta["fighter_fields"].as_array().unwrap().len(), 2);
+        let ff = meta["fighter_fields"].as_array().unwrap();
+        assert_eq!(ff.len(), 3);
+        assert_eq!(ff[2]["name"], "x");
+        assert!(ff[2]["off"].is_null(), "global-sourced field has no off");
+        assert_eq!(ff[2]["globals"]["block1"], "p1_x");
         // Rounds sidecar: v3 marker, port, canonical ids (identity — no id_map).
         let rounds = std::fs::read_to_string(path.with_extension("rounds.jsonl")).unwrap();
         let r: serde_json::Value = serde_json::from_str(rounds.lines().next().unwrap()).unwrap();

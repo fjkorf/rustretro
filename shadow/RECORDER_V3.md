@@ -217,6 +217,23 @@ function (it records honestly sparse rows); the Genesis agent authors
 
 ---
 
+### 2.5 Global-sourced fighter fields (amendment, 2026-08-27)
+
+A `fighter_fields` entry MAY replace `off` with a per-block global pair:
+
+```jsonc
+{ "name": "x", "globals": { "block1": "p1_x", "block2": "p2_x" }, "size": 2 }
+```
+
+Exactly one of `off`/`globals` per entry (load-validated; the named globals
+must resolve). Consumers see a normal named field: the recorder resolves
+absolute per-block addresses at create time and emits `x` in rows as usual;
+the meta sidecar snapshots the entry with `globals` instead of `off`; the
+runner's universal-x resolution accepts either form. Motivation: MK2
+arcade's world X lives in a separate object array (per-player globals), not
+in the fighter structs — without this, the port could never satisfy the
+feature contract's required `x`.
+
 ## 3. Back-compat gates (non-negotiable)
 
 ### G1 — the golden: byte-identical refit of goat-v2 from v2 recordings

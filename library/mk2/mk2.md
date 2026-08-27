@@ -280,3 +280,14 @@ via core descriptors). Coin=`select`, Start=`start`, both live-verified.
    however, is fully served by this profile.
 4. Timeout-draw behavior of `round_over` (one boring 160-second probe).
 5. Select-slot map for the remaining roster; boss-id confirmation.
+
+## Recording enablement (2026-08-27, consolidation follow-up)
+
+`x` is now a GLOBAL-SOURCED fighter field (`p1_x` 0x6CBA / `p2_x` 0x6CFC,
+RECORDER_V3 §2.5) — the recorder emits it as a normal per-block field, the
+smaller-x anchor works, and the first arcade fit succeeded (family mk2,
+port arcade, 7 features — no y). CORNER_PX/SCREEN_W removed from
+calibration: arcade x is WORLD position (observed ~1100 vs screen 400), so
+the corner feature is unusable until stage bounds are RE'd — same decision
+as the Genesis port. Training-enforced smoke recording confirmed refill
+works mid-ladder (the CPU opponent even advanced to char id 10 during it).
