@@ -15,7 +15,7 @@
 //! - `globals` carries every global the recorder samples, keyed by profile
 //!   name: gate-referenced globals first (gate order), then the profile's
 //!   `record_globals` (their order), duplicates once at first position.
-//! - `controllable` is `training::eval_gate` — the ONE gate shared with
+//! - `controllable` is `gate::eval_gate` — the ONE gate shared with
 //!   training enforcement and Lua `game.controllable()`; the recorder keeps
 //!   no private composite.
 //! - Rows serialize with a fixed key order (`v, frame, round_id,
@@ -57,7 +57,7 @@ fn rd8(ds: &DebugState, addr: u32) -> u8 {
 }
 
 /// Guest-order u16: `read_addr` returns little-endian, so swap for big-endian
-/// guests (68k) — same convention as `training::eval_gate`'s reads.
+/// guests (68k) — same convention as `gate::eval_gate`'s reads.
 fn rd16(ds: &DebugState, addr: u32, little: bool) -> u16 {
     let v = ds.read_addr(addr as usize, 2).unwrap_or(0) as u16;
     if little { v } else { v.swap_bytes() }
@@ -385,7 +385,7 @@ impl FrameRecorder {
             .collect();
         // The ONE gate (RECORDER_V3 §1.2 rule 3): identical to training
         // enforcement and Lua `game.controllable()`.
-        let controllable = crate::training::eval_gate(ds, &self.profile);
+        let controllable = crate::gate::eval_gate(ds, &self.profile);
         // A false->true edge starts a new round: bump the id and re-anchor
         // which block is P1 — left side (smaller X) when the profile maps X,
         // else block1 by the fixed-slot assumption the meta declares.
@@ -539,7 +539,7 @@ mod tests {
     }
 
     /// G3: the serialized row for the asurabld profile — exact bytes (key
-    /// names + order per §1.2 rule 6), gate parity with `eval_gate` on an
+    /// names + order per §1.2 rule 6), gate parity with `gate::eval_gate` on an
     /// open AND a closed frame, and writer determinism (two recorders on
     /// identical state emit identical files).
     #[test]
@@ -563,7 +563,7 @@ mod tests {
         assert!(ds.write_addr((p.block2() + off("char_id")) as usize, 1, 7));
         assert!(ds.write_addr((p.block1() + off("x") + 1) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + off("x") + 1) as usize, 1, 200));
-        assert!(crate::training::eval_gate(&ds, p), "gate must be open on this state");
+        assert!(crate::gate::eval_gate(&ds, p), "gate must be open on this state");
 
         let path = tmp("shadow_rec_exact");
         let path_b = tmp("shadow_rec_exact_twin");
@@ -574,7 +574,7 @@ mod tests {
             twin.record(&ds, 0x081, 0x000);
             // Corrupt the clock → eval_gate closes → controllable follows.
             assert!(ds.write_addr(p.global("round_timer").unwrap() as usize, 1, 0xFF));
-            assert!(!crate::training::eval_gate(&ds, p));
+            assert!(!crate::gate::eval_gate(&ds, p));
             rec.record(&ds, 0x000, 0x000);
             twin.record(&ds, 0x000, 0x000);
             rec.finish();
@@ -656,7 +656,7 @@ mod tests {
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
         assert!(ds.write_addr((p.block1() + coff) as usize, 1, 7));
         assert!(ds.write_addr((p.block2() + coff) as usize, 1, 9));
-        assert!(crate::training::eval_gate(&ds, &p));
+        assert!(crate::gate::eval_gate(&ds, &p));
 
         let path = tmp("shadow_rec_mk2");
         {

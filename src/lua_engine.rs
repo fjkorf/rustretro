@@ -179,10 +179,10 @@ fn writes_gate_error() -> mlua::Error {
     )
 }
 
-/// The controllable-gate evaluator lives in `training::eval_gate` — ONE gate
+/// The controllable-gate evaluator lives in `gate::eval_gate` — ONE gate
 /// shared by Lua's `game.controllable()`, training enforcement, and (locked
 /// by a unit test below) the recorder's composite.
-use crate::training::eval_gate;
+use crate::gate::eval_gate;
 
 /// Frames `input.set` holds each pressed button — the same 2-frame idiom as the
 /// training-mode dummy injection (`training::tick`): long enough to bridge into
@@ -706,7 +706,7 @@ impl LuaEngine {
         let game = lua.create_table()?;
 
         // controllable() -> bool — the profile's gate condition list evaluated
-        // against live memory (see eval_gate; same semantics as the recorder).
+        // against live memory (see gate::eval_gate; same semantics as the recorder).
         {
             let dbg = SharedDebugState::clone(debug);
             let f = lua.create_function(move |_, ()| -> mlua::Result<bool> {

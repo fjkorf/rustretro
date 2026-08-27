@@ -21,8 +21,8 @@
 //!   **finish round now** (F4, needs `round_state`) one-shots.
 //!
 //! The in-fight gate is the profile's `gate` condition list — the SAME gate
-//! the recorder and Lua `game.controllable()` evaluate ([`eval_gate`], shared
-//! with `lua_engine`). A profile with no gate list (a stub) has no training
+//! the recorder and Lua `game.controllable()` evaluate (via `crate::gate::eval_gate`,
+//! shared with `lua_engine`). A profile with no gate list (a stub) has no training
 //! at all; [`available`]/[`features`] tell the panel what to offer.
 //!
 //! All writes go through `DebugState::write_addr`: bus-window addresses queue
@@ -211,38 +211,6 @@ fn wr16(ds: &mut DebugState, addr: u32, v: u16, little: bool) {
     let _ = ds.write_addr(addr as usize, 2, v as u32);
 }
 
-/// Evaluate the loaded profile's controllable-gate condition list against the
-/// live snapshot — the ONE in-fight gate shared by training enforcement, the
-/// Lua `game.controllable()` binding, and (in spirit) the recorder's
-/// composite; a lua_engine unit test locks Lua and the recorder together.
-/// The condition vocabulary is closed (docs/game-profiles.md): byte_zero /
-/// word_zero / health_in_range / bcd_valid_nonzero. Reads go through the same
-/// `DebugState::read_addr` path as every other binding; out-of-map reads
-/// collapse to 0, matching the recorder's `unwrap_or(0)` semantics. 16-bit
-/// reads honor the profile's `memory.endianness` per the contract.
-pub(crate) fn eval_gate(ds: &DebugState, p: &GameProfile) -> bool {
-    let little = p.port.memory.endianness == "little";
-    // Profile load validates that every gate global resolves, so a miss here
-    // is impossible in practice; 0 keeps the closure total anyway.
-    let ga = |name: &str| p.global(name).unwrap_or(0);
-    p.port.gate.iter().all(|cond| match cond {
-        GateCond::ByteZero { global } => rd8(ds, ga(global)) == 0,
-        GateCond::WordZero { global } => rd16(ds, ga(global), little) == 0,
-        GateCond::HealthInRange { min, max } => {
-            let Some((off, _size)) = p.field_off("health") else {
-                return false;
-            };
-            let h1 = rd8(ds, p.block1().wrapping_add(off));
-            let h2 = rd8(ds, p.block2().wrapping_add(off));
-            (*min..=*max).contains(&h1) && (*min..=*max).contains(&h2)
-        }
-        GateCond::BcdValidNonzero { global } => {
-            let t = rd8(ds, ga(global));
-            t != 0 && (t >> 4) <= 9 && (t & 0xF) <= 9
-        }
-    })
-}
-
 /// Whether the loaded profile supports training at all (has an in-fight
 /// gate). Per-feature detail comes from [`features`].
 pub fn available() -> bool {
@@ -288,7 +256,7 @@ pub fn tick(ds: &mut DebugState, frame: u64) {
             wr8(ds, addr, target);
         }
     }
-    if !eval_gate(ds, p) {
+    if !crate::gate::eval_gate(ds, p) {
         return;
     }
     // Hold the round clock.
