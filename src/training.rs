@@ -445,6 +445,16 @@ mod tests {
     }
 
     #[test]
+    fn genesis_pins_resolve_to_pad_mode_flags() {
+        let p = GameProfile::load(Path::new("library/mk2/genesis")).expect("genesis loads");
+        let pins = p.resolved_pins();
+        assert_eq!(pins, vec![(0xFFF9D1, 1), (0xFFF9D0, 1)],
+                   "both 6-button flags pinned on (mk2-genesis.md)");
+        // asurabld declares no pins.
+        assert!(crate::profile::init_for_tests().resolved_pins().is_empty());
+    }
+
+    #[test]
     fn asurabld_blocks_by_holding_back_not_a_chord() {
         let p = crate::profile::init_for_tests();
         let r = resolve(p).unwrap();

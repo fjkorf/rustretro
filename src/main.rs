@@ -156,6 +156,12 @@ fn main() -> Result<()> {
         anyhow::anyhow!("--game {}: failed to load game profile: {e}", game_dir.display())
     })?;
     eprintln!("[profile] loaded {} ({})", game_dir.display(), profile::current().port.port);
+    for pin in &profile::current().port.pins {
+        eprintln!(
+            "[profile] pin: {} = {} (held for the session, asserted 1/s)",
+            pin.global, pin.value
+        );
+    }
 
     eprintln!("RustRetro — Bevy libretro frontend");
     eprintln!("Core: {}", args.core);

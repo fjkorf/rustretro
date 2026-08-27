@@ -363,3 +363,22 @@ different game configuration) and is superseded.
   permanently "past the right edge" (87% corner bucket). CORNER_PX/SCREEN_W
   removed from calibration so me_corner drops out via the availability table.
   OPEN: find per-stage world bounds (or a camera-x global to derive screen x).
+
+## Pad-mode flags — pinned (2026-08-27, orchestrator)
+
+**VERIFIED (write-tested, driver-level):** the Extra Controls per-port pad
+type lives at `0xFFF9D1` (Port 1) / `0xFFF9D0` (Port 2): 1 = 6 BUTTON,
+0 = the ACTIVATOR/normal cycle. Found via same-screen WRAM diff across the
+menu's cycle button (the value cycles with Genesis A — RETRO `b` — NOT
+left/right; left/right only reveal the cursor). Three independent proofs:
+(1) writing the byte re-renders the menu label live (the game polls it);
+(2) with flag=1 a held RETRO `l` decodes into the pad-state bytes
+`0xFFF9D5/D6/D8` (bit 0x20), with flag=0 the driver ignores the button
+entirely; (3) cold boot with the profile `pins` asserting both flags at
+1 Hz gives full 6-button decode with no menu visit. Nearby derived bytes
+(`0xFFF9D3/DE/E1/EC/ED`) are driver echoes — do not pin them.
+Note: the 0xFFB2AE/0xFFB2F4 "49/50" bytes track the menu label rendering
+and are DERIVED (write-test showed no re-render) — disproven as sources.
+The `pins` profile key holds both flags for every session, so cold boots
+can no longer silently downgrade recordings to 3-button (which has no
+Block and would poison attack labels).

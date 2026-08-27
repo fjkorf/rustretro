@@ -100,6 +100,20 @@ pub struct PortProfile {
     /// Keys are decimal strings (JSON object constraint). Values must exist in family roster.
     #[serde(default)]
     pub id_map: Option<BTreeMap<String, u8>>,
+    /// RAM values the app holds for the whole session (re-asserted ~1 Hz),
+    /// independent of training mode and the gate — for settings the game
+    /// keeps in volatile RAM that must not silently reset on a cold boot
+    /// (MK2 Genesis: the per-port 6-button pad flags). `freeze` can't do
+    /// this on direct-pointer regions; periodic writes are the mechanism.
+    #[serde(default)]
+    pub pins: Vec<Pin>,
+}
+
+/// One pinned RAM value: a named global asserted to `value` for the session.
+#[derive(Deserialize, Debug, Clone)]
+pub struct Pin {
+    pub global: String,
+    pub value: u8,
 }
 
 #[allow(dead_code)]
@@ -302,6 +316,13 @@ impl GameProfile {
                         global_name
                     ));
                 }
+            }
+        }
+
+        // Validate pin globals resolve.
+        for pin in &port.pins {
+            if !port.memory.globals.contains_key(&pin.global) {
+                return Err(format!("pins names unknown global '{}'", pin.global));
             }
         }
 
@@ -571,6 +592,16 @@ impl GameProfile {
 
     pub fn calibration(&self, key: &str) -> Option<f64> {
         self.port.calibration.get(key).copied()
+    }
+
+    /// Session pins resolved to (address, value) pairs — profile load
+    /// guarantees every pin global resolves.
+    pub fn resolved_pins(&self) -> Vec<(u32, u8)> {
+        self.port
+            .pins
+            .iter()
+            .filter_map(|p| Some((self.global(&p.global)?, p.value)))
+            .collect()
     }
 
     /// Translate a raw RAM char id to its canonical roster id.

@@ -52,7 +52,9 @@
   "globals": {
    "round_over": "0xFFB5E0",
    "menu_state": "0xFFB2CE",
-   "round_timer": "0xFFAB97"
+   "round_timer": "0xFFAB97",
+   "p1_pad_six_button": "0xFFF9D1",
+   "p2_pad_six_button": "0xFFF9D0"
   }
  },
  "gate": [
@@ -109,5 +111,15 @@
   "Block": [
    "a"
   ]
- }
+ },
+ "pins": [
+  {
+   "global": "p1_pad_six_button",
+   "value": 1
+  },
+  {
+   "global": "p2_pad_six_button",
+   "value": 1
+  }
+ ]
 }

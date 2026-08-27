@@ -1114,6 +1114,21 @@ impl Frontend {
         // --- Append this frame to the trace recorder (--record) ---
         self.record_frame();
 
+        // --- Profile pins: hold declared RAM values for the whole session
+        // (game settings that live in volatile RAM — e.g. MK2 Genesis's
+        // per-port 6-button flags). Once a second; independent of training
+        // and the gate because these matter in menus too.
+        if self.frame_count % 60 == 0 {
+            let pins = crate::profile::current().resolved_pins();
+            if !pins.is_empty() {
+                if let Ok(mut ds) = self.debug_state.try_lock() {
+                    for (addr, value) in pins {
+                        let _ = ds.write_addr(addr as usize, 1, value as u32);
+                    }
+                }
+            }
+        }
+
         // --- Training mode (--training): enforce sandbox + drive the dummy.
         // After the snapshot refresh so reads see this frame; its bus writes
         // drain next frame.
