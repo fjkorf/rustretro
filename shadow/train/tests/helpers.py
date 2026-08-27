@@ -64,3 +64,49 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     with open(path, "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
+
+
+# RECORDER_V3.md §3 G2's transcoder: a mechanical v2 -> v3 shape rewrite for
+# the ASURABLD profile, proving the v3 row reorganization changes nothing
+# for a family whose fighter_fields/gate are already what v2 hardcoded.
+_V2_TO_V3_GLOBAL_RENAME = {"timer_bcd": "round_timer", "char_sel": "char_select"}
+
+# §1.2 rule 2 order for asurabld post-§2.4: gate-condition globals (in gate
+# order: round_over, abort, match_end, round_timer, char_select -- health_
+# in_range has no `global`), then record_globals (§2.1/§2.4's own example
+# order: combo_on_b2, combo_on_b1, demo_flag, credits). No duplicates.
+_V3_GLOBAL_ORDER = [
+    "round_over", "abort", "match_end", "round_timer", "char_select",
+    "combo_on_b2", "combo_on_b1", "demo_flag", "credits",
+]
+
+
+def transcode_v2_to_v3(row: dict) -> dict:
+    """One v2 row -> its v3-shaped equivalent (RECORDER_V3.md §3 G2): add
+    `"v":3`; blocks pass through untouched (v2's Fighter key set already
+    equals the profile's post-§2.4 fighter_fields names -- key order doesn't
+    matter to the Python reader); `gate` becomes `globals`, renaming the two
+    ad-hoc v2 names and reordering per §1.2 rule 2. This is a mechanical
+    shape transform over whatever keys the row actually has -- it does not
+    synthesize globals a v2 row never recorded (e.g. real v2 rows have no
+    `char_sel`, so a transcoded row has no `char_select` either)."""
+    gate = row.get("gate", {})
+    renamed = {_V2_TO_V3_GLOBAL_RENAME.get(k, k): v for k, v in gate.items()}
+    globals_out = {name: renamed[name] for name in _V3_GLOBAL_ORDER if name in renamed}
+    # any renamed key _V3_GLOBAL_ORDER doesn't know about still gets carried,
+    # appended after the known order (keeps this generic beyond asurabld).
+    for name, v in renamed.items():
+        if name not in globals_out:
+            globals_out[name] = v
+    return {
+        "v": 3,
+        "frame": row["frame"],
+        "round_id": row["round_id"],
+        "controllable": row["controllable"],
+        "p1_block": row["p1_block"],
+        "block1": dict(row["block1"]),
+        "block2": dict(row["block2"]),
+        "globals": globals_out,
+        "p1_input": row["p1_input"],
+        "p2_input": row["p2_input"],
+    }

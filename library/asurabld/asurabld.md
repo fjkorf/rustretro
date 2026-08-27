@@ -451,6 +451,28 @@ is the positive discriminator. All four gate copies now additionally require
 `shadow_train/runtime.py`, and the probe helpers. Recordings additionally
 log the raw byte per frame (`gate.char_sel`, additive to jsonl-v2).
 
+**Profile extract for jsonl-v3 (2026-08-27, `shadow/RECORDER_V3.md` §2.4):**
+the recorder is now fully profile-driven, so everything it samples must be
+named in `asurabld.profile.json`. Three additions, all restating evidence
+already on this page — no new RE:
+
+- `memory.record_globals` = `combo_on_b2`(1) · `combo_on_b1`(1) ·
+  `demo_flag`(2) · `credits`(1): the v2 recorder's non-gate analysis signals
+  (the cross-block combo counters above; `$4065D8` scene-advance latch, see
+  [[master-script]]; `$40655D` credits, see [[system-control]]), kept so v3
+  rows preserve every signal v2 recorded. The list's order fixes the
+  serialized `globals` order (after the six gate globals).
+- `hitstun_sources` = `{block1: combo_on_b1, block2: combo_on_b2}`: which
+  recorded global's RECENT CHANGE means that block's fighter is in hitstun —
+  the cross-block combo counters (`$4041E7` = block1's combo landing ON
+  block2, `$40470B` the reverse; ≠ 0 doubles as "opponent in hitstun", per
+  the FBNeo training-mode Lua). Feeds `me_hitstun`/`opp_hitstun` in
+  `shadow_train` (`HITSTUN_RECENT_FRAMES` window).
+- `fighter_fields` gains `opp_right_hold`(+0x28,2) · `opp_left_hold`(+0x2A,2):
+  the hold accumulators from the CRITICAL caveat above, recorded (as in v2)
+  strictly for analysis under `opp_*` names because they track the
+  **opponent's** held direction — never usable as self-features.
+
 ### Roster — character IDs (`+0x639`) — COMPLETE
 
 8 playable (ids 0–7) + 2 bosses (0x08/0x09, cheat DB). **Fully mapped

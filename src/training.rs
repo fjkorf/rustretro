@@ -166,7 +166,9 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
 
     let block_chord = if p.family.block.style == "button" {
         p.family.block.class.as_deref().and_then(|class| {
-            let chord = p.port.attack_chords.get(class)?;
+            // An empty chord (block button not yet verified for this port)
+            // must not resolve into a hold-nothing "block" — fall through.
+            let chord = p.port.attack_chords.get(class).filter(|c| !c.is_empty())?;
             let mut bits = [false; 12];
             for name in chord {
                 bits[crate::profile::retro_button_bit(name)? as usize] = true;
@@ -440,6 +442,16 @@ mod tests {
         let chord = r.block_chord.expect("mk2 dummy blocks with a button");
         let held: Vec<usize> = chord.iter().enumerate().filter(|(_, on)| **on).map(|(i, _)| i).collect();
         assert_eq!(held, vec![10], "Block = RETRO L");
+    }
+
+    #[test]
+    fn genesis_pins_resolve_to_pad_mode_flags() {
+        let p = GameProfile::load(Path::new("library/mk2/genesis")).expect("genesis loads");
+        let pins = p.resolved_pins();
+        assert_eq!(pins, vec![(0xFFF9D1, 1), (0xFFF9D0, 1)],
+                   "both 6-button flags pinned on (mk2-genesis.md)");
+        // asurabld declares no pins.
+        assert!(crate::profile::init_for_tests().resolved_pins().is_empty());
     }
 
     #[test]

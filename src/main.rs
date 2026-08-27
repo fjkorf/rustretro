@@ -34,10 +34,13 @@ use std::sync::{Arc, Mutex};
 struct Args {
     #[arg(long, value_name = "PATH")] core: String,
     #[arg(long, value_name = "PATH")] rom: String,
-    /// Game profile directory (family.json + <game>.profile.json). See
-    /// docs/game-profiles.md — loaded once at startup before anything else
-    /// touches game-specific memory knowledge.
-    #[arg(long, value_name = "DIR", default_value = "library/asurabld")] game: String,
+    /// Game profile directory or path with optional port selector.
+    /// Formats: `library/asurabld` (a directory), or `library/mk2/genesis`
+    /// (a directory with optional `/port_name` suffix for multi-port games).
+    /// Each path loads family.json from its directory plus the matching port
+    /// profile (see docs/game-profiles.md). Loaded once at startup before
+    /// anything else touches game-specific memory knowledge.
+    #[arg(long, value_name = "PATH", default_value = "library/asurabld")] game: String,
     #[arg(long)] fullscreen: bool,
     #[arg(long, value_name = "PATH", default_value = ".")] save_dir: PathBuf,
     #[arg(long, value_name = "PATH", default_value = ".")] system_dir: PathBuf,
@@ -153,6 +156,12 @@ fn main() -> Result<()> {
         anyhow::anyhow!("--game {}: failed to load game profile: {e}", game_dir.display())
     })?;
     eprintln!("[profile] loaded {} ({})", game_dir.display(), profile::current().port.port);
+    for pin in &profile::current().port.pins {
+        eprintln!(
+            "[profile] pin: {} = {} (held for the session, asserted 1/s)",
+            pin.global, pin.value
+        );
+    }
 
     eprintln!("RustRetro — Bevy libretro frontend");
     eprintln!("Core: {}", args.core);

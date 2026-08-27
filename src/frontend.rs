@@ -645,36 +645,43 @@ impl Frontend {
         }
     }
 
-    /// Enable per-frame trace recording to `path` (JSONL, `shadow/SPEC.md`).
-    /// Uses the default Asura Blade actor map. Warns if no Work RAM bus window
-    /// is mapped (the actor structs won't be readable without it).
+    /// Enable per-frame trace recording to `path` (jsonl-v3,
+    /// `shadow/RECORDER_V3.md`). v3 is profile-driven: it needs the fighter
+    /// blocks (schema-guaranteed once a profile parses) plus a non-empty
+    /// controllable gate — a partially-mapped game (library/mk2) records
+    /// honestly sparse rows instead of refusing. Warns if no readable region
+    /// covers the fighter blocks (rows would read as zeros).
     pub fn set_recorder(&mut self, path: PathBuf, style: Option<String>) {
-        let has_work_ram = self
+        let prof = crate::profile::current();
+        // No gate list = no `controllable`, no round edges — refuse softly;
+        // the drain publishes the note to the panel.
+        if prof.port.gate.is_empty() {
+            eprintln!(
+                "[record] unavailable for this game: profile maps no `gate` conditions \
+                 — v3 cannot resolve `controllable`/rounds without one (stub profile?)"
+            );
+            return;
+        }
+        let blocks_lo = prof.block1().min(prof.block2()) as usize;
+        let blocks_hi = (prof.block1().max(prof.block2())
+            + prof.port.memory.blocks.stride.0) as usize;
+        let blocks_readable = self
             .debug_state
             .lock()
             .map(|ds| ds.memory_regions.iter().any(|r| {
-                r.addr_start <= 0x40454C && r.addr_end >= 0x406100
+                r.addr_start <= blocks_lo && r.addr_end >= blocks_hi
             }))
             .unwrap_or(false);
-        if !has_work_ram {
+        if !blocks_readable {
             eprintln!(
-                "[record] warning: no Work RAM window covers the actor structs; \
-                 records will be zero-filled. Pass --bus-map with a Work RAM window."
+                "[record] warning: no readable region covers the fighter blocks \
+                 (0x{blocks_lo:X}..0x{blocks_hi:X}); rows will read as zeros. \
+                 Pass --bus-map with a Work RAM window."
             );
         }
-        let prof = crate::profile::current();
-        // Stub profiles can't record (no mapped actor/gate addresses) —
-        // refuse softly; the drain publishes the note to the panel.
-        let map = match crate::record::GameMap::try_from_profile(prof) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[record] unavailable for this game: {e}");
-                return;
-            }
-        };
         match crate::record::FrameRecorder::create(
             &path,
-            map,
+            prof,
             &prof.port.core.provenance_game,
             &prof.port.core.provenance_core,
             style.as_deref(),
@@ -1106,6 +1113,21 @@ impl Frontend {
 
         // --- Append this frame to the trace recorder (--record) ---
         self.record_frame();
+
+        // --- Profile pins: hold declared RAM values for the whole session
+        // (game settings that live in volatile RAM — e.g. MK2 Genesis's
+        // per-port 6-button flags). Once a second; independent of training
+        // and the gate because these matter in menus too.
+        if self.frame_count % 60 == 0 {
+            let pins = crate::profile::current().resolved_pins();
+            if !pins.is_empty() {
+                if let Ok(mut ds) = self.debug_state.try_lock() {
+                    for (addr, value) in pins {
+                        let _ = ds.write_addr(addr as usize, 1, value as u32);
+                    }
+                }
+            }
+        }
 
         // --- Training mode (--training): enforce sandbox + drive the dummy.
         // After the snapshot refresh so reads see this frame; its bus writes

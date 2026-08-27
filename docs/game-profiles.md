@@ -44,6 +44,16 @@ supported experiment, not an accident).
    read helpers consult `memory.endianness`. (Bit-addressed spaces — the
    TMS34010 — will extend this when the MK2-arcade bridge lands; the field
    exists so that change is additive.)
+7. **`pins` hold volatile game settings for the whole session.** A pin is a
+   named global plus a byte value the app re-asserts once a second from
+   boot, independent of training mode and the fight gate (settings matter
+   in menus). Use them for options the game keeps in plain RAM that a cold
+   boot would silently reset — the reference case is MK2 Genesis's
+   per-port 6-button pad flags (`p1_pad_six_button`/`p2_pad_six_button`),
+   without which recordings degrade to 3-button (no Block button) and
+   attack labels are poisoned. Every pin global must resolve at load;
+   startup logs each active pin. Evidence for the pinned address and the
+   poll-vs-latch behavior belongs in the game's `.md`, like any address.
 
 ## What stays out of the profile
 

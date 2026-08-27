@@ -31,7 +31,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import asurabld, dataset
+from . import dataset
 from . import profile as _profile
 from .dataset import ATTACK_CLASSES, MOVE_CLASSES, SCALAR_FEATURES, build
 from .evaluate import MIN_EXAMPLES, evaluate, print_report
@@ -75,19 +75,24 @@ def cmd_fit(args) -> None:
     out_dir = Path(args.out)
     policy.save(out_dir)
     prof = _profile.get()
+    # §4.3: uniform port -> that port (today's behavior); mixed -> "mixed" +
+    # the ports list, so deploy's port-mismatch warning can treat it as
+    # matching every port of the family.
+    ports = data.get("ports") or [prof.port]
     meta = {
-        "feature_names": SCALAR_FEATURES,
+        "feature_names": data.get("feature_names", SCALAR_FEATURES),
         "calibration": {name: getattr(dataset, name) for name in CALIBRATION_KEYS},
         "move_classes": MOVE_CLASSES,
         "attack_classes": ATTACK_CLASSES,
         "family": prof.family,
-        "port": prof.port,
+        "port": ports[0] if len(ports) == 1 else "mixed",
+        **({"ports": ports} if len(ports) > 1 else {}),
         "k": policy.k,
         "temperature": policy.temperature,
         "neutral_cap": neutral_cap,
         "char_filter": args.char,
         "opp_filter": opp,
-        "matchup": asurabld.matchup_slug(args.char, opp),
+        "matchup": prof.matchup_slug(args.char, opp),
         "source_files": [str(p) for p in args.recordings],
         "n_decisions": int(len(data["X"])),
         "n_rounds": int(len(set(data["rounds"]))),
@@ -164,7 +169,7 @@ def cmd_coverage(args) -> None:
 
     mes = sorted({m for m, _ in per})
     opps = sorted({o for _, o in per})
-    name = asurabld.char_name
+    name = _profile.get().char_name
     print(f"matchup coverage — decisions per cell, demo rounds excluded "
           f"({len(files)} recording(s))")
     header = " " * 10 + "".join(f"{name(o):>10}" for o in opps)
@@ -186,16 +191,16 @@ def cmd_coverage(args) -> None:
 
 def cmd_index(args) -> None:
     from . import profile as game_profile
-    fam = game_profile.get().family
+    prof = game_profile.get()
+    fam = prof.family
     recs = args.recordings or sorted(Path("shadow/recordings").joinpath(fam).glob("*.jsonl"))
     done = skipped = 0
     for p in recs:
         if str(p).endswith(".rounds.jsonl"):
             continue
         try:
-            if '"block1"' not in open(p).readline():
-                continue
-        except OSError:
+            version = dataset._detect_version(p)
+        except SystemExit:
             continue
         out = Path(str(p).removesuffix(".jsonl") + ".rounds.jsonl")
         if out.exists() and not args.force:
@@ -212,9 +217,14 @@ def cmd_index(args) -> None:
                 continue
             c = bool(r.get("controllable"))
             if c and not prev_controllable:
+                b1, b2 = dataset.fields(r, "block1"), dataset.fields(r, "block2")
+                # §1.4: block1_char/block2_char are CANONICAL ids (§6),
+                # translated at write time; null (never 0) if unmapped.
+                b1_char = prof.canon_char_id(b1["char_id"]) if "char_id" in b1 else None
+                b2_char = prof.canon_char_id(b2["char_id"]) if "char_id" in b2 else None
                 cur = {"round_id": r["round_id"],
-                       "block1_char": r["block1"].get("char_id", 0),
-                       "block2_char": r["block2"].get("char_id", 0),
+                       "block1_char": b1_char,
+                       "block2_char": b2_char,
                        "p1_block": r.get("p1_block"),
                        "frames": 0, "p1_input_mass": 0}
             if not c and prev_controllable and cur is not None:
@@ -230,6 +240,10 @@ def cmd_index(args) -> None:
             for row in lines:
                 row["demo"] = row["p1_input_mass"] == 0
                 row["style"] = style
+                if version == "v3":
+                    row["family"] = fam
+                    row["port"] = prof.port
+                    row["v"] = 3
                 f.write(json.dumps(row) + chr(10))
         print(f"  {out.name}: {len(lines)} round(s)")
         done += 1
