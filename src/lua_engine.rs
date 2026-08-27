@@ -179,43 +179,10 @@ fn writes_gate_error() -> mlua::Error {
     )
 }
 
-/// Evaluate the loaded profile's controllable-gate condition list against the
-/// live snapshot — the Lua-facing twin of `record.rs`'s `controllable`
-/// computation (`game.controllable()` must flip exactly when the recorder gate
-/// flips; a unit test below locks the two together). The condition vocabulary
-/// is closed (docs/game-profiles.md): byte_zero / word_zero / health_in_range
-/// / bcd_valid_nonzero. Reads go through the same `DebugState::read_addr` path
-/// as every other Lua read binding; out-of-map reads collapse to 0, matching
-/// the recorder's `unwrap_or(0)` semantics. 16-bit reads honor the profile's
-/// `memory.endianness` per the contract.
-fn eval_gate(ds: &crate::debug::DebugState, p: &crate::profile::GameProfile) -> bool {
-    use crate::profile::GateCond;
-    let big = p.port.memory.endianness != "little";
-    let rd8 = |a: u32| ds.read_addr(a as usize, 1).unwrap_or(0) as u8;
-    let rd16 = |a: u32| {
-        let v = ds.read_addr(a as usize, 2).unwrap_or(0) as u16;
-        if big { v.swap_bytes() } else { v }
-    };
-    // Profile load validates that every gate global resolves, so a miss here
-    // is impossible in practice; 0 keeps the closure total anyway.
-    let ga = |name: &str| p.global(name).unwrap_or(0);
-    p.port.gate.iter().all(|cond| match cond {
-        GateCond::ByteZero { global } => rd8(ga(global)) == 0,
-        GateCond::WordZero { global } => rd16(ga(global)) == 0,
-        GateCond::HealthInRange { min, max } => {
-            let Some((off, _size)) = p.field_off("health") else {
-                return false;
-            };
-            let h1 = rd8(p.block1().wrapping_add(off));
-            let h2 = rd8(p.block2().wrapping_add(off));
-            (*min..=*max).contains(&h1) && (*min..=*max).contains(&h2)
-        }
-        GateCond::BcdValidNonzero { global } => {
-            let t = rd8(ga(global));
-            t != 0 && (t >> 4) <= 9 && (t & 0xF) <= 9
-        }
-    })
-}
+/// The controllable-gate evaluator lives in `training::eval_gate` — ONE gate
+/// shared by Lua's `game.controllable()`, training enforcement, and (locked
+/// by a unit test below) the recorder's composite.
+use crate::training::eval_gate;
 
 /// Frames `input.set` holds each pressed button — the same 2-frame idiom as the
 /// training-mode dummy injection (`training::tick`): long enough to bridge into

@@ -164,10 +164,10 @@ impl TrainingPanel {
         );
         ui.separator();
 
-        if !crate::training::available() {
+        let Some(feats) = crate::training::features() else {
             ui.label(
                 egui::RichText::new(
-                    "Training unavailable — this game's profile has no memory map yet \
+                    "Training unavailable — this game's profile has no in-fight gate yet \
                      (see the porting-a-game tutorial).",
                 )
                 .color(egui::Color32::DARK_GRAY),
@@ -175,13 +175,25 @@ impl TrainingPanel {
             ui.separator();
             self.shadow_section(ui, state);
             return;
-        }
+        };
         let was_enabled = state.training.enabled;
         ui.checkbox(&mut state.training.enabled, "Enabled (F5)")
-            .on_hover_text("Credits topped up, round timer held, health refill — the held-fight sandbox");
+            .on_hover_text("The held-fight sandbox — every enforcement the profile maps");
         if state.training.enabled && !was_enabled {
             // Parity with the F5 hotkey: enabling turns refill on.
             state.training.refill = true;
+        }
+        let missing = feats.missing();
+        if !missing.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("Not mapped for this game: {}", missing.join(", ")))
+                    .small()
+                    .color(egui::Color32::DARK_GRAY),
+            )
+            .on_hover_text(
+                "Partial memory map — these enforcements decline until the profile \
+                 gains the addresses (see the game's .md evidence doc)",
+            );
         }
 
         ui.add_enabled_ui(state.training.enabled, |ui| {
@@ -200,12 +212,18 @@ impl TrainingPanel {
                         }
                     });
             });
-            ui.checkbox(&mut state.training.refill, "Health refill (F3)");
+            ui.add_enabled(feats.refill, egui::Checkbox::new(&mut state.training.refill, "Health refill (F3)"));
             ui.horizontal(|ui| {
-                if ui.button("↺ Reset positions (F2)").clicked() {
+                if ui
+                    .add_enabled(feats.position_reset, egui::Button::new("↺ Reset positions (F2)"))
+                    .clicked()
+                {
                     state.training.reset_positions = true;
                 }
-                if ui.button("🏁 Finish round (F4)").clicked() {
+                if ui
+                    .add_enabled(feats.finish_round, egui::Button::new("🏁 Finish round (F4)"))
+                    .clicked()
+                {
                     state.training.finish_round = true;
                 }
             });
