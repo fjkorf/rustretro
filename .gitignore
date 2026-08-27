@@ -32,6 +32,7 @@ shadow/train/.venv/
 
 # Machine/user-local artifacts
 keymap.json
+*.keymap.json
 __pycache__/
 scripts/re/revenv/
 # Training data & derived models (goat-v2 stays tracked for the runner tests)
