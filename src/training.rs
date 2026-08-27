@@ -112,6 +112,9 @@ struct Resolved {
     reset: Option<Reset>,
     finish: Option<u32>,
     x_pair: Option<XPair>,
+    /// For button-block families (MK): the held RETRO buttons that block,
+    /// resolved from `family.block.class` through `attack_chords`.
+    block_chord: Option<[bool; 12]>,
 }
 
 fn resolve(p: &GameProfile) -> Option<Resolved> {
@@ -161,6 +164,19 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
         Some(Reset { x, left, right, y })
     })();
 
+    let block_chord = if p.family.block.style == "button" {
+        p.family.block.class.as_deref().and_then(|class| {
+            let chord = p.port.attack_chords.get(class)?;
+            let mut bits = [false; 12];
+            for name in chord {
+                bits[crate::profile::retro_button_bit(name)? as usize] = true;
+            }
+            Some(bits)
+        })
+    } else {
+        None
+    };
+
     Some(Resolved {
         little: p.port.memory.endianness == "little",
         refill,
@@ -169,6 +185,7 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
         reset,
         finish: g("round_state"),
         x_pair,
+        block_chord,
     })
 }
 
@@ -244,7 +261,7 @@ fn features_of(p: &GameProfile) -> Option<Features> {
         credits: r.credits.is_some(),
         position_reset: r.reset.is_some(),
         finish_round: r.finish.is_some(),
-        block_dummy: r.x_pair.is_some(),
+        block_dummy: r.block_chord.is_some() || r.x_pair.is_some(),
     })
 }
 
@@ -282,14 +299,20 @@ pub fn tick(ds: &mut DebugState, frame: u64) {
     // tracks damage independently of the struct byte — mk2.md).
     if ds.training.refill {
         if let Some(rf) = &r.refill {
-            let writes: Vec<u32> = rf
+            let fired: Vec<(usize, u8, Vec<u32>)> = rf
                 .sides
                 .iter()
-                .filter(|s| rd8(ds, s.check) < rf.below)
-                .flat_map(|s| s.addrs.iter().copied())
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    let h = rd8(ds, s.check);
+                    (h < rf.below).then(|| (i, h, s.addrs.clone()))
+                })
                 .collect();
-            for addr in writes {
-                wr8(ds, addr, rf.max);
+            for (side, was, addrs) in fired {
+                for addr in addrs {
+                    wr8(ds, addr, rf.max);
+                }
+                ds.log(format!("🎯 refill: P{} {was} → {}", side + 1, rf.max));
             }
         }
     }
@@ -334,6 +357,9 @@ pub fn tick(ds: &mut DebugState, frame: u64) {
             b[4] = (frame / 30) % 2 == 0;
             Some(b)
         }
+        // Button-block families (MK): hold the block button(s), no spacing
+        // logic needed. Back-hold families fall through to the X comparison.
+        DummyMode::Block if r.block_chord.is_some() => r.block_chord,
         DummyMode::Block => match r.x_pair {
             // Hold away from the other fighter. The dummy is port 1; without a
             // resolved port→block map, treat the RIGHT fighter as the dummy
@@ -409,5 +435,18 @@ mod tests {
         let rf = r.refill.unwrap();
         let all: Vec<u32> = rf.sides.iter().flat_map(|s| s.addrs.iter().copied()).collect();
         assert_eq!(all.len(), 4, "struct pair + HUD pair: {all:x?}");
+        // MK is button-block: the dummy must hold the Block chord (L), not
+        // walk backward.
+        let chord = r.block_chord.expect("mk2 dummy blocks with a button");
+        let held: Vec<usize> = chord.iter().enumerate().filter(|(_, on)| **on).map(|(i, _)| i).collect();
+        assert_eq!(held, vec![10], "Block = RETRO L");
+    }
+
+    #[test]
+    fn asurabld_blocks_by_holding_back_not_a_chord() {
+        let p = crate::profile::init_for_tests();
+        let r = resolve(p).unwrap();
+        assert!(r.block_chord.is_none(), "back_hold family must use X-relative block");
+        assert!(r.x_pair.is_some());
     }
 }
