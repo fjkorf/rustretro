@@ -408,6 +408,12 @@ impl Frontend {
             .core
             .serialize()
             .ok_or_else(|| "core refused to serialize (no save-state support?)".to_string())?;
+        // Arena captures land in per-family dirs (shadow/arenas/<family>/)
+        // that don't exist until a game's first save — create, don't fail.
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("create dir {} failed: {e}", dir.display()))?;
+        }
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
         std::fs::write(&tmp, &bytes)
             .map_err(|e| format!("write {} failed: {e}", tmp.display()))?;
