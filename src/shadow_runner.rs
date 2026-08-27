@@ -64,74 +64,155 @@ const BIT_LEFT: u16 = 6;
 const BIT_RIGHT: u16 = 7;
 
 // ── profile-resolved addresses (resolved ONCE at load; no per-frame maps) ───
+//
+// Two tiers, per the model-meta-driven requirement contract
+// (RECORDER_V3.md §4.2 / docs/game-profiles.md rule 3):
+//
+// - [`RunnerAddrs`]: resolved ONCE per `ShadowRunner::load`, independent of
+//   any single model. Only `x` is unconditionally required — every fitted
+//   model needs it (dataset.py's `_REQUIRED_FIELDS`/`scalar_features_for`:
+//   `dist_x` never drops, and the runner's own round-anchor probe needs it
+//   before any model is even chosen). `char_id` is best-effort (matchup-set
+//   switching degrades to "never switches" without it, not an error).
+// - [`FeatureAddrs`]: resolved PER LOADED MODEL from that model's own
+//   `feature_names`, so a model without hitstun features doesn't require
+//   `hitstun_sources`, one without `me_corner`'s calibration doesn't require
+//   anything extra (corner only needs `x`, already covered), etc. Errors name
+//   both the feature that wants the data and the missing profile piece.
 
-/// Fighter-block field offsets, lifted from `profile.fighter_fields`.
+/// Addresses/flags every model shares, resolved once at load.
 #[derive(Clone, Copy)]
-struct FighterOffs {
-    timer: u32,
-    anim: u32,
-    x: u32,
-    y: u32,
-    facing: u32,
-    health: u32,
-    meter: u32,
-    meter_max: u32,
-    char_id: u32,
-}
-
-/// Every game address the runner reads, resolved from `profile::current()`
-/// once at [`ShadowRunner::load`]. The tick path only ever dereferences this
-/// struct — it never does name→address map lookups per frame.
-#[derive(Clone, Copy)]
-struct ResolvedAddrs {
+struct RunnerAddrs {
     block1: u32,
     block2: u32,
-    /// block1's combo landing ON block2 / block2's combo landing ON block1.
-    combo_on_b2: u32,
-    combo_on_b1: u32,
-    round_over: u32,
-    abort: u32,
-    match_end: u32,
-    /// BCD seconds.
-    round_timer: u32,
-    /// Select countdown (gate v3: must be 0).
-    char_select: u32,
-    offs: FighterOffs,
+    little: bool,
+    /// `x` fighter-field offset — universally required (see module comment).
+    x_off: u32,
+    /// `char_id` fighter-field offset, if the profile maps one (matchup-set
+    /// switching; absent = the runner never switches models mid-set).
+    char_id_off: Option<u32>,
 }
 
-impl ResolvedAddrs {
-    fn from_profile(p: &crate::profile::GameProfile) -> Result<ResolvedAddrs, String> {
-        let g = |name: &str| {
-            p.global(name)
-                .ok_or_else(|| format!("profile: shadow runner needs global '{name}'"))
-        };
-        let f = |name: &str| {
-            p.field_off(name)
-                .map(|(off, _size)| off)
-                .ok_or_else(|| format!("profile: shadow runner needs fighter field '{name}'"))
-        };
-        Ok(ResolvedAddrs {
+impl RunnerAddrs {
+    fn from_profile(p: &crate::profile::GameProfile) -> Result<RunnerAddrs, String> {
+        let (x_off, _size) = p.field_off("x").ok_or_else(|| {
+            "profile: shadow runner needs fighter field 'x' (dist_x + the round-start \
+             anchor probe — required by every fitted model)"
+                .to_string()
+        })?;
+        Ok(RunnerAddrs {
             block1: p.block1(),
             block2: p.block2(),
-            combo_on_b2: g("combo_on_b2")?,
-            combo_on_b1: g("combo_on_b1")?,
-            round_over: g("round_over")?,
-            abort: g("abort")?,
-            match_end: g("match_end")?,
-            round_timer: g("round_timer")?,
-            char_select: g("char_select")?,
-            offs: FighterOffs {
-                timer: f("timer")?,
-                anim: f("anim")?,
-                x: f("x")?,
-                y: f("y")?,
-                facing: f("facing")?,
-                health: f("health")?,
-                meter: f("meter")?,
-                meter_max: f("meter_max")?,
-                char_id: f("char_id")?,
-            },
+            little: p.port.memory.endianness == "little",
+            x_off,
+            char_id_off: p.field_off("char_id").map(|(off, _)| off),
         })
+    }
+}
+
+/// Fighter-block field offsets a SPECIFIC model's feature list needs.
+/// `None` = this profile doesn't map it (and no loaded model needs it, else
+/// [`FeatureAddrs::from_profile`] would have already failed to load).
+#[derive(Clone, Copy, Default)]
+struct FighterOffs {
+    y: Option<u32>,
+    anim: Option<u32>,
+    timer: Option<u32>,
+    /// Opportunistic, not gated by a specific feature: §4.2's fallback rule
+    /// (`facing_sign = sign(opp.x - me.x)`) means `facing_sign` never fails
+    /// to resolve — it just changes HOW it's computed when the profile has
+    /// no `facing` field.
+    facing: Option<u32>,
+    health: Option<u32>,
+    meter: Option<u32>,
+    meter_max: Option<u32>,
+}
+
+/// Per-model resolved addresses: fighter-field offsets this model's feature
+/// list needs, plus the hitstun global pair if it needs hitstun features.
+#[derive(Clone, Copy)]
+struct FeatureAddrs {
+    offs: FighterOffs,
+    /// (block1's hitstun-evidence global, block2's), only when a model
+    /// declares `me_hitstun`/`opp_hitstun` among its `feature_names`.
+    hitstun_globals: Option<(u32, u32)>,
+}
+
+impl FeatureAddrs {
+    /// Resolve exactly what `feature_names` needs from `p` — per RECORDER_V3
+    /// §4.2's availability table. Errors name both the feature and the
+    /// missing profile piece.
+    fn from_profile(
+        p: &crate::profile::GameProfile,
+        feature_names: &[String],
+    ) -> Result<FeatureAddrs, String> {
+        let want = |f: &str| feature_names.iter().any(|n| n == f);
+        let need_field = |name: &str, feats: &str| -> Result<u32, String> {
+            p.field_off(name).map(|(off, _)| off).ok_or_else(|| {
+                format!(
+                    "profile: feature '{feats}' needs fighter field '{name}' — this \
+                     profile doesn't map it"
+                )
+            })
+        };
+
+        let mut offs = FighterOffs::default();
+        if want("dy") || want("me_airborne") || want("me_height") || want("opp_airborne") || want("opp_height") {
+            let feats: Vec<&str> = ["dy", "me_airborne", "me_height", "opp_airborne", "opp_height"]
+                .into_iter()
+                .filter(|f| want(f))
+                .collect();
+            offs.y = Some(need_field("y", &feats.join("/"))?);
+        }
+        if want("me_anim") || want("opp_anim") {
+            offs.anim = Some(need_field("anim", "me_anim/opp_anim")?);
+        }
+        if want("me_timer") || want("opp_timer") {
+            offs.timer = Some(need_field("timer", "me_timer/opp_timer")?);
+        }
+        if want("me_health") || want("opp_health") || want("health_lead") {
+            offs.health = Some(need_field("health", "me_health/opp_health/health_lead")?);
+        }
+        if want("me_meter") || want("opp_meter") {
+            offs.meter = Some(need_field("meter", "me_meter/opp_meter")?);
+            offs.meter_max = Some(need_field("meter_max", "me_meter/opp_meter")?);
+        }
+        offs.facing = p.field_off("facing").map(|(off, _)| off);
+
+        let hitstun_globals = if want("me_hitstun") || want("opp_hitstun") {
+            let hs = p.port.hitstun_sources.as_ref().ok_or_else(|| {
+                "profile: feature 'me_hitstun'/'opp_hitstun' needs 'hitstun_sources' — \
+                 this profile declares none"
+                    .to_string()
+            })?;
+            let g1name = hs.get("block1").ok_or_else(|| {
+                "profile: feature 'me_hitstun'/'opp_hitstun' needs hitstun_sources.block1 \
+                 — this profile's hitstun_sources has no 'block1' entry"
+                    .to_string()
+            })?;
+            let g2name = hs.get("block2").ok_or_else(|| {
+                "profile: feature 'me_hitstun'/'opp_hitstun' needs hitstun_sources.block2 \
+                 — this profile's hitstun_sources has no 'block2' entry"
+                    .to_string()
+            })?;
+            let g1 = p.global(g1name).ok_or_else(|| {
+                format!(
+                    "profile: feature 'me_hitstun'/'opp_hitstun' needs global '{g1name}' \
+                     (hitstun_sources.block1) — not mapped"
+                )
+            })?;
+            let g2 = p.global(g2name).ok_or_else(|| {
+                format!(
+                    "profile: feature 'me_hitstun'/'opp_hitstun' needs global '{g2name}' \
+                     (hitstun_sources.block2) — not mapped"
+                )
+            })?;
+            Some((g1, g2))
+        } else {
+            None
+        };
+
+        Ok(FeatureAddrs { offs, hitstun_globals })
     }
 }
 
@@ -348,6 +429,38 @@ impl Default for Calibration {
     }
 }
 
+impl Calibration {
+    /// Merge a model's `meta.json` calibration snapshot with the loaded
+    /// profile's own `calibration` block: meta wins per-key (it snapshots the
+    /// fit-side constants — RECORDER_V3.md §4.3), the profile fills any key
+    /// the meta lacks, and the hardcoded literals above are the last-resort
+    /// default for a very old meta/profile that maps neither.
+    fn merged(
+        meta_cal: Option<&std::collections::BTreeMap<String, f64>>,
+        prof: &crate::profile::GameProfile,
+    ) -> Calibration {
+        let get = |key: &str, default: f64| -> f64 {
+            meta_cal
+                .and_then(|m| m.get(key).copied())
+                .or_else(|| prof.calibration(key))
+                .unwrap_or(default)
+        };
+        Calibration {
+            GROUND_Y: get("GROUND_Y", d_ground_y()),
+            X_SCALE: get("X_SCALE", d_x_scale()),
+            Y_SCALE: get("Y_SCALE", d_y_scale()),
+            TIMER_SCALE: get("TIMER_SCALE", d_timer_scale()),
+            ANIM_SCALE: get("ANIM_SCALE", d_anim_scale()),
+            CORNER_PX: get("CORNER_PX", d_corner_px()),
+            HEALTH_MAX: get("HEALTH_MAX", d_health_max()),
+            SCREEN_W: get("SCREEN_W", d_screen_w()),
+            P: get("P", d_p() as f64) as u64,
+            K: get("K", d_k() as f64) as usize,
+            HITSTUN_RECENT_FRAMES: get("HITSTUN_RECENT_FRAMES", d_hitstun() as f64) as u64,
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct MetaJson {
     feature_names: Vec<String>,
@@ -365,8 +478,13 @@ struct MetaJson {
     family: Option<String>,
     #[serde(default)]
     port: Option<String>,
+    /// Raw snapshot, merged with the profile's own calibration per-key by
+    /// [`Calibration::merged`] — NOT deserialized straight into `Calibration`
+    /// (that would silently fall back to asurabld-shaped hardcoded defaults
+    /// for any key a sparse-feature meta omits, instead of this game's own
+    /// profile calibration).
     #[serde(default)]
-    calibration: Option<Calibration>,
+    calibration: Option<std::collections::BTreeMap<String, f64>>,
     #[serde(default)]
     neutral_cap: Option<f64>,
     // Fit-summary fields for the model card (absent in very old models).
@@ -660,30 +778,41 @@ struct Fighter {
     health: u8,
     meter: u8,
     meter_max: u8,
-    char_id: u8,
 }
 
-/// `read_addr` returns little-endian bytes; the 68k stores big-endian — swap
-/// (same as record.rs's u16be helper).
-fn u16be(ds: &DebugState, addr: u32) -> u16 {
-    (ds.read_addr(addr as usize, 2).unwrap_or(0) as u16).swap_bytes()
+/// 16-bit read honoring the profile's `memory.endianness` (mirror of
+/// `training::rd16`/record.rs's helper): `read_addr` returns little-endian
+/// bytes; big-endian guests (68k on asurabld's arcade port) need a swap,
+/// little-endian guests (68k on MK2 Genesis, per that profile's own
+/// declaration) don't. Never hardcode the swap — the CPU being 68k does not
+/// imply the byte order this port's profile was authored against.
+fn rd16(ds: &DebugState, addr: u32, little: bool) -> u16 {
+    let v = ds.read_addr(addr as usize, 2).unwrap_or(0) as u16;
+    if little { v } else { v.swap_bytes() }
 }
 
 fn u8g(ds: &DebugState, addr: u32) -> u8 {
     ds.read_addr(addr as usize, 1).unwrap_or(0) as u8
 }
 
-fn read_fighter(ds: &DebugState, base: u32, o: &FighterOffs) -> Fighter {
+/// Read one fighter block. `x` always comes from [`RunnerAddrs`] (universal);
+/// `char_id` is read SEPARATELY by [`read_char_id_pair`] (it drives matchup
+/// selection, not any scalar feature); everything else here is whatever this
+/// model's [`FeatureAddrs`] resolved — absent fields read as 0 (never
+/// consulted by [`build_scalars`] unless the model's `feature_names` asked
+/// for them).
+fn read_fighter(ds: &DebugState, base: u32, ra: &RunnerAddrs, o: &FighterOffs) -> Fighter {
+    let opt16 = |off: Option<u32>| off.map(|o| rd16(ds, base + o, ra.little)).unwrap_or(0);
+    let opt8 = |off: Option<u32>| off.map(|o| u8g(ds, base + o)).unwrap_or(0);
     Fighter {
-        timer: u16be(ds, base + o.timer),
-        anim: u16be(ds, base + o.anim),
-        x: u16be(ds, base + o.x),
-        y: u16be(ds, base + o.y),
-        facing: u8g(ds, base + o.facing),
-        health: u8g(ds, base + o.health),
-        meter: u8g(ds, base + o.meter),
-        meter_max: u8g(ds, base + o.meter_max),
-        char_id: u8g(ds, base + o.char_id),
+        timer: opt16(o.timer),
+        anim: opt16(o.anim),
+        x: rd16(ds, base + ra.x_off, ra.little),
+        y: opt16(o.y),
+        facing: opt8(o.facing),
+        health: opt8(o.health),
+        meter: opt8(o.meter),
+        meter_max: opt8(o.meter_max),
     }
 }
 
@@ -691,47 +820,34 @@ fn read_fighter(ds: &DebugState, base: u32, o: &FighterOffs) -> Fighter {
 struct TickSnapshot {
     block1: Fighter,
     block2: Fighter,
-    char_sel: u8,
+    /// block1's combo landing ON block2 / block2's combo landing ON block1.
+    /// (0, 0) when the active model needs no hitstun feature.
     combo_on_b1: u8,
     combo_on_b2: u8,
-    round_over: u16,
-    abort: u16,
-    match_end: u16,
-    timer_bcd: u8,
 }
 
-fn read_tick(ds: &DebugState, a: &ResolvedAddrs) -> TickSnapshot {
+fn read_tick(ds: &DebugState, ra: &RunnerAddrs, fa: &FeatureAddrs) -> TickSnapshot {
+    let (combo_on_b1, combo_on_b2) = fa
+        .hitstun_globals
+        .map(|(g1, g2)| (u8g(ds, g1), u8g(ds, g2)))
+        .unwrap_or((0, 0));
     TickSnapshot {
-        block1: read_fighter(ds, a.block1, &a.offs),
-        block2: read_fighter(ds, a.block2, &a.offs),
-        char_sel: u8g(ds, a.char_select),
-        combo_on_b1: u8g(ds, a.combo_on_b1),
-        combo_on_b2: u8g(ds, a.combo_on_b2),
-        round_over: u16be(ds, a.round_over),
-        abort: u16be(ds, a.abort),
-        match_end: u16be(ds, a.match_end),
-        timer_bcd: u8g(ds, a.round_timer),
+        block1: read_fighter(ds, ra.block1, ra, &fa.offs),
+        block2: read_fighter(ds, ra.block2, ra, &fa.offs),
+        combo_on_b1,
+        combo_on_b2,
     }
 }
 
-fn timer_bcd_valid(t: u8) -> bool {
-    t != 0 && (t >> 4) <= 9 && (t & 0xF) <= 9
+/// Read just the two `x` values — used for the round-anchor probe before any
+/// model's [`FeatureAddrs`] is consulted (x is universal; see [`RunnerAddrs`]).
+fn read_x_pair(ds: &DebugState, ra: &RunnerAddrs) -> (u16, u16) {
+    (rd16(ds, ra.block1 + ra.x_off, ra.little), rd16(ds, ra.block2 + ra.x_off, ra.little))
 }
 
-/// The composite in-fight gate (record.rs `controllable` / runtime.py
-/// `is_controllable`): hop flags clear, both healths live, clock is BCD.
-fn is_controllable(snap: &TickSnapshot, health_max: u8) -> bool {
-    let healthy = |f: &Fighter| (1..=health_max).contains(&f.health);
-    snap.round_over == 0
-        && snap.abort == 0
-        && snap.match_end == 0
-        && healthy(&snap.block1)
-        && healthy(&snap.block2)
-        && timer_bcd_valid(snap.timer_bcd)
-        // Gate v3: all of the above is TRUE on the char-select screen too —
-        // without this an ENABLED shadow injects into char select (it would
-        // drive the P2 cursor between matches). Probe-verified 2026-08-25.
-        && snap.char_sel == 0
+/// Read the two `char_id` values, if the profile maps one.
+fn read_char_id_pair(ds: &DebugState, ra: &RunnerAddrs) -> Option<(u8, u8)> {
+    ra.char_id_off.map(|o| (u8g(ds, ra.block1 + o), u8g(ds, ra.block2 + o)))
 }
 
 // ── hitstun edge tracker (runtime.HitstunTracker, tick-granular) ────────────
@@ -780,6 +896,13 @@ pub struct LoadedModel {
     opp: Option<u8>,
     /// Fit timestamp, for newest-per-key dedup when loading a set.
     created: String,
+    /// This model's OWN feature list, in vector order — model-meta-driven,
+    /// never a hardcoded 21-scalar assumption (a sparse-feature model like
+    /// MK2 Genesis's may declare 13).
+    feature_names: Vec<String>,
+    /// Fighter-field/global addresses resolved from `feature_names` (only
+    /// what this model actually needs — see [`FeatureAddrs::from_profile`]).
+    feature_addrs: FeatureAddrs,
 }
 
 pub struct ShadowRunner {
@@ -788,8 +911,8 @@ pub struct ShadowRunner {
     library: Vec<LoadedModel>,
     /// Index into `library` currently driving decisions.
     active: usize,
-    /// Game addresses, resolved from the profile once at load.
-    addrs: ResolvedAddrs,
+    /// Addresses every model shares, resolved from the profile once at load.
+    addrs: RunnerAddrs,
     pub enabled: bool,
     rng: XorShift64,
     // Per-round buffers (runtime.RoundBuffers) — cleared on every gate edge.
@@ -803,7 +926,11 @@ pub struct ShadowRunner {
     me_block1: Option<bool>,
     frames_live: u64,
     tick: u64,
-    stacker: VecDeque<[f32; 21]>,
+    /// Stacked decision-tick scalar vectors — each entry's length is the
+    /// ACTIVE model's `feature_names.len()` (model-meta-driven, not a fixed
+    /// 21). Safe across a mid-set model switch because switches only ever
+    /// happen at round start, before this is filled (`reset_round` clears it).
+    stacker: VecDeque<Vec<f32>>,
     me_hitstun: HitstunTracker,
     opp_hitstun: HitstunTracker,
     prev_opp: Option<Fighter>,
@@ -825,7 +952,7 @@ impl ShadowRunner {
     /// ENABLED runner; errors are strings meant for a fatal `--shadow`
     /// startup message (runtime loads report them softly instead).
     pub fn load(dir: &Path) -> Result<ShadowRunner, String> {
-        let addrs = ResolvedAddrs::from_profile(crate::profile::current())?;
+        let addrs = RunnerAddrs::from_profile(crate::profile::current())?;
         let mut library: Vec<LoadedModel> = Vec::new();
         if dir.join("cases.npz").is_file() {
             library.push(Self::load_single(dir)?);
@@ -883,7 +1010,7 @@ impl ShadowRunner {
             me_block1: None,
             frames_live: 0,
             tick: 0,
-            stacker: VecDeque::with_capacity(4),
+            stacker: VecDeque::new(),
             me_hitstun: HitstunTracker::default(),
             opp_hitstun: HitstunTracker::default(),
             prev_opp: None,
@@ -1002,23 +1129,34 @@ impl ShadowRunner {
             meta.attack_classes.len(),
         )?;
 
-        if meta.feature_names[..] != SCALAR_FEATURES[..] {
-            return Err(format!(
-                "feature_names mismatch — this build computes {:?} but {} declares {:?}; \
-                 retrain the model or update src/shadow_runner.rs to match",
-                SCALAR_FEATURES,
-                meta_path.display(),
-                meta.feature_names,
-            ));
+        // Every declared feature must be one this build knows how to compute
+        // (RECORDER_V3.md §4.2's canonical list — model.feature_names is any
+        // ORDERED SUBSET of it, never a fixed 21; unknown names are refused
+        // rather than silently mis-vectorized).
+        for name in &meta.feature_names {
+            if !SCALAR_FEATURES.contains(&name.as_str()) {
+                return Err(format!(
+                    "{}: unknown feature '{name}' — this runner build only knows how to \
+                     compute {SCALAR_FEATURES:?}",
+                    meta_path.display()
+                ));
+            }
         }
-        let cal = meta.calibration.unwrap_or_default();
-        let want_dims = cal.K * SCALAR_FEATURES.len();
+        // Resolve ONLY what this model's own feature list needs from the
+        // profile (per-feature requirements, not an all-or-nothing demand for
+        // every asurabld-shaped global — see FeatureAddrs::from_profile).
+        let feature_addrs = FeatureAddrs::from_profile(prof, &meta.feature_names)
+            .map_err(|e| format!("{}: {e}", meta_path.display()))?;
+
+        let cal = Calibration::merged(meta.calibration.as_ref(), prof);
+        let want_dims = cal.K * meta.feature_names.len();
         if model.dims != want_dims {
             return Err(format!(
-                "cases.npz X has {} feature dims but calibration K={} × {} scalars = {want_dims}",
+                "cases.npz X has {} feature dims but calibration K={} × {} features {:?} = {want_dims}",
                 model.dims,
                 cal.K,
-                SCALAR_FEATURES.len()
+                meta.feature_names.len(),
+                meta.feature_names,
             ));
         }
         eprintln!(
@@ -1072,6 +1210,8 @@ impl ShadowRunner {
             me: meta.char_filter,
             opp: meta.opp_filter,
             created: meta.created.clone().unwrap_or_default(),
+            feature_names: meta.feature_names,
+            feature_addrs,
         })
     }
 
@@ -1111,8 +1251,14 @@ impl ShadowRunner {
         if !self.enabled {
             return;
         }
-        let snap = read_tick(ds, &self.addrs);
-        let live = is_controllable(&snap, self.library[self.active].cal.HEALTH_MAX as u8);
+        let prof = crate::profile::current();
+        // The ONE in-fight gate (RECORDER_V3.md §1.2 rule 3 / game-profiles.md):
+        // the same evaluator the recorder and Lua `game.controllable()` use —
+        // no private composite here. Fully profile-driven (health range,
+        // BCD-timer, menu/gate globals, whatever THIS game's gate list says),
+        // so a sparse profile like MK2 Genesis's needs nothing this runner
+        // doesn't already resolve for it.
+        let live = crate::training::eval_gate(ds, prof);
 
         if !live {
             // Off-gate: no injection, buffers cleared for the next round
@@ -1131,29 +1277,36 @@ impl ShadowRunner {
         }
         self.was_live = true;
 
+        // Anchor probe: `x` is universal (every model needs it — RunnerAddrs),
+        // so this is read independent of which model is active, BEFORE any
+        // matchup switch decides that.
+        let (x1, x2) = read_x_pair(ds, &self.addrs);
         if self.me_block1.is_none() {
-            if snap.block1.x == snap.block2.x {
+            if x1 == x2 {
                 // Positions not written yet (or a dead heat) — wait a frame.
                 return;
             }
             // The BOT is the block with the LARGER X (the mirror of the
             // recorder's p1_block = smaller X).
-            self.me_block1 = Some(snap.block1.x > snap.block2.x);
+            self.me_block1 = Some(x1 > x2);
             eprintln!(
-                "[shadow] round start — me=block{} (x1={} x2={})",
+                "[shadow] round start — me=block{} (x1={x1} x2={x2})",
                 if self.me_block1 == Some(true) { 1 } else { 2 },
-                snap.block1.x,
-                snap.block2.x
             );
             // Matchup selection: chars are valid once positions are — pick
-            // the best model for (my char, opponent char) from the set.
-            let (me_f, opp_f) = if self.me_block1 == Some(true) {
-                (snap.block1, snap.block2)
-            } else {
-                (snap.block2, snap.block1)
-            };
-            self.select_model(me_f.char_id, opp_f.char_id, ds);
+            // the best model for (my char, opponent char) from the set. Only
+            // possible when the profile maps `char_id` at all; absent, the
+            // set never switches away from its starting model.
+            if let Some((c1, c2)) = read_char_id_pair(ds, &self.addrs) {
+                let (me_c, opp_c) = if self.me_block1 == Some(true) { (c1, c2) } else { (c2, c1) };
+                self.select_model(me_c, opp_c, ds);
+            }
         }
+
+        // Read the full per-model feature snapshot AFTER any matchup switch
+        // above, so it reflects the model that will actually consume it.
+        let fa = self.library[self.active].feature_addrs;
+        let snap = read_tick(ds, &self.addrs, &fa);
 
         if self.frames_live % self.library[self.active].cal.P == 0 {
             self.decide(&snap);
@@ -1185,11 +1338,23 @@ impl ShadowRunner {
             (snap.combo_on_b2, snap.combo_on_b1)
         };
 
-        let s: i32 = if me_now.facing == 1 { 1 } else { -1 };
-
-        // Opponent read one decision tick stale (runtime.py approximation #1).
+        // Opponent read one decision tick stale (runtime.py approximation #1) —
+        // resolved BEFORE `s` because the no-`facing`-field fallback below
+        // needs this same stale read (dataset.py `_decisions_for_round`
+        // order: `s = sign(opp["x"] - me["x"])` uses the STALE opp).
         let opp_lagged = self.prev_opp.unwrap_or(opp_now);
         let opp_combo_lagged = self.prev_opp_combo;
+
+        let has_facing = self.library[self.active].feature_addrs.offs.facing.is_some();
+        let s: i32 = if has_facing {
+            if me_now.facing == 1 { 1 } else { -1 }
+        } else {
+            // RECORDER_V3.md §4.2 facing fallback: no `facing` field mapped
+            // (e.g. MK2 Genesis) → s = sign(opp.x - me.x). With this s,
+            // dist_x collapses to |Δx| and fwd/back holds become
+            // position-relative, exactly as the contract note says.
+            if opp_lagged.x as i32 - me_now.x as i32 >= 0 { 1 } else { -1 }
+        };
 
         // Holds from the bot's own last EMITTED mask (not the intent class).
         let (fwd_bit, back_bit) = if s > 0 { (BIT_RIGHT, BIT_LEFT) } else { (BIT_LEFT, BIT_RIGHT) };
@@ -1200,13 +1365,24 @@ impl ShadowRunner {
         let me_hit = self.me_hitstun.update(self.tick, me_combo_now, window_ticks);
         let opp_hit = self.opp_hitstun.update(self.tick, opp_combo_lagged, window_ticks);
 
-        let scal = build_scalars(&self.library[self.active].cal, &me_now, &opp_lagged, s, fwd_hold, back_hold, me_hit, opp_hit);
-        if self.stacker.len() == self.library[self.active].cal.K {
+        let k = self.library[self.active].cal.K;
+        let scal = build_scalars(
+            &self.library[self.active].feature_names,
+            &self.library[self.active].cal,
+            &me_now,
+            &opp_lagged,
+            s,
+            fwd_hold,
+            back_hold,
+            me_hit,
+            opp_hit,
+        );
+        if self.stacker.len() == k {
             self.stacker.pop_front();
         }
         self.stacker.push_back(scal);
 
-        if self.stacker.len() == self.library[self.active].cal.K {
+        if self.stacker.len() == k {
             // Oldest → newest concatenation (dataset.build stacking order).
             let q: Vec<f64> = self
                 .stacker
@@ -1222,11 +1398,12 @@ impl ShadowRunner {
             self.driving = true;
             if self.tick < 12 || self.tick % 75 == 0 {
                 let lm = &self.library[self.active];
+                let dist_x = lm.feature_names.iter().position(|n| n == "dist_x").map(|i| self.stacker.back().unwrap()[i]);
                 eprintln!(
-                    "[shadow] tick={:4} me=block{} dist_x={:+.3} s={:+} move={} attack={} mask={:#05x}",
+                    "[shadow] tick={:4} me=block{} dist_x={:?} s={:+} move={} attack={} mask={:#05x}",
                     self.tick,
                     if me_is_block1 { 1 } else { 2 },
-                    scal[0],
+                    dist_x,
                     s,
                     lm.move_classes[mv],
                     lm.attack_classes[at],
@@ -1250,9 +1427,16 @@ pub const MOVE_CLASSES: [&str; 9] = [
 ];
 pub const ATTACK_CLASSES: [&str; 6] = ["None", "Light", "Medium", "Heavy", "Launcher", "Toss"];
 
-/// The §1a scalar vector in SCALAR_FEATURES order (runtime.build_scalars).
+/// The scalar vector in the MODEL'S OWN `feature_names` order (mirror of
+/// `dataset.py`'s per-feature formulas in `_decisions_for_round` — see the
+/// RECORDER_V3.md §4.2 availability table this mirrors). Sparse by
+/// construction: a model that never declared `me_anim` never asks for it
+/// here, so a profile that doesn't map `anim` is never consulted for it
+/// either (this is what makes a 13-feature MK2 Genesis model loadable next to
+/// a 21-feature asurabld one — see `FeatureAddrs::from_profile`).
 #[allow(clippy::too_many_arguments)]
 fn build_scalars(
+    feature_names: &[String],
     cal: &Calibration,
     me: &Fighter,
     opp: &Fighter,
@@ -1261,44 +1445,52 @@ fn build_scalars(
     back_hold: f64,
     me_hitstun: bool,
     opp_hitstun: bool,
-) -> [f32; 21] {
+) -> Vec<f32> {
     let sf = s as f64;
     let airborne = |f: &Fighter| if cal.GROUND_Y - f.y as f64 > 4.0 { 1.0 } else { 0.0 };
     let height = |f: &Fighter| (cal.GROUND_Y - f.y as f64).max(0.0) / cal.Y_SCALE;
-    let v: [f64; 21] = [
-        sf * (opp.x as f64 - me.x as f64) / cal.X_SCALE,          // dist_x
-        (opp.y as f64 - me.y as f64) / cal.Y_SCALE,               // dy
-        airborne(me),                                             // me_airborne
-        height(me),                                               // me_height
-        fwd_hold,                                                 // me_fwd_hold
-        back_hold,                                                // me_back_hold
-        me.anim as f64 / cal.ANIM_SCALE,                          // me_anim
-        me.timer as f64 / cal.TIMER_SCALE,                        // me_timer
-        airborne(opp),                                            // opp_airborne
-        height(opp),                                              // opp_height
-        opp.anim as f64 / cal.ANIM_SCALE,                         // opp_anim
-        opp.timer as f64 / cal.TIMER_SCALE,                       // opp_timer
-        sf,                                                       // facing_sign
-        me.health as f64 / cal.HEALTH_MAX,                        // me_health
-        opp.health as f64 / cal.HEALTH_MAX,                       // opp_health
-        (me.health as f64 - opp.health as f64) / cal.HEALTH_MAX,  // health_lead
-        me.meter as f64 / (me.meter_max as f64).max(1.0),         // me_meter
-        opp.meter as f64 / (opp.meter_max as f64).max(1.0),       // opp_meter
-        if me_hitstun { 1.0 } else { 0.0 },                       // me_hitstun
-        if opp_hitstun { 1.0 } else { 0.0 },                      // opp_hitstun
-        if me.x as f64 <= cal.CORNER_PX || me.x as f64 >= cal.SCREEN_W - cal.CORNER_PX {
-            1.0
-        } else {
-            0.0
-        },                                                        // me_corner
-    ];
-    // float32, like runtime.scalars_to_vector — the query then standardizes in
-    // f64 exactly as numpy upcasts.
-    let mut out = [0.0f32; 21];
-    for (o, x) in out.iter_mut().zip(v) {
-        *o = x as f32;
-    }
-    out
+    feature_names
+        .iter()
+        .map(|name| {
+            let v: f64 = match name.as_str() {
+                "dist_x" => sf * (opp.x as f64 - me.x as f64) / cal.X_SCALE,
+                "dy" => (opp.y as f64 - me.y as f64) / cal.Y_SCALE,
+                "me_airborne" => airborne(me),
+                "me_height" => height(me),
+                "me_fwd_hold" => fwd_hold,
+                "me_back_hold" => back_hold,
+                "me_anim" => me.anim as f64 / cal.ANIM_SCALE,
+                "me_timer" => me.timer as f64 / cal.TIMER_SCALE,
+                "opp_airborne" => airborne(opp),
+                "opp_height" => height(opp),
+                "opp_anim" => opp.anim as f64 / cal.ANIM_SCALE,
+                "opp_timer" => opp.timer as f64 / cal.TIMER_SCALE,
+                "facing_sign" => sf,
+                "me_health" => me.health as f64 / cal.HEALTH_MAX,
+                "opp_health" => opp.health as f64 / cal.HEALTH_MAX,
+                "health_lead" => (me.health as f64 - opp.health as f64) / cal.HEALTH_MAX,
+                "me_meter" => me.meter as f64 / (me.meter_max as f64).max(1.0),
+                "opp_meter" => opp.meter as f64 / (opp.meter_max as f64).max(1.0),
+                "me_hitstun" => if me_hitstun { 1.0 } else { 0.0 },
+                "opp_hitstun" => if opp_hitstun { 1.0 } else { 0.0 },
+                "me_corner" => {
+                    if me.x as f64 <= cal.CORNER_PX || me.x as f64 >= cal.SCREEN_W - cal.CORNER_PX {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                other => unreachable!(
+                    "feature '{other}' unknown to build_scalars — should have been \
+                     rejected at load (load_single validates every feature_names entry \
+                     against SCALAR_FEATURES)"
+                ),
+            };
+            // float32, like runtime.scalars_to_vector — the query then
+            // standardizes in f64 exactly as numpy upcasts.
+            v as f32
+        })
+        .collect()
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -1585,14 +1777,15 @@ mod tests {
         let cal = Calibration::default();
         let me = Fighter {
             timer: 512, anim: 128, x: 84, y: 216, facing: 1,
-            health: 239, meter: 32, meter_max: 64, char_id: 1,
+            health: 239, meter: 32, meter_max: 64,
         };
         let opp = Fighter {
             timer: 256, anim: 64, x: 232, y: 200, facing: 0,
-            health: 120, meter: 0, meter_max: 64, char_id: 7,
+            health: 120, meter: 0, meter_max: 64,
         };
         let s = 1; // me.facing == 1
-        let v = build_scalars(&cal, &me, &opp, s, 1.0, 0.0, false, true);
+        let feats: Vec<String> = SCALAR_FEATURES.iter().map(|s| s.to_string()).collect();
+        let v = build_scalars(&feats, &cal, &me, &opp, s, 1.0, 0.0, false, true);
         let want: [f32; 21] = [
             (232.0 - 84.0) / 128.0,   // dist_x
             (200.0 - 216.0) / 128.0,  // dy
@@ -1622,36 +1815,181 @@ mod tests {
         // Corner: x = 20 (<= 24) and x = 300 (>= 296) both flag.
         let mut cme = me;
         cme.x = 20;
-        assert_eq!(build_scalars(&cal, &cme, &opp, s, 0.0, 0.0, false, false)[20], 1.0);
+        let corner_i = feats.iter().position(|f| f == "me_corner").unwrap();
+        assert_eq!(build_scalars(&feats, &cal, &cme, &opp, s, 0.0, 0.0, false, false)[corner_i], 1.0);
         cme.x = 300;
-        assert_eq!(build_scalars(&cal, &cme, &opp, s, 0.0, 0.0, false, false)[20], 1.0);
+        assert_eq!(build_scalars(&feats, &cal, &cme, &opp, s, 0.0, 0.0, false, false)[corner_i], 1.0);
     }
 
+    /// RECORDER_V3.md §4.2's availability table, mirrored: a SPARSE feature
+    /// list (genesis-smoke-v0's 13 features — no anim/timer/meter/hitstun)
+    /// assembles a shorter, differently-ordered-from-the-full-list vector,
+    /// and the facing fallback (`s = sign(opp.x - me.x)`) applies since MK2
+    /// Genesis maps no `facing` field.
     #[test]
-    fn gate_and_anchor_semantics() {
-        let f = |health: u8, x: u16| Fighter { health, x, ..Default::default() };
-        let snap = TickSnapshot {
-            block1: f(0xEF, 84),
-            block2: f(0x80, 232),
-            char_sel: 0,
-            combo_on_b1: 0,
-            combo_on_b2: 0,
-            round_over: 0,
-            abort: 0,
-            match_end: 0,
-            timer_bcd: 0x85,
+    fn build_scalars_sparse_feature_set_matches_hand_computed_row() {
+        let cal = Calibration {
+            GROUND_Y: 121.0, X_SCALE: 128.0, Y_SCALE: 128.0, TIMER_SCALE: 256.0,
+            ANIM_SCALE: 64.0, CORNER_PX: 24.0, HEALTH_MAX: 120.0, SCREEN_W: 320.0,
+            P: 8, K: 4, HITSTUN_RECENT_FRAMES: 20,
         };
-        assert!(is_controllable(&snap, 0xEF));
-        // Any hop flag, dead health, or a non-BCD clock closes the gate.
-        assert!(!is_controllable(&TickSnapshot { round_over: 1, ..snap }, 0xEF));
-        assert!(!is_controllable(&TickSnapshot { abort: 1, ..snap }, 0xEF));
-        assert!(!is_controllable(&TickSnapshot { match_end: 1, ..snap }, 0xEF));
-        assert!(!is_controllable(&TickSnapshot { block1: f(0, 84), ..snap }, 0xEF));
-        assert!(!is_controllable(&TickSnapshot { block2: f(0xF0, 232), ..snap }, 0xEF));
-        assert!(!is_controllable(&TickSnapshot { timer_bcd: 0x3A, ..snap }, 0xEF));
-        assert!(!is_controllable(&TickSnapshot { timer_bcd: 0, ..snap }, 0xEF));
-        // Gate v3: a live char-select countdown closes the gate.
-        assert!(!is_controllable(&TickSnapshot { char_sel: 0x28, ..snap }, 0xEF));
+        let me = Fighter { x: 84, y: 121, health: 100, ..Default::default() };
+        let opp = Fighter { x: 232, y: 105, health: 60, ..Default::default() };
+        // No `facing` field on this profile → s = sign(opp.x - me.x) = +1.
+        let s = 1;
+        let feats: Vec<String> = [
+            "dist_x", "dy", "me_airborne", "me_height", "me_fwd_hold", "me_back_hold",
+            "opp_airborne", "opp_height", "facing_sign", "me_health", "opp_health",
+            "health_lead", "me_corner",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let v = build_scalars(&feats, &cal, &me, &opp, s, 1.0, 0.0, false, false);
+        assert_eq!(v.len(), 13, "13 features, no more no less");
+        let want: [f32; 13] = [
+            (232.0 - 84.0) / 128.0,  // dist_x
+            (105.0 - 121.0) / 128.0, // dy
+            0.0,                     // me_airborne (121-121=0, not >4)
+            0.0,                     // me_height
+            1.0,                     // me_fwd_hold
+            0.0,                     // me_back_hold
+            1.0,                     // opp_airborne (121-105=16 > 4)
+            16.0 / 128.0,            // opp_height
+            1.0,                     // facing_sign
+            100.0 / 120.0,           // me_health
+            60.0 / 120.0,            // opp_health
+            (100.0 - 60.0) / 120.0,  // health_lead
+            0.0,                     // me_corner (84 in 24..296)
+        ];
+        for (i, (g, w)) in v.iter().zip(want).enumerate() {
+            assert!((g - w).abs() < 1e-6, "sparse scalar {i} ({}): {g} vs {w}", feats[i]);
+        }
+    }
+
+    /// Model-meta-driven requirement resolution (RECORDER_V3.md §4.2): the
+    /// genesis-smoke-v0 shape (13 sparse features, no hitstun) resolves
+    /// cleanly against the real MK2 Genesis profile, which maps no
+    /// `hitstun_sources` at all — a model that DID need hitstun must fail,
+    /// naming both the feature and the missing profile piece, without ever
+    /// touching the global `crate::profile::current()` (these load a
+    /// standalone `GameProfile`, so this test can't race other tests' global
+    /// asurabld profile install).
+    #[test]
+    fn feature_addrs_resolve_per_model_meta_not_all_or_nothing() {
+        let genesis = crate::profile::GameProfile::load(Path::new("library/mk2/genesis"))
+            .expect("library/mk2/genesis.profile.json loads");
+
+        let sparse: Vec<String> = [
+            "dist_x", "dy", "me_airborne", "me_height", "me_fwd_hold", "me_back_hold",
+            "opp_airborne", "opp_height", "facing_sign", "me_health", "opp_health",
+            "health_lead", "me_corner",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let fa = FeatureAddrs::from_profile(&genesis, &sparse)
+            .expect("genesis-smoke-v0's feature list needs nothing this profile lacks");
+        // No `facing` field on this profile — the fallback applies.
+        assert!(fa.offs.facing.is_none());
+        // None of these features were requested — must NOT be required.
+        assert!(fa.offs.anim.is_none());
+        assert!(fa.offs.timer.is_none());
+        assert!(fa.offs.meter.is_none());
+        assert!(fa.hitstun_globals.is_none());
+        // y/health WERE requested and ARE mapped by this profile.
+        assert!(fa.offs.y.is_some());
+        assert!(fa.offs.health.is_some());
+
+        // A hitstun-featured meta on the SAME profile (which has no
+        // hitstun_sources) must fail, naming the feature and the missing
+        // piece — not a generic "profile: shadow runner needs global
+        // 'combo_on_b2'" that doesn't say WHY.
+        let mut with_hitstun = sparse.clone();
+        with_hitstun.push("me_hitstun".to_string());
+        with_hitstun.push("opp_hitstun".to_string());
+        let err = FeatureAddrs::from_profile(&genesis, &with_hitstun)
+            .err()
+            .expect("genesis profile has no hitstun_sources — must fail");
+        assert!(err.contains("me_hitstun"), "{err}");
+        assert!(err.contains("hitstun_sources"), "{err}");
+
+        // A model needing `me_anim` similarly fails naming 'anim' + the
+        // feature that wants it (genesis profile maps no 'anim' field).
+        let mut with_anim = sparse.clone();
+        with_anim.push("me_anim".to_string());
+        let err = FeatureAddrs::from_profile(&genesis, &with_anim).err().expect("no anim field");
+        assert!(err.contains("me_anim"), "{err}");
+        assert!(err.contains("'anim'"), "{err}");
+    }
+
+    /// The runner's in-fight gate is `training::eval_gate` — the SAME
+    /// evaluator the recorder and Lua `game.controllable()` use, no private
+    /// composite (RECORDER_V3.md §1.2 rule 3). End-to-end through a real
+    /// `ShadowRunner::load`ed model against a synthetic asurabld memory
+    /// image: closed gate → no anchor/injection; opening it lets the
+    /// round-start anchor (larger-x = bot) resolve, and after enough decision
+    /// ticks the shadow starts driving port 1.
+    #[test]
+    fn tick_gate_is_training_eval_gate_and_resolves_anchor() {
+        crate::profile::init_for_tests();
+        let prof = crate::profile::current();
+        let mut runner = ShadowRunner::load(&goat_v2()).unwrap();
+
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "Work RAM".into(),
+            addr: 0x400000,
+            len: 0x8000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        // Big-endian guest: to make the game "see" value V at a 2-byte
+        // field, write V.swap_bytes() (write_addr's own bytes are read back
+        // unswapped by read_addr; the swap happens in this module's `rd16`).
+        let wbig16 = |ds: &mut DebugState, addr: u32, v: u16| {
+            ds.write_addr(addr as usize, 2, v.swap_bytes() as u32);
+        };
+        let wbig8 = |ds: &mut DebugState, addr: u32, v: u8| {
+            ds.write_addr(addr as usize, 1, v as u32);
+        };
+
+        let (b1, b2) = (prof.block1(), prof.block2());
+        let (x_off, _) = prof.field_off("x").unwrap();
+        let (health_off, _) = prof.field_off("health").unwrap();
+
+        // Gate closed: round_over nonzero.
+        wbig16(&mut ds, prof.global("round_over").unwrap(), 1);
+        wbig16(&mut ds, prof.global("abort").unwrap(), 0);
+        wbig16(&mut ds, prof.global("match_end").unwrap(), 0);
+        wbig8(&mut ds, prof.global("char_select").unwrap(), 0);
+        wbig8(&mut ds, prof.global("round_timer").unwrap(), 0x30);
+        wbig8(&mut ds, b1 + health_off, 200);
+        wbig8(&mut ds, b2 + health_off, 150);
+        wbig16(&mut ds, b1 + x_off, 200);
+        wbig16(&mut ds, b2 + x_off, 50);
+
+        runner.tick(&mut ds, 0);
+        assert!(runner.me_block1.is_none(), "gate closed — no anchor yet");
+        assert!(!runner.driving);
+
+        // Open the gate (round_over -> 0): same eval_gate the recorder uses.
+        wbig16(&mut ds, prof.global("round_over").unwrap(), 0);
+        assert!(crate::training::eval_gate(&ds, prof), "gate must now read open");
+
+        // Drive enough ticks (P * K, plus headroom) for the anchor to
+        // resolve and a full K-deep stack to produce a decision.
+        for f in 0..(8 * 4 + 8) {
+            runner.tick(&mut ds, f as u64);
+        }
+        assert_eq!(runner.me_block1, Some(true), "block1 has the larger x (200 > 50)");
+        assert!(runner.driving, "a full K-stack must have produced a decision by now");
+
+        // Closing the gate again ends the round and clears the anchor.
+        wbig16(&mut ds, prof.global("round_over").unwrap(), 1);
+        runner.tick(&mut ds, 1000);
+        assert!(runner.me_block1.is_none());
+        assert!(!runner.driving);
     }
 
     /// meta.json provenance: wrong family = hard error; same family on a
