@@ -166,7 +166,9 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
 
     let block_chord = if p.family.block.style == "button" {
         p.family.block.class.as_deref().and_then(|class| {
-            let chord = p.port.attack_chords.get(class)?;
+            // An empty chord (block button not yet verified for this port)
+            // must not resolve into a hold-nothing "block" — fall through.
+            let chord = p.port.attack_chords.get(class).filter(|c| !c.is_empty())?;
             let mut bits = [false; 12];
             for name in chord {
                 bits[crate::profile::retro_button_bit(name)? as usize] = true;

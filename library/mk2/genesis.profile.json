@@ -16,7 +16,7 @@
     "fighter_fields": [
       { "name": "char_id", "off": "0xE8", "size": 1 },
       { "name": "health", "off": "0x32", "size": 1 },
-      { "name": "health_mirror", "off": "0x34", "size": 1 }
+      { "name": "health2", "off": "0x34", "size": 1 }
     ],
     "globals": {
       "round_over": "0xFFB5E0"
