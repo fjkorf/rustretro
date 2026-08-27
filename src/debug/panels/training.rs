@@ -156,6 +156,18 @@ impl TrainingPanel {
         );
         ui.separator();
 
+        if !crate::training::available() {
+            ui.label(
+                egui::RichText::new(
+                    "Training unavailable — this game's profile has no memory map yet \
+                     (see the porting-a-game tutorial).",
+                )
+                .color(egui::Color32::DARK_GRAY),
+            );
+            ui.separator();
+            self.shadow_section(ui, state);
+            return;
+        }
         let was_enabled = state.training.enabled;
         ui.checkbox(&mut state.training.enabled, "Enabled (F5)")
             .on_hover_text("Credits topped up, round timer held, health refill — the held-fight sandbox");

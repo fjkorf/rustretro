@@ -47,29 +47,24 @@ struct Resolved {
     ground_y: u16,
 }
 
-fn resolve(p: &GameProfile) -> Resolved {
-    let g = |name: &str| {
-        p.global(name)
-            .unwrap_or_else(|| panic!("profile missing global '{name}'"))
-    };
-    let field = |name: &str| {
-        p.field_off(name)
-            .unwrap_or_else(|| panic!("profile missing fighter field '{name}'"))
-            .0
-    };
-    Resolved {
+fn resolve(p: &GameProfile) -> Option<Resolved> {
+    // A stub profile (library/mk2) has no mapped globals/fields — training
+    // must no-op rather than panic (same class as the QA-found Record crash).
+    let g = |name: &str| p.global(name);
+    let field = |name: &str| p.field_off(name).map(|(off, _)| off);
+    Some(Resolved {
         block1: p.block1(),
         block2: p.block2(),
-        health_off: field("health"),
-        health2_off: field("health2"),
-        x_off: field("x"),
-        y_off: field("y"),
-        round_timer: g("round_timer"),
-        round_state: g("round_state"),
-        credits: g("credits"),
-        round_over: g("round_over"),
-        abort: g("abort"),
-        match_end: g("match_end"),
+        health_off: field("health")?,
+        health2_off: field("health2")?,
+        x_off: field("x")?,
+        y_off: field("y")?,
+        round_timer: g("round_timer")?,
+        round_state: g("round_state")?,
+        credits: g("credits")?,
+        round_over: g("round_over")?,
+        abort: g("abort")?,
+        match_end: g("match_end")?,
 
         health_max: p.port.enforcement.health_max,
         refill_below: p.port.enforcement.refill_below,
@@ -81,7 +76,7 @@ fn resolve(p: &GameProfile) -> Resolved {
             *p.port.positions.get("round_start_x_right").unwrap_or(&232) as u16,
         ),
         ground_y: *p.port.positions.get("round_start_y").unwrap_or(&216) as u16,
-    }
+    })
 }
 
 fn rd8(ds: &DebugState, addr: u32) -> u8 {
@@ -116,6 +111,12 @@ fn in_fight(ds: &DebugState, r: &Resolved) -> bool {
         && (t & 0xF) <= 9
 }
 
+/// Whether the loaded profile maps everything training needs (stub
+/// profiles don't) — panel uses this to disable the controls with a hint.
+pub fn available() -> bool {
+    resolve(crate::profile::current()).is_some()
+}
+
 /// Run one training-mode frame. Called from `Frontend::run_frame` after the
 /// bus-window refresh (reads see this frame's snapshot; writes drain to the
 /// live bus next frame).
@@ -123,7 +124,13 @@ pub fn tick(ds: &mut DebugState, frame: u64) {
     if !ds.training.enabled {
         return;
     }
-    let r = resolve(crate::profile::current());
+    let Some(r) = resolve(crate::profile::current()) else {
+        // Stub profile: no mapped enforcement addresses — refuse softly, once.
+        ds.training.enabled = false;
+        ds.log("🎯 Training unavailable: this game's profile has no memory map yet".into());
+        eprintln!("[training] unavailable: profile has no mapped globals (stub) — disabled");
+        return;
+    };
     // Credits top-up, checked once a second: Start must always work.
     if frame % 60 == 0 && rd8(ds, r.credits) < r.credits_min {
         wr8(ds, r.credits, r.credits_target);

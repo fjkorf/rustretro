@@ -48,30 +48,37 @@ impl GameMap {
     /// Populate every field from the loaded `GameProfile`'s blocks + named
     /// globals (see `docs/game-profiles.md`) — the data-driven replacement
     /// for the old compiled constants.
-    pub fn from_profile(p: &crate::profile::GameProfile) -> GameMap {
+    /// Errs (never panics) on a profile with unmapped globals — stub
+    /// profiles (library/mk2) are a supported way to BOOT a game, so the
+    /// recorder must refuse softly, not crash the app (QA-found: pressing
+    /// Record while playing MK2 panicked here).
+    pub fn try_from_profile(p: &crate::profile::GameProfile) -> Result<GameMap, String> {
         let g = |name: &str| {
             p.global(name)
-                .unwrap_or_else(|| panic!("profile missing global '{name}'"))
+                .ok_or_else(|| format!("profile has no '{name}' global mapped (stub profile?)"))
         };
-        GameMap {
+        Ok(GameMap {
             block1: p.block1(),
             block2: p.block2(),
-            round_timer: g("round_timer"),
-            char_select: g("char_select"),
-            round_over: g("round_over"),
-            abort: g("abort"),
-            match_end: g("match_end"),
-            demo_flag: g("demo_flag"),
-            combo_on_b2: g("combo_on_b2"),
-            combo_on_b1: g("combo_on_b1"),
-            credits: g("credits"),
-        }
+            round_timer: g("round_timer")?,
+            char_select: g("char_select")?,
+            round_over: g("round_over")?,
+            abort: g("abort")?,
+            match_end: g("match_end")?,
+            demo_flag: g("demo_flag")?,
+            combo_on_b2: g("combo_on_b2")?,
+            combo_on_b1: g("combo_on_b1")?,
+            credits: g("credits")?,
+        })
     }
 }
 
 impl Default for GameMap {
+    /// For tests and complete profiles only — panics on a stub profile.
+    /// Production paths use [`GameMap::try_from_profile`].
     fn default() -> Self {
-        GameMap::from_profile(crate::profile::current())
+        GameMap::try_from_profile(crate::profile::current())
+            .expect("GameMap::default requires a fully-mapped profile")
     }
 }
 

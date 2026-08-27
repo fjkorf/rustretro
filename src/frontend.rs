@@ -605,8 +605,9 @@ impl Frontend {
                     note = Some(if self.recorder.is_some() {
                         format!("recording → {}", path.display())
                     } else {
-                        // set_recorder printed the io error to stderr.
-                        format!("start FAILED: could not open {}", path.display())
+                        // set_recorder printed the reason to stderr
+                        // (stub profile, or the file could not open).
+                        format!("start FAILED — see stderr ({})", path.display())
                     });
                 }
             }
@@ -656,9 +657,18 @@ impl Frontend {
             );
         }
         let prof = crate::profile::current();
+        // Stub profiles can't record (no mapped actor/gate addresses) —
+        // refuse softly; the drain publishes the note to the panel.
+        let map = match crate::record::GameMap::try_from_profile(prof) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[record] unavailable for this game: {e}");
+                return;
+            }
+        };
         match crate::record::FrameRecorder::create(
             &path,
-            crate::record::GameMap::default(),
+            map,
             &prof.port.core.provenance_game,
             &prof.port.core.provenance_core,
             style.as_deref(),
