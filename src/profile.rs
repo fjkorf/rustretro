@@ -266,6 +266,10 @@ pub enum GateCond {
     ByteZero { global: String },
     /// u16 (guest order) at global == 0.
     WordZero { global: String },
+    /// u16 (guest order) at global is one of `values`. For phase words with
+    /// more than one legitimate in-fight value (MK2 arcade screen_state: 0
+    /// in 1P play, 276 after first contact in a 2-human match).
+    WordIn { global: String, values: Vec<u16> },
     /// BOTH fighters' `health` field in min..=max.
     HealthInRange { min: u8, max: u8 },
     /// u8 at global is nonzero and both BCD nibbles are decimal.
@@ -829,7 +833,8 @@ impl GateCond {
         match self {
             GateCond::ByteZero { global }
             | GateCond::WordZero { global }
-            | GateCond::BcdValidNonzero { global } => Some(global),
+            | GateCond::BcdValidNonzero { global }
+            | GateCond::WordIn { global, .. } => Some(global),
             GateCond::HealthInRange { .. } => None,
         }
     }

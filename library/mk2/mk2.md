@@ -560,3 +560,17 @@ input — `word_zero(screen_state)` reads not-controllable from that moment.
 All 46 prior gate snapshots were 1P/attract phases; 276 never appeared
 there. Effects: the recorder under-counts controllable frames in 2P
 rounds, and round summaries for such rounds close early.
+
+## Gate revision: word_in for the 2-human screen_state leak (2026-08-28)
+
+Live finding (A-Rust's 2-human punish rig): `screen_state` flips to **276**
+(0x114) at first contact in a 2-HUMAN match and holds for the rest of the
+round while the fight continues normally — `word_zero` then reads
+not-controllable, which froze the recorder, training enforcement, and ALL
+dummy injection (user-visible as "block-punish works once, then the dummy
+goes limp" once the punish's gate-grace expired). New gate vocabulary
+condition `word_in` (u16 ∈ values); arcade gate now
+`word_in(screen_state, [0, 276])`. Caveat recorded honestly: 276 has only
+been observed in 2-human-fight-after-contact; if it ever appears on a menu
+this gate leaks there — no such observation across all phase sweeps to
+date (menus read 0x9C01-family values).

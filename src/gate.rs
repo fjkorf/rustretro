@@ -1,7 +1,7 @@
 //! The in-fight controllable gate — ONE shared predicate evaluated by the
 //! training enforcer, the Lua `game.controllable()` binding, and (in spirit)
 //! the recorder's composite. See docs/game-profiles.md for the condition
-//! vocabulary and semantics: byte_zero / word_zero / health_in_range /
+//! vocabulary and semantics: byte_zero / word_zero / word_in / health_in_range /
 //! bcd_valid_nonzero. Reads go through the same `DebugState::read_addr` path
 //! as every other binding; out-of-map reads collapse to 0, matching the
 //! recorder's `unwrap_or(0)` semantics. 16-bit reads honor the profile's
@@ -36,6 +36,9 @@ pub(crate) fn eval_gate(ds: &DebugState, p: &GameProfile) -> bool {
     p.port.gate.iter().all(|cond| match cond {
         GateCond::ByteZero { global } => rd8(ds, ga(global)) == 0,
         GateCond::WordZero { global } => rd16(ds, ga(global), little) == 0,
+        GateCond::WordIn { global, values } => {
+            values.contains(&rd16(ds, ga(global), little))
+        }
         GateCond::HealthInRange { min, max } => {
             let Some((off, _size)) = p.field_off("health") else {
                 return false;
