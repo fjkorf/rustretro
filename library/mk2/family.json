@@ -15,5 +15,12 @@
     "UpForward", "UpBack", "DownForward", "DownBack"
   ],
   "attack_classes": ["None", "HP", "LP", "HK", "LK", "Block"],
-  "block": { "style": "button", "class": "Block" }
+  "block": { "style": "button", "class": "Block" },
+  "moves": {
+    "reptile": [
+      { "name": "slide",      "tags": ["special", "low"] },
+      { "name": "acid_spit",  "tags": ["special", "projectile"] },
+      { "name": "force_ball", "tags": ["special", "projectile"] }
+    ]
+  }
 }

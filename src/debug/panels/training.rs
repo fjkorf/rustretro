@@ -30,13 +30,24 @@ pub struct TrainingPanel {
     record_style: String,
 }
 
-const DUMMY_MODES: [(DummyMode, &str); 5] = [
+const DUMMY_MODES: [(DummyMode, &str); 6] = [
     (DummyMode::Free, "Free (human / shadow drives P2)"),
     (DummyMode::Stand, "Stand"),
     (DummyMode::Crouch, "Crouch"),
     (DummyMode::Jump, "Jump (hop cadence)"),
     (DummyMode::Block, "Block (hold away)"),
+    (DummyMode::BlockPunish, "Block + punish (on contact)"),
 ];
+
+/// ContinueBlock hold length offered by the panel (MACRO_ACTIONS §6).
+const PUNISH_CONTINUE_FRAMES: u16 = 30;
+
+/// Pool identity ignores ContinueBlock's frame payload — the panel offers
+/// one Continue Block row, whatever N an older pool stored.
+fn same_option(a: &crate::macros::PunishOption, b: &crate::macros::PunishOption) -> bool {
+    use crate::macros::PunishOption::*;
+    matches!((a, b), (ContinueBlock(_), ContinueBlock(_))) || a == b
+}
 
 /// Shadow data roots are PER-FAMILY (`shadow/<kind>/<family>/`) so one
 /// game's models/recordings/arenas never appear under another (QA-found:
@@ -208,10 +219,26 @@ impl TrainingPanel {
                     .selected_text(current)
                     .show_ui(ui, |ui| {
                         for (mode, label) in DUMMY_MODES {
+                            // BlockPunish needs a mapped contact signal —
+                            // offered greyed with the reason otherwise.
+                            if mode == DummyMode::BlockPunish && !feats.block_punish {
+                                ui.add_enabled(
+                                    false,
+                                    egui::Button::selectable(false, label),
+                                )
+                                .on_disabled_hover_text(
+                                    "Needs a contact signal (hitstun_sources or \
+                                     contact_signal) in the profile — see the game's .md",
+                                );
+                                continue;
+                            }
                             ui.selectable_value(&mut state.training.dummy, mode, label);
                         }
                     });
             });
+            if state.training.dummy == DummyMode::BlockPunish {
+                self.punish_section(ui, state, feats.block_punish);
+            }
             ui.add_enabled(feats.refill, egui::Checkbox::new(&mut state.training.refill, "Health refill (F3)"));
             ui.horizontal(|ui| {
                 if ui
@@ -235,6 +262,100 @@ impl TrainingPanel {
         self.shadow_section(ui, state);
         ui.separator();
         self.arena_section(ui, state);
+    }
+
+    /// BlockPunish option pool (MACRO_ACTIONS §6): the char-aware legal list
+    /// — dummy char → family∩port specials + base attack classes + Continue
+    /// Block — with weight steppers writing straight into the sampled pool.
+    fn punish_section(&mut self, ui: &mut egui::Ui, state: &mut DebugState, available: bool) {
+        use crate::macros::PunishOption;
+        if !available {
+            ui.label(
+                egui::RichText::new(
+                    "Block-punish unavailable: no contact signal mapped \
+                     (hitstun_sources or contact_signal) — the dummy just blocks.",
+                )
+                .small()
+                .color(egui::Color32::DARK_GRAY),
+            );
+            return;
+        }
+        let profile = crate::profile::current();
+        let char_id = crate::training::punish_dummy_char(state);
+
+        // The legal option list, in offer order.
+        let mut options: Vec<PunishOption> = Vec::new();
+        if let Some(id) = char_id {
+            for (name, _) in profile.specials_for(id) {
+                options.push(PunishOption::Move(name.to_string()));
+            }
+        }
+        let block_class = profile.family.block.class.as_deref();
+        for class in &profile.family.attack_classes {
+            let has_chord =
+                profile.port.attack_chords.get(class).map(|c| !c.is_empty()).unwrap_or(false);
+            if class != "None" && Some(class.as_str()) != block_class && has_chord {
+                options.push(PunishOption::Attack(class.clone()));
+            }
+        }
+        options.push(PunishOption::ContinueBlock(PUNISH_CONTINUE_FRAMES));
+
+        // Default pool on first open: the first special w=3, continue w=1.
+        if state.training.punish_pool.is_empty() {
+            if let Some(first) = options.iter().find(|o| matches!(o, PunishOption::Move(_))) {
+                state.training.punish_pool.push((first.clone(), 3));
+            }
+            state
+                .training
+                .punish_pool
+                .push((PunishOption::ContinueBlock(PUNISH_CONTINUE_FRAMES), 1));
+        }
+
+        ui.label(
+            egui::RichText::new(format!(
+                "Punish pool ({}):",
+                char_id.map(|id| profile.char_name(id)).unwrap_or_else(|| "char unknown".into())
+            ))
+            .small(),
+        )
+        .on_hover_text("On each guarded contact, one option is sampled by weight (weight 0 = never)");
+        ui.indent("punish_pool", |ui| {
+            for opt in &options {
+                let old = state
+                    .training
+                    .punish_pool
+                    .iter()
+                    .find(|(o, _)| same_option(o, opt))
+                    .map(|(_, w)| *w)
+                    .unwrap_or(0);
+                let mut w = old;
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut w).range(0..=9).speed(0.05));
+                    let tag = match opt {
+                        PunishOption::Move(_) => "special",
+                        PunishOption::Attack(_) => "attack",
+                        PunishOption::ContinueBlock(_) => "",
+                    };
+                    ui.monospace(opt.label());
+                    if !tag.is_empty() {
+                        ui.label(
+                            egui::RichText::new(tag).small().color(egui::Color32::DARK_GRAY),
+                        );
+                    }
+                });
+                if w != old {
+                    match state
+                        .training
+                        .punish_pool
+                        .iter_mut()
+                        .find(|(o, _)| same_option(o, opt))
+                    {
+                        Some(entry) => entry.1 = w,
+                        None => state.training.punish_pool.push((opt.clone(), w)),
+                    }
+                }
+            }
+        });
     }
 
     /// The training save: list `shadow/arenas/*.state`, load one, promote one

@@ -44,7 +44,12 @@
 //! game.calibration(key)             -> number|nil
 //! training.enabled()                -> bool     (native training mode on?)
 //! training.refill()                 -> bool     (native health refill on?)
-//! training.dummy()                  -> string   ("free"/"stand"/"crouch"/"jump"/"block")
+//! training.dummy()                  -> string   ("free"/"stand"/"crouch"/"jump"/"block"/"block_punish")
+//! training.set_enabled(bool)                    (write-gated; on = refill on, F5 parity)
+//! training.set_dummy(mode)                      (write-gated; headless F1 — same mode strings)
+//! training.set_punish(pool)                     (write-gated; BlockPunish pool:
+//!                                                {{weight=3, move="slide"}, {weight=2, attack="HP"},
+//!                                                 {weight=1, continue_frames=30}, ...})
 //! shadow.on()                       -> bool|nil (nil = no model loaded)
 //! shadow.model()                    -> string|nil  (loaded model name)
 //! shadow.toggle()                                (queue a shadow on/off toggle)
@@ -809,10 +814,90 @@ impl LuaEngine {
                     DummyMode::Crouch => "crouch",
                     DummyMode::Jump => "jump",
                     DummyMode::Block => "block",
+                    DummyMode::BlockPunish => "block_punish",
                 }
                 .to_string())
             })?;
             training.set("dummy", f)?;
+        }
+        // Setters — the headless twin of F5/F1/the panel's pool steppers
+        // (agents drive training over run_lua; hotkeys need a window). All
+        // behind the ONE write gate (`--training` arms it, MCP enable_writes
+        // toggles it) because they change what the app injects into the game.
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, on: bool| -> mlua::Result<()> {
+                let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                if !ds.lua_writes_enabled {
+                    return Err(mlua::Error::external(
+                        "training.set_enabled blocked: writes disabled (enable_writes)",
+                    ));
+                }
+                ds.training.enabled = on;
+                if on {
+                    ds.training.refill = true; // F5 parity
+                }
+                Ok(())
+            })?;
+            training.set("set_enabled", f)?;
+        }
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, name: String| -> mlua::Result<()> {
+                use crate::debug::DummyMode;
+                let mode = match name.as_str() {
+                    "free" => DummyMode::Free,
+                    "stand" => DummyMode::Stand,
+                    "crouch" => DummyMode::Crouch,
+                    "jump" => DummyMode::Jump,
+                    "block" => DummyMode::Block,
+                    "block_punish" => DummyMode::BlockPunish,
+                    other => {
+                        return Err(mlua::Error::external(format!("unknown dummy mode '{other}'")))
+                    }
+                };
+                let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                if !ds.lua_writes_enabled {
+                    return Err(mlua::Error::external(
+                        "training.set_dummy blocked: writes disabled (enable_writes)",
+                    ));
+                }
+                ds.training.dummy = mode;
+                Ok(())
+            })?;
+            training.set("set_dummy", f)?;
+        }
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, pool: mlua::Table| -> mlua::Result<()> {
+                use crate::macros::PunishOption;
+                let mut out: Vec<(PunishOption, u8)> = Vec::new();
+                for entry in pool.sequence_values::<mlua::Table>() {
+                    let t = entry?;
+                    let w: u8 = t.get::<Option<u8>>("weight")?.unwrap_or(1);
+                    let opt = if let Some(m) = t.get::<Option<String>>("move")? {
+                        PunishOption::Move(m)
+                    } else if let Some(a) = t.get::<Option<String>>("attack")? {
+                        PunishOption::Attack(a)
+                    } else if let Some(n) = t.get::<Option<u16>>("continue_frames")? {
+                        PunishOption::ContinueBlock(n)
+                    } else {
+                        return Err(mlua::Error::external(
+                            "pool entry needs one of: move / attack / continue_frames",
+                        ));
+                    };
+                    out.push((opt, w));
+                }
+                let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                if !ds.lua_writes_enabled {
+                    return Err(mlua::Error::external(
+                        "training.set_punish blocked: writes disabled (enable_writes)",
+                    ));
+                }
+                ds.training.punish_pool = out;
+                Ok(())
+            })?;
+            training.set("set_punish", f)?;
         }
         globals.set("training", training)?;
 
