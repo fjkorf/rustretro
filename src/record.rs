@@ -92,7 +92,7 @@ fn recorded_globals(p: &GameProfile) -> Vec<Slot> {
     };
     for cond in &p.port.gate {
         if let Some(name) = cond.global_name() {
-            let size = if matches!(cond, GateCond::WordZero { .. }) { 2 } else { 1 };
+            let size = if matches!(cond, GateCond::WordZero { .. } | GateCond::WordMaskedNotAll { .. }) { 2 } else { 1 };
             push(name, size, &mut out);
         }
     }
@@ -140,6 +140,10 @@ fn gate_cond_json(cond: &GateCond) -> serde_json::Value {
         }
         GateCond::WordZero { global } => {
             serde_json::json!({"kind": "word_zero", "global": global})
+        }
+        GateCond::WordMaskedNotAll { global, mask } => {
+            serde_json::json!({"kind": "word_masked_not_all", "global": global,
+                               "mask": format!("0x{:X}", mask.0)})
         }
         GateCond::HealthInRange { min, max } => {
             serde_json::json!({"kind": "health_in_range", "min": min, "max": max})
@@ -206,6 +210,19 @@ pub struct FrameRecorder {
     /// (round-summary matchups); None = unmapped for this port.
     x_idx: Option<usize>,
     char_idx: Option<usize>,
+    /// Live special-move matchers over (p1, p2) input streams (MACRO_ACTIONS
+    /// §3) — char-blind union of every encoding the profile carries, compiled
+    /// once at create; None when the port encodes nothing (zero overhead).
+    matchers: Option<(crate::macros::Matcher, crate::macros::Matcher)>,
+    /// Per-round completion counts, union of both players (rounds sidecar).
+    round_specials: std::collections::BTreeMap<String, u32>,
+    // x-liveness sentinel (mk2.md: an object-pool slot can go stale between
+    // boots): first controllable x sample, frames seen unchanged, and the
+    // outcome latches (varied = proven alive, or warned once).
+    x_base: Option<(u64, u64)>,
+    x_ctrl: u64,
+    x_alive: bool,
+    x_warned: bool,
     out: BufWriter<File>,
     /// Where the jsonl is being written (for status display / stop messages).
     path: PathBuf,
@@ -266,6 +283,25 @@ impl FrameRecorder {
             |name: &str| profile.port.memory.fighter_fields.iter().position(|f| f.name == name);
         let x_idx = field_idx("x");
         let char_idx = field_idx("char_id");
+
+        // Compile every special the profile encodes (family∩port, all
+        // characters — the annotation is coverage data, and the train-side
+        // matcher stays authoritative). An uncompilable encoding is skipped
+        // with a warning, never fatal.
+        let compiled: Vec<crate::macros::CompiledMacro> = profile
+            .all_specials()
+            .iter()
+            .filter_map(|(name, steps)| match crate::macros::compile(name, steps, profile) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    eprintln!("[record] warning: special skipped: {e}");
+                    None
+                }
+            })
+            .collect();
+        let matchers = (!compiled.is_empty()).then(|| {
+            (crate::macros::Matcher::new(compiled.clone()), crate::macros::Matcher::new(compiled))
+        });
 
         // Provenance sidecar: everything the Python side needs to interpret
         // the file WITHOUT the recorder's profile — snapshot of the field
@@ -338,6 +374,12 @@ impl FrameRecorder {
             globals,
             x_idx,
             char_idx,
+            matchers,
+            round_specials: std::collections::BTreeMap::new(),
+            x_base: None,
+            x_ctrl: 0,
+            x_alive: false,
+            x_warned: false,
             out: BufWriter::new(file),
             path: path.to_path_buf(),
             rounds_out,
@@ -367,7 +409,7 @@ impl FrameRecorder {
             ),
             None => (serde_json::Value::Null, serde_json::Value::Null),
         };
-        let line = serde_json::json!({
+        let mut line = serde_json::json!({
             "round_id": self.round_id,
             "block1_char": c1,
             "block2_char": c2,
@@ -380,6 +422,12 @@ impl FrameRecorder {
             "port": self.profile.port.port,
             "v": 3,
         });
+        // Per-round special counts (MACRO_ACTIONS §3), union of both players.
+        // Omitted when empty so profiles without encodings emit unchanged
+        // sidecar lines.
+        if !self.round_specials.is_empty() {
+            line["specials"] = serde_json::json!(self.round_specials);
+        }
         let _ = out.write_all(line.to_string().as_bytes());
         let _ = out.write_all(b"\n");
         let _ = out.flush(); // rounds are rare; keep the index crash-current
@@ -418,6 +466,7 @@ impl FrameRecorder {
             self.round_frames = 0;
             self.round_p1_mass = 0;
             self.round_chars = self.char_idx.map(|i| (b1[i] as u8, b2[i] as u8));
+            self.round_specials.clear();
         }
         // A true->false edge ends one: index it (matchup, size, demo-ness).
         if !controllable && self.prev_controllable {
@@ -428,6 +477,54 @@ impl FrameRecorder {
             self.round_p1_mass += p1_mask as u64;
         }
         self.prev_controllable = controllable;
+
+        // x-liveness sentinel: 300 controllable frames of a byte-identical x
+        // pair almost certainly means the object-pool slot moved between
+        // boots (mk2.md caveat) — say so once, on stderr, per recording.
+        if let Some(i) = self.x_idx {
+            if controllable && !self.x_alive && !self.x_warned {
+                let cur = (b1[i], b2[i]);
+                match self.x_base {
+                    Some(base) if base != cur => self.x_alive = true,
+                    _ => {
+                        self.x_base = Some(cur);
+                        self.x_ctrl += 1;
+                        if self.x_ctrl >= 300 {
+                            self.x_warned = true;
+                            eprintln!(
+                                "[record] warning: x looks frozen — object slot may have moved (mk2.md)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Live special recognition (MACRO_ACTIONS §3): feed each port's mask
+        // with its fighter's side (port→block via the round anchor; side =
+        // sign(opp.x − me.x), left-fighter default when x is unmapped/tied).
+        let (mut p1_special, mut p2_special) = (None::<String>, None::<String>);
+        if let Some((m1, m2)) = self.matchers.as_mut() {
+            let p1b: u8 = self.p1_block.unwrap_or(1);
+            let xs = self.x_idx.map(|i| (b1[i], b2[i]));
+            let opp_right = |me_block: u8| -> bool {
+                match xs {
+                    Some((x1, x2)) => {
+                        let (xm, xo) = if me_block == 1 { (x1, x2) } else { (x2, x1) };
+                        if xm == xo { me_block == 1 } else { xo > xm }
+                    }
+                    None => me_block == 1,
+                }
+            };
+            let p2b: u8 = if p1b == 1 { 2 } else { 1 };
+            p1_special = m1.feed(p1_mask, opp_right(p1b)).first().map(|n| n.to_string());
+            p2_special = m2.feed(p2_mask, opp_right(p2b)).first().map(|n| n.to_string());
+        }
+        if controllable {
+            for n in [&p1_special, &p2_special].into_iter().flatten() {
+                *self.round_specials.entry(n.clone()).or_insert(0) += 1;
+            }
+        }
 
         // Hand-built row with the fixed v3 key order — deterministic bytes
         // (two recorders on identical state must emit identical lines).
@@ -454,7 +551,16 @@ impl FrameRecorder {
         for (i, (g, v)) in self.globals.iter().zip(gvals.iter()).enumerate() {
             let _ = write!(line, "{}{}:{v}", if i > 0 { "," } else { "" }, g.key);
         }
-        let _ = write!(line, "}},\"p1_input\":{p1_mask},\"p2_input\":{p2_mask}}}");
+        let _ = write!(line, "}},\"p1_input\":{p1_mask},\"p2_input\":{p2_mask}");
+        // §3 annotation: appended AFTER p2_input in the fixed key order;
+        // absent when no special completed this frame.
+        if let Some(n) = &p1_special {
+            let _ = write!(line, ",\"p1_special\":{}", json_key(n));
+        }
+        if let Some(n) = &p2_special {
+            let _ = write!(line, ",\"p2_special\":{}", json_key(n));
+        }
+        line.push('}');
 
         let _ = self.out.write_all(line.as_bytes());
         let _ = self.out.write_all(b"\n");
@@ -467,6 +573,11 @@ impl FrameRecorder {
 
     pub fn frames_written(&self) -> u64 {
         self.frames
+    }
+
+    #[cfg(test)]
+    fn x_frozen_warning_fired(&self) -> bool {
+        self.x_warned
     }
 
     pub fn path(&self) -> &Path {
@@ -689,18 +800,29 @@ mod tests {
         assert!(text.starts_with("{\"v\":3,"));
         for block in ["block1", "block2"] {
             let keys: Vec<&str> = v[block].as_object().unwrap().keys().map(|k| k.as_str()).collect();
-            // Exactly the profile's fighter_fields, in profile order — no
-            // zero-filled asurabld fields. `x` is GLOBAL-SOURCED (p1_x/p2_x,
-            // §2.5) yet appears as a normal named field.
-            assert_eq!(keys, vec!["char_id", "health", "x"], "{block} carries only mapped fields");
+            // Exactly the profile's fighter_fields — no zero-filled
+            // asurabld fields. (Parsed Value maps sort, so this is the
+            // alphabetical set; the serialized TEXT keeps profile order and
+            // is asserted separately below.) `x` is GLOBAL-SOURCED
+            // (p1_x/p2_x, §2.5) yet appears as a normal named field.
+            assert_eq!(keys, vec!["action_counter", "char_id", "health", "x"],
+                       "{block} carries only mapped fields");
         }
         assert!(v["block1"]["y"].is_null(), "unmapped field must be ABSENT");
         assert_eq!(v["block1"]["health"], 100);
         let gkeys: Vec<&str> = v["globals"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
-        assert_eq!(gkeys, vec!["round_over", "screen_state"]); // set (Value maps sort)
-        // Serialized order is gate order: word-read screen_state, then round_over.
-        assert!(text.contains("\"globals\":{\"screen_state\":0,\"round_over\":0}"));
-        assert!(text.contains("\"block1\":{\"char_id\":7,\"health\":100,\"x\":0}"));
+        // Set membership (Value maps sort): gate globals + record_globals.
+        assert_eq!(
+            gkeys,
+            vec!["hit_counter", "p1_health_hud", "p2_health_hud", "round_over", "screen_state"]
+        );
+        // Serialized order is gate order (word-read screen_state, round_over)
+        // then record_globals order (the hitstun-source HUD pair, hit_counter).
+        assert!(text.contains(
+            "\"globals\":{\"screen_state\":0,\"round_over\":0,\
+             \"p1_health_hud\":0,\"p2_health_hud\":0,\"hit_counter\":0}"
+        ));
+        assert!(text.contains("\"block1\":{\"char_id\":7,\"health\":100,\"x\":0,\"action_counter\":0}"));
         assert_eq!(v["controllable"], true);
         assert_eq!(v["p1_block"], 1, "equal x (both unwritten) → block1 anchors as P1");
         // Meta declares the smaller-x anchor (x is mapped, via globals) +
@@ -714,7 +836,7 @@ mod tests {
         assert_eq!(meta["port"], "arcade");
         assert_eq!(meta["profile_file"], "mk2.profile.json");
         let ff = meta["fighter_fields"].as_array().unwrap();
-        assert_eq!(ff.len(), 3);
+        assert_eq!(ff.len(), 4);   // char_id, health, x, action_counter
         assert_eq!(ff[2]["name"], "x");
         assert!(ff[2]["off"].is_null(), "global-sourced field has no off");
         assert_eq!(ff[2]["globals"]["block1"], "p1_x");
@@ -727,6 +849,120 @@ mod tests {
         assert_eq!(r["block2_char"], 9);
         assert_eq!(r["p1_block"], 1);
         cleanup(&path);
+    }
+
+    /// MACRO_ACTIONS §3: the live matcher annotates completion frames with
+    /// `p1_special`/`p2_special` AFTER `p2_input`, absent otherwise; the
+    /// rounds sidecar counts the union; and the writer stays deterministic.
+    #[test]
+    fn v3_rows_annotate_specials_and_count_them_per_round() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-mk2-specials".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        let coff = p.field_off("char_id").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        assert!(ds.write_addr((p.block1() + coff) as usize, 1, 9));
+        assert!(ds.write_addr((p.block2() + coff) as usize, 1, 9));
+        // block1 left of block2 → p1 = block1, facing right; p2 faces left.
+        assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
+        assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
+        assert!(crate::gate::eval_gate(&ds, &p));
+
+        let path = tmp("shadow_rec_specials");
+        let path_b = tmp("shadow_rec_specials_twin");
+        {
+            let mut rec = FrameRecorder::create(&path, &p, "mk2", "fbneo", None).unwrap();
+            let mut twin = FrameRecorder::create(&path_b, &p, "mk2", "fbneo", None).unwrap();
+            let mut both = |ds: &DebugState, m1: u16, m2: u16, rec: &mut FrameRecorder, twin: &mut FrameRecorder| {
+                rec.record(ds, m1, m2);
+                twin.record(ds, m1, m2);
+            };
+            // P1 slide: back(Left,6)+LK(a,8)+LP(b,0)+Block(l,10) = 0x541.
+            both(&ds, 0x541, 0, &mut rec, &mut twin);
+            // Held chord: consumed, no re-annotation.
+            both(&ds, 0x541, 0, &mut rec, &mut twin);
+            // P2 slide mirrored: back is Right (7) on the right side = 0x581.
+            both(&ds, 0, 0x581, &mut rec, &mut twin);
+            // Close the gate → the round summary lands.
+            assert!(ds.write_addr(p.global("screen_state").unwrap() as usize, 2, 262));
+            both(&ds, 0, 0, &mut rec, &mut twin);
+            rec.finish();
+            twin.finish();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(
+            lines[0].ends_with("\"p1_input\":1345,\"p2_input\":0,\"p1_special\":\"slide\"}"),
+            "annotation appended after p2_input: {}",
+            lines[0]
+        );
+        assert!(!lines[1].contains("special"), "held chord must not re-fire: {}", lines[1]);
+        assert!(
+            lines[2].ends_with("\"p1_input\":0,\"p2_input\":1409,\"p2_special\":\"slide\"}"),
+            "mirrored p2 slide: {}",
+            lines[2]
+        );
+        assert!(!lines[3].contains("special"));
+        // Determinism holds with the matchers in the loop.
+        assert_eq!(text, std::fs::read_to_string(&path_b).unwrap());
+        // Rounds sidecar: the union count for the round.
+        let rounds = std::fs::read_to_string(path.with_extension("rounds.jsonl")).unwrap();
+        let r: serde_json::Value = serde_json::from_str(rounds.lines().next().unwrap()).unwrap();
+        assert_eq!(r["specials"]["slide"], 2);
+        cleanup(&path);
+        cleanup(&path_b);
+    }
+
+    /// The x-liveness sentinel (mk2.md: object-pool slots go stale between
+    /// boots): 300 controllable frames of byte-identical x warns once;
+    /// any variance proves liveness and suppresses it.
+    #[test]
+    fn frozen_x_warns_after_300_controllable_frames() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-mk2-frozenx".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        assert!(crate::gate::eval_gate(&ds, &p));
+
+        let path = tmp("shadow_rec_frozenx");
+        let mut rec = FrameRecorder::create(&path, &p, "mk2", "fbneo", None).unwrap();
+        for _ in 0..299 {
+            rec.record(&ds, 0, 0);
+        }
+        assert!(!rec.x_frozen_warning_fired(), "not yet at the threshold");
+        rec.record(&ds, 0, 0);
+        assert!(rec.x_frozen_warning_fired(), "300th identical controllable frame warns");
+
+        // Variance before the threshold suppresses it for good.
+        let path2 = tmp("shadow_rec_livex");
+        let mut rec2 = FrameRecorder::create(&path2, &p, "mk2", "fbneo", None).unwrap();
+        rec2.record(&ds, 0, 0);
+        assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 7));
+        for _ in 0..400 {
+            rec2.record(&ds, 0, 0);
+        }
+        assert!(!rec2.x_frozen_warning_fired(), "x moved — no warning");
+        rec.finish();
+        rec2.finish();
+        cleanup(&path);
+        cleanup(&path2);
     }
 
     #[test]

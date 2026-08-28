@@ -458,3 +458,270 @@ honestly:
    combo counter (`0xD3FE`) covers "was just struck" adequately for a
    punish trainer; a true frame-data lab (startup/recovery measurement)
    still has no state-id field to key off.
+
+## Arena recapture: `reptile-vs-reptile.state` (2026-08-28, A-RE)
+
+The committed `shadow/arenas/mk2/reptile-vs-reptile.state` was an attract
+demo (input-dead) prior to this session; recaptured as a real, INPUT-LIVE
+1P-vs-CPU fight. Headless FBNeo, port 4032, `--game library/mk2 --pace 1`.
+
+**Coin/char-select flow used** (fresh boot each time this session, since a
+cold boot shows a one-time "CMOS INVALID — FACTORY SETTINGS RESTORED"
+screen that eats the first button press): any button past the CMOS screen
+→ `select` (coin) to skip the attract story → `select` again (2nd coin,
+"2 CREDITS TO START") → `start`. Landed on the "CHOOSE YOUR FIGHTER" grid
+with the cursor on Liu Kang (slot 0), confirming the existing "P1 default =
+Liu Kang" doc fact. **3× `right` reaches Reptile** (row 1, col 4) — verified
+both visually (portrait highlight + the animated preview model turning into
+a green ninja) and by memory read (`0xC050` = `9` at the cursor, matching
+the roster table). A `start` press locks P1's pick; this needed 1-6 retries
+across different session attempts (the press did not always land the very
+first time — no distinguishing symptom found, just poll `0xC1CA` (P2
+char id) until it leaves `255` to confirm the lock actually took before
+moving on, rather than trusting a single `start` press blindly).
+
+**Full-health capture, and a real trap worth recording**: health fills from
+0 in the "ROUND 1"/"FIGHT!!" banner window (already documented above), but
+polling for "P1 health `0xC05E` >= 161" as the sole "fight is ready" signal
+is **not sufficient** — a fast tight poll can catch a **transient overshoot**
+to 161 seconds before the real, stable full-health frame (observed
+repeatedly: detection at 161, then a settle read moments later showing
+40-70, i.e. the fill was still climbing through its documented `0→38→...`
+curve and the detector caught a one-frame glitch on the way up, not the
+final value). Fix: after first seeing `hp1>=161 and hp2>=161`, sleep a
+fixed ~2.2 s (comfortably past the documented ~1.5 s fill) and re-read
+before trusting it; only save once health is STILL 161/161 and
+`round_over==0` after that settle.
+
+**Input-liveness verification** (the mission-critical check — the prior
+committed state had none): `0x6CBA` (P1 world X) can appear **frozen**
+across a short read window even with input genuinely live and landing — not
+because the address is wrong (it is the same write-verified store from the
+Positions section above), but because MK2's CPU AI is aggressive enough
+that a short verification window has a real chance of landing entirely
+inside **hitstun or a knockdown** (screenshot-confirmed: Reptile flat on the
+ground, immovable by design, exactly when a 1-2 sample x-read looked
+"stuck"). The reliable test, done both immediately before saving and again
+against the saved file after a reload: refill both fighters' health every
+iteration (removes the KO/long-hitstun confound) and hold alternating
+`left`/`right` bursts for ~2-3 seconds while sampling `0x6CBA` — a genuinely
+live P1 traces a real path (`390→452→426→401→391→196...` observed one run),
+where a truly dead/wrong-slot address would stay bit-for-bit constant
+across the whole window regardless of hitstun timing. Do not conclude
+"input is dead" from 1-2 samples with this game; sample across several
+seconds with health forced up.
+
+**Final captured state**: Reptile (P1, char id 9) vs Scorpion (P2, char id
+10, CPU-picked), both healths **161/161** (`0xC05E`/`0xC1D8`, plus the
+secondary pair `0xBCA0`/`0xBC88` also topped off), `round_over` (`0xC360`)
+`== 0`, screenshot-confirmed both health bars full green, ROUND 1 in
+progress. Input-liveness re-confirmed on a fresh reload of the saved file
+using the multi-sample method above. Saved via `save_state` over
+`shadow/arenas/mk2/reptile-vs-reptile.state` (2,447,284 bytes, matching the
+existing file's format/size).
+
+## Macro-action encodings — live verification (2026-08-28, A-Rust, port 4033)
+
+Rig: headless 2-HUMAN match (P1 Liu Kang port 0, P2 Reptile port 1 — joined
+by `start` on port 1 during a live 1P fight, then both re-select; P2's
+default cursor is Reptile), state-banked and reloaded per trial. The
+BlockPunish dummy (port 1) provided the executor path: P1 jabs the guarding
+dummy → chip → `p2_health_hud` change → punish macro plays.
+
+| move | encoding (arcade) | verdict | evidence |
+|---|---|---|---|
+| slide | `back + LK+LP+Block`, 8f | **VERIFIED** (chord corrected) | The contract's back+LK+LP produced a NORMAL (pose screenshot); adding Block: slide pose + h1 161→148 (−13), 3/3 trials from round-start range. **Point-blank caveat**: the LP-bearing chord resolves to a close normal/throw (the §1 proximity phenomenon) — a point-blank punish slide whiffs by game rule. |
+| acid_spit | `F` · `F+HP`, 3f steps | **VERIFIED** | Via the punish executor at point blank: h1 161→137 (−24), repeated across two runs; full mask trace in the session recording (`0x40`×3, 2f gap, `0x42`×4) with `p2_special:"acid_spit"` annotated. |
+| force_ball | `B` · `B+HP+LP`, 3f steps | **VERIFIED** | Same path: h1 161→145 (−16), repeated; trace `0x80`×3, gap, `0x83`×4, annotated. |
+
+Punish-timing findings (now constants in `src/training.rs`):
+- **Inputs played into hit-freeze are eaten.** The macro must start
+  ~26 frames after the contact (hit-freeze ≈10 + jab blockstun ≈14): a
+  chord at +16 was swallowed while a motion whose chord lands at +21 came
+  out.
+- **Held Block bleeds into the chord.** The dummy's guard must be fully
+  released ~4 frames before the first step or the game stays in block
+  stance and ignores attack buttons (slide fires from a clean simultaneous
+  press ≥4f after a Block release — release recovery itself is not the
+  issue).
+
+Contact-signal correction: `hit_counter 0xD3FE` **did not move** for hits
+ON P2 — blocked (chip −6) or clean — in this 2-human rig; every prior
+observation had P1 as the victim. It is a P1-victim counter at best (it
+also stayed 0 when Reptile's slide/projectiles struck P1 here — possibly
+1P-mode-only). The per-victim contact signal is the HUD damage pair
+`0xBCA0`/`0xBC88` (`hitstun_sources` in the profile); caveat: the training
+refill rewrites those bytes, so one spurious punish per refill is possible.
+
+**New gate leak (needs an A-RE pass):** in a 2-human (challenger) match,
+`screen_state 0xC37E` flips to **276** at the first contact and stays there
+for the rest of the round while the fight visibly continues and accepts
+input — `word_zero(screen_state)` reads not-controllable from that moment.
+All 46 prior gate snapshots were 1P/attract phases; 276 never appeared
+there. Effects: the recorder under-counts controllable frames in 2P
+rounds, and round summaries for such rounds close early.
+
+## Gate revision (SUPERSEDED — see the masked revision below): word_in for the 2-human screen_state leak (2026-08-28)
+
+Live finding (A-Rust's 2-human punish rig): `screen_state` flips to **276**
+(0x114) at first contact in a 2-HUMAN match and holds for the rest of the
+round while the fight continues normally — `word_zero` then reads
+not-controllable, which froze the recorder, training enforcement, and ALL
+dummy injection (user-visible as "block-punish works once, then the dummy
+goes limp" once the punish's gate-grace expired). New gate vocabulary
+condition `word_in` (u16 ∈ values); arcade gate now
+`word_in(screen_state, [0, 276])`. Caveat recorded honestly: 276 has only
+been observed in 2-human-fight-after-contact; if it ever appears on a menu
+this gate leaks there — no such observation across all phase sweeps to
+date (menus read 0x9C01-family values).
+
+## Gate revision 2 (SUPERSEDED by revision 3 below): single-bit mask (2026-08-28)
+
+The `word_in [0, 276]` allowlist above was whack-a-mole and broke on the
+THIRD observed value. User QA (Reptile vs Reptile, 2-human) read
+**260** (0x104) while the earlier smoke rig read **276** (0x114) — the
+gate closed, and since ALL dummy injection, refill, timer hold, and
+recorder capture sit behind the gate, the block-punish dummy went limp
+after one punish (diagnosed live via MCP on the paused session:
+`gate=false`, `screen_state=260`, dummy mode still block_punish).
+
+Every value ever recorded, in binary:
+
+| value | hex | bit 1 | phase |
+|---|---|---|---|
+| 0 | 0x000 | clear | 1P fight, post-KO |
+| 259 | 0x103 | SET | attract |
+| 260 | 0x104 | clear | 2-human fight (user QA) |
+| 262 | 0x106 | SET | char select / ladder / bios |
+| 263 | 0x107 | SET | attract |
+| 276 | 0x114 | clear | 2-human fight (smoke rig) |
+
+**Rule: bit 0x02 SET = not in a fight**; the 0x100 bit is set by 2-human
+play and the other low bits vary within a match. New gate vocabulary
+condition `word_masked_zero {global, mask}` (u16 & mask == 0); arcade
+gate uses mask `0x2`. Live-verified 6/6 against the table above, plus a
+regression test in `src/gate.rs`.
+
+This also explains the user's "only a CLOSE HIGH PUNCH revives the
+dummy" observation: under the old allowlist 260 was excluded but 276 was
+allowed, and 260→276 differ by exactly bit 4 (0x10) — the close elbow's
+reaction flips that bit, momentarily re-opening the gate; far HP and
+knockdowns don't set it. Not a proximity-semantics effect in our code at
+all. What sets bit 4 remains unmapped (harmless under the masked rule).
+
+## `action_counter` — an ACTION counter, NOT the contact signal (2026-08-28, twin-counter hunt; conclusion CORRECTED below)
+
+**VERIFIED (live, user's 2-human Reptile-mirror session).** Fighter field
+**`+0xC0`** (P1 `0xC110`, P2 `0xC28A`), u8, increments by **+32** (a count
+in the high bits) each time that fighter starts a new action — its own
+swing, OR a reaction to being struck.
+
+Why it matters: it is the per-victim contact signal BlockPunish needed.
+Decisive test — hold Block on the defender continuously, let it settle,
+then attack mid-hold, 4/4 rounds:
+
+| settled | after 0.35 s idle-blocking | after the attack |
+|---|---|---|
+| 112 | 112 (quiet) | 144 **fired** |
+| 144 | 144 (quiet) | 176 **fired** |
+| 176 | 176 (quiet) | 208 **fired** |
+| 208 | 208 (quiet) | 240 **fired** |
+
+It fires on blocked contact that deals **zero chip** (observed 123→123
+and 134→134 health), which the previous health-delta trigger
+(`hitstun_sources`) cannot see — that was the cause of the user-reported
+"the dummy punishes some hits but not others". It is quiet while the
+fighter merely holds guard, so it does not false-fire in neutral.
+
+Also mapped on the way (attacker side, same field): the counter fires on
+every swing INCLUDING whiffs — so it is an action counter, not a hit
+counter. Useful corollary discovered by the whiff control: **a fighter's
+struct is entirely static when untouched** (0 of 0x17A bytes change), so
+any change in an idle fighter's struct means contact.
+
+Profile: `action_counter` added as a fighter field (+0xC0) and
+`contact_signal: {"field": "action_counter"}`; `contact_signal` now takes
+PRECEDENCE over `hitstun_sources` for the punish trigger, and gains a
+per-fighter `field` variant alongside the old shared `global` (MK2's
+`hit_counter` 0xD3FE remains disproven for this use — P1-victim only).
+`hitstun_sources` stays as the health-delta fallback and as the hitstun
+FEATURE source (where "took damage" is the correct meaning).
+
+Rig note: `shadow/arenas/mk2/reptile-vs-reptile.state` is 1P-vs-CPU, so
+injected dummy input CANNOT drive P2 there — BlockPunish end-to-end
+testing requires a 2-human match (controller 2 joins).
+
+## CORRECTION: the contact signal is the health delta after all (2026-08-28)
+
+The section above over-claimed from a rig where the defender was struck
+shortly after a FRESH block press. Re-tested in the configuration that
+actually matters — the training dummy holding guard CONTINUOUSLY — the
+result reverses:
+
+- The dummy's `action_counter` (+0xC0) moved on only **1 of 4** blocked
+  contacts. It fires when a fighter ENTERS an action (including entering
+  block), not when an already-blocking fighter is struck.
+- Full-struct diff while guarding, 6 trials: **idle churn = 0 bytes** (a
+  blocking MK2 fighter's whole 0x17A struct is frozen), and the ONLY byte
+  that changed on blocked contact was **`block+0xE` — health itself**,
+  5 of 5.
+- Every blocked contact in these trials chipped (−3 or −6). The one
+  "no change" trial was a WHIFF (no damage, no struct change at all).
+
+So for MK2 arcade the health delta (`hitstun_sources`, the HUD pair) IS
+the contact event, and the earlier "zero-chip blocked contact" reading
+was a fresh-block-press artifact. `contact_signal` was removed from the
+arcade profile; the trigger uses the hitstun_sources fallback.
+
+**Consequence for the user-reported "punishes some hits but not others":
+the likely causes are WHIFFS (which correctly produce no punish — note
+MK2's proximity normals mean a far attack can whiff where a close one
+connects) and the post-punish window (≈1 s of delay + macro + recovery
+during which the dummy is not guarding).** Not a signal bug.
+
+`action_counter` is KEPT as a recorded fighter field — it is honest,
+useful data (action transitions, incl. the attacker's swings and whiffs)
+and costs nothing. The `contact_signal` schema keeps its per-fighter
+`field` variant for games that do have a true contact counter.
+
+## Gate revision 3: bits 1 AND 2 TOGETHER mark a menu — word_masked_not_all (2026-08-28)
+
+Revision 2's single-bit rule (0x02 set = not in a fight) fit six values and
+was broken by the seventh: the user's live 2-human fight read **259**
+(0x103) — which HAS bit 1 set, and which the original RE had recorded as an
+attract value. The gate closed mid-fight; the dummy stopped guarding and
+both fighters stood still (the user-visible "punish: slide never came out"
+freeze, made worse by a stale phase label — see below).
+
+Every screen_state value observed to date:
+
+| value | hex | &0x6 | phase |
+|---|---|---|---|
+| 0 | 0x000 | 0 | 1P fight, post-KO (also seen on attract) |
+| 257 | 0x101 | 0 | 2-human fight |
+| 259 | 0x103 | 2 | **2-human fight (live)** — also recorded on attract |
+| 260 | 0x104 | 4 | 2-human fight |
+| 262 | 0x106 | **6** | char select / ladder / bios |
+| 263 | 0x107 | **6** | attract |
+| 276 | 0x114 | 4 | 2-human fight |
+
+**Rule: bits 1 and 2 BOTH set (mask 0x06) = not in a fight.** New gate
+condition `word_masked_not_all {global, mask}` — `v & mask != mask`;
+replaces `word_masked_zero` (which no game used once this landed, and the
+vocabulary stays small with every member live-verified). Verified 7/7 live
+plus a regression test.
+
+**Honest limits, third time asking:** 0 and 259 have BOTH been observed
+in fights and on attract screens, so screen_state cannot fully separate
+them alone — the gate's `health_in_range` + `round_over` conditions carry
+the rest, and an attract-demo leak is possible (harmless: demo rounds are
+dropped at fit time by their zero p1_input). Char select, the leak that
+made this global worth gating on at all, still closes correctly (262).
+If an eighth value appears, prefer finding a DIFFERENT discriminator over
+a fourth revision of this mask.
+
+**Also fixed here:** while the gate is closed, BlockPunish's phase string
+now reads "gate closed — not in a fight" instead of freezing on the stale
+"punishing: <move>" label. The old behaviour actively misled diagnosis —
+the mode was not running at all. (The in-flight punish grace was working
+correctly the whole time; only the label lied.)

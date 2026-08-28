@@ -42,6 +42,21 @@ pub struct Family {
     pub attack_classes: Vec<String>,
     #[serde(default)]
     pub block: BlockStyle,
+    /// Family-level move vocabulary (shadow/MACRO_ACTIONS.md §1), keyed by
+    /// canonical roster NAME. A character absent here simply has no specials;
+    /// an absent map keeps the whole macro layer off (asurabld this phase).
+    #[serde(default)]
+    pub moves: BTreeMap<String, Vec<MoveDef>>,
+}
+
+/// One named family-level move intent. Tags are open strings; "special"
+/// marks label-space membership on the Python side.
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
+pub struct MoveDef {
+    pub name: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -107,6 +122,47 @@ pub struct PortProfile {
     /// this on direct-pointer regions; periodic writes are the mechanism.
     #[serde(default)]
     pub pins: Vec<Pin>,
+    /// Port-level special-move encodings (shadow/MACRO_ACTIONS.md §2):
+    /// character name -> move name -> ordered macro steps. OMISSION IS
+    /// MEANINGFUL — a port that lacks a move omits its entry and every
+    /// consumer offers only what the port encodes.
+    #[serde(default)]
+    pub special_inputs: BTreeMap<String, BTreeMap<String, Vec<StepSpec>>>,
+    /// Global "somebody was just struck" signal (hit OR block), used by the
+    /// block-punish dummy when `hitstun_sources` is absent (MK2 arcade's
+    /// hit_counter). Neither mapped → BlockPunish degrades per-feature.
+    #[serde(default)]
+    pub contact_signal: Option<ContactSignal>,
+}
+
+/// The contact-signal declaration: something whose CHANGE means "this
+/// fighter was struck (hit OR blocked)". Exactly one source:
+/// - `field`: a per-fighter field name, resolved per block — PREFERRED,
+///   because it is per-victim by construction and (MK2's `action_counter`)
+///   fires on zero-chip blocked contact, which a health delta cannot see.
+/// - `global`: one address shared by both fighters (weaker: usually
+///   victim-asymmetric, as MK2's hit_counter turned out to be).
+#[derive(Deserialize, Debug, Clone)]
+pub struct ContactSignal {
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub global: Option<String>,
+}
+
+/// One macro step (MACRO_ACTIONS §2): held SEMANTIC directions, attack
+/// CLASSES pressed together, and the executor's hold length in frames.
+#[derive(Deserialize, Debug, Clone)]
+pub struct StepSpec {
+    #[serde(default)]
+    pub dirs: Vec<String>,
+    #[serde(default)]
+    pub press: Vec<String>,
+    #[serde(default = "d_step_frames")]
+    pub frames: u8,
+}
+fn d_step_frames() -> u8 {
+    3
 }
 
 /// One pinned RAM value: a named global asserted to `value` for the session.
@@ -219,6 +275,15 @@ pub enum GateCond {
     ByteZero { global: String },
     /// u16 (guest order) at global == 0.
     WordZero { global: String },
+    /// `u16 (guest order) at global & mask != mask` — "these bits are not
+    /// ALL set". For phase words that are BITFIELDS rather than enums: MK2
+    /// arcade's screen_state carries match-type bits (2-human play sets
+    /// 0x100 plus varying low bits; 0/257/259/260/276 all observed IN a
+    /// fight) and only the COMBINATION 0x06 marks a menu (char select 262,
+    /// attract 263). Enumerating in-fight values, then testing a single
+    /// bit, were both whack-a-mole that later observations broke — see
+    /// mk2.md's three gate revisions.
+    WordMaskedNotAll { global: String, mask: HexAddr },
     /// BOTH fighters' `health` field in min..=max.
     HealthInRange { min: u8, max: u8 },
     /// u8 at global is nonzero and both BCD nibbles are decimal.
@@ -391,6 +456,66 @@ impl GameProfile {
         for class in port.attack_chords.keys() {
             if !family.attack_classes.iter().any(|c| c == class) {
                 return Err(format!("attack_chords names unknown class '{class}'"));
+            }
+        }
+
+        // Macro-action vocabulary (MACRO_ACTIONS §1/§2): moves are keyed by
+        // roster NAME; encodings must reference declared moves, chord-backed
+        // classes, and dirs from the closed semantic set.
+        for chr in family.moves.keys() {
+            if !family.roster.iter().any(|r| r.name == *chr) {
+                return Err(format!("moves names unknown roster character '{chr}'"));
+            }
+        }
+        const DIRS: [&str; 4] = ["back", "forward", "up", "down"];
+        for (chr, mvs) in &port.special_inputs {
+            let Some(fam_moves) = family.moves.get(chr) else {
+                return Err(format!("special_inputs names character '{chr}' absent from family moves"));
+            };
+            for (mv, steps) in mvs {
+                if !fam_moves.iter().any(|m| m.name == *mv) {
+                    return Err(format!("special_inputs '{chr}' encodes unknown move '{mv}'"));
+                }
+                if steps.is_empty() {
+                    return Err(format!("special_inputs '{chr}.{mv}' has no steps"));
+                }
+                for st in steps {
+                    if st.dirs.is_empty() && st.press.is_empty() {
+                        return Err(format!("special_inputs '{chr}.{mv}' has an empty step"));
+                    }
+                    for d in &st.dirs {
+                        if !DIRS.contains(&d.as_str()) {
+                            return Err(format!("special_inputs '{chr}.{mv}' names unknown dir '{d}'"));
+                        }
+                    }
+                    for class in &st.press {
+                        if !port.attack_chords.contains_key(class) {
+                            return Err(format!(
+                                "special_inputs '{chr}.{mv}' presses unknown class '{class}'"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(cs) = &port.contact_signal {
+            match (&cs.field, &cs.global) {
+                (Some(_), Some(_)) => {
+                    return Err("contact_signal: pick field OR global, not both".to_string());
+                }
+                (None, None) => {
+                    return Err("contact_signal needs field or global".to_string());
+                }
+                (Some(f), None) => {
+                    if !port.memory.fighter_fields.iter().any(|x| &x.name == f) {
+                        return Err(format!("contact_signal names unknown field '{f}'"));
+                    }
+                }
+                (None, Some(gl)) => {
+                    if !port.memory.globals.contains_key(gl) {
+                        return Err(format!("contact_signal names unknown global '{gl}'"));
+                    }
+                }
             }
         }
         Ok(GameProfile { dir: fam_dir, family, port })
@@ -666,6 +791,40 @@ impl GameProfile {
             .collect()
     }
 
+    /// The family∩port special intersection for a CANONICAL char id — the
+    /// legal offer list (panel, executor): family `moves` order, only the
+    /// moves this port encodes. Empty when either side omits the character.
+    pub fn specials_for(&self, canon_id: u8) -> Vec<(&str, &[StepSpec])> {
+        let Some(name) = self.family.roster.iter().find(|r| r.id == canon_id).map(|r| &r.name)
+        else {
+            return Vec::new();
+        };
+        let (Some(fam), Some(enc)) =
+            (self.family.moves.get(name), self.port.special_inputs.get(name))
+        else {
+            return Vec::new();
+        };
+        fam.iter()
+            .filter_map(|m| enc.get(&m.name).map(|s| (m.name.as_str(), s.as_slice())))
+            .collect()
+    }
+
+    /// Every encoding this port carries (family∩port across all characters),
+    /// in deterministic (character, family-move) order — the recorder's
+    /// char-blind matcher input. Duplicate move names across characters are
+    /// deduped by the matcher at emission time, not here.
+    pub fn all_specials(&self) -> Vec<(&str, &[StepSpec])> {
+        self.port
+            .special_inputs
+            .iter()
+            .filter_map(|(chr, enc)| self.family.moves.get(chr).map(|fam| (fam, enc)))
+            .flat_map(|(fam, enc)| {
+                fam.iter()
+                    .filter_map(|m| enc.get(&m.name).map(|s| (m.name.as_str(), s.as_slice())))
+            })
+            .collect()
+    }
+
     /// Translate a raw RAM char id to its canonical roster id.
     /// If no id_map is present or the raw id is not in the map, returns identity (raw).
     #[allow(dead_code)]
@@ -703,7 +862,8 @@ impl GateCond {
         match self {
             GateCond::ByteZero { global }
             | GateCond::WordZero { global }
-            | GateCond::BcdValidNonzero { global } => Some(global),
+            | GateCond::BcdValidNonzero { global }
+            | GateCond::WordMaskedNotAll { global, .. } => Some(global),
             GateCond::HealthInRange { .. } => None,
         }
     }
@@ -1081,6 +1241,105 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("hitstun_sources names unrecorded global"));
+    }
+
+    #[test]
+    fn mk2_ships_the_reptile_special_intersection() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        // Family order (moves list), only what the port encodes.
+        let names: Vec<&str> = p.specials_for(9).iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["slide", "acid_spit", "force_ball"]);
+        // slide: single chord step, back+LK+LP+Block (the §2 two-button
+        // chord was live-DISPROVEN — the game performs a normal without
+        // Block; slide pose + hit verified with Block in the chord).
+        let (_, slide) = p.specials_for(9)[0];
+        assert_eq!(slide.len(), 1);
+        assert_eq!(slide[0].dirs, vec!["back"]);
+        assert_eq!(slide[0].press, vec!["LK", "LP", "Block"]);
+        assert_eq!(slide[0].frames, 8);
+        // Characters without encodings offer nothing.
+        assert!(p.specials_for(1).is_empty(), "liukang has no specials this phase");
+        assert!(p.specials_for(99).is_empty());
+        assert_eq!(p.all_specials().len(), 3);
+        // The arcade contact signal is the per-fighter `action_counter`
+        // FIELD (quiet while guarding, fires on blocked contact even at zero
+        // chip — live-verified). hitstun_sources stays as the health-delta
+        // fallback and as the hitstun FEATURE source.
+        assert!(p.port.contact_signal.is_none(), "mk2 uses the hitstun_sources fallback");
+        let hs = p.port.hitstun_sources.as_ref().unwrap();
+        assert_eq!(hs.get("block1").map(String::as_str), Some("p1_health_hud"));
+        assert_eq!(hs.get("block2").map(String::as_str), Some("p2_health_hud"));
+        // asurabld stays macro-free — that is the back-compat gate.
+        let a = init_for_tests();
+        assert!(a.family.moves.is_empty());
+        assert!(a.all_specials().is_empty());
+        assert!(a.port.contact_signal.is_none());
+    }
+
+    /// Build a family+port pair with macro fields spliced in, and load it.
+    fn load_with_macros(tag: &str, moves: &str, port_extra: &str) -> Result<GameProfile, String> {
+        let dir = make_test_dir(tag).join("g");
+        fs::create_dir(&dir).unwrap();
+        let family_json = format!(
+            r#"{{"family":"g","roster":[{{"id":9,"name":"reptile"}}],"move_classes":[],
+                "attack_classes":["None","LK","LP"],"moves":{moves}}}"#
+        );
+        fs::write(dir.join("family.json"), family_json).unwrap();
+        let port_json = format!(
+            r#"{{"family":"g","port":"test","core":{{"library_name":"","provenance_game":"g","provenance_core":"g"}},
+                "memory":{{"blocks":{{"block1":"0x0","block2":"0x0","stride":"0x0"}},"fighter_fields":[],"globals":{{"hits":"0x100"}}}},
+                "gate":[],"enforcement":{{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0}},
+                "calibration":{{}},"attack_chords":{{"LK":["a"],"LP":["b"]}}{port_extra}}}"#
+        );
+        fs::write(dir.join("g.profile.json"), port_json).unwrap();
+        GameProfile::load(&dir)
+    }
+
+    #[test]
+    fn macro_schema_validation_rejects_bad_references() {
+        let moves = r#"{"reptile":[{"name":"slide","tags":["special"]}]}"#;
+        // Valid baseline parses.
+        assert!(load_with_macros(
+            "macros_ok", moves,
+            r#","special_inputs":{"reptile":{"slide":[{"dirs":["back"],"press":["LK","LP"]}]}},"contact_signal":{"global":"hits"}"#
+        ).is_ok());
+        // moves keyed by a name not in the roster.
+        assert!(load_with_macros("macros_badchar", r#"{"ghost":[{"name":"boo"}]}"#, "")
+            .unwrap_err()
+            .contains("unknown roster character"));
+        // special_inputs for a character with no family moves.
+        assert!(load_with_macros(
+            "macros_nochar", "{}",
+            r#","special_inputs":{"reptile":{"slide":[{"press":["LK"]}]}}"#
+        ).unwrap_err().contains("absent from family moves"));
+        // Encoding an undeclared move.
+        assert!(load_with_macros(
+            "macros_badmove", moves,
+            r#","special_inputs":{"reptile":{"warp":[{"press":["LK"]}]}}"#
+        ).unwrap_err().contains("unknown move 'warp'"));
+        // Dir outside the closed semantic set.
+        assert!(load_with_macros(
+            "macros_baddir", moves,
+            r#","special_inputs":{"reptile":{"slide":[{"dirs":["left"],"press":["LK"]}]}}"#
+        ).unwrap_err().contains("unknown dir 'left'"));
+        // Press class with no chord entry.
+        assert!(load_with_macros(
+            "macros_badclass", moves,
+            r#","special_inputs":{"reptile":{"slide":[{"press":["HP"]}]}}"#
+        ).unwrap_err().contains("unknown class 'HP'"));
+        // Empty step / empty step list.
+        assert!(load_with_macros(
+            "macros_emptystep", moves,
+            r#","special_inputs":{"reptile":{"slide":[{}]}}"#
+        ).unwrap_err().contains("empty step"));
+        assert!(load_with_macros(
+            "macros_nosteps", moves,
+            r#","special_inputs":{"reptile":{"slide":[]}}"#
+        ).unwrap_err().contains("no steps"));
+        // contact_signal must name a mapped global.
+        assert!(load_with_macros("macros_badsignal", moves, r#","contact_signal":{"global":"nope"}"#)
+            .unwrap_err()
+            .contains("contact_signal names unknown global"));
     }
 
     #[test]

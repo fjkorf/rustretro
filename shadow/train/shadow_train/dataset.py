@@ -48,6 +48,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import macros as _macros
 from . import profile as _profile
 
 # ── calibration constants (SPEC §1) ─────────────────────────────────────────
@@ -96,7 +97,17 @@ def reload_profile() -> None:
     # nothing may hardcode 9 moves / 6 attacks; everything sizes from these
     # lists' lengths). Mutated in place -- see the module note above.
     MOVE_CLASSES[:] = list(_PROF.move_classes)
-    ATTACK_CLASSES[:] = list(_PROF.attack_classes)
+    # MACRO_ACTIONS.md §4: attack-head classes = family attack_classes +
+    # sorted names of every family move tagged "special" (family-level and
+    # port-independent -- one head shared across ports/matchups). A family
+    # with no `moves` table (asurabld) contributes no specials, so its
+    # ATTACK_CLASSES is byte-for-byte what it always was -- the phase's hard
+    # back-compat gate. Any accidental name collision with a base class is
+    # deduped rather than raising, since the base list is load-validated
+    # elsewhere and a collision would just mean "no new class added".
+    base_attacks = list(_PROF.attack_classes)
+    specials = [n for n in _PROF.all_special_names() if n not in base_attacks]
+    ATTACK_CLASSES[:] = base_attacks + specials
 
 
 reload_profile()
@@ -502,6 +513,47 @@ def _rounds(path: Path):
         yield (str(path.name), rid), rows
 
 
+def _macro_override_events(rows: list[dict], p1b: str, oppb: str,
+                            has_facing: bool, prof) -> dict[int, str]:
+    """MACRO_ACTIONS.md §4: {frame_index (into `rows`): special_name} for
+    every macro `me` (p1) completes over this round's raw `p1_input` mask
+    stream -- the train-side matcher is authoritative, so this runs on every
+    round regardless of whether the recorder ever wrote a `p1_special`
+    annotation (§3; annotations are for humans/coverage, never the labeler).
+
+    Fast no-op (empty dict, no per-frame work at all) when the profile has
+    no `moves`/`special_inputs` for this round's character -- this is what
+    keeps asurabld's labeling byte-identical (it ships neither table)."""
+    if not prof.moves or not prof.special_inputs:
+        return {}
+    me0 = fields(rows[0], p1b)
+    if "char_id" not in me0:
+        return {}
+    char_name = prof.char_name(prof.canon_char_id(me0["char_id"]))
+    char_macros_raw = prof.special_inputs.get(char_name)
+    if not char_macros_raw:
+        return {}
+    macro_list = _macros.compile_macros(char_macros_raw)
+    if not macro_list:
+        return {}
+
+    masks = [r["p1_input"] for r in rows]
+    sides = []
+    for r in rows:
+        me = fields(r, p1b)
+        opp = fields(r, oppb)
+        if has_facing and "facing" in me:
+            sides.append(1 if me["facing"] == 1 else -1)
+        else:
+            sides.append(1 if (opp.get("x", 0) - me.get("x", 0)) >= 0 else -1)
+
+    events = _macros.match_all(macro_list, masks, sides, prof.attack_chords)
+    out: dict[int, str] = {}
+    for frame_idx, name in events:
+        out.setdefault(frame_idx, name)
+    return out
+
+
 def _decisions_for_round(round_key: tuple, rows: list[dict],
                           view: _RecordingView | None = None,
                           feats: list[str] | None = None):
@@ -541,6 +593,12 @@ def _decisions_for_round(round_key: tuple, rows: list[dict],
         b2_active = _recent_change_mask(rows, hmap["block2"], HITSTUN_RECENT_FRAMES)
         me_active = b1_active if p1b == "block1" else b2_active
         opp_active = b2_active if p1b == "block1" else b1_active
+
+    # MACRO_ACTIONS.md §4: {frame_idx: special_name} for every macro `me`
+    # completes anywhere in this round, computed ONCE over the whole raw
+    # mask stream (not per-decision) -- see _macro_override_events. Empty
+    # (and free) for any profile shipping no moves/special_inputs.
+    macro_events = _macro_override_events(rows, p1b, oppb, has_facing, prof)
 
     out = []
     for i in range(P * 1, len(rows), P):
@@ -602,8 +660,17 @@ def _decisions_for_round(round_key: tuple, rows: list[dict],
                 else 0.0
             )
         # label = what the user held over the NEXT decision window (§4)
-        masks = [rows[j]["p1_input"] for j in range(i, min(len(rows), i + P))]
-        move, attack = _window_label(masks, s)
+        window_masks = [rows[j]["p1_input"] for j in range(i, min(len(rows), i + P))]
+        move, attack = _window_label(window_masks, s)
+        if macro_events:
+            # a special completing anywhere within this decision's window
+            # overrides the base attack class for the WHOLE decision (§4);
+            # earliest completion in the window wins if more than one.
+            for j in range(i, min(len(rows), i + P)):
+                special = macro_events.get(j)
+                if special is not None:
+                    attack = ATTACK_CLASSES.index(special)
+                    break
         out.append(
             Decision(
                 scalars=np.array([scal[k] for k in feats], dtype=np.float32),

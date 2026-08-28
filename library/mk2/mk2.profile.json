@@ -1,5 +1,5 @@
 {
- "_STATUS": "Memory-RE pass done 2026-08-27 (headless FBNeo, MCP port 4036, real mk2.zip = rev L3.1; evidence log: mk2.md). VERIFIED (live, write-tested where stated): blocks/stride + char_id(+0x0) + health(+0xE, max 0xA1=161) [write-tested]; globals round_over 0xC360, screen_state 0xC37E, round_num 0xC35E, timer tens/ones 0xBD74/0xBD76 (read-verified vs drawn countdown), p1/p2 HUD health 0xBCA0/0xBC88 [write-tested], p1/p2 world X 0x6CBA/0x6CFC [write-tested teleports, screenshots], p1_screen_x 0x3E40 (derived, read-only). LIKELY (correlated twice, not write-verified): p1_facing 0xBE81. 2026-08-28 hitstun/blockstun grounding pass (mk2.md 'Hitstun / blockstun observables'): hit_counter 0xD3FE VERIFIED as a GLOBAL 'was just struck' signal (increments on every hit AND every blocked/chip hit, resets ~20 frames after the last one; not per-player-attributable, does not distinguish hit from block). Block-stance flag and a general animation/state-id field were searched for and NOT found (P1's whole fighter struct is otherwise static outside char_id/health). CAVEAT from the same session: p1_x (0x6CBA) read STALE/frozen across a full fresh-boot session despite visually-confirmed movement (screenshot evidence) — the 0x42-stride object-pool slot backing a player is apparently not stable run-to-run; do not use p1_x/p2_x reads alone as an input-liveness check. The gate list is fully live-verified against 46 labeled phase snapshots; known ~2s leak during the ROUND-N banner (inputs ignored there; recorder's zero-input filtering covers it), and timeout-draw behavior of round_over is untested. UNKNOWN/absent by honesty: player Y (jump height \u2014 extensive arc probes found only recomputed outputs; see mk2.md), authoritative round-timer store (digits/master/frame-counter all write-revert; timer_hold below is a NON-FUNCTIONAL placeholder), credits (live in T-Unit CMOS OUTSIDE the exposed region \u2014 credits_target/min below are placeholders; coin-up must go through the 'select' input), wins (fightcade's 0xC36A/C36C stayed 0 through CPU round wins \u2014 disproven for 1P play). Note: 'freeze' does not land on this core's fallback region (watch registers, value never written \u2014 verified); enforcement must use periodic write_memory, and a health refill must write ALL FOUR health bytes (both struct healths AND 0xBCA0/0xBC88 \u2014 independent damage accumulators). x lives at a 0x42-stride object array, NOT at the fighter-block stride, hence globals rather than fighter_fields; src/training.rs resolve() therefore no-ops for this game (recorder gate fully functional). attack_chords verified prior session (Wave W2): FBNeo retro_input.cpp mk-driver special case + live pose screenshots for HP/LP/HK; LK/Block source-backed.",
+ "_STATUS": "Memory-RE pass done 2026-08-27 (headless FBNeo, MCP port 4036, real mk2.zip = rev L3.1; evidence log: mk2.md). VERIFIED (live, write-tested where stated): blocks/stride + char_id(+0x0) + health(+0xE, max 0xA1=161) [write-tested]; globals round_over 0xC360, screen_state 0xC37E, round_num 0xC35E, timer tens/ones 0xBD74/0xBD76 (read-verified vs drawn countdown), p1/p2 HUD health 0xBCA0/0xBC88 [write-tested], p1/p2 world X 0x6CBA/0x6CFC [write-tested teleports, screenshots], p1_screen_x 0x3E40 (derived, read-only). LIKELY (correlated twice, not write-verified): p1_facing 0xBE81. 2026-08-28 hitstun/blockstun grounding pass (mk2.md 'Hitstun / blockstun observables'): hit_counter 0xD3FE VERIFIED as a GLOBAL 'was just struck' signal (increments on every hit AND every blocked/chip hit, resets ~20 frames after the last one; not per-player-attributable, does not distinguish hit from block). Block-stance flag and a general animation/state-id field were searched for and NOT found (P1's whole fighter struct is otherwise static outside char_id/health). CAVEAT from the same session: p1_x (0x6CBA) read STALE/frozen across a full fresh-boot session despite visually-confirmed movement (screenshot evidence) \u2014 the 0x42-stride object-pool slot backing a player is apparently not stable run-to-run; do not use p1_x/p2_x reads alone as an input-liveness check. The gate list is fully live-verified against 46 labeled phase snapshots; known ~2s leak during the ROUND-N banner (inputs ignored there; recorder's zero-input filtering covers it), and timeout-draw behavior of round_over is untested. UNKNOWN/absent by honesty: player Y (jump height \u2014 extensive arc probes found only recomputed outputs; see mk2.md), authoritative round-timer store (digits/master/frame-counter all write-revert; timer_hold below is a NON-FUNCTIONAL placeholder), credits (live in T-Unit CMOS OUTSIDE the exposed region \u2014 credits_target/min below are placeholders; coin-up must go through the 'select' input), wins (fightcade's 0xC36A/C36C stayed 0 through CPU round wins \u2014 disproven for 1P play). Note: 'freeze' does not land on this core's fallback region (watch registers, value never written \u2014 verified); enforcement must use periodic write_memory, and a health refill must write ALL FOUR health bytes (both struct healths AND 0xBCA0/0xBC88 \u2014 independent damage accumulators). x lives at a 0x42-stride object array, NOT at the fighter-block stride, hence globals rather than fighter_fields; src/training.rs resolve() therefore no-ops for this game (recorder gate fully functional). attack_chords verified prior session (Wave W2): FBNeo retro_input.cpp mk-driver special case + live pose screenshots for HP/LP/HK; LK/Block source-backed. MACRO-ACTIONS pass 2026-08-28 (A-Rust, live 2P rig on 4033): hit_counter 0xD3FE DISPROVEN as a global contact signal \u2014 it stayed 0 through both blocked (chip -6) and clean hits ON P2 in a live 2-human fight, so the prior session's evidence (all P1-victim combos) generalized wrongly; it is a P1-VICTIM counter. contact_signal therefore NOT shipped; the per-victim signal is hitstun_sources = the HUD health accumulators (0xBCA0/0xBC88, write-verified earlier) \u2014 they change exactly when that side takes damage, chip included (blocked HP: p2_health_hud 161\u2192155 observed live). Training-mode caveat: the health-refill enforcement rewrites those same bytes, so one spurious BlockPunish trigger can fire per refill (cooldown absorbs repeats). special_inputs per MACRO_ACTIONS \u00a72, all three LIVE-VERIFIED on this rig (evidence: mk2.md 'Macro-action encodings'): slide is back+LK+LP+BLOCK \u2014 the \u00a72 two-button chord (back+LK+LP) was live-DISPROVEN (game performs a normal; with Block added: slide pose screenshot + h1 161\u2192148); at point-blank the game resolves the LP-bearing chord into a close normal/throw instead (proximity override \u2014 the \u00a71 phenomenon), so a point-blank punish slide whiffs by game rule, not executor fault. acid_spit (F,F+HP: h1 -24) and force_ball (B,B+HP+LP: h1 -16) verified via the BlockPunish executor end-to-end. Executor timing constants live-calibrated: punish delay 26f (a chord at +16 was eaten by hit-freeze+blockstun), guard-release tail 4f (held Block bleeding into the chord suppresses specials). 2P-mode gate leak: screen_state flips to 276 at first contact of a 2-human (challenger) match and stays there while the fight visibly continues and accepts input \u2014 word_zero(screen_state) reads NOT-controllable for the rest of such rounds (all prior gate evidence was 1P/attract); needs an A-RE pass.",
  "family": "mk2",
  "port": "arcade",
  "core": {
@@ -41,6 +41,11 @@
      "block2": "p2_x"
     },
     "size": 2
+   },
+   {
+    "name": "action_counter",
+    "off": "0xC0",
+    "size": 1
    }
   ],
   "globals": {
@@ -59,12 +64,31 @@
    "p1_facing": "0xBE81",
    "credits_hud_ascii": "0x1704D",
    "hit_counter": "0xD3FE"
-  }
+  },
+  "record_globals": [
+   {
+    "name": "p1_health_hud",
+    "size": 1
+   },
+   {
+    "name": "p2_health_hud",
+    "size": 1
+   },
+   {
+    "name": "hit_counter",
+    "size": 1
+   }
+  ]
+ },
+ "hitstun_sources": {
+  "block1": "p1_health_hud",
+  "block2": "p2_health_hud"
  },
  "gate": [
   {
-   "kind": "word_zero",
-   "global": "screen_state"
+   "kind": "word_masked_not_all",
+   "global": "screen_state",
+   "mask": "0x6"
   },
   {
    "kind": "byte_zero",
@@ -115,5 +139,57 @@
   "Block": [
    "l"
   ]
+ },
+ "special_inputs": {
+  "reptile": {
+   "slide": [
+    {
+     "dirs": [
+      "back"
+     ],
+     "press": [
+      "LK",
+      "LP",
+      "Block"
+     ],
+     "frames": 8
+    }
+   ],
+   "acid_spit": [
+    {
+     "dirs": [
+      "forward"
+     ],
+     "frames": 3
+    },
+    {
+     "dirs": [
+      "forward"
+     ],
+     "press": [
+      "HP"
+     ],
+     "frames": 3
+    }
+   ],
+   "force_ball": [
+    {
+     "dirs": [
+      "back"
+     ],
+     "frames": 3
+    },
+    {
+     "dirs": [
+      "back"
+     ],
+     "press": [
+      "HP",
+      "LP"
+     ],
+     "frames": 3
+    }
+   ]
+  }
  }
 }

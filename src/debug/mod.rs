@@ -501,6 +501,10 @@ pub enum DummyMode {
     Jump,
     /// Hold away from the other fighter (blocks everything blockable).
     Block,
+    /// Guard like [`Block`](Self::Block), and on each guarded contact sample
+    /// the weighted punish pool (MACRO_ACTIONS §6) — needs a contact signal
+    /// (`hitstun_sources` or `contact_signal`) mapped in the profile.
+    BlockPunish,
 }
 
 /// Training-mode control block (shadow PLAN Wave 2b). GUI hotkeys flip these
@@ -513,6 +517,32 @@ pub struct TrainingConfig {
     pub refill: bool,
     pub reset_positions: bool,
     pub finish_round: bool,
+    /// BlockPunish option pool: (option, weight). The panel edits it
+    /// char-aware; `training::tick` samples it on each guarded contact.
+    /// Weight 0 entries are dead (kept so the panel remembers the setting).
+    pub punish_pool: Vec<(crate::macros::PunishOption, u8)>,
+    /// BlockPunish runtime (not UI): the in-flight punish macro, contact-
+    /// signal edge tracking, and the quiet-window re-arm state.
+    pub punish_exec: Option<crate::macros::MacroExec>,
+    pub punish_prev_signal: Option<u8>,
+    pub punish_last_change: u64,
+    /// Armed after the signal has been quiet ≥ HITSTUN_RECENT_FRAMES; a
+    /// trigger disarms — the §6 cooldown.
+    pub punish_armed: bool,
+    /// ContinueBlock outcome: keep guarding (and don't re-trigger) until here.
+    pub punish_hold_until: u64,
+    /// Consecutive gate-closed frames survived by the in-flight punish macro
+    /// (hit-freeze grace — see `training::PUNISH_GATE_GRACE`).
+    pub punish_gate_grace: u64,
+    /// Frames of guarding left before the scheduled punish macro starts
+    /// (`training::PUNISH_DELAY` — hit-freeze + blockstun ride-out).
+    pub punish_wait: u64,
+    /// Human-readable BlockPunish phase, refreshed every frame the mode
+    /// runs: "guarding — armed" / "cooling (Nf)" / "punishing: slide" /
+    /// "unavailable …". The ONE place this is computed (panel, Lua
+    /// `training.punish_state()`, and any overlay all read it) so a silent
+    /// dummy explains itself instead of looking broken.
+    pub punish_phase: String,
 }
 
 pub struct DebugState {

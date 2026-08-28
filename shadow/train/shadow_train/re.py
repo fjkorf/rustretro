@@ -27,6 +27,31 @@ wrong wastes a live session, not just a re-read:
      the *source flag* — both change on every toggle. Only a write-test that
      provokes re-derivation (or fails to) tells you which one you found.
 
+Field-test notes (MACRO_ACTIONS phase, no API changes -- these are usage
+gotchas that cost live-session time before being written down):
+
+  - `Probe.press()` schedules the hold and returns as soon as the MCP call
+    completes; it does NOT block for `frames` frames. The emulator core runs
+    on its OWN clock (RetroArch's frame pump), not in lockstep with this
+    Python call, so a read immediately after `press()` can land BEFORE the
+    hold has actually been applied for its intended duration. Give the
+    session real wall-clock time after the call -- `time.sleep(frames / fps
+    + slack)`, or another round-trip that itself takes long enough -- before
+    trusting a memory read that depends on those held frames landing.
+  - Small `rd8` polls are cheap: a single-byte read runs 200+ Hz in practice
+    over the local MCP loop. For anything cadence-sensitive (catching a
+    value mid-transition, sampling a counter every few frames), prefer a
+    tight `rd8` polling loop over `stable_snapshot` -- the latter's whole-
+    region snapshot + fixed `delay` is built for finding CONFIG bytes across
+    two settled states, not for tracking a byte's frame-by-frame trajectory.
+  - Avoid running the frontend with `--pace 0` (uncapped) during a live CPU
+    fight you're trying to RE: an uncapped core races ahead of the CPU
+    opponent's normal decision cadence, which both makes `running()`'s
+    settle window less reliable (the oracle byte can tick many times during
+    one `settle` sleep) and makes any manually-timed macro (`lua_macro`,
+    `press`) land on different in-game frames run to run. Default pacing
+    keeps frame timing reproducible across a session.
+
 Dependencies: stdlib only (project convention — see dataset.py, mcpclient.py).
 """
 
@@ -197,6 +222,12 @@ class Probe:
         self.client.screenshot(path)
 
     def press(self, buttons, frames: int = 3, port: int = 0) -> dict:
+        """NOTE: returns as soon as the hold is SCHEDULED, not after `frames`
+        frames have actually elapsed on the core's own clock -- see the
+        module docstring's field-test notes. A read that depends on the held
+        input actually having landed needs real wall-clock time to pass
+        after this call returns (sleep, or another round-trip), not just
+        the next line of Python."""
         if isinstance(buttons, str):
             buttons = [buttons]
         return self.client.press(buttons, frames=frames, port=port)

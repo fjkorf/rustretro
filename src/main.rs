@@ -6,6 +6,7 @@ mod frontend;
 mod libretro;
 mod litui_pages;
 mod lua_engine;
+mod macros;
 mod record;
 mod mcp;
 mod shadow_runner;
@@ -815,7 +816,8 @@ fn read_input(
                         Stand => Crouch,
                         Crouch => Jump,
                         Jump => Block,
-                        Block => Free,
+                        Block => BlockPunish,
+                        BlockPunish => Free,
                     };
                     eprintln!("[training] dummy: {:?}", ds.training.dummy);
                 }

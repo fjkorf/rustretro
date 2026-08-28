@@ -367,6 +367,126 @@ find per-stage world bounds (or a camera-x global to derive screen x).
 | position write | **Works** — X (`+0xD8`) and Y (`+0xDC`) both accept writes and visibly relocate the fighter (teleport/levitate verified); write the fraction word (`+0xDA`/`+0xDE`) to 0 alongside. |
 | credits | **N/A** — home-console cartridge, no coin/credit system; `start` joins/continues directly. |
 
+## Special-move encodings (`special_inputs`, 2026-08-28)
+
+Pasted verbatim from `shadow/MACRO_ACTIONS.md` §2 (user-verified reference
+data, both MK2 ports) — profiled in `genesis.profile.json`:
+
+```jsonc
+"special_inputs": {
+  "reptile": {
+    "slide": [ { "dirs": ["back"], "press": ["LK", "HK"], "frames": 4 } ]
+  }
+}
+```
+
+Genesis Reptile's slide is `back+LK+HK` — **different** from arcade's
+`back+LK+LP` (MACRO_ACTIONS.md's motivating cross-port-divergence case).
+
+## Contact/hit signal hunt (2026-08-28, A-RE, live grounding pass)
+
+Session goal: find genesis MK2's analog of the arcade port's verified global
+`hit_counter` (`0xD3FE`, `mk2.md`) — a value that changes on every landed hit
+AND on blocked/chip contact, quiet in neutral — for the block-punish dummy's
+`contact_signal` (MACRO_ACTIONS.md §6). Headless FBNeo, port 4032, arena
+`genesis-probe.state` (Liu Kang vs Baraka CPU), `shadow_train.re.Probe`.
+
+**Method, refined from the arcade session's**: single-emulated-frame
+precision throughout (`pause` once, then `step()` + a **mandatory ~20 ms
+real-time sleep per step** — `step()` alone is a no-op if polled faster than
+the main loop consumes the flag, the first and most expensive gotcha this
+session hit; see Toolkit friction). Health-drop-bracketing full-window
+snapshot diffs (`re.diff` across exactly one `step()`) isolate a hit's true
+byte-level footprint far more tightly than a real-time `resume()`-and-poll
+loop, which lets 10+ frames of unrelated churn leak into the diff (measured:
+a real-time bracket produced 8000-11000 changed bytes per event out of
+205 KB; single-frame bracketing cut this to 90-1300).
+
+**The neutral bar was raised past the arcade session's own**: an early pass
+(candidates `0xFFC726`/`0xFFC734`, see Disproven below) satisfied "fires on
+every hit, fires on every block-chip, quiet while standing" and looked like
+a clean find — but a dedicated single-frame-precision walking/jumping check
+(not run by the arcade session, which only checked a pre-contact **standing**
+window) showed it firing 15-30% of frames during ordinary movement with zero
+contact. A byte that pulses on footsies would make the block-punish dummy
+fire on nothing; "quiet in neutral" was redefined for this session to mean
+standing **and** walking **and** jumping **and** block-held-with-no-incoming-
+attack, not just standing.
+
+### NOT FOUND — searched exhaustively, honestly open
+
+No byte in the accessible WRAM window (`0xFF0000`-`0xFFFFFF`, all 65536
+bytes swept) or the region's tail (`0x10000`-`0x321E4` offset, Z80/sound +
+other spans per Overview) survives the full bar: fires on every one of 5-6
+raw hits (P1 vs CPU Baraka, single-frame-bracketed), fires on every one of
+3-4 blocked/chip hits (P1 holds `a`=Block while CPU attacks), AND is absent
+from a union of single-frame-precision neutral sweeps (standing ~20-30
+frames, walking left/right, jumping, block-held far from the opponent — all
+zero contact). Two independent full-sweep passes (the 64 KiB work-RAM window
+and the >64 KiB tail) both returned **zero** surviving candidates once the
+neutral sweep was done at single-frame precision instead of coarse
+before/after snapshots (see Toolkit friction — coarse sampling produces
+false negatives in the noise set, which is what let the disproven candidate
+through the first pass).
+
+The tail region (`0x10000`+ offset) reconfirms the existing doc's own
+caution: a **pure-standing** single-frame sweep there touched **8493** of
+~139000 bytes in under a second — Z80 sound-driver/music churn, exactly as
+already documented for the Overview's blob layout, not gameplay state.
+
+### LIKELY (fires on contact, but NOT contact-exclusive — disqualified as `contact_signal`)
+
+| address | field | evidence |
+|---|---|---|
+| `0xFFC726` / `0xFFC734` (part of a ~13-byte cluster `0xFFC71D`-`0xFFC734`) | shared VFX/collision-effect object, NOT a hitstun counter | Fires on **6/6** raw hits and **4/4** blocked/chip hits (single-frame-bracketed, both P1-gets-hit-by-CPU and P1-attacks-P2 directions — see Per-player vs global below) and is silent across a 30-frame pure-standing sweep, but ALSO fires on 21-27 of 120 single-frame-sampled walking frames and 12-16 of ~180 jumping frames (probe: `/tmp/mk2_genesis_probe8.py`-style value log, not committed). Values jump erratically between contact events (`10→26`, `0→255`, `116→2`) rather than incrementing — consistent with a rotating slot in a small shared particle/hit-spark/footstep-dust object pool, not a dedicated counter. **Do not adopt as `contact_signal`** — it would false-fire during ordinary footsies. |
+
+**Per-player vs global**: the same `0xFFC726`/`0xFFC734` pair changed both
+when P1 was hit by the CPU AND when P1 landed a hit on P2 (LP button, 4
+events, 1 landed as `p2_hit_by_p1`) — no distinct P1-victim vs P2-victim
+address pair emerged; whatever this cluster is, it looks **global/shared**
+between the two fighters, not a per-player pair. (Caveat: only one clean
+P1-attacks-P2 landed hit was captured this session — same "couldn't
+reliably land clean P1→P2 hits" friction the arcade session reported.)
+
+**`pause_flag` (`0xFFD7D3`/twin `0xFFDA53`) re-examined as a hitstop-based
+contact signal**: mk2-genesis.md's own existing caveat ("flag briefly reads
+1... most likely HITSTOP") was retested directly — a single-frame timeline
+across 6 hits shows the flag flickering on-and-off constantly (not
+correlated with the `<<HIT>>` markers specifically) AND flickers just as
+often during a pure walking control with zero contact. **Reconfirmed
+unreliable as a contact signal** — likely a display double-buffer or
+similar per-frame render toggle unrelated to hitstop specifically; the
+existing gate-leak caveat about it stands, but it is not usable for
+`contact_signal`.
+
+### Toolkit friction (this session)
+
+- **`step()` needs real wall-clock time after the call, same as
+  `press_buttons`** (already documented for `press`/`press_buttons` in
+  mk2-genesis.md's Session craft) — but this was NOT previously documented
+  for `step()` specifically, and it manifested differently: calling `step()`
+  in a tight loop with no sleep produced almost no game progress at all
+  (300 calls advanced world X by only ~9 units, no CPU approach) rather than
+  an obviously-wrong read. A ~20 ms sleep after every `step()` call fixed it
+  completely (CPU aggression resumed at its normal live-play rate). Add to
+  the SKILL: `step()` shares `press_buttons`'s "consumed once per real
+  emulated frame, not per call" behavior.
+- **Coarse before/after neutral sampling under-reports noise.** A neutral
+  "walk 6 bursts of press+sleep, snapshot only before and after" pass missed
+  candidates that a single-frame-precision sweep of the SAME activity caught
+  reliably 15-30% of frames — the byte returns to a value close to its
+  starting point often enough that a two-sample bracket has a real chance of
+  missing the whole excursion. Any "is this quiet in neutral" check needs
+  the same per-frame precision as the hit-bracketing check, not a coarser
+  one — asymmetric rigor here is what let `0xFFC726`/`0xFFC734` look
+  contact-exclusive on the first pass.
+- Small-window (`~0x1000`-`0x5000` byte) `read_region` snapshots at
+  single-frame cadence are cheap enough (2-3 chunked reads) to run
+  per-`step()` through an entire hit search without materially slowing the
+  session; a full 64 KiB window (8 chunks) is still fast enough for this
+  (a 4-6-hit search completed in 1-3 seconds of wall time). The >64 KiB tail
+  (18 chunks for the full ~139 KB span) is the practical upper bound tried.
+
 ## Open gaps
 
 1. **Facing** — not hunted; candidates likely near the X/Y fields.
@@ -377,6 +497,14 @@ find per-stage world bounds (or a camera-x global to derive screen x).
    matters in practice.
 6. **Per-stage world-X bounds** (or a camera-x global) needed before the
    corner feature can be reintroduced (see Calibration).
+7. **Contact/hit signal (`contact_signal`) — NOT FOUND** (2026-08-28): no
+   byte satisfies "fires on every hit and block, quiet through standing +
+   walking + jumping neutral" (see Contact/hit signal hunt, above). The
+   shared-object-pool lead (`0xFFC726`/`0xFFC734`) is a plausible next
+   thread — mapping the actual object-pool structure (slot stride, spawn
+   trigger) rather than treating it as a flat byte could recover a genuine
+   per-hit spawn-index signal, but that is real RE work, not a quick
+   follow-up.
 
 ## Disproven & traps
 
@@ -384,6 +512,26 @@ Preserved verbatim in substance — these are as useful as the confirmed
 addresses, either because the trap could recur or because the disprove
 (or, in one case, disprove-then-*retract*) teaches the method.
 
+- **`0xFFC726`/`0xFFC734` as `contact_signal`** (2026-08-28, contact/hit
+  signal hunt): passed a coarse "fires on hit, fires on block, quiet
+  standing" check, then FAILED a follow-up single-frame-precision walking
+  and jumping check (fired on 15-30% of frames with zero contact). The trap:
+  the first-pass neutral control used coarse before/after snapshots around
+  several presses, which under-sample fast-toggling bytes (see Toolkit
+  friction). Root-caused as a likely shared VFX/collision-effect object pool
+  slot (erratic, non-incrementing values on every touch), not a hitstun
+  counter. Full evidence in Contact/hit signal hunt, above.
+- **`0xFFD7D3`/`0xFFDA53` (`pause_flag`) as a hitstop-based `contact_signal`**
+  (2026-08-28): re-tested directly against a single-frame hit timeline —
+  flickers constantly, uncorrelated with hit instants, and flickers just as
+  often during pure walking with zero contact. The gate's existing pause-flag
+  caveat about a possible hitstop flicker is reconfirmed as real but useless
+  for contact detection (too noisy). See Contact/hit signal hunt, above.
+- **The region tail (`0x10000`-`0x321E4` offset, beyond the 64 KiB m68k work
+  RAM window)** (2026-08-28): re-confirmed as sound-driver/music churn, NOT
+  gameplay state — a pure-standing single-frame sweep touched 8493 of
+  ~139000 bytes there in under a second. Do not hunt gameplay signals in
+  this span; matches the Overview's existing blob-layout description.
 - **Genesis Game Genie codes for this game** (`gamegenie.com`, e.g.
   `ALAA-AA9C` "P1 Infinite Health", `ABVT-BE64` "Infinite time"): decoded
   with a from-scratch implementation of the documented Genesis GG algorithm
