@@ -307,3 +307,154 @@ works mid-ladder (the CPU opponent even advanced to char id 10 during it).
   port-correct specials. This is the concrete motivating case for the
   long-queued MACRO-ACTION layer: specials as named intents in family.json
   with per-port input encodings, labeled and replayed as units.
+
+## Hitstun / blockstun observables (2026-08-28, live grounding pass)
+
+Session goal: find the signals a block-punish training dummy and a frame-data
+lab need — "I was just struck" (hit or block) and, ideally, a general
+animation/state-id field. Method: headless FBNeo on MCP port 4032, 1P
+(Liu Kang) vs CPU (Baraka), a save-state checkpoint banked at a fresh
+"ROUND 2, both full" frame (`/tmp/mk2_round2_full.state`, not committed —
+regenerate via coin+start+select, see Method below), then fast MCP-polling
+(200-1300 reads/sec achievable with small `read_memory` calls — no sleep
+needed between them) through live combos, correlated against the frame when
+`health` (`+0xE`) visibly drops. Two independent noise controls were used:
+(a) a "fake hit times" pass over a pre-contact neutral window (rules out
+ambient per-frame counters that trivially "differ before/after" any instant
+regardless of combat), and (b) `stable_snapshot`/`static_diff` pairs
+(neutral-vs-hit, no-block-vs-block) over a widened `0xB000-0xD800` window to
+catch fields outside the narrow fighter struct.
+
+### VERIFIED (live, correlated across two independent combo replays + a
+chip-damage/blocking replay; passes the neutral-noise control)
+
+| address | field | evidence |
+|---|---|---|
+| `0xD3FE` | **hit/combo counter** (u8, GLOBAL — not inside either fighter struct) | 0 at rest; increments by exactly 1 at the *same poll* `health` (P1, `0xC05E`) drops, for **every** hit in an 11-hit combo (both single pokes and the mid-combo launcher) and again for a run of **blocked/chip** hits (161→159→157→155, `0xD3FE` 0→1→2→3 in lock-step) — fires identically for hitstun and blockstun. Resets to 0 after a **~200-370 ms gap with no new hit** (12-22 frames @ ~55-60 fps) — closely matches the profile's existing `HITSTUN_RECENT_FRAMES: 20` calibration constant, which this finding now retroactively justifies. Zero false-fires: constant 0 across a 6-sample pre-contact neutral control (fake "hit" instants at t=0.15/.25/.35/.45/.55/.65s, all before the CPU's first real hit). |
+
+This is exactly the asurabld-style "combo counter as hitstun proxy"
+(CLAUDE.md: *"hitstun = counter changed within 20 frames"*) — a training
+dummy/frame-data lab can use **`d3fe` incremented within the last ~20
+frames → defender was just struck (hit OR block)**. Caveats, stated
+honestly:
+- **Does not distinguish hitstun from blockstun by value** — both increment
+  the same counter the same way. Distinguishing needs either (a) the
+  trainer's own knowledge of whether Block was held (it drives the dummy,
+  so it already knows), or (b) more RE (see Open below).
+- **Per-player scope untested.** Every sample this session was "P1 gets hit
+  by CPU Baraka" — P1's `health` dropping is what triggered every read. I
+  was unable to reliably land clean hits FROM P1 onto P2 to check the
+  symmetric case (see Toolkit friction below), so whether `0xD3FE` is a
+  P1-specific/P2-specific/shared-whoever-just-got-hit register is open. In
+  a 1v1 match only one side can be mid-combo at a time, so "global" would
+  still be a usable signal in practice, just not per-player-attributable
+  from this byte alone.
+
+### LIKELY (single-mechanism correlation, not yet cross-verified)
+
+| address | field | evidence |
+|---|---|---|
+| `0xC050`+`0xC` / `+0xD` (P1 struct, u16 LE; presumably `0xC1CA`+`0xC`/`+0xD` for P2) | **airborne/juggle latch**, value `0xFFFC` (-4) while active, `0` at rest | 0 through the first 4 hits of an 11-hit combo, then latches to `0xFFFC` for ~366 ms starting the instant the 5th hit (mid-combo launcher) lands, clears back to 0, and repeats on the next launcher later in the same combo (2 independent activations, same replay). Does **NOT** fire on the ground-poke hits before/after the launcher — fails "must fire on every hit," so it is NOT the general hitstun signal, but is a plausible knockup/juggle-substate indicator (a small constant Y-nudge or "airborne" flag) worth chasing as a lead on the still-missing player-Y field. |
+
+### NOT FOUND — searched, honestly open
+
+- **Block-stance flag** (item 3): no live boolean found. Two lines of
+  attack failed for different reasons: (a) offsets `0xBE4F/51/5A/62/63/6B/6C`
+  etc. initially looked promising from a single before/after block-vs-noblock
+  diff, but a longer time-series showed they **cycle continuously on their
+  own** (an idle-animation loop, ~150-500 ms period) whether or not Block is
+  held — a single-sample A/B comparison caught a phase coincidence, not a
+  real flag; this is the exact "toggle-intersect catches the rendered echo"
+  trap the re-probe SKILL warns about, just with an idle cycle standing in
+  for the echo. (b) Inside P1's own struct, `+0x18/+0x1C/+0x1E` (`0xC068`,
+  `0xC06C`, `0xC06D`) DO change the instant Block is first pressed, but they
+  are **monotonic counters / one-shot latches** (`+0x18` steps up by 32 once
+  per *press event*, `+0x1C`/`+0x1E` set once and never clear) — not a live
+  "currently blocking" boolean. No candidate survived a press/hold/release
+  cycle test.
+- **General action/state-id word** (item 4): P1's entire struct (`0xC050`,
+  the full `0x17A`-byte stride) was diffed neutral-vs-combo byte-for-byte —
+  the ONLY bytes that ever move are `+0x0` (char_id), `+0xE` (health), the
+  `+0xC/+0xD` juggle latch above, and the one-shot `+0x18/+0x1C/+0x1E` block
+  counters. No animation/pose-id byte cycling through recognizable
+  stand/walk/attack/hitstun/block values was found anywhere in the struct.
+  This is a genuine negative result, not a gap in search effort — MK2's
+  arcade fighter struct is far sparser than asurabld's; the state machine
+  driving animation appears to live entirely outside this struct (object
+  pool, T-Unit "gfx object" table, or CPU-local variables never DMA'd to a
+  fixed RAM slot), consistent with x/facing already being GLOBAL-sourced
+  rather than struct fields (see Positions, above).
+- **Genesis cross-check** (item 5 / bonus): NOT ATTEMPTED. The session's time
+  budget went entirely into arcade-side toolkit friction (below); this is an
+  open follow-up, not a "checked, no result."
+- **External MAME-cheat/community sweep**: one search + a few fetches
+  (mamecheat.co.uk blocks non-browser fetches with 403; mortalkombatonline.com
+  and a MAME-cheat-forum snippet were reachable). Found only the ALREADY-KNOWN
+  char-id table (`0x0020C050`/`0x0020C1CA` old-format, matches `+0x0` above)
+  and one unverified lead — `user1.mw@06B70` "Hit Anywhere Both Players" —
+  whose `user1`/`mw` MAME region-and-width tag does NOT match the
+  `maincpu`-bit-address convention this doc's conversion formula assumes, so
+  it was NOT converted/trusted; flagging as an external candidate with
+  provenance only, for a future session to map properly. No community
+  address for "stun"/"hitstun"/"combo counter"/"attack state" turned up —
+  unsurprising, since MAME cheat databases skew toward infinite-health/time,
+  not frame-data internals.
+
+### Toolkit friction (`shadow_train.re`, first real field test)
+
+- **`Probe.press()` is fine; reading world X (`0x6CBA`) to verify it is
+  NOT.** Across this entire fresh-boot session, `0x6CBA` (P1 world X, per
+  the existing profile write-verified in a PRIOR session) read a frozen
+  value (214) through repeated `left`/`right` holds that **visibly moved
+  Liu Kang on screen** (screenshot-confirmed retreat), then spontaneously
+  jumped to 546 in lockstep with an unrelated knockback. This matches the
+  profile's own caution that `x` lives in a dynamic `0x42`-stride object
+  pool rather than a fixed per-player slot — apparently the pool slot
+  backing "P1" is not stable across boots/matches. Net effect: **do not
+  trust `p1_x`/`p2_x` reads as a liveness check for input** — use a visible
+  screenshot or a struct field (health, char_id) instead. This is a
+  real risk for anything in the codebase that reads `p1_x`/`p2_x` for
+  training/recording purposes; worth a follow-up session to find a
+  stable-slot alternative or a slot-resolution indirection.
+- **`press_buttons` needs `resume()` called first, obviously, but ALSO
+  needs real wall-clock time to elapse AFTER the call returns** for the
+  held frames to actually tick (the headless loop consumes the hold
+  counter once per emulated frame, independent of the calling thread) —
+  undocumented gotcha the first few attempts tripped on by reading
+  immediately after `press()` with no `sleep`.
+  Related: launching with `--pace 0` (uncapped) for "fast-forward to phase
+  X" is exactly right for boot/menus, but is actively dangerous once a CPU
+  opponent is live — a match can start and finish (KO) inside a single
+  `sleep(0.5)` because uncapped means *far* more than 0.5 s of emulated
+  time elapses. Switch to `--pace 1` before any live-fight interaction.
+- **No `reset`/`restart` MCP tool** — the only way to get back to a clean
+  boot (e.g., to re-test 2P-join semantics) is to kill and relaunch the
+  headless process. Fine once known, but cost one relaunch cycle
+  discovering it.
+- Small **`read_memory` calls are cheap enough to poll at 200-1300 Hz**
+  (no chunking needed under a few hundred bytes), which is what actually
+  cracked this session open — far better temporal resolution than the
+  `stable_snapshot`/1-second-apart default suggests. Worth calling out in
+  the SKILL: for hitstun/frame-data-style work, prefer many small
+  `read_memory` polls over periodic wide `read_region` snapshots; reserve
+  the wide snapshot for an initial *candidate-narrowing* pass (its 2-sample
+  `static_diff` is still exactly right for that), then confirm/characterize
+  candidates with tight per-address polling.
+- **2-human join (`start` on port 1) did not reliably convert P2 to human**
+  in these attempts — the select screen locked in a 1P-vs-CPU match despite
+  the join press (P2's HUD then intermittently showed "INSERT COIN" mid-fight,
+  suggesting a late/second join attempt was queued and partially processed).
+  Consequence: all data above is from a CPU defender, not a controllable
+  one; the prompt's suggested "human defender holds Block" isolation
+  protocol was not achieved this session. `mk2.md`'s existing gotcha ("P2
+  joining mid-1P-game aborts the current match...") likely explains part of
+  this; the clean 2P-from-boot path (coin x2 before either `start`) needs
+  more careful sequencing than attempted here.
+
+### Updated: What training-mode readiness still lacks
+
+6. **Block-stance flag and a general animation/state-id field** — both
+   searched for directly this session (see above), neither found. The
+   combo counter (`0xD3FE`) covers "was just struck" adequately for a
+   punish trainer; a true frame-data lab (startup/recovery measurement)
+   still has no state-id field to key off.
