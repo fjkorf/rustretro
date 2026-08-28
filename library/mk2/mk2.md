@@ -609,7 +609,7 @@ reaction flips that bit, momentarily re-opening the gate; far HP and
 knockdowns don't set it. Not a proximity-semantics effect in our code at
 all. What sets bit 4 remains unmapped (harmless under the masked rule).
 
-## `action_counter` — the real contact signal (2026-08-28, twin-counter hunt)
+## `action_counter` — an ACTION counter, NOT the contact signal (2026-08-28, twin-counter hunt; conclusion CORRECTED below)
 
 **VERIFIED (live, user's 2-human Reptile-mirror session).** Fighter field
 **`+0xC0`** (P1 `0xC110`, P2 `0xC28A`), u8, increments by **+32** (a count
@@ -650,3 +650,36 @@ FEATURE source (where "took damage" is the correct meaning).
 Rig note: `shadow/arenas/mk2/reptile-vs-reptile.state` is 1P-vs-CPU, so
 injected dummy input CANNOT drive P2 there — BlockPunish end-to-end
 testing requires a 2-human match (controller 2 joins).
+
+## CORRECTION: the contact signal is the health delta after all (2026-08-28)
+
+The section above over-claimed from a rig where the defender was struck
+shortly after a FRESH block press. Re-tested in the configuration that
+actually matters — the training dummy holding guard CONTINUOUSLY — the
+result reverses:
+
+- The dummy's `action_counter` (+0xC0) moved on only **1 of 4** blocked
+  contacts. It fires when a fighter ENTERS an action (including entering
+  block), not when an already-blocking fighter is struck.
+- Full-struct diff while guarding, 6 trials: **idle churn = 0 bytes** (a
+  blocking MK2 fighter's whole 0x17A struct is frozen), and the ONLY byte
+  that changed on blocked contact was **`block+0xE` — health itself**,
+  5 of 5.
+- Every blocked contact in these trials chipped (−3 or −6). The one
+  "no change" trial was a WHIFF (no damage, no struct change at all).
+
+So for MK2 arcade the health delta (`hitstun_sources`, the HUD pair) IS
+the contact event, and the earlier "zero-chip blocked contact" reading
+was a fresh-block-press artifact. `contact_signal` was removed from the
+arcade profile; the trigger uses the hitstun_sources fallback.
+
+**Consequence for the user-reported "punishes some hits but not others":
+the likely causes are WHIFFS (which correctly produce no punish — note
+MK2's proximity normals mean a far attack can whiff where a close one
+connects) and the post-punish window (≈1 s of delay + macro + recovery
+during which the dummy is not guarding).** Not a signal bug.
+
+`action_counter` is KEPT as a recorded fighter field — it is honest,
+useful data (action transitions, incl. the attacker's swings and whiffs)
+and costs nothing. The `contact_signal` schema keeps its per-fighter
+`field` variant for games that do have a true contact counter.

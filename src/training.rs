@@ -687,10 +687,12 @@ mod tests {
         assert!(ds.write_addr((p.block2() + coff) as usize, 1, 9)); // reptile
         assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
         assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
-        // The dummy is block2 (larger x), so its contact signal is
-        // block2's `action_counter` field — quiet while it holds guard,
-        // fires on blocked contact even with zero chip (live-verified).
-        let sig = p.field_addr(2, "action_counter").unwrap().0 as usize;
+        // The dummy is block2 (larger x); mk2 ships no contact_signal, so
+        // the trigger falls back to hitstun_sources — block2's HUD health.
+        // (A blocking MK2 fighter's struct is otherwise frozen and blocked
+        // contact always chips, so the health delta IS the contact event —
+        // see mk2.md's contact-signal investigation.)
+        let sig = p.global("p2_health_hud").unwrap() as usize;
         assert!(crate::gate::eval_gate(&ds, &p));
 
         ds.training.enabled = true;

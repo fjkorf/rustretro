@@ -1264,9 +1264,7 @@ mod tests {
         // FIELD (quiet while guarding, fires on blocked contact even at zero
         // chip — live-verified). hitstun_sources stays as the health-delta
         // fallback and as the hitstun FEATURE source.
-        let cs = p.port.contact_signal.as_ref().unwrap();
-        assert_eq!(cs.field.as_deref(), Some("action_counter"));
-        assert!(cs.global.is_none());
+        assert!(p.port.contact_signal.is_none(), "mk2 uses the hitstun_sources fallback");
         let hs = p.port.hitstun_sources.as_ref().unwrap();
         assert_eq!(hs.get("block1").map(String::as_str), Some("p1_health_hud"));
         assert_eq!(hs.get("block2").map(String::as_str), Some("p2_health_hud"));

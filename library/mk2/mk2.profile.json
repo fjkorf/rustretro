@@ -191,8 +191,5 @@
     }
    ]
   }
- },
- "contact_signal": {
-  "field": "action_counter"
  }
 }
