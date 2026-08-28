@@ -12,7 +12,9 @@
 
   report <model-dir>
       Print the §7.6 coverage drill list stored in a fitted model's meta.json
-      -- no recordings needed, just what's already on disk.
+      -- no recordings needed, just what's already on disk. Also prints a
+      MACRO_ACTIONS.md §8 string/juggle summary read from the source
+      recordings' `.rounds.jsonl` sidecars, when any carry one.
 
   coverage [recordings...]
       Print the MATCHUP coverage matrix (decisions per me-char x opp-char,
@@ -234,6 +236,62 @@ def cmd_report(args) -> None:
     if specials:
         counts = meta.get("attack_label_counts", {})
         print("specials:                 ", {name: counts.get(name, 0) for name in specials})
+    # MACRO_ACTIONS.md §8: string/juggle stats aggregated from the
+    # `.rounds.jsonl` sidecars of every recording that fed this model --
+    # these are per-round facts the RUST recorder wrote, not fit-time
+    # features, so `report` reads them straight off disk rather than through
+    # meta.json. Omitted entirely when no round carries a `strings` object
+    # (unmapped contact source, or nothing recorded yet) -- never a zeroed
+    # line for an unaffected game (same per-feature-degradation house style
+    # as the specials line above).
+    strings_line = _string_stats_line(meta.get("source_files", []))
+    if strings_line:
+        print(strings_line)
+
+
+def _string_stats_line(source_files: list) -> str | None:
+    """Aggregate MACRO_ACTIONS.md §8 per-round `strings` objects across the
+    `.rounds.jsonl` sidecar of every recording in `source_files`. Returns
+    None when no round anywhere carries a `strings` object."""
+    total = 0
+    longest_hits = 0
+    longest_damage = 0
+    block_strings = 0
+    juggle_hits = 0
+    juggle_seen = False
+    seen_any = False
+    for f in source_files:
+        sidecar = Path(str(f).removesuffix(".jsonl") + ".rounds.jsonl")
+        if not sidecar.exists():
+            continue
+        for line in sidecar.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            s = row.get("strings")
+            if not s:
+                continue
+            seen_any = True
+            total += s.get("count", 0)
+            if s.get("longest_hits", 0) > longest_hits:
+                longest_hits = s["longest_hits"]
+                longest_damage = s.get("longest_damage", 0)
+            block_strings += s.get("block_strings", 0)
+            if "juggle_hits" in s:
+                juggle_seen = True
+                juggle_hits += s["juggle_hits"]
+    if not seen_any:
+        return None
+    line = f"strings: {total} (longest {longest_hits} hits / {longest_damage} dmg)"
+    if block_strings:
+        line += f" · block strings: {block_strings}"
+    if juggle_seen:
+        line += f" · juggle hits: {juggle_hits}"
+    return line
 
 
 def _recording_style(p: Path) -> str | None:

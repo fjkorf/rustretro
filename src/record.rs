@@ -71,6 +71,74 @@ fn read_sized(ds: &DebugState, addr: u32, size: u8, little: bool) -> u64 {
     }
 }
 
+/// Where per-defender contact evidence lives (MACRO_ACTIONS.md §8, string/
+/// juggle stats): resolved once at [`FrameRecorder::create`], mirroring
+/// `training::resolve`'s `contact_signal`-then-`hitstun_sources` precedence
+/// (§6) so both call sites agree on what counts as "struck" — WITHOUT
+/// importing from `training.rs`, to keep this file's ownership separate (a
+/// shared resolver module is future work if a third call site appears).
+///
+/// A `contact_signal.global` — one counter shared by both fighters — cannot
+/// say WHICH fighter was struck, so it degrades to `None` here rather than
+/// guessing a defender (honest degradation, never fabricated); string/juggle
+/// stats then stay entirely absent from the round summary, same as an
+/// unmapped port.
+enum ContactSrc {
+    /// `contact_signal.field`: one fighter-field name, present at the same
+    /// index in both `fields1`/`fields2` (they share names/order).
+    Field(usize),
+    /// `hitstun_sources`: independent global name per block — indices into
+    /// the recorder's `globals` union for block1's and block2's signal.
+    Globals(usize, usize),
+}
+
+fn resolve_contact_src(p: &GameProfile, fields1: &[Slot], globals: &[Slot]) -> Option<ContactSrc> {
+    if let Some(cs) = &p.port.contact_signal {
+        match (&cs.field, &cs.global) {
+            (Some(f), _) => return fields1.iter().position(|s| &s.name == f).map(ContactSrc::Field),
+            (None, Some(_)) => return None, // shared counter: defender-ambiguous
+            (None, None) => {} // unreachable post-validation; fall through
+        }
+    }
+    let hs = p.port.hitstun_sources.as_ref()?;
+    let find = |name: &str| globals.iter().position(|s| s.name == name);
+    let i1 = find(hs.get("block1")?)?;
+    let i2 = find(hs.get("block2")?)?;
+    Some(ContactSrc::Globals(i1, i2))
+}
+
+/// One in-progress "string" for one defender (MACRO_ACTIONS §8.1): the
+/// game's own linking judgment is its contact signal's reset window — while
+/// consecutive contact events stay within `HITSTUN_RECENT_FRAMES` of each
+/// other they belong to the same string. `hits`/`damage` count only the
+/// damage-dealing events (§8 caveat below); a string of all no-damage events
+/// is a "block string" (never asserted as literally "blocked" — see
+/// `classify_contact`).
+#[derive(Default)]
+struct StringAcc {
+    hits: u32,
+    damage: u64,
+}
+
+/// Per-defender string-tracking state, reset at the start of every round.
+#[derive(Default)]
+struct StringTracker {
+    last_event_frame: Option<u64>,
+    current: Option<StringAcc>,
+}
+
+/// Per-event classification by the defender's health delta at that frame
+/// (MACRO_ACTIONS §8 item 2). `NoDamage` is the honest name: on asurabld a
+/// blocked attack deals zero chip, so `NoDamage` here means "blocked OR a
+/// signal that fired for another reason" — it is NEVER asserted as
+/// `Blocked`, because the recorder has no independent block-flag to confirm
+/// that reading.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum EventKind {
+    Hit,
+    NoDamage,
+}
+
 /// The recorded-globals union (RECORDER_V3 §1.2 rule 2): every gate-condition
 /// global (gate order; `word_zero` reads u16, the byte conditions u8), then
 /// every `record_globals` entry (profile order, own size). Duplicates appear
@@ -216,6 +284,34 @@ pub struct FrameRecorder {
     matchers: Option<(crate::macros::Matcher, crate::macros::Matcher)>,
     /// Per-round completion counts, union of both players (rounds sidecar).
     round_specials: std::collections::BTreeMap<String, u32>,
+    /// MACRO_ACTIONS §8: resolved contact-evidence source; None when neither
+    /// `contact_signal` nor `hitstun_sources` is usable (unmapped port, or a
+    /// defender-ambiguous shared counter) — string/juggle stats stay absent.
+    contact_src: Option<ContactSrc>,
+    /// Index into `fields1`/`fields2` of `health` (damage-delta classification)
+    /// and `y` (juggle flag); `ground_y` is the profile's calibration for the
+    /// off-ground margin. `y_idx`/`ground_y` both `Some` = juggle flag emitted.
+    health_idx: Option<usize>,
+    y_idx: Option<usize>,
+    ground_y: Option<f64>,
+    /// `HITSTUN_RECENT_FRAMES` calibration (default 20, same as the trainer):
+    /// the max quiet gap between two contact events that still links them
+    /// into one string.
+    hitstun_window: u64,
+    /// Per-defender ([block1, block2]) previous-frame contact-signal value
+    /// and health, so a change/delta can be measured frame-to-frame. Reset
+    /// to `None` at the start of every round (no cross-round linking).
+    prev_contact: [Option<u64>; 2],
+    prev_health: [Option<u64>; 2],
+    /// Per-defender in-progress string state, reset every round.
+    strings: [StringTracker; 2],
+    // Per-round string/juggle aggregates (MACRO_ACTIONS §8 item 4), reset on
+    // the rising edge alongside `round_specials`.
+    round_string_count: u32,
+    round_longest_hits: u32,
+    round_longest_damage: u64,
+    round_block_strings: u32,
+    round_juggle_hits: u32,
     // x-liveness sentinel (mk2.md: an object-pool slot can go stale between
     // boots): first controllable x sample, frames seen unchanged, and the
     // outcome latches (varied = proven alive, or warned once).
@@ -283,6 +379,11 @@ impl FrameRecorder {
             |name: &str| profile.port.memory.fighter_fields.iter().position(|f| f.name == name);
         let x_idx = field_idx("x");
         let char_idx = field_idx("char_id");
+        let health_idx = field_idx("health");
+        let y_idx = field_idx("y");
+        let ground_y = profile.calibration("GROUND_Y");
+        let contact_src = resolve_contact_src(profile, &fields1, &globals);
+        let hitstun_window = profile.calibration("HITSTUN_RECENT_FRAMES").unwrap_or(20.0) as u64;
 
         // Compile every special the profile encodes (family∩port, all
         // characters — the annotation is coverage data, and the train-side
@@ -376,6 +477,19 @@ impl FrameRecorder {
             char_idx,
             matchers,
             round_specials: std::collections::BTreeMap::new(),
+            contact_src,
+            health_idx,
+            y_idx,
+            ground_y,
+            hitstun_window,
+            prev_contact: [None, None],
+            prev_health: [None, None],
+            strings: [StringTracker::default(), StringTracker::default()],
+            round_string_count: 0,
+            round_longest_hits: 0,
+            round_longest_damage: 0,
+            round_block_strings: 0,
+            round_juggle_hits: 0,
             x_base: None,
             x_ctrl: 0,
             x_alive: false,
@@ -428,9 +542,44 @@ impl FrameRecorder {
         if !self.round_specials.is_empty() {
             line["specials"] = serde_json::json!(self.round_specials);
         }
+        // MACRO_ACTIONS §8 item 4: string/juggle stats, omitted ENTIRELY when
+        // no contact source is mapped — existing sidecars for unaffected
+        // games (or profiles) stay byte-identical. `juggle_hits` is nested
+        // omission: present only when the profile maps `y` (and its
+        // GROUND_Y calibration), absent (never fabricated) otherwise.
+        if self.contact_src.is_some() {
+            let mut strings = serde_json::json!({
+                "count": self.round_string_count,
+                "longest_hits": self.round_longest_hits,
+                "longest_damage": self.round_longest_damage,
+                "block_strings": self.round_block_strings,
+            });
+            if self.y_idx.is_some() && self.ground_y.is_some() {
+                strings["juggle_hits"] = serde_json::json!(self.round_juggle_hits);
+            }
+            line["strings"] = strings;
+        }
         let _ = out.write_all(line.to_string().as_bytes());
         let _ = out.write_all(b"\n");
         let _ = out.flush(); // rounds are rare; keep the index crash-current
+    }
+
+    /// Close one defender's in-progress string (if any) into the round
+    /// aggregates: bumps the count, marks it a block string when it landed
+    /// no damage-dealing events, and updates "longest" (by hit count, ties
+    /// broken by damage). A no-op when `side` has no open string.
+    fn finalize_string(&mut self, side: usize) {
+        let Some(acc) = self.strings[side].current.take() else { return };
+        self.round_string_count += 1;
+        if acc.hits == 0 {
+            self.round_block_strings += 1;
+        }
+        if acc.hits > self.round_longest_hits
+            || (acc.hits == self.round_longest_hits && acc.damage > self.round_longest_damage)
+        {
+            self.round_longest_hits = acc.hits;
+            self.round_longest_damage = acc.damage;
+        }
     }
 
     /// Append one frame. `p1_mask`/`p2_mask` are the authoritative 12-bit RETRO
@@ -467,9 +616,22 @@ impl FrameRecorder {
             self.round_p1_mass = 0;
             self.round_chars = self.char_idx.map(|i| (b1[i] as u8, b2[i] as u8));
             self.round_specials.clear();
+            // MACRO_ACTIONS §8: strings never bridge rounds — drop any
+            // stale previous-frame values and per-round aggregates.
+            self.prev_contact = [None, None];
+            self.prev_health = [None, None];
+            self.strings = [StringTracker::default(), StringTracker::default()];
+            self.round_string_count = 0;
+            self.round_longest_hits = 0;
+            self.round_longest_damage = 0;
+            self.round_block_strings = 0;
+            self.round_juggle_hits = 0;
         }
-        // A true->false edge ends one: index it (matchup, size, demo-ness).
+        // A true->false edge ends one: close any open strings, then index it
+        // (matchup, size, demo-ness).
         if !controllable && self.prev_controllable {
+            self.finalize_string(0);
+            self.finalize_string(1);
             self.emit_round_summary();
         }
         if controllable {
@@ -477,6 +639,74 @@ impl FrameRecorder {
             self.round_p1_mass += p1_mask as u64;
         }
         self.prev_controllable = controllable;
+
+        // MACRO_ACTIONS §8: string segmentation + hit/juggle classification.
+        // Only while controllable (round_frames/round_specials are gated the
+        // same way) — the contact source's value outside a fight is noise.
+        if controllable {
+            if let Some(src) = &self.contact_src {
+                let cur = match *src {
+                    ContactSrc::Field(i) => (b1[i], b2[i]),
+                    ContactSrc::Globals(i1, i2) => (gvals[i1], gvals[i2]),
+                };
+                let prev_health = self.prev_health; // snapshot before this frame's update
+                let cur_health = self.health_idx.map(|i| (b1[i], b2[i]));
+                let cur_y = self.y_idx.zip(self.ground_y).map(|(i, gy)| (b1[i] as f64, b2[i] as f64, gy));
+                let cur_vals = [cur.0, cur.1];
+                for side in 0..2 {
+                    let val = cur_vals[side];
+                    if let Some(prev) = self.prev_contact[side] {
+                        if val != prev {
+                            // Contact event fires this frame for `side`'s
+                            // defender. Link into the current string only if
+                            // the previous event (if any) was recent enough
+                            // (§8.1 — the game's own linking judgment).
+                            let linked = self.strings[side]
+                                .last_event_frame
+                                .is_some_and(|lf| self.frames.saturating_sub(lf) <= self.hitstun_window);
+                            if !linked {
+                                self.finalize_string(side);
+                            }
+                            self.strings[side].last_event_frame = Some(self.frames);
+
+                            let damage = cur_health
+                                .zip(prev_health[side])
+                                .map(|((h1, h2), ph)| {
+                                    let ch = if side == 0 { h1 } else { h2 };
+                                    ph.saturating_sub(ch)
+                                })
+                                .unwrap_or(0);
+                            // §8 caveat: NoDamage is honest, not "Blocked" —
+                            // see EventKind's doc comment.
+                            let kind = if damage > 0 { EventKind::Hit } else { EventKind::NoDamage };
+                            if kind == EventKind::Hit {
+                                let juggle = cur_y.is_some_and(|(y1, y2, gy)| {
+                                    let yv = if side == 0 { y1 } else { y2 };
+                                    gy - yv > 4.0 // same off-ground margin as shadow_runner's airborne test
+                                });
+                                if juggle {
+                                    self.round_juggle_hits += 1;
+                                }
+                                let acc = self.strings[side].current.get_or_insert_with(StringAcc::default);
+                                acc.hits += 1;
+                                acc.damage += damage;
+                            } else {
+                                // Still part of the string (a no-damage
+                                // contact doesn't break the link) — just
+                                // ensure a string is open so an all-block
+                                // string counts.
+                                self.strings[side].current.get_or_insert_with(StringAcc::default);
+                            }
+                        }
+                    }
+                    self.prev_contact[side] = Some(val);
+                }
+            }
+            if let Some(i) = self.health_idx {
+                self.prev_health[0] = Some(b1[i]);
+                self.prev_health[1] = Some(b2[i]);
+            }
+        }
 
         // x-liveness sentinel: 300 controllable frames of a byte-identical x
         // pair almost certainly means the object-pool slot moved between
@@ -588,6 +818,8 @@ impl FrameRecorder {
     /// partial summary — stopping mid-round shouldn't lose its index entry.
     pub fn finish(&mut self) {
         if self.prev_controllable {
+            self.finalize_string(0);
+            self.finalize_string(1);
             self.emit_round_summary();
             self.prev_controllable = false;
         }
@@ -1015,6 +1247,189 @@ mod tests {
         // The meta sidecar carries the style declaration too.
         let meta = std::fs::read_to_string(path.with_extension("meta.json")).unwrap();
         assert!(meta.contains("\"style\": \"rushdown\""));
+        cleanup(&path);
+    }
+
+    /// MACRO_ACTIONS §8 item 1/§8.1: a 3-hit string, a gap longer than
+    /// `HITSTUN_RECENT_FRAMES` (20 on asurabld), then one more hit — must
+    /// split into TWO strings, with "longest" reporting the first (3 hits).
+    #[test]
+    fn v3_string_segmentation_splits_on_a_long_gap() {
+        let p = crate::profile::init_for_tests();
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-strings-gap".into(),
+            addr: 0x400000,
+            len: 0x7000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        let b2_health = p.block2() + hoff;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 200));
+        assert!(ds.write_addr(b2_health as usize, 1, 200));
+        assert!(ds.write_addr(p.global("round_timer").unwrap() as usize, 1, 0x90));
+        let combo_b2 = p.global("combo_on_b2").unwrap() as usize;
+        assert!(crate::gate::eval_gate(&ds, p));
+
+        let path = tmp("shadow_rec_string_gap");
+        {
+            let mut rec = FrameRecorder::create(&path, p, "test", "test", None).unwrap();
+            rec.record(&ds, 0, 0); // frame 0: establishes the baseline, no event yet
+            // Three hits, one frame apart — well within the 20-frame window.
+            for n in 1u32..=3 {
+                assert!(ds.write_addr(combo_b2, 1, n));
+                assert!(ds.write_addr(b2_health as usize, 1, 200 - 10 * n));
+                rec.record(&ds, 0, 0);
+            }
+            // 26 quiet frames (self.frames goes 4..=29) — gap to the next
+            // event (at frame 30) is 30-3 = 27 > 20, so it must NOT link.
+            for _ in 0..26 {
+                rec.record(&ds, 0, 0);
+            }
+            assert!(ds.write_addr(combo_b2, 1, 4));
+            assert!(ds.write_addr(b2_health as usize, 1, 165)); // -5 more damage
+            rec.record(&ds, 0, 0);
+            // Close the gate: falling edge finalizes the still-open 2nd string.
+            assert!(ds.write_addr(p.global("round_timer").unwrap() as usize, 1, 0xFF));
+            assert!(!crate::gate::eval_gate(&ds, p));
+            rec.record(&ds, 0, 0);
+            rec.finish();
+        }
+        let rounds = std::fs::read_to_string(path.with_extension("rounds.jsonl")).unwrap();
+        let r: serde_json::Value = serde_json::from_str(rounds.lines().next().unwrap()).unwrap();
+        assert_eq!(r["strings"]["count"], 2, "the gap must split one string into two: {r}");
+        assert_eq!(r["strings"]["longest_hits"], 3);
+        assert_eq!(r["strings"]["longest_damage"], 30);
+        assert_eq!(r["strings"]["block_strings"], 0, "both strings dealt damage");
+        cleanup(&path);
+    }
+
+    /// MACRO_ACTIONS §8 item 2: a contact event with NO health change on the
+    /// defender classifies as `no_damage`, never asserted as "blocked" — it
+    /// still opens/holds a string, and a string with zero hits counts as a
+    /// block string. Exercises the mk2-shaped profile (hitstun_sources over
+    /// the HUD health-accumulator globals, distinct from the `health`
+    /// fighter field used for the damage delta).
+    #[test]
+    fn v3_zero_damage_contact_classifies_as_no_damage() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-mk2-nodamage".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90)); // unchanged all test
+        let p2_hud = p.global("p2_health_hud").unwrap() as usize;
+        assert!(crate::gate::eval_gate(&ds, &p));
+
+        let path = tmp("shadow_rec_no_damage");
+        {
+            let mut rec = FrameRecorder::create(&path, &p, "mk2", "fbneo", None).unwrap();
+            rec.record(&ds, 0, 0); // baseline
+            // The contact signal fires (HUD counter changes) but the
+            // fighter's own `health` field never moves — no_damage.
+            assert!(ds.write_addr(p2_hud, 1, 1));
+            rec.record(&ds, 0, 0);
+            // Close the round.
+            assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 0)); // out of range -> gate closes
+            rec.record(&ds, 0, 0);
+            rec.finish();
+        }
+        let rounds = std::fs::read_to_string(path.with_extension("rounds.jsonl")).unwrap();
+        let r: serde_json::Value = serde_json::from_str(rounds.lines().next().unwrap()).unwrap();
+        assert_eq!(r["strings"]["count"], 1);
+        assert_eq!(r["strings"]["longest_hits"], 0, "no damage-dealing events: {r}");
+        assert_eq!(r["strings"]["block_strings"], 1, "an all-no_damage string is a block string");
+        assert!(r["strings"]["juggle_hits"].is_null(), "mk2 arcade maps no y — flag stays absent");
+        cleanup(&path);
+    }
+
+    /// MACRO_ACTIONS §8 item 3: the juggle flag fires ONLY where the profile
+    /// maps `y` AND the defender is off the ground (margin over GROUND_Y) at
+    /// a damage-dealing event. Asurabld-shaped profile (y IS mapped).
+    #[test]
+    fn v3_juggle_flag_fires_only_for_airborne_hits_when_y_is_mapped() {
+        let p = crate::profile::init_for_tests();
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-juggle".into(),
+            addr: 0x400000,
+            len: 0x7000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        let yoff = p.field_off("y").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 200));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 200));
+        assert!(ds.write_addr(p.global("round_timer").unwrap() as usize, 1, 0x90));
+        // GROUND_Y is 216 (asurabld.md calibration): well below it is airborne.
+        assert!(ds.write_addr((p.block2() + yoff + 1) as usize, 1, 100));
+        let combo_b2 = p.global("combo_on_b2").unwrap() as usize;
+        assert!(crate::gate::eval_gate(&ds, p));
+
+        let path = tmp("shadow_rec_juggle");
+        {
+            let mut rec = FrameRecorder::create(&path, p, "test", "test", None).unwrap();
+            rec.record(&ds, 0, 0); // baseline
+            // Hit #1: airborne (y=100, well off GROUND_Y=216) -> juggle.
+            assert!(ds.write_addr(combo_b2, 1, 1));
+            assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 190));
+            rec.record(&ds, 0, 0);
+            // Hit #2: grounded (y == GROUND_Y) -> NOT a juggle.
+            assert!(ds.write_addr((p.block2() + yoff + 1) as usize, 1, 216));
+            assert!(ds.write_addr(combo_b2, 1, 2));
+            assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 180));
+            rec.record(&ds, 0, 0);
+            assert!(ds.write_addr(p.global("round_timer").unwrap() as usize, 1, 0xFF));
+            rec.record(&ds, 0, 0);
+            rec.finish();
+        }
+        let rounds = std::fs::read_to_string(path.with_extension("rounds.jsonl")).unwrap();
+        let r: serde_json::Value = serde_json::from_str(rounds.lines().next().unwrap()).unwrap();
+        assert_eq!(r["strings"]["longest_hits"], 2);
+        assert_eq!(r["strings"]["juggle_hits"], 1, "only the airborne hit counts: {r}");
+        cleanup(&path);
+    }
+
+    /// MACRO_ACTIONS §8: a profile with neither `contact_signal` nor
+    /// `hitstun_sources` mapped (sf2ce, the partial game-#2 seed) must omit
+    /// the `strings` key ENTIRELY — existing sidecars for unaffected games
+    /// stay byte-identical, never a zeroed-out block.
+    #[test]
+    fn v3_strings_key_absent_when_no_contact_source_is_mapped() {
+        let p = GameProfile::load(Path::new("library/sf2ce")).expect("sf2ce profile loads");
+        assert!(p.port.hitstun_sources.is_none() && p.port.contact_signal.is_none());
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-sf2ce".into(),
+            addr: 0xFF0000,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        assert!(crate::gate::eval_gate(&ds, &p));
+
+        let path = tmp("shadow_rec_sf2ce_nostrings");
+        {
+            let mut rec = FrameRecorder::create(&path, &p, "sf2ce", "fbalpha2012", None).unwrap();
+            rec.record(&ds, 0, 0);
+            assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 0)); // out of range -> gate closes
+            rec.record(&ds, 0, 0);
+            rec.finish();
+        }
+        let rounds = std::fs::read_to_string(path.with_extension("rounds.jsonl")).unwrap();
+        let r: serde_json::Value = serde_json::from_str(rounds.lines().next().unwrap()).unwrap();
+        assert!(r.get("strings").is_none(), "no contact source mapped -> no strings key: {r}");
         cleanup(&path);
     }
 }
