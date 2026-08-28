@@ -237,6 +237,30 @@ impl TrainingPanel {
                     });
             });
             if state.training.dummy == DummyMode::BlockPunish {
+                // Live phase — a silent dummy explains itself (ARMED vs
+                // cooling vs mid-punish) instead of looking broken. The
+                // string is computed once in training::tick; Lua reads the
+                // same one via training.punish_state().
+                let phase = state.training.punish_phase.clone();
+                if !phase.is_empty() {
+                    let color = if phase.starts_with("punishing") {
+                        egui::Color32::from_rgb(0xFF, 0xC1, 0x07)
+                    } else if phase.contains("ARMED") {
+                        egui::Color32::from_rgb(0x4C, 0xAF, 0x50)
+                    } else {
+                        egui::Color32::GRAY
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("state:").small().color(egui::Color32::DARK_GRAY));
+                        ui.label(egui::RichText::new(phase).small().strong().color(color));
+                    })
+                    .response
+                    .on_hover_text(
+                        "ARMED = the next blocked contact punishes. cooling = waiting for \
+                         the contact signal to go quiet. A whiffed attack never registers \
+                         as contact, so the dummy correctly stays armed.",
+                    );
+                }
                 self.punish_section(ui, state, feats.block_punish);
             }
             ui.add_enabled(feats.refill, egui::Checkbox::new(&mut state.training.refill, "Health refill (F3)"));

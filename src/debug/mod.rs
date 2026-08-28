@@ -537,6 +537,12 @@ pub struct TrainingConfig {
     /// Frames of guarding left before the scheduled punish macro starts
     /// (`training::PUNISH_DELAY` — hit-freeze + blockstun ride-out).
     pub punish_wait: u64,
+    /// Human-readable BlockPunish phase, refreshed every frame the mode
+    /// runs: "guarding — armed" / "cooling (Nf)" / "punishing: slide" /
+    /// "unavailable …". The ONE place this is computed (panel, Lua
+    /// `training.punish_state()`, and any overlay all read it) so a silent
+    /// dummy explains itself instead of looking broken.
+    pub punish_phase: String,
 }
 
 pub struct DebugState {

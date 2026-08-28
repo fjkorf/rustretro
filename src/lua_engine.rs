@@ -45,6 +45,9 @@
 //! training.enabled()                -> bool     (native training mode on?)
 //! training.refill()                 -> bool     (native health refill on?)
 //! training.dummy()                  -> string   ("free"/"stand"/"crouch"/"jump"/"block"/"block_punish")
+//! training.punish_state()          -> string   (BlockPunish phase, same string the
+//!                                                panel shows: "guarding — ARMED" /
+//!                                                "cooling — Nf" / "punishing: slide")
 //! training.set_enabled(bool)                    (write-gated; on = refill on, F5 parity)
 //! training.set_dummy(mode)                      (write-gated; headless F1 — same mode strings)
 //! training.set_punish(pool)                     (write-gated; BlockPunish pool:
@@ -819,6 +822,19 @@ impl LuaEngine {
                 .to_string())
             })?;
             training.set("dummy", f)?;
+        }
+        {
+            // The BlockPunish phase string, computed once in training::tick
+            // (the panel shows the same value) — for on-screen overlays:
+            //   event.onframeend(function()
+            //     gui.text(4, 4, "dummy: " .. training.punish_state())
+            //   end)
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<String> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(ds.training.punish_phase.clone())
+            })?;
+            training.set("punish_state", f)?;
         }
         // Setters — the headless twin of F5/F1/the panel's pool steppers
         // (agents drive training over run_lua; hotkeys need a window). All

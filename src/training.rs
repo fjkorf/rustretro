@@ -465,6 +465,13 @@ const PUNISH_RELEASE: u64 = 4;
 /// Frames an in-flight punish (delay + macro) may keep running while the
 /// gate is closed (MK2 zeroes its in-fight word from the contact frame
 /// onward) before it is dropped as a real round end.
+/// Quiet frames required to re-arm the trigger after a punish. The contact
+/// signal (a health delta) moves for a SINGLE frame per hit, so this only has
+/// to outlast the write itself; the old value reused HITSTUN_RECENT_FRAMES
+/// (20 — the hitstun FEATURE window, a different concept) and made
+/// back-to-back pressure feel unresponsive.
+const PUNISH_REARM_FRAMES: u64 = 8;
+
 const PUNISH_GATE_GRACE: u64 = 60;
 
 /// One BlockPunish frame: guard by default; when the contact signal changes
@@ -489,7 +496,7 @@ fn block_punish(ds: &mut DebugState, frame: u64, p: &GameProfile, r: &Resolved) 
         ds.training.punish_last_change = frame;
     }
     if !ds.training.punish_armed
-        && frame.saturating_sub(ds.training.punish_last_change) >= r.hitstun_window
+        && frame.saturating_sub(ds.training.punish_last_change) >= PUNISH_REARM_FRAMES
     {
         ds.training.punish_armed = true;
     }
@@ -520,6 +527,17 @@ fn block_punish(ds: &mut DebugState, frame: u64, p: &GameProfile, r: &Resolved) 
                 ds.training.punish_exec = None;
             }
         }
+    }
+
+    if ds.training.punish_exec.is_none() {
+        ds.training.punish_phase = if frame < ds.training.punish_hold_until {
+            "guarding — holding block".to_string()
+        } else if ds.training.punish_armed {
+            "guarding — ARMED".to_string()
+        } else {
+            let quiet = frame.saturating_sub(ds.training.punish_last_change);
+            format!("cooling — {}f", PUNISH_REARM_FRAMES.saturating_sub(quiet))
+        };
     }
 
     if ds.training.punish_exec.is_none()
@@ -555,6 +573,7 @@ fn block_punish(ds: &mut DebugState, frame: u64, p: &GameProfile, r: &Resolved) 
                 match steps.and_then(|s| crate::macros::compile(&name, &s, p).ok()) {
                     Some(m) => {
                         start(m, ds);
+                        ds.training.punish_phase = format!("punishing: {name}");
                         ds.log(format!("🎯 punish: {name}"));
                         eprintln!("[training] punish: {name}"); // headless-visible twin
                     }
@@ -570,6 +589,7 @@ fn block_punish(ds: &mut DebugState, frame: u64, p: &GameProfile, r: &Resolved) 
                 };
                 if let Ok(m) = crate::macros::compile(&class, &[spec], p) {
                     start(m, ds);
+                    ds.training.punish_phase = format!("punishing: {class}");
                     ds.log(format!("🎯 punish: {class}"));
                     eprintln!("[training] punish: {class}"); // headless-visible twin
                 }
