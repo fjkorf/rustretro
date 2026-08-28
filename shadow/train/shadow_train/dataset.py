@@ -634,9 +634,18 @@ def _segment(round_decisions: list[Decision]) -> list[Decision]:
     return round_decisions
 
 
-def _decisions_from_file(path: Path) -> tuple[list[Decision], list[str], str]:
+def _decisions_from_file(
+    path: Path, restrict: frozenset | None = None
+) -> tuple[list[Decision], list[str], str]:
     """One file's (decisions, its resolved feature-name list, its port) --
-    the per-file unit both load_decisions() and build() are built from."""
+    the per-file unit both load_decisions() and build() are built from.
+
+    `restrict` (§4.3 cross-port fits): keep only these feature names --
+    canonical order preserved -- and ABORT if any requested feature is
+    unavailable in this recording. Restricting every input to the ports'
+    shared feature subset is what makes a mixed-port (or cross-port-
+    deployable) fit pass the feature-parity check honestly instead of
+    zero-filling the missing signals."""
     version = _detect_version(path)
     prof = _profile.get()
     view = _view_for(path, version, prof)
@@ -650,13 +659,21 @@ def _decisions_from_file(path: Path) -> tuple[list[Decision], list[str], str]:
             f"(or set RUSTRETRO_GAME_DIR) and re-run"
         )
     feats = scalar_features_for(view)
+    if restrict is not None:
+        missing = sorted(restrict - set(feats))
+        if missing:
+            raise SystemExit(
+                f"{path.name}: --features asks for {missing} but this "
+                f"recording can only supply {feats}"
+            )
+        feats = [f for f in feats if f in restrict]
     decisions: list[Decision] = []
     for round_key, rows in _rounds(path):
         decisions.extend(_segment(_decisions_for_round(round_key, rows, view, feats)))
     return decisions, feats, view.port
 
 
-def _load_decisions_with_meta(paths: list[Path]):
+def _load_decisions_with_meta(paths: list[Path], restrict: frozenset | None = None):
     # `session-*.jsonl` globs inevitably also match the `.rounds.jsonl`
     # summary sidecars the recorder writes next to every recording — those
     # are per-round index lines, not frame traces. Skip them, loudly.
@@ -672,7 +689,7 @@ def _load_decisions_with_meta(paths: list[Path]):
     feature_sets: dict = {}
     ports: list[str] = []
     for p in paths:
-        decs, feats, port = _decisions_from_file(p)
+        decs, feats, port = _decisions_from_file(p, restrict)
         feature_sets[p] = feats
         ports.append(port)
         decisions.extend(decs)
@@ -718,7 +735,7 @@ def load_decisions(paths: list[Path], char_filter: int | None = None,
 
 
 def build(paths: list[Path], char_filter: int | None = None,
-          opp_filter: int | None = None):
+          opp_filter: int | None = None, restrict: frozenset | None = None):
     """Load recordings -> stacked dataset arrays.
 
     Returns dict with X (N, K*len(feature_names)), y_move, y_attack, buckets,
@@ -726,7 +743,7 @@ def build(paths: list[Path], char_filter: int | None = None,
     `feature_names` (§4.2 -- SCALAR_FEATURES filtered per-recording), and the
     unique `ports` seen (§4.3 -- "mixed" meta when more than one).
     """
-    decisions, feature_sets, ports = _load_decisions_with_meta(paths)
+    decisions, feature_sets, ports = _load_decisions_with_meta(paths, restrict)
     _check_feature_parity(feature_sets)
     feature_names = next(iter(feature_sets.values()))
     if char_filter is not None:

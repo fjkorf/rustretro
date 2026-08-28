@@ -146,7 +146,9 @@ def _label_counts(y, classes: list[str]) -> dict:
 def cmd_fit(args) -> None:
     opp = getattr(args, "opp", None)  # absent in hand-built Namespaces (tests)
     _resolve_profile_for(args.recordings, getattr(args, "game", None))
-    data = build(args.recordings, char_filter=args.char, opp_filter=opp)
+    features = getattr(args, "features", None)
+    restrict = frozenset(f.strip() for f in features.split(",")) if features else None
+    data = build(args.recordings, char_filter=args.char, opp_filter=opp, restrict=restrict)
     n_raw = len(data["X"])
     neutral_cap = getattr(args, "neutral_cap", dataset.NEUTRAL_CAP_RATIO)
     data = dataset.subsample_neutral(data, cap_ratio=neutral_cap)
@@ -355,6 +357,11 @@ def main():
     p_fit.add_argument("--neutral-cap", type=float, default=dataset.NEUTRAL_CAP_RATIO,
                         help="cap idle (Neutral,None) decisions at this ratio x "
                              "active decisions; 0 disables (default %(default)s)")
+    p_fit.add_argument("--features", type=str, default=None,
+                       help="comma-separated feature names to restrict the fit to "
+                            "(canonical order kept; aborts if a recording can't "
+                            "supply one) — use the ports' shared subset for a "
+                            "cross-port-deployable model")
     p_fit.add_argument("--game", type=str, default=None,
                         help="force this game/port profile (overrides the "
                              "recordings' own v3 sidecars and RUSTRETRO_GAME_DIR; "
