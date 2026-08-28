@@ -92,7 +92,7 @@ fn recorded_globals(p: &GameProfile) -> Vec<Slot> {
     };
     for cond in &p.port.gate {
         if let Some(name) = cond.global_name() {
-            let size = if matches!(cond, GateCond::WordZero { .. } | GateCond::WordMaskedZero { .. }) { 2 } else { 1 };
+            let size = if matches!(cond, GateCond::WordZero { .. } | GateCond::WordMaskedNotAll { .. }) { 2 } else { 1 };
             push(name, size, &mut out);
         }
     }
@@ -141,8 +141,8 @@ fn gate_cond_json(cond: &GateCond) -> serde_json::Value {
         GateCond::WordZero { global } => {
             serde_json::json!({"kind": "word_zero", "global": global})
         }
-        GateCond::WordMaskedZero { global, mask } => {
-            serde_json::json!({"kind": "word_masked_zero", "global": global,
+        GateCond::WordMaskedNotAll { global, mask } => {
+            serde_json::json!({"kind": "word_masked_not_all", "global": global,
                                "mask": format!("0x{:X}", mask.0)})
         }
         GateCond::HealthInRange { min, max } => {

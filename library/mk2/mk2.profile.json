@@ -86,9 +86,9 @@
  },
  "gate": [
   {
-   "kind": "word_masked_zero",
+   "kind": "word_masked_not_all",
    "global": "screen_state",
-   "mask": "0x2"
+   "mask": "0x6"
   },
   {
    "kind": "byte_zero",

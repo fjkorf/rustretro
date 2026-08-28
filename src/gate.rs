@@ -1,7 +1,7 @@
 //! The in-fight controllable gate — ONE shared predicate evaluated by the
 //! training enforcer, the Lua `game.controllable()` binding, and (in spirit)
 //! the recorder's composite. See docs/game-profiles.md for the condition
-//! vocabulary and semantics: byte_zero / word_zero / word_masked_zero / health_in_range /
+//! vocabulary and semantics: byte_zero / word_zero / word_masked_not_all / health_in_range /
 //! bcd_valid_nonzero. Reads go through the same `DebugState::read_addr` path
 //! as every other binding; out-of-map reads collapse to 0, matching the
 //! recorder's `unwrap_or(0)` semantics. 16-bit reads honor the profile's
@@ -36,8 +36,9 @@ pub(crate) fn eval_gate(ds: &DebugState, p: &GameProfile) -> bool {
     p.port.gate.iter().all(|cond| match cond {
         GateCond::ByteZero { global } => rd8(ds, ga(global)) == 0,
         GateCond::WordZero { global } => rd16(ds, ga(global), little) == 0,
-        GateCond::WordMaskedZero { global, mask } => {
-            rd16(ds, ga(global), little) & (mask.0 as u16) == 0
+        GateCond::WordMaskedNotAll { global, mask } => {
+            let m = mask.0 as u16;
+            rd16(ds, ga(global), little) & m != m
         }
         GateCond::HealthInRange { min, max } => {
             let Some((off, _size)) = p.field_off("health") else {
@@ -84,9 +85,10 @@ mod tests {
 
         for (value, in_fight) in [
             (0u32, true),    // 1P fight / post-KO
-            (260, true),     // 2-human fight (user's session)
-            (276, true),     // 2-human fight (smoke rig)
-            (259, false),    // attract
+            (257, true),     // 2-human fight
+            (259, true),     // 2-human fight — LIVE (broke the bit-1 rule)
+            (260, true),     // 2-human fight
+            (276, true),     // 2-human fight
             (262, false),    // char select / ladder / bios
             (263, false),    // attract
         ] {

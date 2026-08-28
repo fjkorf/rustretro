@@ -275,14 +275,15 @@ pub enum GateCond {
     ByteZero { global: String },
     /// u16 (guest order) at global == 0.
     WordZero { global: String },
-    /// `u16 (guest order) at global & mask == 0`. For phase words that are
-    /// BITFIELDS rather than enums: MK2 arcade's screen_state carries
-    /// match-type bits (2-human play sets 0x100 plus varying low bits —
-    /// observed 260 and 276 in-fight), so only the "not in a fight" bit
-    /// (0x02: set on attract 259/263 and char select 262, clear in every
-    /// observed fight) may be tested. Enumerating values here was a
-    /// whack-a-mole that the third observed value broke — see mk2.md.
-    WordMaskedZero { global: String, mask: HexAddr },
+    /// `u16 (guest order) at global & mask != mask` — "these bits are not
+    /// ALL set". For phase words that are BITFIELDS rather than enums: MK2
+    /// arcade's screen_state carries match-type bits (2-human play sets
+    /// 0x100 plus varying low bits; 0/257/259/260/276 all observed IN a
+    /// fight) and only the COMBINATION 0x06 marks a menu (char select 262,
+    /// attract 263). Enumerating in-fight values, then testing a single
+    /// bit, were both whack-a-mole that later observations broke — see
+    /// mk2.md's three gate revisions.
+    WordMaskedNotAll { global: String, mask: HexAddr },
     /// BOTH fighters' `health` field in min..=max.
     HealthInRange { min: u8, max: u8 },
     /// u8 at global is nonzero and both BCD nibbles are decimal.
@@ -862,7 +863,7 @@ impl GateCond {
             GateCond::ByteZero { global }
             | GateCond::WordZero { global }
             | GateCond::BcdValidNonzero { global }
-            | GateCond::WordMaskedZero { global, .. } => Some(global),
+            | GateCond::WordMaskedNotAll { global, .. } => Some(global),
             GateCond::HealthInRange { .. } => None,
         }
     }

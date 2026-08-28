@@ -575,7 +575,7 @@ been observed in 2-human-fight-after-contact; if it ever appears on a menu
 this gate leaks there — no such observation across all phase sweeps to
 date (menus read 0x9C01-family values).
 
-## Gate revision 2: screen_state is a BITFIELD — word_masked_zero (2026-08-28)
+## Gate revision 2 (SUPERSEDED by revision 3 below): single-bit mask (2026-08-28)
 
 The `word_in [0, 276]` allowlist above was whack-a-mole and broke on the
 THIRD observed value. User QA (Reptile vs Reptile, 2-human) read
@@ -683,3 +683,45 @@ during which the dummy is not guarding).** Not a signal bug.
 useful data (action transitions, incl. the attacker's swings and whiffs)
 and costs nothing. The `contact_signal` schema keeps its per-fighter
 `field` variant for games that do have a true contact counter.
+
+## Gate revision 3: bits 1 AND 2 TOGETHER mark a menu — word_masked_not_all (2026-08-28)
+
+Revision 2's single-bit rule (0x02 set = not in a fight) fit six values and
+was broken by the seventh: the user's live 2-human fight read **259**
+(0x103) — which HAS bit 1 set, and which the original RE had recorded as an
+attract value. The gate closed mid-fight; the dummy stopped guarding and
+both fighters stood still (the user-visible "punish: slide never came out"
+freeze, made worse by a stale phase label — see below).
+
+Every screen_state value observed to date:
+
+| value | hex | &0x6 | phase |
+|---|---|---|---|
+| 0 | 0x000 | 0 | 1P fight, post-KO (also seen on attract) |
+| 257 | 0x101 | 0 | 2-human fight |
+| 259 | 0x103 | 2 | **2-human fight (live)** — also recorded on attract |
+| 260 | 0x104 | 4 | 2-human fight |
+| 262 | 0x106 | **6** | char select / ladder / bios |
+| 263 | 0x107 | **6** | attract |
+| 276 | 0x114 | 4 | 2-human fight |
+
+**Rule: bits 1 and 2 BOTH set (mask 0x06) = not in a fight.** New gate
+condition `word_masked_not_all {global, mask}` — `v & mask != mask`;
+replaces `word_masked_zero` (which no game used once this landed, and the
+vocabulary stays small with every member live-verified). Verified 7/7 live
+plus a regression test.
+
+**Honest limits, third time asking:** 0 and 259 have BOTH been observed
+in fights and on attract screens, so screen_state cannot fully separate
+them alone — the gate's `health_in_range` + `round_over` conditions carry
+the rest, and an attract-demo leak is possible (harmless: demo rounds are
+dropped at fit time by their zero p1_input). Char select, the leak that
+made this global worth gating on at all, still closes correctly (262).
+If an eighth value appears, prefer finding a DIFFERENT discriminator over
+a fourth revision of this mask.
+
+**Also fixed here:** while the gate is closed, BlockPunish's phase string
+now reads "gate closed — not in a fight" instead of freezing on the stale
+"punishing: <move>" label. The old behaviour actively misled diagnosis —
+the mode was not running at all. (The in-flight punish grace was working
+correctly the whole time; only the label lied.)

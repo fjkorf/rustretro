@@ -336,6 +336,12 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
         // stalling here would strand every punish two frames in. A closure
         // longer than the grace is a real round end and drops the macro.
         // Nothing else runs while closed: enforcement stays off menus.
+        if ds.training.dummy == DummyMode::BlockPunish {
+            // The phase must stay TRUTHFUL while gated: the mode isn't
+            // running, so saying "punishing" (the stale trigger label)
+            // hides the real reason the dummy is standing still.
+            ds.training.punish_phase = "gate closed — not in a fight".to_string();
+        }
         if ds.training.punish_exec.is_some() {
             ds.training.punish_gate_grace += 1;
             let mut bits = None;
