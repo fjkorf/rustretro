@@ -458,3 +458,105 @@ honestly:
    combo counter (`0xD3FE`) covers "was just struck" adequately for a
    punish trainer; a true frame-data lab (startup/recovery measurement)
    still has no state-id field to key off.
+
+## Arena recapture: `reptile-vs-reptile.state` (2026-08-28, A-RE)
+
+The committed `shadow/arenas/mk2/reptile-vs-reptile.state` was an attract
+demo (input-dead) prior to this session; recaptured as a real, INPUT-LIVE
+1P-vs-CPU fight. Headless FBNeo, port 4032, `--game library/mk2 --pace 1`.
+
+**Coin/char-select flow used** (fresh boot each time this session, since a
+cold boot shows a one-time "CMOS INVALID — FACTORY SETTINGS RESTORED"
+screen that eats the first button press): any button past the CMOS screen
+→ `select` (coin) to skip the attract story → `select` again (2nd coin,
+"2 CREDITS TO START") → `start`. Landed on the "CHOOSE YOUR FIGHTER" grid
+with the cursor on Liu Kang (slot 0), confirming the existing "P1 default =
+Liu Kang" doc fact. **3× `right` reaches Reptile** (row 1, col 4) — verified
+both visually (portrait highlight + the animated preview model turning into
+a green ninja) and by memory read (`0xC050` = `9` at the cursor, matching
+the roster table). A `start` press locks P1's pick; this needed 1-6 retries
+across different session attempts (the press did not always land the very
+first time — no distinguishing symptom found, just poll `0xC1CA` (P2
+char id) until it leaves `255` to confirm the lock actually took before
+moving on, rather than trusting a single `start` press blindly).
+
+**Full-health capture, and a real trap worth recording**: health fills from
+0 in the "ROUND 1"/"FIGHT!!" banner window (already documented above), but
+polling for "P1 health `0xC05E` >= 161" as the sole "fight is ready" signal
+is **not sufficient** — a fast tight poll can catch a **transient overshoot**
+to 161 seconds before the real, stable full-health frame (observed
+repeatedly: detection at 161, then a settle read moments later showing
+40-70, i.e. the fill was still climbing through its documented `0→38→...`
+curve and the detector caught a one-frame glitch on the way up, not the
+final value). Fix: after first seeing `hp1>=161 and hp2>=161`, sleep a
+fixed ~2.2 s (comfortably past the documented ~1.5 s fill) and re-read
+before trusting it; only save once health is STILL 161/161 and
+`round_over==0` after that settle.
+
+**Input-liveness verification** (the mission-critical check — the prior
+committed state had none): `0x6CBA` (P1 world X) can appear **frozen**
+across a short read window even with input genuinely live and landing — not
+because the address is wrong (it is the same write-verified store from the
+Positions section above), but because MK2's CPU AI is aggressive enough
+that a short verification window has a real chance of landing entirely
+inside **hitstun or a knockdown** (screenshot-confirmed: Reptile flat on the
+ground, immovable by design, exactly when a 1-2 sample x-read looked
+"stuck"). The reliable test, done both immediately before saving and again
+against the saved file after a reload: refill both fighters' health every
+iteration (removes the KO/long-hitstun confound) and hold alternating
+`left`/`right` bursts for ~2-3 seconds while sampling `0x6CBA` — a genuinely
+live P1 traces a real path (`390→452→426→401→391→196...` observed one run),
+where a truly dead/wrong-slot address would stay bit-for-bit constant
+across the whole window regardless of hitstun timing. Do not conclude
+"input is dead" from 1-2 samples with this game; sample across several
+seconds with health forced up.
+
+**Final captured state**: Reptile (P1, char id 9) vs Scorpion (P2, char id
+10, CPU-picked), both healths **161/161** (`0xC05E`/`0xC1D8`, plus the
+secondary pair `0xBCA0`/`0xBC88` also topped off), `round_over` (`0xC360`)
+`== 0`, screenshot-confirmed both health bars full green, ROUND 1 in
+progress. Input-liveness re-confirmed on a fresh reload of the saved file
+using the multi-sample method above. Saved via `save_state` over
+`shadow/arenas/mk2/reptile-vs-reptile.state` (2,447,284 bytes, matching the
+existing file's format/size).
+
+## Macro-action encodings — live verification (2026-08-28, A-Rust, port 4033)
+
+Rig: headless 2-HUMAN match (P1 Liu Kang port 0, P2 Reptile port 1 — joined
+by `start` on port 1 during a live 1P fight, then both re-select; P2's
+default cursor is Reptile), state-banked and reloaded per trial. The
+BlockPunish dummy (port 1) provided the executor path: P1 jabs the guarding
+dummy → chip → `p2_health_hud` change → punish macro plays.
+
+| move | encoding (arcade) | verdict | evidence |
+|---|---|---|---|
+| slide | `back + LK+LP+Block`, 8f | **VERIFIED** (chord corrected) | The contract's back+LK+LP produced a NORMAL (pose screenshot); adding Block: slide pose + h1 161→148 (−13), 3/3 trials from round-start range. **Point-blank caveat**: the LP-bearing chord resolves to a close normal/throw (the §1 proximity phenomenon) — a point-blank punish slide whiffs by game rule. |
+| acid_spit | `F` · `F+HP`, 3f steps | **VERIFIED** | Via the punish executor at point blank: h1 161→137 (−24), repeated across two runs; full mask trace in the session recording (`0x40`×3, 2f gap, `0x42`×4) with `p2_special:"acid_spit"` annotated. |
+| force_ball | `B` · `B+HP+LP`, 3f steps | **VERIFIED** | Same path: h1 161→145 (−16), repeated; trace `0x80`×3, gap, `0x83`×4, annotated. |
+
+Punish-timing findings (now constants in `src/training.rs`):
+- **Inputs played into hit-freeze are eaten.** The macro must start
+  ~26 frames after the contact (hit-freeze ≈10 + jab blockstun ≈14): a
+  chord at +16 was swallowed while a motion whose chord lands at +21 came
+  out.
+- **Held Block bleeds into the chord.** The dummy's guard must be fully
+  released ~4 frames before the first step or the game stays in block
+  stance and ignores attack buttons (slide fires from a clean simultaneous
+  press ≥4f after a Block release — release recovery itself is not the
+  issue).
+
+Contact-signal correction: `hit_counter 0xD3FE` **did not move** for hits
+ON P2 — blocked (chip −6) or clean — in this 2-human rig; every prior
+observation had P1 as the victim. It is a P1-victim counter at best (it
+also stayed 0 when Reptile's slide/projectiles struck P1 here — possibly
+1P-mode-only). The per-victim contact signal is the HUD damage pair
+`0xBCA0`/`0xBC88` (`hitstun_sources` in the profile); caveat: the training
+refill rewrites those bytes, so one spurious punish per refill is possible.
+
+**New gate leak (needs an A-RE pass):** in a 2-human (challenger) match,
+`screen_state 0xC37E` flips to **276** at the first contact and stays there
+for the rest of the round while the fight visibly continues and accepts
+input — `word_zero(screen_state)` reads not-controllable from that moment.
+All 46 prior gate snapshots were 1P/attract phases; 276 never appeared
+there. Effects: the recorder under-counts controllable frames in 2P
+rounds, and round summaries for such rounds close early.
