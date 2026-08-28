@@ -146,3 +146,26 @@ label space ships in models).
   attract demo — coin/start flow is documented in mk2.md).
 - File conflicts resolved by the split above; the contract's §2 JSON is
   pasted verbatim by whichever agent owns each file.
+
+## 8. W2 scope (added after the juggle/wakeup design review)
+
+State-free tracking, per the review's findings (no state word needed):
+
+1. **String segmentation stats** in the rounds sidecar: contact events come
+   from the port's contact signal (arcade `hit_counter` — its own ~20-frame
+   reset window IS the game's linking judgment: consecutive increments
+   without reset = one string; genesis analog pending A-RE). Each event
+   classified hit-vs-block by defender health delta (MK2: blocked normals
+   do 0, blocked specials chip). Per round: string count, longest string
+   (hits + damage), block-string count. Feeds report/coverage as drill
+   inputs ("juggle conversion after launcher: 2/9").
+2. **Juggle context flag**: genesis = defender y off ground at contact;
+   arcade = the `+0xC` latch (0xFFFC ~366ms, fires on launcher hits) —
+   VERIFY the latch holds through the juggle and clears on landing before
+   trusting it (RE nibble, assigned to A-RE's arcade visit).
+3. **Live string/juggle ticker overlay** (optional polish): hits-in-string,
+   string damage, JUGGLE flag — gui.text or native.
+4. **Explicitly deferred to the frame lab**: all wakeup timing. Pattern of
+   record: event detection + measured per-move duration tables (probe-poke
+   protocol) replaces live state detection; the tables are the frame-data
+   DB's first contents.
