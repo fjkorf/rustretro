@@ -63,8 +63,11 @@ plays them back; both read the same profile data.
 
 ### Reference data this phase ships (Reptile, both MK2 ports)
 
-- `slide`: **user-verified** — arcade `[{dirs:["back"], press:["LK","LP"]}]`,
-  genesis `[{dirs:["back"], press:["LK","HK"]}]`.
+- `slide`: LIVE-VERIFIED (correcting the user-reported chord for arcade):
+  arcade `[{dirs:["back"], press:["LK","LP","Block"], frames:8}]` — without
+  Block the chord resolves to a normal, and point-blank it resolves to a
+  close normal/throw (the §1 proximity rule; a point-blank punish slide
+  whiffs by game rule); genesis `[{dirs:["back"], press:["LK","HK"]}]`.
 - `acid_spit` (F,F,HP) and `force_ball` (B,B,HP+LP) are CANDIDATES: encode
   them, live-verify with the executor (projectile appears / hit_counter fires
   at range), and DROP any that fail verification rather than shipping guesses.
@@ -109,11 +112,14 @@ label space ships in models).
 - Dummy guards per family block style (button → hold the Block chord;
   back_hold → hold away, existing logic).
 - **Trigger** = dummy is guarding AND the profile's contact signal fires:
-  the existing `hitstun_sources` mapping where present (asurabld), else a
-  global `hit_counter`-change signal (MK2 arcade, verified `0xD3FE`;
-  genesis pending — the RE task this wave). New optional profile key:
-  `contact_signal: {"global": "hit_counter"}` — used when `hitstun_sources`
-  is absent. No signal mapped → BlockPunish is offered greyed with a hint
+  the existing `hitstun_sources` mapping where present, else the
+  `contact_signal` global. AMENDED by live findings: arcade `hit_counter`
+  0xD3FE is P1-victim-only (never fires for hits ON P2) — DROPPED as the
+  arcade trigger; arcade uses `hitstun_sources` = the per-player HUD damage
+  pair (caveat: training refill rewrites those bytes — one spurious punish
+  per refill, absorbed by the cooldown). Genesis has NO verified contact
+  signal (honest negative — VFX-cluster candidate false-fires on movement);
+  BlockPunish greys there until one lands. No signal mapped → BlockPunish is offered greyed with a hint
   (per-feature degradation, house pattern).
 - **On trigger, select from a WEIGHTED OPTION POOL** (never deterministic —
   the survey's number-one finding): options are `{move: <special name>}`,
