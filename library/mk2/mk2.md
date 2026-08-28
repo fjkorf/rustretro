@@ -291,3 +291,19 @@ calibration: arcade x is WORLD position (observed ~1100 vs screen 400), so
 the corner feature is unusable until stage bounds are RE'd — same decision
 as the Genesis port. Training-enforced smoke recording confirmed refill
 works mid-ladder (the CPU opponent even advanced to char id 10 during it).
+
+## Cross-port notes (2026-08-28, first transfer experiment)
+
+- **goat-x-v1**: Genesis-trained (585 decisions, Reptile) restricted at fit
+  time to the arcade-shared 7-feature subset (`--features`), deployed on
+  arcade — runner acknowledged the cross-port run and re-encoded attack
+  CLASSES into arcade chords (HK intent → arcade x/0x200 vs genesis l).
+  Intents transfer; buttons re-encode per port.
+- **Special-move encodings differ per port** (user observation, verified in
+  the data): Reptile's slide is back+LK+HK on Genesis but back+LK+LP on
+  arcade. Consequence today: multi-button specials label as a SINGLE attack
+  class per the chord matcher (the arcade session showed 0 LK labels — the
+  slides hid inside 47 "LP"s), and a transferred ghost cannot perform
+  port-correct specials. This is the concrete motivating case for the
+  long-queued MACRO-ACTION layer: specials as named intents in family.json
+  with per-port input encodings, labeled and replayed as units.
