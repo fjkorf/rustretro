@@ -561,7 +561,7 @@ All 46 prior gate snapshots were 1P/attract phases; 276 never appeared
 there. Effects: the recorder under-counts controllable frames in 2P
 rounds, and round summaries for such rounds close early.
 
-## Gate revision: word_in for the 2-human screen_state leak (2026-08-28)
+## Gate revision (SUPERSEDED — see the masked revision below): word_in for the 2-human screen_state leak (2026-08-28)
 
 Live finding (A-Rust's 2-human punish rig): `screen_state` flips to **276**
 (0x114) at first contact in a 2-HUMAN match and holds for the rest of the
@@ -574,3 +574,37 @@ condition `word_in` (u16 ∈ values); arcade gate now
 been observed in 2-human-fight-after-contact; if it ever appears on a menu
 this gate leaks there — no such observation across all phase sweeps to
 date (menus read 0x9C01-family values).
+
+## Gate revision 2: screen_state is a BITFIELD — word_masked_zero (2026-08-28)
+
+The `word_in [0, 276]` allowlist above was whack-a-mole and broke on the
+THIRD observed value. User QA (Reptile vs Reptile, 2-human) read
+**260** (0x104) while the earlier smoke rig read **276** (0x114) — the
+gate closed, and since ALL dummy injection, refill, timer hold, and
+recorder capture sit behind the gate, the block-punish dummy went limp
+after one punish (diagnosed live via MCP on the paused session:
+`gate=false`, `screen_state=260`, dummy mode still block_punish).
+
+Every value ever recorded, in binary:
+
+| value | hex | bit 1 | phase |
+|---|---|---|---|
+| 0 | 0x000 | clear | 1P fight, post-KO |
+| 259 | 0x103 | SET | attract |
+| 260 | 0x104 | clear | 2-human fight (user QA) |
+| 262 | 0x106 | SET | char select / ladder / bios |
+| 263 | 0x107 | SET | attract |
+| 276 | 0x114 | clear | 2-human fight (smoke rig) |
+
+**Rule: bit 0x02 SET = not in a fight**; the 0x100 bit is set by 2-human
+play and the other low bits vary within a match. New gate vocabulary
+condition `word_masked_zero {global, mask}` (u16 & mask == 0); arcade
+gate uses mask `0x2`. Live-verified 6/6 against the table above, plus a
+regression test in `src/gate.rs`.
+
+This also explains the user's "only a CLOSE HIGH PUNCH revives the
+dummy" observation: under the old allowlist 260 was excluded but 276 was
+allowed, and 260→276 differ by exactly bit 4 (0x10) — the close elbow's
+reaction flips that bit, momentarily re-opening the gate; far HP and
+knockdowns don't set it. Not a proximity-semantics effect in our code at
+all. What sets bit 4 remains unmapped (harmless under the masked rule).

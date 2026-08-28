@@ -29,7 +29,7 @@ supported experiment, not an accident).
 2. **Logic lives once.** The gate is evaluated from the condition list by
    one evaluator per language surface (Rust native; Python mirrors it;
    Lua ASKS via a binding — it never re-implements). The condition
-   vocabulary is closed: `byte_zero`, `word_zero`, `word_in`, `health_in_range`,
+   vocabulary is closed: `byte_zero`, `word_zero`, `word_masked_zero`, `health_in_range`,
    `bcd_valid_nonzero`. A game that needs more gets a Lua adapter hook —
    an explicit decision, not a schema creep.
 3. **Class lists size the model heads.** Nothing may hardcode 9 moves /

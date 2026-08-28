@@ -702,12 +702,13 @@ mod tests {
         assert_eq!(ds.injected_input2[10], 2, "still guarding through the delay");
         assert!(!ds.training.punish_armed, "trigger disarms");
 
-        // Transient gate closure (round banner / round_over pulse) — the
-        // scheduled punish must ride it out under grace instead of stalling.
-        // (276 is no longer a closure: it's a legal 2-human in-fight value,
-        // word_in — see mk2.md's gate revision. Use a menu-family value.)
+        // Transient gate closure — the scheduled punish must ride it out
+        // under grace instead of stalling. 262 = char select/ladder (the
+        // documented arcade menu value: bit 0x02 set); the 2-human in-fight
+        // values 260/276 have it CLEAR and are legal — see mk2.md's gate
+        // revisions.
         let scr = p.global("screen_state").unwrap() as usize;
-        assert!(ds.write_addr(scr, 2, 0x9C01));
+        assert!(ds.write_addr(scr, 2, 262));
         assert!(!crate::gate::eval_gate(&ds, &p));
         let mut f = 27;
         tick_with(&mut ds, f, &p);
