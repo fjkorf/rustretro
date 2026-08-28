@@ -144,11 +144,14 @@ class SlideOverridesTheDecisionWindowTest(_MacroFamilyTestCase):
         return rows
 
     def test_slide_chord_overrides_its_decision_attack_label(self):
-        # LK held frames 10-11, LP held frames 12-13 (2-frame stagger) --
-        # completes at frame 12 (see test_macros.py's identical fixture).
+        # LK held frames 10-13, LP held frames 12-13 -- a 2-frame stagger
+        # between the two presses starting, but LK is still held when LP
+        # arrives so they overlap and the chord completes at frame 12 (see
+        # test_macros.py's identical fixture; §2: simultaneity, not a
+        # trailing "recently pressed" window).
         # P=4: decisions at i=4,8,12,16,... -- frame 12 falls in the i=12
         # decision's window [12,16).
-        rows = self._round_rows(40, (range(10, 12), range(12, 14)))
+        rows = self._round_rows(40, (range(10, 14), range(12, 14)))
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "session.jsonl"
             with open(path, "w") as f:
@@ -189,7 +192,7 @@ class SlideOverridesTheDecisionWindowTest(_MacroFamilyTestCase):
         # AND meta gains a dedicated "specials" key `report` reads from.
         from shadow_train.__main__ import cmd_fit, cmd_report
 
-        rows = self._round_rows(40, (range(10, 12), range(12, 14)))
+        rows = self._round_rows(40, (range(10, 14), range(12, 14)))
         with tempfile.TemporaryDirectory() as d:
             rec_path = Path(d) / "session.jsonl"
             with open(rec_path, "w") as f:

@@ -6,6 +6,12 @@ correctly, because this module re-derives specials from the raw per-frame
 `p1_input` mask stream rather than trusting any `p1_special` annotation
 (annotations are for humans/coverage only, per §4).
 
+This module is a frame-by-frame port of `src/macros.rs`'s `Matcher` -- same
+state machine, same semantics, so Python and Rust produce byte-identical
+completions off the same input stream. That parity is load-bearing: the
+golden fixture (`shadow/train/tests/fixtures/matcher_golden.json`) pins one
+truth both languages are tested against.
+
 Vocabulary mirrors the contract exactly:
 
   - a MACRO is an ordered list of steps (`Macro`/`MacroStep`); a single-step
@@ -15,14 +21,22 @@ Vocabulary mirrors the contract exactly:
     facing sign `s` (>0 = facing right) the same way `dataset._move_class`
     resolves fwd/back -- both must agree so a matcher and dataset labeling
     call it the same move.
-  - `press` names are attack-CLASS names (`attack_chords` keys); a step's
-    chord is "down" at frame `i` when, within the trailing `chord_tolerance`
-    frames ending at `i` (inclusive), every press class's full button chord
-    was held on at least one frame in that window -- this is what makes a
-    2-frame-staggered LK-then-LP still read as one chord (§2's tolerance
-    bullet) without demanding literal single-frame simultaneity.
-  - between steps, at most `max_gap` frames may elapse from one step's
-    completion frame to the next step's completion frame.
+  - `press` names are attack-CLASS names (`attack_chords` keys). A step is
+    SATISFIED at frame `i` when its `dirs` are held at `i` and every `press`
+    class's full button chord is down AT FRAME `i` -- simultaneously, in
+    that single frame. NO trailing "recently pressed" window: the game
+    reads button state per frame, so simultaneity is the rule, not a
+    lookback (a press-class onset that lands late still satisfies the chord
+    the moment it overlaps the others still being held -- that overlap IS
+    the simultaneity, not a tolerance grant).
+  - a macro COMPLETES on the rising edge of its final step's satisfaction
+    (satisfied now, not satisfied last frame) -- one input is one move, so a
+    chord held for 50 frames fires once, not once per frame. After firing,
+    it re-arms only once the final step stops being satisfied (release), not
+    after a fixed frame offset.
+  - between steps of a multi-step motion, at most `max_gap` frames may
+    elapse from one step's completion frame to the next step's completion
+    frame (unchanged).
 
 This module has no profile.py import (keeps it a pure function library,
 unit-testable on synthetic mask streams with hand-built `attack_chords`
@@ -35,12 +49,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 __all__ = [
-    "CHORD_TOLERANCE", "MAX_GAP", "MacroStep", "Macro",
+    "MAX_GAP", "MacroStep", "Macro",
     "compile_macros", "find_macro_completions", "match_all",
 ]
 
-CHORD_TOLERANCE = 3   # frames a step's press events may be staggered across
 MAX_GAP = 12          # max frames between one step's completion and the next
+_NEVER = -1           # sentinel onset/activation value meaning "not yet"
 
 # RETRO joypad button -> mask bit (same table as shadow_train.re.BUTTON_MASKS
 # / src/lua_engine.rs's input.set -- duplicated here, not imported, so this
@@ -109,90 +123,111 @@ def _class_mask(cls: str, attack_chords: dict) -> int:
     return mask
 
 
-def _step_satisfied_at(
-    step: MacroStep, i: int, masks: list, sides: list,
-    attack_chords: dict, chord_tolerance: int,
-) -> bool:
-    """Is `step` complete AT frame `i` (§2 tolerance semantics)? `dirs` are
-    checked at `i` itself (a held direction, current); `press` classes are
-    each satisfied if their full chord was down on any frame within
-    `[i - chord_tolerance, i]` (a "recently pressed" window, not necessarily
-    the same single frame -- this is the staggered-press tolerance)."""
-    if step.dirs:
-        s = sides[i]
-        m = masks[i]
-        if not all(m & _dir_bit(d, s) for d in step.dirs):
-            return False
-    if step.press:
-        window_lo = max(0, i - chord_tolerance)
-        chord_masks = [_class_mask(cls, attack_chords) for cls in step.press]
-        seen = [False] * len(step.press)
-        for j in range(window_lo, i + 1):
-            mj = masks[j]
-            for k, bit in enumerate(chord_masks):
-                if not seen[k] and (mj & bit) == bit:
-                    seen[k] = True
-        if not all(seen):
-            return False
-    return True
+_SEMANTIC_DIRS = ("back", "forward", "up", "down")
 
 
-def _find_one_completion(
-    macro: Macro, masks: list, sides: list, attack_chords: dict,
-    chord_tolerance: int, max_gap: int, start: int,
-):
-    """First occurrence of `macro` completing at or after frame `start` ->
-    its last step's completion frame, or None."""
-    n = len(masks)
-    step_completion = None
-    for step_idx, step in enumerate(macro.steps):
-        if step_idx == 0:
-            lo, hi = start, n - 1
-        else:
-            lo, hi = step_completion, min(n - 1, step_completion + max_gap)
-        found = None
-        for i in range(lo, hi + 1):
-            if _step_satisfied_at(step, i, masks, sides, attack_chords, chord_tolerance):
-                found = i
-                break
-        if found is None:
-            return None
-        step_completion = found
-    return step_completion
+def _run_matcher(
+    macros: list, masks: list, sides: list, attack_chords: dict, max_gap: int,
+) -> list:
+    """Frame-by-frame simulation of every macro's state machine across the
+    whole stream at once -- a line-for-line port of `src/macros.rs`'s
+    `Matcher::feed`, run in a loop instead of fed live, since Python gets
+    the full `masks`/`sides` arrays up front. Returns `(frame, macro_name)`
+    completions in the order they occur.
+
+    `press` classes carry no memory (§2: satisfied iff the full chord is
+    down THIS frame); `dirs` still track a per-frame onset so multi-step
+    motions can require a FRESH tap on non-first steps (F,F needs a second
+    forward TAP, not a continuous hold) -- that half of the contract is
+    unchanged by the press-tolerance fix.
+    """
+    chord_mask_cache: dict = {}
+
+    def chord_mask(cls: str) -> int:
+        m = chord_mask_cache.get(cls)
+        if m is None:
+            m = _class_mask(cls, attack_chords)
+            chord_mask_cache[cls] = m
+        return m
+
+    prev_dir = {d: False for d in _SEMANTIC_DIRS}
+    dir_onset = {d: _NEVER for d in _SEMANTIC_DIRS}
+
+    # Per-macro state: [next step index (== len(steps) means "cooldown:
+    # waiting for the final step to release before re-arming"), activation
+    # frame of the previous step / last reset].
+    states = [[0, _NEVER] for _ in macros]
+    events: list = []
+
+    for i, (mask, s) in enumerate(zip(masks, sides)):
+        for d in _SEMANTIC_DIRS:
+            held = bool(mask & _dir_bit(d, s))
+            if held and not prev_dir[d]:
+                dir_onset[d] = i
+            prev_dir[d] = held
+        prev_mask = mask  # noqa: F841 (kept for parity/readability with Rust)
+
+        def held_now(step: MacroStep) -> bool:
+            if not all(prev_dir[d] for d in step.dirs):
+                return False
+            return all(mask & chord_mask(cls) == chord_mask(cls) for cls in step.press)
+
+        def sat(step: MacroStep, activation: int, first: bool) -> bool:
+            if not held_now(step):
+                return False
+            if not step.press or not first:
+                onset_max = _NEVER
+                for d in step.dirs:
+                    o = dir_onset[d]
+                    if o <= activation:
+                        return False  # stale hold, not a fresh tap
+                    onset_max = max(onset_max, o)
+                return onset_max <= activation + max_gap
+            return True
+
+        for mi, macro in enumerate(macros):
+            st = states[mi]
+            n_steps = len(macro.steps)
+
+            if st[0] == n_steps:
+                # Cooldown: this macro just completed. Re-arm only once its
+                # final step releases -- holding the chord is ONE input, so
+                # it must not multiply-count completions (contract §2).
+                if not held_now(macro.steps[-1]):
+                    st[0], st[1] = 0, i
+                continue
+
+            if sat(macro.steps[st[0]], st[1], st[0] == 0):
+                st[1] = i
+                st[0] += 1
+                if st[0] == n_steps:
+                    events.append((i, macro.name))
+                    # stays at step == n_steps (cooldown) -- see above.
+            elif st[0] > 0:
+                # A fresh step-0 satisfaction mid-macro restarts the window;
+                # otherwise a blown gap resets to neutral.
+                if sat(macro.steps[0], i - 1, True):
+                    st[0], st[1] = 1, i
+                elif i > st[1] + max_gap:
+                    st[0], st[1] = 0, i
+
+    return events
 
 
 def find_macro_completions(
     macro: Macro, masks: list, sides: list, attack_chords: dict,
-    chord_tolerance: int = CHORD_TOLERANCE, max_gap: int = MAX_GAP,
+    max_gap: int = MAX_GAP,
 ) -> list:
-    """All of `macro`'s non-overlapping completion frames across the stream,
-    in order. Resumes each search `chord_tolerance + 1` frames past the
-    previous completion, not just +1 -- `_step_satisfied_at`'s trailing
-    "recently pressed" window means the SAME physical button-down event can
-    still satisfy the chord for up to `chord_tolerance` more frames after the
-    earliest completion; skipping past that window is what keeps one press
-    of a chord from being reported as several consecutive completions."""
-    out = []
-    start = 0
-    n = len(masks)
-    while start < n:
-        c = _find_one_completion(macro, masks, sides, attack_chords, chord_tolerance, max_gap, start)
-        if c is None:
-            break
-        out.append(c)
-        start = c + chord_tolerance + 1
-    return out
+    """All of `macro`'s completion frames across the stream, in order."""
+    return [f for f, _ in _run_matcher([macro], masks, sides, attack_chords, max_gap)]
 
 
 def match_all(
     macros: list, masks: list, sides: list, attack_chords: dict,
-    chord_tolerance: int = CHORD_TOLERANCE, max_gap: int = MAX_GAP,
+    max_gap: int = MAX_GAP,
 ) -> list:
     """`(completion_frame, macro_name)` for every macro's every completion,
     frame-order sorted (ties broken by name for determinism)."""
-    events = []
-    for macro in macros:
-        for f in find_macro_completions(macro, masks, sides, attack_chords, chord_tolerance, max_gap):
-            events.append((f, macro.name))
+    events = _run_matcher(macros, masks, sides, attack_chords, max_gap)
     events.sort()
     return events

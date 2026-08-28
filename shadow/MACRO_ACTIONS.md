@@ -56,10 +56,15 @@ plays them back; both read the same profile data.
 - Facing: `back`/`forward` resolve against live side = sign(opp.x − me.x)
   (fighter field `facing` MAY refine this when mapped). Both matcher and
   executor MUST use the same resolution.
-- Matcher tolerance: within a step, all of `press` must be down simultaneously
-  for ≥1 frame while `dirs` are held (chord tolerance: presses may arrive up
-  to 3 frames apart); between steps, at most `max_gap` = 12 frames. A macro
-  with a single step is a chord (the slide); multi-step is a motion.
+- Matcher semantics: a step is satisfied at frame `i` when `dirs` are held at
+  `i` and every `press` class's full chord is down AT `i` — simultaneously,
+  in that one frame; the game reads button state per frame, so simultaneity
+  is the rule, not a trailing "recently pressed" window. A macro completes on
+  the rising edge of its final step's satisfaction (satisfied now, not
+  satisfied the frame before) — one input is one move, so a chord held for
+  many frames fires once, not once per frame; it re-arms only once that final
+  step releases. Between steps, at most `max_gap` = 12 frames (unchanged). A
+  macro with a single step is a chord (the slide); multi-step is a motion.
 
 ### Reference data this phase ships (Reptile, both MK2 ports)
 

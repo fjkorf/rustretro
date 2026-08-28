@@ -29,32 +29,39 @@ GENESIS_SLIDE = {"reptile": {"slide": [{"dirs": ["back"], "press": ["LK", "HK"],
 
 
 class ArcadeSlideStaggerTest(unittest.TestCase):
-    """"the arcade slide (back+LK+LP with 2-frame stagger) labels 'slide'"."""
+    """"the arcade slide (back+LK+LP with a staggered press) labels 'slide'"
+    -- the game reads button STATE per frame (§2), so a chord completes the
+    instant every class is simultaneously down, however far apart their
+    onsets landed, as long as the first one is still HELD when the second
+    arrives (no trailing "recently pressed" window; overlap is what counts).
+    """
 
     def test_two_frame_stagger_still_completes_the_chord(self):
         macros = compile_macros(ARCADE_SLIDE["reptile"])
         n = 20
         masks = [LEFT] * n  # back held throughout
-        # LK ("a") pressed frames 10-11; LP ("b") pressed frames 12-13 --
-        # a 2-frame stagger between the two presses starting.
-        for i in (10, 11):
+        # LK ("a") pressed frames 10-13 (held); LP ("b") pressed frames
+        # 12-13 -- a 2-frame stagger between the two presses starting, but
+        # LK is still held when LP arrives, so they overlap at frame 12.
+        for i in range(10, 14):
             masks[i] |= A
         for i in (12, 13):
             masks[i] |= B
         sides = [1] * n  # facing right -> back = LEFT
 
         completions = find_macro_completions(macros[0], masks, sides, ARCADE_CHORDS)
-        self.assertEqual(completions, [12])  # earliest frame both presses are in-window
+        self.assertEqual(completions, [12])  # first frame both presses overlap
 
         events = match_all(macros, masks, sides, ARCADE_CHORDS)
         self.assertEqual(events, [(12, "slide")])
 
-    def test_stagger_beyond_tolerance_does_not_complete(self):
+    def test_presses_that_never_overlap_do_not_complete(self):
         macros = compile_macros(ARCADE_SLIDE["reptile"])
         n = 20
         masks = [LEFT] * n
         masks[0] |= A
-        masks[10] |= B  # 10 frames apart -- far past chord_tolerance=3
+        masks[10] |= B  # A already released by the time B arrives -- never
+                        # simultaneously down, so never a chord.
         sides = [1] * n
         self.assertEqual(find_macro_completions(macros[0], masks, sides, ARCADE_CHORDS), [])
 
@@ -88,6 +95,7 @@ class FacingFlipTest(unittest.TestCase):
         n = 20
         masks = [RIGHT] * n  # holding RIGHT is "back" while facing left
         masks[8] |= A
+        masks[9] |= A  # LK held through frame 9 so it overlaps LP
         masks[9] |= B
         sides = [-1] * n  # facing left
         self.assertEqual(match_all(macros, masks, sides, ARCADE_CHORDS), [(9, "slide")])
@@ -114,6 +122,7 @@ class GenesisSlideEncodingTest(unittest.TestCase):
         R, L = 0x800, 0x400  # r, l bits
         masks = [LEFT] * n
         masks[3] |= R  # LK on genesis
+        masks[4] |= R  # LK held through frame 4 so it overlaps HK
         masks[4] |= L  # HK on genesis
         sides = [1] * n
         self.assertEqual(
