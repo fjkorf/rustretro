@@ -107,6 +107,12 @@ class GameProfile:
     hitstun_sources: Optional[dict] = None                  # block name -> global name
     id_map: dict = field(default_factory=dict)              # raw char id (int) -> canonical id
 
+    # MACRO_ACTIONS.md additions (all optional; absent = no specials, today's
+    # exact meaning -- this is what keeps asurabld's label space untouched).
+    moves: dict = field(default_factory=dict)                # family.json §1: char name -> [{"name","tags"}, ...]
+    special_inputs: dict = field(default_factory=dict)       # port §2: char name -> move name -> [step, ...]
+    contact_signal: Optional[dict] = None                    # port §6: {"global": name}
+
     _char_by_id: dict = field(default_factory=dict, repr=False)
 
     # ── convenience accessors (mirror GameProfile's methods in profile.rs) ──
@@ -163,6 +169,35 @@ class GameProfile:
         exactly (same id_map, same fallback). The ONE Python call site is
         `dataset._decisions_for_round`, building `Decision.me_char/opp_char`."""
         return self.id_map.get(raw, raw)
+
+    # ── MACRO_ACTIONS.md §1/§4 accessors ────────────────────────────────────
+
+    def special_names_for(self, char_name: str) -> list[str]:
+        """Sorted names of `char_name`'s family moves tagged "special" --
+        empty when the character has no `moves` entry, or none of its moves
+        carry the tag. Port-independent (family.json only)."""
+        return sorted(
+            m["name"] for m in self.moves.get(char_name, [])
+            if "special" in m.get("tags", [])
+        )
+
+    def all_special_names(self) -> list[str]:
+        """§4's label-space unit: the sorted, deduped union of every family
+        character's "special"-tagged move names -- family-level and port-
+        independent, so a cross-port model shares one attack head no matter
+        which characters/ports contributed recordings. Empty when the
+        family ships no `moves` table (asurabld stays at today's exact
+        attack-class list -- the phase's hard back-compat gate)."""
+        names: set = set()
+        for char_name in self.moves:
+            names.update(self.special_names_for(char_name))
+        return sorted(names)
+
+    def macro_steps_for(self, char_name: str, move_name: str) -> Optional[list]:
+        """This port's encoding of `char_name`'s `move_name` (§2's ordered
+        step list), or None if this port doesn't encode that move at all --
+        "omission is meaningful": a port simply offers less, never a guess."""
+        return self.special_inputs.get(char_name, {}).get(move_name)
 
 
 def _resolve_game_dir(game_dir: Path) -> tuple[Path, Path]:
@@ -324,6 +359,85 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
         if cls not in attack_classes:
             raise ProfileError(f"attack_chords names unknown class {cls!r}")
 
+    # MACRO_ACTIONS.md §1: family.json `moves` -- char name (canonical roster
+    # NAME, not id) -> [{"name":.., "tags":[...]}, ...]. Absent/empty is
+    # today's exact meaning (no specials, asurabld's label space untouched).
+    moves_raw = family_raw.get("moves") or {}
+    roster_names = {r["name"] for r in family_raw["roster"]}
+    for char_name, move_list in moves_raw.items():
+        if char_name not in roster_names:
+            raise ProfileError(f"moves names unknown character {char_name!r}")
+        for mv in move_list:
+            if "name" not in mv:
+                raise ProfileError(f"moves[{char_name!r}] has an entry with no 'name'")
+    moves = {k: [dict(mv) for mv in v] for k, v in moves_raw.items()}
+
+    # MACRO_ACTIONS.md §2: port profile `special_inputs` -- char name -> move
+    # name -> ordered step list. Load-validated: character key must exist in
+    # the family `moves` table, move name must be one of that character's
+    # moves, dirs must be the semantic vocabulary, and `press` class names
+    # must exist in `attack_chords` (all per §2's "load-validated" bullet).
+    _VALID_MACRO_DIRS = {"back", "forward", "up", "down"}
+    special_inputs_raw = port_raw.get("special_inputs") or {}
+    special_inputs: dict = {}
+    for char_name, move_map in special_inputs_raw.items():
+        if char_name not in moves:
+            raise ProfileError(
+                f"special_inputs names character {char_name!r} with no "
+                "family moves entry"
+            )
+        char_move_names = {mv["name"] for mv in moves[char_name]}
+        compiled_moves: dict = {}
+        for move_name, steps in move_map.items():
+            if move_name not in char_move_names:
+                raise ProfileError(
+                    f"special_inputs[{char_name!r}] names move {move_name!r} "
+                    f"not in family moves[{char_name!r}]"
+                )
+            compiled_steps = []
+            for step in steps:
+                dirs = list(step.get("dirs", []))
+                for d in dirs:
+                    if d not in _VALID_MACRO_DIRS:
+                        raise ProfileError(
+                            f"special_inputs[{char_name!r}][{move_name!r}] "
+                            f"names unknown direction {d!r} (valid: "
+                            f"{sorted(_VALID_MACRO_DIRS)})"
+                        )
+                press = list(step.get("press", []))
+                for cls in press:
+                    if cls not in attack_chords:
+                        raise ProfileError(
+                            f"special_inputs[{char_name!r}][{move_name!r}] "
+                            f"names unknown attack-chord class {cls!r}"
+                        )
+                compiled_steps.append({
+                    "dirs": dirs, "press": press,
+                    "frames": int(step.get("frames", 3)),
+                })
+            compiled_moves[move_name] = compiled_steps
+        special_inputs[char_name] = compiled_moves
+
+    # MACRO_ACTIONS.md §6: contact_signal fallback for BlockPunish's trigger
+    # when hitstun_sources is absent. This is Rust-only data today (no
+    # Python consumer -- src/training.rs reads it, not dataset.py), so
+    # unlike hitstun_sources (load-bearing for THIS loader's own hitstun
+    # bucketing, hence the stricter "must be in recorded_globals" check)
+    # this only validates the name is a real global, not that it's already
+    # wired into record_globals -- that keeps the Python mirror from hard-
+    # failing every mk2 profile load while record_globals catches up on the
+    # Rust side (see the final report's contract-ambiguity note).
+    contact_signal = port_raw.get("contact_signal")
+    if contact_signal:
+        sig_global = contact_signal.get("global")
+        if sig_global is None:
+            raise ProfileError("contact_signal missing 'global' key")
+        if sig_global not in globals_map:
+            raise ProfileError(f"contact_signal names unknown global {sig_global!r}")
+        contact_signal = {"global": sig_global}
+    else:
+        contact_signal = None
+
     roster = [
         RosterEntry(
             id=r["id"], name=r["name"],
@@ -373,6 +487,9 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
         recorded_globals=recorded_globals,
         hitstun_sources=dict(hitstun_sources) if hitstun_sources else None,
         id_map=id_map,
+        moves=moves,
+        special_inputs=special_inputs,
+        contact_signal=contact_signal,
         _char_by_id=char_by_id,
     )
 

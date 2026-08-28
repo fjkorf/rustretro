@@ -164,11 +164,20 @@ def cmd_fit(args) -> None:
     # the ports list, so deploy's port-mismatch warning can treat it as
     # matching every port of the family.
     ports = data.get("ports") or [prof.port]
+    # MACRO_ACTIONS.md §4: the specials appended onto ATTACK_CLASSES beyond
+    # this profile's own family attack_classes -- stored so `report` (which
+    # only ever reads a persisted meta.json, no recordings/profile reload)
+    # can print a dedicated specials line without re-deriving the family/
+    # port split from scratch. Omitted entirely (not an empty list) for any
+    # family shipping no `moves` table (asurabld) -- keeps meta.json's key
+    # set byte-for-byte what it always was for the G1 golden gate.
+    specials = [n for n in ATTACK_CLASSES if n not in prof.attack_classes]
     meta = {
         "feature_names": data.get("feature_names", SCALAR_FEATURES),
         "calibration": {name: getattr(dataset, name) for name in CALIBRATION_KEYS},
         "move_classes": MOVE_CLASSES,
         "attack_classes": ATTACK_CLASSES,
+        **({"specials": specials} if specials else {}),
         "family": prof.family,
         "port": ports[0] if len(ports) == 1 else "mixed",
         **({"ports": ports} if len(ports) > 1 else {}),
@@ -218,6 +227,13 @@ def cmd_report(args) -> None:
         print(f"  {b:<9} {n:>6}{flag}")
     print("\nattack-label distribution:", meta["attack_label_counts"])
     print("move-label distribution:  ", meta["move_label_counts"])
+    # MACRO_ACTIONS.md §4: a dedicated specials line -- omitted entirely for
+    # a model with no specials in its label space (asurabld today), never
+    # printed as an empty/zeroed line (per-feature degradation, house style).
+    specials = meta.get("specials") or []
+    if specials:
+        counts = meta.get("attack_label_counts", {})
+        print("specials:                 ", {name: counts.get(name, 0) for name in specials})
 
 
 def _recording_style(p: Path) -> str | None:

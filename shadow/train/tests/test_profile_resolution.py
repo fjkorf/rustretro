@@ -23,6 +23,7 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
+from shadow_train import __main__ as _main
 from shadow_train import dataset
 from shadow_train import profile as _profile
 from shadow_train.__main__ import _resolve_profile_for, cmd_fit
@@ -83,10 +84,13 @@ def _write_recording(d: Path, name: str, family: str, port: str,
 class _ProfileEnvTestCase(unittest.TestCase):
     """Save/restore RUSTRETRO_GAME_DIR and dataset's profile-derived module
     globals around each test -- _resolve_profile_for mutates process-wide
-    state that other test files assume is asurabld's."""
+    state (RUSTRETRO_GAME_DIR, dataset's reload_profile() globals, AND
+    __main__.CALIBRATION_KEYS -- all three, see _resolve_profile_for's tail)
+    that other test files assume is asurabld's."""
 
     def setUp(self):
         self._orig_env = os.environ.get("RUSTRETRO_GAME_DIR")
+        self._orig_calibration_keys = list(_main.CALIBRATION_KEYS)
 
     def tearDown(self):
         if self._orig_env is None:
@@ -94,6 +98,7 @@ class _ProfileEnvTestCase(unittest.TestCase):
         else:
             os.environ["RUSTRETRO_GAME_DIR"] = self._orig_env
         dataset.reload_profile()
+        _main.CALIBRATION_KEYS = self._orig_calibration_keys
 
 
 class AutoResolutionTest(_ProfileEnvTestCase):
@@ -112,13 +117,20 @@ class AutoResolutionTest(_ProfileEnvTestCase):
 
         self.assertEqual(meta["family"], "mk2")
         self.assertEqual(meta["port"], "genesis")
-        self.assertEqual(meta["attack_classes"], ["None", "HP", "LP", "HK", "LK", "Block"])
+        # attack-head classes = family attack_classes + sorted "special" move
+        # names (MACRO_ACTIONS.md §4) -- computed from the resolved profile
+        # rather than a frozen literal, so this doesn't keep breaking as
+        # mk2/family.json's `moves` table grows (it already has reptile
+        # specials as of this phase).
+        resolved_prof = _profile.load(MK2_DIR / "genesis")
+        expected_attacks = list(resolved_prof.attack_classes) + resolved_prof.all_special_names()
+        self.assertEqual(meta["attack_classes"], expected_attacks)
         self.assertEqual(
             Path(os.environ["RUSTRETRO_GAME_DIR"]).resolve(),
             (MK2_DIR / "genesis").resolve(),
         )
         # dataset's frozen-at-import globals actually moved to mk2 too.
-        self.assertEqual(dataset.ATTACK_CLASSES, ["None", "HP", "LP", "HK", "LK", "Block"])
+        self.assertEqual(dataset.ATTACK_CLASSES, expected_attacks)
 
 
 class DisagreementAbortTest(_ProfileEnvTestCase):

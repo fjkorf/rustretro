@@ -418,5 +418,141 @@ class SchemaAdditionsTest(unittest.TestCase):
             self.assertIn("hitstun_sources names unrecorded global", str(ctx.exception))
 
 
+class MacroActionsSchemaTest(unittest.TestCase):
+    """shadow/MACRO_ACTIONS.md §1/§2/§6: family `moves`, port `special_
+    inputs`, and `contact_signal` -- absence is today's exact meaning
+    (no specials), presence is load-validated."""
+
+    def _write(self, d: Path, moves=None, special_inputs=None, contact_signal=None,
+               roster=None, attack_chords=None, record_globals=None,
+               globals_map=None):
+        roster = roster or [{"id": 0, "name": "reptile"}, {"id": 1, "name": "foe"}]
+        fam = {
+            "family": "fam", "roster": roster,
+            "move_classes": [], "attack_classes": ["None", "LP", "LK"],
+        }
+        if moves is not None:
+            fam["moves"] = moves
+        (d / "family.json").write_text(json.dumps(fam))
+
+        port = json.loads(_minimal_port_json(
+            "test", attack_chords=attack_chords or {"LP": ["b"], "LK": ["a"]},
+        ))
+        port["memory"]["globals"] = globals_map or {}
+        if record_globals is not None:
+            port["memory"]["record_globals"] = record_globals
+        if special_inputs is not None:
+            port["special_inputs"] = special_inputs
+        if contact_signal is not None:
+            port["contact_signal"] = contact_signal
+        (d / "fam.profile.json").write_text(json.dumps(port))
+        return profile.load(d)
+
+    def test_absent_moves_and_special_inputs_are_identity(self):
+        with tempfile.TemporaryDirectory() as d:
+            prof = self._write(Path(d))
+            self.assertEqual(prof.moves, {})
+            self.assertEqual(prof.special_inputs, {})
+            self.assertIsNone(prof.contact_signal)
+            self.assertEqual(prof.all_special_names(), [])
+            self.assertEqual(prof.special_names_for("reptile"), [])
+            self.assertIsNone(prof.macro_steps_for("reptile", "slide"))
+
+    def test_moves_parsed_and_special_names_accessors(self):
+        moves = {"reptile": [
+            {"name": "slide", "tags": ["special", "low"]},
+            {"name": "roll", "tags": ["low"]},  # not tagged special
+        ]}
+        with tempfile.TemporaryDirectory() as d:
+            prof = self._write(Path(d), moves=moves)
+            self.assertEqual(prof.special_names_for("reptile"), ["slide"])
+            self.assertEqual(prof.all_special_names(), ["slide"])
+            self.assertEqual(prof.special_names_for("foe"), [])  # no moves entry
+
+    def test_moves_unknown_character_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(Path(d), moves={"nobody": [{"name": "x", "tags": ["special"]}]})
+            self.assertIn("moves names unknown character", str(ctx.exception))
+
+    def test_special_inputs_parsed_and_macro_steps_for(self):
+        moves = {"reptile": [{"name": "slide", "tags": ["special"]}]}
+        special_inputs = {"reptile": {"slide": [
+            {"dirs": ["back"], "press": ["LK", "LP"], "frames": 4},
+        ]}}
+        with tempfile.TemporaryDirectory() as d:
+            prof = self._write(Path(d), moves=moves, special_inputs=special_inputs)
+            steps = prof.macro_steps_for("reptile", "slide")
+            self.assertEqual(steps, [{"dirs": ["back"], "press": ["LK", "LP"], "frames": 4}])
+            self.assertIsNone(prof.macro_steps_for("reptile", "nonexistent"))
+
+    def test_special_inputs_default_frames_is_3(self):
+        moves = {"reptile": [{"name": "slide", "tags": ["special"]}]}
+        special_inputs = {"reptile": {"slide": [{"dirs": ["back"], "press": ["LK"]}]}}
+        with tempfile.TemporaryDirectory() as d:
+            prof = self._write(Path(d), moves=moves, special_inputs=special_inputs)
+            self.assertEqual(prof.macro_steps_for("reptile", "slide")[0]["frames"], 3)
+
+    def test_special_inputs_unknown_character_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(Path(d), special_inputs={"ghost": {"slide": []}})
+            self.assertIn("no family moves entry", str(ctx.exception))
+
+    def test_special_inputs_unknown_move_raises(self):
+        moves = {"reptile": [{"name": "slide", "tags": ["special"]}]}
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(Path(d), moves=moves,
+                             special_inputs={"reptile": {"not_a_move": []}})
+            self.assertIn("not in family moves", str(ctx.exception))
+
+    def test_special_inputs_unknown_direction_raises(self):
+        moves = {"reptile": [{"name": "slide", "tags": ["special"]}]}
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(Path(d), moves=moves, special_inputs={
+                    "reptile": {"slide": [{"dirs": ["sideways"], "press": ["LK"]}]},
+                })
+            self.assertIn("unknown direction", str(ctx.exception))
+
+    def test_special_inputs_unknown_press_class_raises(self):
+        moves = {"reptile": [{"name": "slide", "tags": ["special"]}]}
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(Path(d), moves=moves, special_inputs={
+                    "reptile": {"slide": [{"dirs": ["back"], "press": ["NoSuchClass"]}]},
+                })
+            self.assertIn("unknown attack-chord class", str(ctx.exception))
+
+    def test_contact_signal_valid(self):
+        with tempfile.TemporaryDirectory() as d:
+            prof = self._write(
+                Path(d),
+                globals_map={"hit_counter": "0x1000"},
+                record_globals=[{"name": "hit_counter", "size": 1}],
+                contact_signal={"global": "hit_counter"},
+            )
+            self.assertEqual(prof.contact_signal, {"global": "hit_counter"})
+
+    def test_contact_signal_unknown_global_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(Path(d), contact_signal={"global": "hit_counter"})
+            self.assertIn("contact_signal names unknown global", str(ctx.exception))
+
+    def test_contact_signal_valid_without_being_recorded_yet(self):
+        # Unlike hitstun_sources, contact_signal has no Python-side consumer
+        # today (Rust-only, src/training.rs) -- a global that EXISTS but
+        # isn't (yet) in record_globals must still load, not hard-fail.
+        with tempfile.TemporaryDirectory() as d:
+            prof = self._write(
+                Path(d),
+                globals_map={"hit_counter": "0x1000"},
+                contact_signal={"global": "hit_counter"},
+            )
+            self.assertEqual(prof.contact_signal, {"global": "hit_counter"})
+
+
 if __name__ == "__main__":
     unittest.main()
