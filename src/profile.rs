@@ -135,10 +135,19 @@ pub struct PortProfile {
     pub contact_signal: Option<ContactSignal>,
 }
 
-/// The contact-signal declaration: a named global whose CHANGE means contact.
+/// The contact-signal declaration: something whose CHANGE means "this
+/// fighter was struck (hit OR blocked)". Exactly one source:
+/// - `field`: a per-fighter field name, resolved per block — PREFERRED,
+///   because it is per-victim by construction and (MK2's `action_counter`)
+///   fires on zero-chip blocked contact, which a health delta cannot see.
+/// - `global`: one address shared by both fighters (weaker: usually
+///   victim-asymmetric, as MK2's hit_counter turned out to be).
 #[derive(Deserialize, Debug, Clone)]
 pub struct ContactSignal {
-    pub global: String,
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub global: Option<String>,
 }
 
 /// One macro step (MACRO_ACTIONS §2): held SEMANTIC directions, attack
@@ -489,8 +498,23 @@ impl GameProfile {
             }
         }
         if let Some(cs) = &port.contact_signal {
-            if !port.memory.globals.contains_key(&cs.global) {
-                return Err(format!("contact_signal names unknown global '{}'", cs.global));
+            match (&cs.field, &cs.global) {
+                (Some(_), Some(_)) => {
+                    return Err("contact_signal: pick field OR global, not both".to_string());
+                }
+                (None, None) => {
+                    return Err("contact_signal needs field or global".to_string());
+                }
+                (Some(f), None) => {
+                    if !port.memory.fighter_fields.iter().any(|x| &x.name == f) {
+                        return Err(format!("contact_signal names unknown field '{f}'"));
+                    }
+                }
+                (None, Some(gl)) => {
+                    if !port.memory.globals.contains_key(gl) {
+                        return Err(format!("contact_signal names unknown global '{gl}'"));
+                    }
+                }
             }
         }
         Ok(GameProfile { dir: fam_dir, family, port })
@@ -1236,10 +1260,13 @@ mod tests {
         assert!(p.specials_for(1).is_empty(), "liukang has no specials this phase");
         assert!(p.specials_for(99).is_empty());
         assert_eq!(p.all_specials().len(), 3);
-        // The arcade contact signal is per-victim: the HUD health pair via
-        // hitstun_sources (hit_counter was live-disproven as global — it is
-        // P1-victim only; see the profile _STATUS).
-        assert!(p.port.contact_signal.is_none());
+        // The arcade contact signal is the per-fighter `action_counter`
+        // FIELD (quiet while guarding, fires on blocked contact even at zero
+        // chip — live-verified). hitstun_sources stays as the health-delta
+        // fallback and as the hitstun FEATURE source.
+        let cs = p.port.contact_signal.as_ref().unwrap();
+        assert_eq!(cs.field.as_deref(), Some("action_counter"));
+        assert!(cs.global.is_none());
         let hs = p.port.hitstun_sources.as_ref().unwrap();
         assert_eq!(hs.get("block1").map(String::as_str), Some("p1_health_hud"));
         assert_eq!(hs.get("block2").map(String::as_str), Some("p2_health_hud"));

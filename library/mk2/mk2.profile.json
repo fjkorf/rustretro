@@ -41,6 +41,11 @@
      "block2": "p2_x"
     },
     "size": 2
+   },
+   {
+    "name": "action_counter",
+    "off": "0xC0",
+    "size": 1
    }
   ],
   "globals": {
@@ -186,5 +191,8 @@
     }
    ]
   }
+ },
+ "contact_signal": {
+  "field": "action_counter"
  }
 }

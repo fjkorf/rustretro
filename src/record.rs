@@ -800,10 +800,13 @@ mod tests {
         assert!(text.starts_with("{\"v\":3,"));
         for block in ["block1", "block2"] {
             let keys: Vec<&str> = v[block].as_object().unwrap().keys().map(|k| k.as_str()).collect();
-            // Exactly the profile's fighter_fields, in profile order — no
-            // zero-filled asurabld fields. `x` is GLOBAL-SOURCED (p1_x/p2_x,
-            // §2.5) yet appears as a normal named field.
-            assert_eq!(keys, vec!["char_id", "health", "x"], "{block} carries only mapped fields");
+            // Exactly the profile's fighter_fields — no zero-filled
+            // asurabld fields. (Parsed Value maps sort, so this is the
+            // alphabetical set; the serialized TEXT keeps profile order and
+            // is asserted separately below.) `x` is GLOBAL-SOURCED
+            // (p1_x/p2_x, §2.5) yet appears as a normal named field.
+            assert_eq!(keys, vec!["action_counter", "char_id", "health", "x"],
+                       "{block} carries only mapped fields");
         }
         assert!(v["block1"]["y"].is_null(), "unmapped field must be ABSENT");
         assert_eq!(v["block1"]["health"], 100);
@@ -819,7 +822,7 @@ mod tests {
             "\"globals\":{\"screen_state\":0,\"round_over\":0,\
              \"p1_health_hud\":0,\"p2_health_hud\":0,\"hit_counter\":0}"
         ));
-        assert!(text.contains("\"block1\":{\"char_id\":7,\"health\":100,\"x\":0}"));
+        assert!(text.contains("\"block1\":{\"char_id\":7,\"health\":100,\"x\":0,\"action_counter\":0}"));
         assert_eq!(v["controllable"], true);
         assert_eq!(v["p1_block"], 1, "equal x (both unwritten) → block1 anchors as P1");
         // Meta declares the smaller-x anchor (x is mapped, via globals) +
@@ -833,7 +836,7 @@ mod tests {
         assert_eq!(meta["port"], "arcade");
         assert_eq!(meta["profile_file"], "mk2.profile.json");
         let ff = meta["fighter_fields"].as_array().unwrap();
-        assert_eq!(ff.len(), 3);
+        assert_eq!(ff.len(), 4);   // char_id, health, x, action_counter
         assert_eq!(ff[2]["name"], "x");
         assert!(ff[2]["off"].is_null(), "global-sourced field has no off");
         assert_eq!(ff[2]["globals"]["block1"], "p1_x");

@@ -111,7 +111,7 @@ class GameProfile:
     # exact meaning -- this is what keeps asurabld's label space untouched).
     moves: dict = field(default_factory=dict)                # family.json §1: char name -> [{"name","tags"}, ...]
     special_inputs: dict = field(default_factory=dict)       # port §2: char name -> move name -> [step, ...]
-    contact_signal: Optional[dict] = None                    # port §6: {"global": name}
+    contact_signal: Optional[dict] = None                    # port §6: {"field"|"global": name}
 
     _char_by_id: dict = field(default_factory=dict, repr=False)
 
@@ -427,14 +427,25 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
     # wired into record_globals -- that keeps the Python mirror from hard-
     # failing every mk2 profile load while record_globals catches up on the
     # Rust side (see the final report's contract-ambiguity note).
+    # Two sources, exactly one: `field` (per-fighter, PREFERRED -- MK2's
+    # action_counter fires on zero-chip blocked contact, which a health
+    # delta cannot see) or `global` (shared, usually victim-asymmetric).
     contact_signal = port_raw.get("contact_signal")
     if contact_signal:
+        sig_field = contact_signal.get("field")
         sig_global = contact_signal.get("global")
-        if sig_global is None:
-            raise ProfileError("contact_signal missing 'global' key")
-        if sig_global not in globals_map:
-            raise ProfileError(f"contact_signal names unknown global {sig_global!r}")
-        contact_signal = {"global": sig_global}
+        if sig_field and sig_global:
+            raise ProfileError("contact_signal: pick field OR global, not both")
+        if sig_field:
+            if sig_field not in fighter_fields:
+                raise ProfileError(f"contact_signal names unknown field {sig_field!r}")
+            contact_signal = {"field": sig_field}
+        elif sig_global:
+            if sig_global not in globals_map:
+                raise ProfileError(f"contact_signal names unknown global {sig_global!r}")
+            contact_signal = {"global": sig_global}
+        else:
+            raise ProfileError("contact_signal needs 'field' or 'global'")
     else:
         contact_signal = None
 

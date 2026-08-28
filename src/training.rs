@@ -199,15 +199,26 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
         None
     };
 
+    // `contact_signal` FIRST: it is the purpose-built "was struck" signal.
+    // hitstun_sources is a health delta — blind to zero-chip blocked hits
+    // (the user-reported "punishes some hits but not others") and disturbed
+    // by refill writes — so it is only the fallback.
     let contact = p
         .port
-        .hitstun_sources
+        .contact_signal
         .as_ref()
-        .and_then(|hs| {
-            Some(Contact::PerBlock(g(hs.get("block1")?)?, g(hs.get("block2")?)?))
+        .and_then(|cs| match (&cs.field, &cs.global) {
+            (Some(f), _) => Some(Contact::PerBlock(
+                p.field_addr(1, f)?.0,
+                p.field_addr(2, f)?.0,
+            )),
+            (None, Some(gl)) => g(gl).map(Contact::Global),
+            _ => None,
         })
         .or_else(|| {
-            p.port.contact_signal.as_ref().and_then(|cs| g(&cs.global)).map(Contact::Global)
+            p.port.hitstun_sources.as_ref().and_then(|hs| {
+                Some(Contact::PerBlock(g(hs.get("block1")?)?, g(hs.get("block2")?)?))
+            })
         });
 
     Some(Resolved {
@@ -676,7 +687,10 @@ mod tests {
         assert!(ds.write_addr((p.block2() + coff) as usize, 1, 9)); // reptile
         assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
         assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
-        let sig = p.global("p2_health_hud").unwrap() as usize;
+        // The dummy is block2 (larger x), so its contact signal is
+        // block2's `action_counter` field — quiet while it holds guard,
+        // fires on blocked contact even with zero chip (live-verified).
+        let sig = p.field_addr(2, "action_counter").unwrap().0 as usize;
         assert!(crate::gate::eval_gate(&ds, &p));
 
         ds.training.enabled = true;

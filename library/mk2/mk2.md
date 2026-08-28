@@ -608,3 +608,45 @@ allowed, and 260→276 differ by exactly bit 4 (0x10) — the close elbow's
 reaction flips that bit, momentarily re-opening the gate; far HP and
 knockdowns don't set it. Not a proximity-semantics effect in our code at
 all. What sets bit 4 remains unmapped (harmless under the masked rule).
+
+## `action_counter` — the real contact signal (2026-08-28, twin-counter hunt)
+
+**VERIFIED (live, user's 2-human Reptile-mirror session).** Fighter field
+**`+0xC0`** (P1 `0xC110`, P2 `0xC28A`), u8, increments by **+32** (a count
+in the high bits) each time that fighter starts a new action — its own
+swing, OR a reaction to being struck.
+
+Why it matters: it is the per-victim contact signal BlockPunish needed.
+Decisive test — hold Block on the defender continuously, let it settle,
+then attack mid-hold, 4/4 rounds:
+
+| settled | after 0.35 s idle-blocking | after the attack |
+|---|---|---|
+| 112 | 112 (quiet) | 144 **fired** |
+| 144 | 144 (quiet) | 176 **fired** |
+| 176 | 176 (quiet) | 208 **fired** |
+| 208 | 208 (quiet) | 240 **fired** |
+
+It fires on blocked contact that deals **zero chip** (observed 123→123
+and 134→134 health), which the previous health-delta trigger
+(`hitstun_sources`) cannot see — that was the cause of the user-reported
+"the dummy punishes some hits but not others". It is quiet while the
+fighter merely holds guard, so it does not false-fire in neutral.
+
+Also mapped on the way (attacker side, same field): the counter fires on
+every swing INCLUDING whiffs — so it is an action counter, not a hit
+counter. Useful corollary discovered by the whiff control: **a fighter's
+struct is entirely static when untouched** (0 of 0x17A bytes change), so
+any change in an idle fighter's struct means contact.
+
+Profile: `action_counter` added as a fighter field (+0xC0) and
+`contact_signal: {"field": "action_counter"}`; `contact_signal` now takes
+PRECEDENCE over `hitstun_sources` for the punish trigger, and gains a
+per-fighter `field` variant alongside the old shared `global` (MK2's
+`hit_counter` 0xD3FE remains disproven for this use — P1-victim only).
+`hitstun_sources` stays as the health-delta fallback and as the hitstun
+FEATURE source (where "took damage" is the correct meaning).
+
+Rig note: `shadow/arenas/mk2/reptile-vs-reptile.state` is 1P-vs-CPU, so
+injected dummy input CANNOT drive P2 there — BlockPunish end-to-end
+testing requires a 2-human match (controller 2 joins).
