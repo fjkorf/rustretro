@@ -953,10 +953,10 @@ mod tests {
             "{\"v\":3,\"frame\":0,\"round_id\":1,\"controllable\":true,\"p1_block\":1,",
             "\"block1\":{\"timer\":0,\"anim\":0,\"action\":0,\"x\":100,\"y\":0,",
             "\"facing\":0,\"weapon\":0,\"health\":239,\"health2\":0,\"meter\":0,",
-            "\"meter_max\":0,\"char_id\":1,\"wins\":0,\"opp_right_hold\":0,\"opp_left_hold\":0},",
+            "\"meter_max\":0,\"char_id\":1,\"wins\":0,\"opp_right_hold\":0,\"opp_left_hold\":0,\"attacking\":0},",
             "\"block2\":{\"timer\":0,\"anim\":0,\"action\":0,\"x\":200,\"y\":0,",
             "\"facing\":0,\"weapon\":0,\"health\":239,\"health2\":0,\"meter\":0,",
-            "\"meter_max\":0,\"char_id\":7,\"wins\":0,\"opp_right_hold\":0,\"opp_left_hold\":0},",
+            "\"meter_max\":0,\"char_id\":7,\"wins\":0,\"opp_right_hold\":0,\"opp_left_hold\":0,\"attacking\":0},",
             "\"globals\":{\"round_over\":0,\"abort\":0,\"match_end\":0,\"round_timer\":144,",
             "\"char_select\":0,\"combo_on_b2\":0,\"combo_on_b1\":0,\"demo_flag\":0,\"credits\":0},",
             "\"p1_input\":129,\"p2_input\":0}"
@@ -992,7 +992,7 @@ mod tests {
                 "combo_on_b2", "combo_on_b1", "demo_flag", "credits"
             ]
         );
-        assert_eq!(meta["fighter_fields"].as_array().unwrap().len(), 15);
+        assert_eq!(meta["fighter_fields"].as_array().unwrap().len(), 16); // +attacking
         cleanup(&path);
         cleanup(&path_b);
     }

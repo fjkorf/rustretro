@@ -81,6 +81,15 @@ description: Launch a headless RustRetro instance and run a live memory-RE sessi
 
 ## Known platform quirks
 
+- **`press_buttons(frames=N)` does NOT reliably sustain a HELD input.** A
+  single long call (e.g. frames=180) fails game logic that requires a
+  continuous hold — guard checks especially. Proven 3/3 by A/B: only
+  repeated short re-presses (~every 40 ms) or the native `DummyMode::Block`
+  sustain it. This ALREADY caused one wrong conclusion (a "contact signal"
+  that was really the guard being dropped and re-entered, generating action
+  transitions). If an experiment depends on something being held, verify the
+  hold is actually live before trusting the result.
+
 - `freeze` does not land on direct-pointer regions (FBNeo fallback RAM) — periodic writes
   (or a profile `pin`) are the mechanism.
 - Injected input drains while paused (pause→step loses it) — inject only while running.

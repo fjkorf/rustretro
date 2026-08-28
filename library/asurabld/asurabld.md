@@ -611,3 +611,204 @@ pad-row misattribution). Game mechanics (FAQ-verified): weapon toss =
 buttons**; EX = motion + two buttons; block = hold back / down-back (air
 block ok); throw = f/b+M/H close; dash f,f; **health regenerates ~1%/1.5s
 standing neutral** (health is NOT monotone within a round).
+
+## Guard policy RE — reactive back-to-block findings (live session, 2026-08-28)
+
+Motivated by `shadow/MACRO_ACTIONS.md` §9 (the reactive `back_hold` guard
+design for asurabld). Arena: `shadow/arenas/asurabld/goat-vs-rosemary.state`
+(block1 = Goat id 1, block2 = Rose Mary id 7). Method throughout: `Probe`
+(port 4032) driving both ports directly (port0=block1, port1=block2 —
+confirmed live: injecting `left`/`right` on port1 moves block2's `+0x54`,
+independent of `DummyMode`), `training.set_dummy('stand')` to zero any
+official dummy override before each manual trial, save-states as per-scenario
+checkpoints, and `combo_on_b1`/`combo_on_b2` (`$40470B`/`$4041E7`) + the
+health bytes as the hit-vs-whiff oracle.
+
+**Platform quirk that cost real time and belongs in the SKILL crib**: a
+single `press_buttons` call with a long `frames` value (e.g. 180) does
+**NOT** reliably sustain a held direction for game-logic purposes that need
+"holding back" to be continuously true (the guard check) — a one-shot
+180-frame hold on port1 measurably failed to block an attack that the
+*same* input direction blocked cleanly when re-asserted every ~40ms via
+repeated short `press_buttons(frames=6)` calls, and also blocked cleanly
+under the native `DummyMode::Block` (which re-applies its mask every
+in-engine frame via `tick_with`). Isolated with a direct A/B on one saved
+state (3/3 reproductions): one-shot 180f hold → 42 dmg (unblocked); repeated
+6f re-press every 40ms → 0 dmg (blocked, matches official mode). Long
+single presses are fine for *movement* (walking tests throughout this repo
+use them safely) but are NOT a substitute for a continuous frame-exact hold
+when testing anything gated on "is this input currently held" game logic —
+use the native dummy mode where one exists, or repeated short re-presses
+(or an in-engine `event.onframeend` Lua hold) otherwise.
+
+### 1. Attacking-action discriminator — `action`/`anim` are NOT it; `+0x6F` is
+
+`anim` (`+0x12`) is **disproven** as a per-fighter animation/attack signal:
+block1's own `+0x12` read a constant `0` across every tested state (idle,
+walk, crouch, jump, all 5 attacks, both directions) for both Goat and Rose
+Mary; block2's `+0x12` free-runs `0`→`63` continuously **even at total
+idle with zero input from either player** — it's a global (VFX/palette-style)
+counter, unrelated to either fighter's state. Do not use it.
+
+`action` (`+0x50`) is a **per-current-animation frame-index counter**: it
+free-runs `0..(N-1)` where `N` = that specific animation's frame-table
+length, wrapping to `0` and repeating for as long as the animation holds.
+Critically, `N` is **per-character** even for the SAME logical state: Goat's
+idle loop is 12 frames (`0-11`); Rose Mary's is 21 frames (`0-20`). Walking
+(either direction) extends Goat's loop to 15 frames (`0-14`). Heavy reaches
+a 17-frame table (`0-16`) for BOTH characters (same absolute peak, 16) —
+which happens to exceed Goat's idle+walk range (clean escape) but sits
+*under* Rose Mary's own idle range (no escape for her). **No cross-character,
+cross-move numeric threshold on `action` works**: Light/Medium/Launcher/Toss
+never left Goat's idle range at all despite screenshot-confirmed distinct
+attack animations firing. `action` is disproven as the attack discriminator
+this phase went looking for.
+
+**New field found by struct-diff (idle-paused snapshot vs. mid-attack-paused
+snapshot, common-changed-offset intersection across Light and Heavy), then
+verified across all 5 attack classes and both characters:**
+
+::: region kind=lookup_table id=attacking-flag addr=0x403807,0x4045BB label="per-fighter 'committing an attack' flag (+0x6F)" confidence=confirmed
+`block+0x6F` (u8) = `0` at rest, `1` for the full live duration of an attack,
+clearing back to `0` after recovery — a genuine LIVE (not sticky) signal.
+Verified 0→1→0 for Light/Medium/Heavy/Launcher/Toss on BOTH Goat (block1,
+`$403807`) and Rose Mary (block2, `$4045BB`); stays `0` through idle,
+walk-forward, walk-back, crouch, jump, and unrelated button presses (`x`,
+`l` — not attack chords). This is the clean cross-character, cross-move
+"this fighter is committing an attack" discriminator MACRO_ACTIONS.md §9.2
+option (2) needs. Timing: flips to `1` almost immediately after the button
+press lands (near-zero startup lag in the read), no observed false
+positives against neutral/walk/crouch/jump. Live 2026-08-28.
+
+**Disproven candidate, recorded so it isn't re-discovered and mis-trusted**:
+`+0x1DC` (paired `+0x1DD`, u8) looked IDENTICAL to `+0x6F` in a single
+paused mid-attack sample (`0` at idle, `1`/`211` during attack) but is a
+**sticky per-round latch**, not a live flag — once set by a fighter's first
+attack it never clears (traced 4s of subsequent idle, and a full walk cycle,
+with zero reset), and reads as *already 1* at idle for Rose Mary in the
+committed arena state (she'd evidently attacked at least once before the
+state was saved). Do not use it for a clearing guard-window signal.
+:::
+
+### 2. Guard-range threshold
+
+Method: `training.set_dummy('stand')` (fully static defender — no react),
+walk Goat to controlled `x`-gaps against a static Rose Mary, save a state per
+gap, then fire each attack from that exact gap and read health/combo deltas
+(HIT vs whiff). Binary-searched per move (screen-space `x` units, same field
+as `+0x54`):
+
+| move | connects up to (gap) | whiffs from (gap) |
+|---|---|---|
+| Light | ~95 | ~99 |
+| Toss | ~92 (bulk scan); narrower/noisier on repeat — see caveat below | ~99-109 |
+| Launcher | ~149 | ~153 |
+| Heavy | ~156 | ~158 |
+| Medium (longest reach) | ~160 | ~165 |
+
+Max stage separation (screen-space) measured ≈286 (matches the "165→286"
+figure already in MACRO_ACTIONS.md §9). **`guard_range` = 175** (margin
+above Medium's ~162 boundary, the longest-reaching tested attack) — proposed
+value, written to `asurabld.profile.json` `block.guard_range`. Toss's
+hit window looked narrower and less monotone on a follow-up single-sample
+pass (hit at 90, whiff at 88/95/104) than the bulk scan suggested (clean
+hits 32→92); given no repeats were run at the disputed points this reads as
+measurement noise (Toss is a grab-like move and inherently fiddly to
+position-test) rather than a confirmed non-monotone range — flagged for a
+follow-up pass with repeated trials per gap, not shipped as a hard finding.
+
+### 3. Down-back vs overheads (§9.5)
+
+**Finding: down-back does not block ANY of the 5 tested attacks** (Light,
+Medium, Heavy, Launcher — 4/4, cross-validated 3× on one saved cornered
+state with the repeated-re-press hold; Toss blocked by both conditions in
+one trial, less certain given its narrow hit window). Method: Rose Mary
+cornered against the stage wall first (eliminates the retreat/spacing
+confound §9.3 warns about — a guard hold that's free to walk widens the gap
+so fast it can push a connecting attack into whiff range, contaminating the
+result), then guard re-asserted continuously (see the platform-quirk note
+above) as either pure standing-back (`right`) or down-back (`down`+`right`)
+before each attack, with an unguarded control at the same gap:
+
+| move | no guard | standing-back | down-back |
+|---|---|---|---|
+| Light | 7 dmg | 0 (blocked) | 7 dmg (NOT blocked) |
+| Medium | 16 dmg | 0 (blocked) | 16 dmg (NOT blocked) |
+| Heavy | 42 dmg | 0 (blocked) | 42 dmg (NOT blocked) |
+| Launcher | 12 dmg | 0 (blocked) | 12 dmg (NOT blocked) |
+| Toss | 40 dmg | 0 (blocked) | 0 (blocked) — single trial |
+
+Given down-back fails uniformly across every tested normal (not
+move-specific), the honest read is **not** "these particular moves are
+overheads" but that **this build has no working crouch-guard sub-state at
+all** — holding Down forfeits blocking outright, regardless of the incoming
+attack. This directly contradicts the FAQ-sourced claim earlier on this page
+("block = hold back / down-back") — live measurement overrides the FAQ here.
+Practical consequence for the guard implementation: **the reactive guard
+must hold pure away (no Down), ever** — adding Down to "cover lows" (the
+convention in SF-era engines that §9.5 flagged as needing verification) would
+actively break blocking in this game. `overhead_verdict` written to the
+profile's `block` object.
+
+### 4. Charge characters (§9.5)
+
+Tested Goat and Rose Mary: hold back ~45-60 frames (frame-exact via an
+in-engine `event.onframeend` Lua macro, not a Python-side press, to get a
+real sustained charge), then forward+{Light,Medium,Heavy} within a few
+frames of releasing back, compared against the same button from neutral.
+**No charge-move found for either character.** A promising-looking first
+observation (Goat charge-back + forward+Medium produced what looked like a
+long horizontal projectile/beam in a screenshot) did **not** reproduce across
+3 follow-up trials (same recipe, same and different gaps, and a shorter
+20-frame charge) — those all showed a plain melee swing, matching Goat's
+ordinary uncharged Medium's weapon-swing trail sprite, which itself reaches
+far enough to look beam-like at the right captured frame. **Decisively
+disproven** by a range test: fired both charged and uncharged Medium from
+gap≈200-203 (past Medium's own ~162 whiff boundary from §2) — both whiffed
+identically (0 dmg, combo counter unchanged), ruling out any charge-granted
+extra reach/projectile. Rose Mary showed the same pattern (whiff at far gap
+regardless of charge); her charged attempt at a normally-connecting gap
+(~114) actually **whiffed where the uncharged version connected**, consistent
+with a turnaround/direction-reversal animation cost eating the attack window
+rather than any special move being invoked. **Verdict: no charge hazard
+found on Goat or Rose Mary for back+forward+{L,M,H}; not tested on the other
+6 roster characters.** `charge_hazard_verdict` written to the profile.
+
+### 5. Third-party cross-validation (§9.6) — `peon2/fbneo-training-mode`
+
+Fetched `games/asurabld/asurabld.lua` from the `master` branch (the `main`
+branch path used in the mission brief 404s; the repo's default branch is
+`master`). Every address it derives independently **matches ours exactly** —
+no disagreements found:
+
+| signal | peon2 address | our profile | match |
+|---|---|---|---|
+| P1/P2 facing | `0x4037F9` / `0x4045AD` | `facing` = block+`0x61` → same | ✅ |
+| P1/P2 health (real/displayed) | `0x40390F`/`0x403911`, `0x4046C3`/`0x4046C5` | `health`/(displayed not separately named) = block+`0x177`/+`0x179`-adjacent — same addresses | ✅ |
+| P1/P2 meter | `0x403913` / `0x4046C7` | `meter` = block+`0x17B` → same | ✅ |
+| P1/P2 max-meter | `0x403917` / `0x4046CB` | `meter_max` = block+`0x17F` → same | ✅ |
+| P1/P2 character id | `0x403DD1` / `0x404B85` | `char_id` = block+`0x639` → same | ✅ |
+| combo counters | `p1combocounter=0x4041E7`, `p2combocounter=0x40470B` | `combo_on_b2=0x4041E7`, `combo_on_b1=0x40470B` | ✅ addresses AND hitstun-direction semantics match: their `playerOneInHitstun()` reads `0x40470B` (= our `combo_on_b1`, block1's hitstun source) |
+| round timer | `0x40000A` | `round_timer` | ✅ |
+| credits | `0x40655D` (writes `0x09`) | `credits` global, `credits_target: 9` | ✅ |
+
+No new addresses beyond what we already have, no move/special-input data,
+and — confirming MACRO_ACTIONS.md's claim — **no AutoBlock implementation**
+for this game in their script; we remain first. One trivia-level, non-address
+difference: their frozen timer value is `0x90-7=0x89`, ours is `0x85` —
+both just "a near-max BCD constant," not a discovered/disputed value.
+
+### 6. Blocked-vs-whiff pushback (§9.3, time-boxed)
+
+One clean trial supports the pushback lead §9.3 flags as the most promising
+path to distinguishing blocked contact from a whiff on a static defender:
+briefly guarding (repeated re-press, not cornered) then taking a Heavy that
+would otherwise connect showed `x` jump `255→269` (**+14**, pushed away) with
+`0` damage (blocked), versus `+0` drift for both a whiff control (attack
+thrown from gap 220) and a no-attack static-baseline window of the same
+length. Did **not** get a clean *unblocked-hit* pushback data point in the
+time-boxed pass (that trial's attack unexpectedly whiffed rather than
+connecting) so the blocked-vs-**hit** pushback contrast — the actually
+load-bearing comparison for a punish-vs-block-punish split — remains
+undone. Worth a dedicated follow-up session; not shipped as a verified
+rule.
