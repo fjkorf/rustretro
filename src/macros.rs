@@ -9,20 +9,28 @@
 //! through the port's `attack_chords`, which is what makes a cross-port
 //! ghost's `slide` intent press the right buttons on each port).
 //!
-//! Matcher semantics (contract §2): within a step, every press class must be
-//! fully down simultaneously for ≥1 frame while the step's dirs are held —
-//! class onsets may straggle up to [`CHORD_TOLERANCE`] frames; between steps
-//! at most [`MAX_GAP`] frames. A completed step is consumed: re-firing needs
-//! fresh rising edges, so a held chord matches once, not every frame.
-//! `frames` is the executor's hold length; the matcher matches human taps of
-//! any length (≥1 frame) instead of enforcing it.
+//! Matcher semantics (contract §2): a step is SATISFIED at frame i when its
+//! `dirs` are held at frame i and every `press` class's full chord is down
+//! AT FRAME i — simultaneously, in that single frame. NO trailing "recently
+//! pressed" window: the game reads button state per frame, so simultaneity
+//! is the rule, not a lookback. (A press-class onset that lands late still
+//! satisfies the chord from the moment it overlaps the other classes still
+//! being held — a human chording three buttons rarely lands them on one
+//! exact frame, and that overlap IS the simultaneity, not a tolerance grant.)
+//! A macro COMPLETES on the rising edge of its final step's satisfaction
+//! (satisfied now, not satisfied last frame) — one input is one move, so a
+//! chord held for 50 frames fires once, not once per frame. After firing,
+//! the macro re-arms only once the final step stops being satisfied
+//! (release), not after a fixed frame offset — holding the buttons is one
+//! slide, not a slide every N frames. Between steps of a multi-step motion,
+//! at most [`MAX_GAP`] frames may elapse (unchanged). `frames` is the
+//! executor's hold length; the matcher matches human taps of any length
+//! (≥1 frame) instead of enforcing it.
 
 use crate::profile::{GameProfile, StepSpec};
 
 /// Max frames between one step's completion and the next step's onset.
 pub const MAX_GAP: u64 = 12;
-/// Max spread (frames) between the press-class onsets inside one step.
-pub const CHORD_TOLERANCE: u64 = 3;
 /// Neutral frames the executor inserts between steps so the game (and our
 /// own matcher) sees distinct taps — well inside `MAX_GAP`.
 const STEP_GAP: u8 = 2;
@@ -140,7 +148,9 @@ pub fn compile(name: &str, steps: &[StepSpec], p: &GameProfile) -> Result<Compil
 // ── the matcher ─────────────────────────────────────────────────────────────
 
 struct MState {
-    /// Next step to satisfy.
+    /// Next step to satisfy. Equal to `steps.len()` means the macro just
+    /// completed and is in COOLDOWN: waiting for its final step to release
+    /// before re-arming (rising-edge completion, contract §2).
     step: usize,
     /// Completion frame of the previous step (or the last reset) — onsets
     /// must land strictly after it, so a continuous hold can't re-fire.
@@ -201,20 +211,28 @@ impl Matcher {
 
         let mut done: Vec<&str> = Vec::new();
         for (m, st) in self.macros.iter().zip(self.states.iter_mut()) {
-            // A step is satisfied NOW when its dirs are held, its classes are
-            // fully down within CHORD_TOLERANCE of each other, and the
-            // relevant onsets are FRESH (strictly after `activation`, i.e.
-            // after the previous step completed). Dir onsets count for
-            // dir-only steps and for non-first press steps (F,F+HP needs a
-            // second forward TAP); a first press step only needs its dirs
-            // held — that is what lets "hold back, slide, keep holding back,
-            // slide again" re-fire on the chord alone.
+            // Raw §2 satisfaction: dirs held now, every press class's full
+            // chord down now — one frame, no memory. This is also the
+            // release test the cooldown branch below uses.
+            let held_now = |step: &Step| -> bool {
+                step.dirs.iter().all(|d| self.prev_dir[d.idx()])
+                    && step.press.iter().all(|chord| mask & chord == *chord)
+            };
+            // Step-advance satisfaction: `held_now` PLUS the freshness/gap
+            // bookkeeping that keeps multi-step motions distinct from a
+            // continuous hold (F,F needs a second forward TAP, not F held).
+            // Dir onsets gate this for dir-only steps and for non-first
+            // press steps; a first press step only needs its dirs held —
+            // that is what lets "hold back, slide, keep holding back, slide
+            // again" re-fire on the chord alone. Press itself carries no
+            // onset/tolerance bookkeeping any more (§2: simultaneity, not a
+            // trailing window) — see `held_now`.
             let sat = |step: &Step, activation: u64, first: bool| -> bool {
-                if !step.dirs.iter().all(|d| self.prev_dir[d.idx()]) {
+                if !held_now(step) {
                     return false;
                 }
-                let mut onset_max = 0u64;
                 if step.press.is_empty() || !first {
+                    let mut onset_max = 0u64;
                     for d in &step.dirs {
                         let o = self.dir_onset[d.idx()];
                         if o <= activation {
@@ -222,32 +240,20 @@ impl Matcher {
                         }
                         onset_max = onset_max.max(o);
                     }
+                    return onset_max <= activation + MAX_GAP;
                 }
-                if !step.press.is_empty() {
-                    let mut lo = u64::MAX;
-                    let mut hi = 0u64;
-                    for chord in &step.press {
-                        if mask & chord != *chord {
-                            return false; // class not fully down
-                        }
-                        let o = (0..12)
-                            .filter(|i| chord & (1 << i) != 0)
-                            .map(|i| self.bit_onset[i])
-                            .max()
-                            .unwrap_or(0);
-                        lo = lo.min(o);
-                        hi = hi.max(o);
-                    }
-                    if hi - lo > CHORD_TOLERANCE {
-                        return false; // presses straggled too far apart
-                    }
-                    if hi <= activation {
-                        return false; // consumed chord must not re-fire
-                    }
-                    onset_max = onset_max.max(hi);
-                }
-                first || onset_max <= activation + MAX_GAP
+                true
             };
+
+            if st.step == m.steps.len() {
+                // Cooldown: this macro just completed. Re-arm only once its
+                // final step releases — holding the chord is ONE input, so
+                // it must not multiply-count completions (contract §2).
+                if !held_now(&m.steps[m.steps.len() - 1]) {
+                    *st = MState { step: 0, activation: now };
+                }
+                continue;
+            }
 
             if sat(&m.steps[st.step], st.activation, st.step == 0) {
                 st.activation = now;
@@ -256,7 +262,9 @@ impl Matcher {
                     if !done.contains(&m.name.as_str()) {
                         done.push(&m.name);
                     }
-                    *st = MState { step: 0, activation: now };
+                    // Stays at step == len (cooldown) — see above, NOT an
+                    // immediate reset, so a held final chord can't re-fire
+                    // next frame just because it's still down.
                 }
             } else if st.step > 0 {
                 // A fresh step-0 satisfaction mid-macro restarts the window
@@ -377,6 +385,7 @@ mod tests {
     use super::*;
     use crate::profile::GameProfile;
     use std::path::PathBuf;
+    use std::env;
 
     /// A minimal two-port MK2-shaped pair of profiles built in a temp dir —
     /// the tests must not read library/mk2/genesis.profile.json (edited
@@ -433,7 +442,7 @@ mod tests {
     const B_Y: u16 = 1 << 1; // HP chord
 
     #[test]
-    fn slide_chord_matches_with_two_frame_stagger_not_five() {
+    fn slide_chord_matches_regardless_of_press_stagger() {
         let p = arcade();
         // Opponent to the right → back = Left. LK lands 2 frames after LP.
         let mut m = Matcher::new(vec![slide_arcade(&p)]);
@@ -443,15 +452,34 @@ mod tests {
         // Held chord must not re-fire on the following frames.
         assert!(m.feed(B_LEFT | B_B | B_A, true).is_empty());
 
-        // 5-frame stagger: never a match, even though both end up held.
+        // 5-frame stagger: LP is held from frame 1; LK lands 5 frames later
+        // while LP is still down. The game reads state, not history — once
+        // both are simultaneously held (whenever that happens to land), the
+        // chord is satisfied. It fires exactly once (rising edge), then
+        // holding the completed chord produces no further completions.
         let mut m = Matcher::new(vec![slide_arcade(&p)]);
         assert!(m.feed(B_LEFT | B_B, true).is_empty());
         for _ in 0..4 {
             assert!(m.feed(B_LEFT | B_B, true).is_empty());
         }
-        for _ in 0..6 {
+        assert_eq!(m.feed(B_LEFT | B_B | B_A, true), vec!["slide"]);
+        for _ in 0..5 {
             assert!(m.feed(B_LEFT | B_B | B_A, true).is_empty());
         }
+    }
+
+    #[test]
+    fn slide_chord_never_matches_when_presses_dont_overlap() {
+        let p = arcade();
+        // LP pressed and released BEFORE LK is ever pressed: the two class
+        // chords never share a frame, so the chord never completes — this
+        // is one input each, not a chord (contract §2: simultaneity, not a
+        // trailing "recently pressed" window).
+        let mut m = Matcher::new(vec![slide_arcade(&p)]);
+        assert!(m.feed(B_LEFT | B_B, true).is_empty());
+        assert!(m.feed(B_LEFT, true).is_empty()); // LP released
+        assert!(m.feed(B_LEFT | B_A, true).is_empty()); // LK pressed alone
+        assert!(m.feed(B_LEFT | B_A, true).is_empty());
     }
 
     #[test]
@@ -619,5 +647,123 @@ mod tests {
         assert!(counts[1] > 400, "{counts:?}");
         let empty: Vec<(PunishOption, u8)> = vec![(PunishOption::ContinueBlock(1), 0)];
         assert!(weighted_pick(&empty, 7).is_none(), "all-zero weights pick nothing");
+    }
+
+    #[test]
+    fn golden_fixture_parity() {
+        // Load the golden fixture from shadow/train/tests/fixtures/matcher_golden.json
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let fixture_path = manifest_dir
+            .join("shadow/train/tests/fixtures/matcher_golden.json");
+        let fixture_json = std::fs::read_to_string(&fixture_path)
+            .expect("golden fixture file exists");
+
+        #[derive(serde::Deserialize, Debug)]
+        struct GoldenCase {
+            name: String,
+            description: Option<String>,
+            #[serde(rename = "macro")]
+            macro_steps: Vec<serde_json::Value>,
+            facing: serde_json::Value,
+            frames: Vec<String>,
+            expected: Vec<GoldenExpectation>,
+        }
+
+        #[derive(serde::Deserialize, Debug)]
+        struct GoldenExpectation {
+            frame: usize,
+            #[serde(rename = "move")]
+            move_name: String,
+        }
+
+        let cases: Vec<GoldenCase> = serde_json::from_str(&fixture_json)
+            .expect("golden fixture parses as JSON");
+        assert!(!cases.is_empty(), "golden fixture must contain cases to be a gate at all");
+        let mut exercised = 0usize;
+
+        // Create the test profile (arcade-shaped with MK2 chords).
+        let profile = arcade();
+
+        for case in cases {
+            exercised += 1;
+            // Determine the move name from expected completions or case name.
+            let move_name = if !case.expected.is_empty() {
+                case.expected[0].move_name.clone()
+            } else if case.name.contains("slide") {
+                "slide".to_string()
+            } else if case.name.contains("acid_spit") {
+                "acid_spit".to_string()
+            } else {
+                case.name.clone()
+            };
+
+            // Parse the facing field (string or per-frame array).
+            let num_frames = case.frames.len();
+            let sides: Vec<bool> = if let serde_json::Value::String(s) = &case.facing {
+                vec![s == "right"; num_frames]
+            } else if let serde_json::Value::Array(arr) = &case.facing {
+                arr.iter()
+                    .map(|v| {
+                        v.as_str().expect("facing element is string") == "right"
+                    })
+                    .collect()
+            } else {
+                panic!("facing must be string or array");
+            };
+
+            // Parse frames from hex strings.
+            let masks: Vec<u16> = case
+                .frames
+                .iter()
+                .map(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16)
+                    .expect("frame is valid hex"))
+                .collect();
+
+            // Compile the macro steps using the determined move name.
+            let macro_spec = serde_json::to_string(&case.macro_steps)
+                .expect("macro_steps serialize");
+            let steps: Vec<crate::profile::StepSpec> =
+                serde_json::from_str(&macro_spec)
+                    .expect("macro steps parse");
+
+            let compiled = compile(&move_name, &steps, &profile)
+                .expect(&format!("macro '{}' compiles", move_name));
+
+            // Run the matcher frame-by-frame.
+            // Note: Rust's Matcher uses 1-based frame numbering; our fixture uses 0-based indexing.
+            // When feed() is called at array index i, Rust's internal frame counter is i+1.
+            // But we want to report completions using the array index for consistency with Python.
+            let mut matcher = Matcher::new(vec![compiled]);
+            let mut actual_events: Vec<(usize, String)> = Vec::new();
+            for (frame_idx, (mask, opponent_right)) in
+                masks.iter().zip(sides.iter()).enumerate()
+            {
+                let completions = matcher.feed(*mask, *opponent_right);
+                for _move_name in completions {
+                    // Report completion at the 0-indexed array position where it occurred
+                    actual_events.push((frame_idx, move_name.clone()));
+                }
+            }
+
+            // Convert expected to the same format.
+            let expected_events: Vec<(usize, String)> = case
+                .expected
+                .iter()
+                .map(|e| (e.frame, e.move_name.clone()))
+                .collect();
+
+            // This IS the gate: fail on any mismatch, naming the case so a
+            // regression is traceable straight back to its fixture entry.
+            assert_eq!(
+                actual_events, expected_events,
+                "golden case '{}' diverged: expected {:?}, got {:?}",
+                case.name, expected_events, actual_events,
+            );
+        }
+
+        assert!(
+            exercised >= 9,
+            "golden fixture parity only exercised {exercised} cases — fixture shrank?"
+        );
     }
 }

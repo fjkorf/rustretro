@@ -2,7 +2,7 @@ use bevy_egui::egui;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
-use crate::debug::{DebugState, DummyMode, RecordControl, StateOp};
+use crate::debug::{DebugState, DummyMode, GuardMode, RecordControl, StateOp};
 
 /// GUI face of the shadow lifecycle's two app-side stages — demonstrate
 /// (recorder start/stop + status) and deploy (model card, runtime model load,
@@ -30,14 +30,33 @@ pub struct TrainingPanel {
     record_style: String,
 }
 
-const DUMMY_MODES: [(DummyMode, &str); 6] = [
-    (DummyMode::Free, "Free (human / shadow drives P2)"),
-    (DummyMode::Stand, "Stand"),
-    (DummyMode::Crouch, "Crouch"),
-    (DummyMode::Jump, "Jump (hop cadence)"),
-    (DummyMode::Block, "Block (hold away)"),
-    (DummyMode::BlockPunish, "Block + punish (on contact)"),
+const DUMMY_MODES: [DummyMode; 6] = [
+    DummyMode::Free,
+    DummyMode::Stand,
+    DummyMode::Crouch,
+    DummyMode::Jump,
+    DummyMode::Block,
+    DummyMode::BlockPunish,
 ];
+
+/// The two guarding modes read differently per family guard STYLE: a button
+/// family holds a chord (inert), a back-hold family guards reactively and
+/// punishes on attack COMMITMENT rather than confirmed contact (§9.3).
+fn dummy_label(mode: DummyMode, reactive: bool) -> &'static str {
+    match (mode, reactive) {
+        (DummyMode::Free, _) => "Free (human / shadow drives P2)",
+        (DummyMode::Stand, _) => "Stand",
+        (DummyMode::Crouch, _) => "Crouch",
+        (DummyMode::Jump, _) => "Jump (hop cadence)",
+        (DummyMode::Block, true) => "Block (reactive guard)",
+        (DummyMode::Block, false) => "Block (hold block button)",
+        (DummyMode::BlockPunish, true) => "Block + punish (on attack commit)",
+        (DummyMode::BlockPunish, false) => "Block + punish (on contact)",
+    }
+}
+
+const GUARD_MODES: [GuardMode; 4] =
+    [GuardMode::All, GuardMode::AfterFirstHit, GuardMode::Random, GuardMode::None];
 
 /// ContinueBlock hold length offered by the panel (MACRO_ACTIONS §6).
 const PUNISH_CONTINUE_FRAMES: u16 = 30;
@@ -208,34 +227,40 @@ impl TrainingPanel {
         }
 
         ui.add_enabled_ui(state.training.enabled, |ui| {
+            let reactive = crate::training::guard_is_reactive();
             ui.horizontal(|ui| {
                 ui.label("Dummy (F1):");
-                let current = DUMMY_MODES
-                    .iter()
-                    .find(|(m, _)| *m == state.training.dummy)
-                    .map(|(_, label)| *label)
-                    .unwrap_or("?");
+                let current = dummy_label(state.training.dummy, reactive);
                 egui::ComboBox::from_id_salt("training_dummy")
                     .selected_text(current)
                     .show_ui(ui, |ui| {
-                        for (mode, label) in DUMMY_MODES {
-                            // BlockPunish needs a mapped contact signal —
-                            // offered greyed with the reason otherwise.
-                            if mode == DummyMode::BlockPunish && !feats.block_punish {
-                                ui.add_enabled(
-                                    false,
-                                    egui::Button::selectable(false, label),
-                                )
-                                .on_disabled_hover_text(
-                                    "Needs a contact signal (hitstun_sources or \
-                                     contact_signal) in the profile — see the game's .md",
-                                );
+                        for mode in DUMMY_MODES {
+                            let label = dummy_label(mode, reactive);
+                            // The guarding modes need a resolvable guard, and
+                            // BlockPunish additionally a trigger — offered
+                            // greyed with the reason otherwise.
+                            let ok = match mode {
+                                DummyMode::Block => feats.block_dummy,
+                                DummyMode::BlockPunish => feats.block_punish,
+                                _ => true,
+                            };
+                            if !ok {
+                                ui.add_enabled(false, egui::Button::selectable(false, label))
+                                    .on_disabled_hover_text(
+                                        "Needs a guard source in the profile: a block chord \
+                                         (button families) or x + an attack-commitment signal \
+                                         (back-hold families), plus a contact signal for the \
+                                         contact-triggered punish — see the game's .md",
+                                    );
                                 continue;
                             }
                             ui.selectable_value(&mut state.training.dummy, mode, label);
                         }
                     });
             });
+            if matches!(state.training.dummy, DummyMode::Block | DummyMode::BlockPunish) {
+                self.guard_section(ui, state, &feats, reactive);
+            }
             if state.training.dummy == DummyMode::BlockPunish {
                 // Live phase — a silent dummy explains itself (ARMED vs
                 // cooling vs mid-punish) instead of looking broken. The
@@ -255,11 +280,16 @@ impl TrainingPanel {
                         ui.label(egui::RichText::new(phase).small().strong().color(color));
                     })
                     .response
-                    .on_hover_text(
+                    .on_hover_text(if reactive {
+                        "ARMED = the next attack committed in range punishes. \
+                         'punishing (commit)' means exactly that — blocked contact is \
+                         undetectable on this game, so the trigger is the opponent's \
+                         commitment (block-punish AND whiff-punish)."
+                    } else {
                         "ARMED = the next blocked contact punishes. cooling = waiting for \
                          the contact signal to go quiet. A whiffed attack never registers \
-                         as contact, so the dummy correctly stays armed.",
-                    );
+                         as contact, so the dummy correctly stays armed."
+                    });
                 }
                 self.punish_section(ui, state, feats.block_punish);
             }
@@ -286,6 +316,63 @@ impl TrainingPanel {
         self.shadow_section(ui, state);
         ui.separator();
         self.arena_section(ui, state);
+    }
+
+    /// Guard mode (MACRO_ACTIONS §9.4) — the selector every trainer has:
+    /// Guard All / After First Hit / Random / None, plus a one-line honest
+    /// description of what the family's guard STYLE actually does.
+    fn guard_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        state: &mut DebugState,
+        feats: &crate::training::Features,
+        reactive: bool,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label("Guard:");
+            egui::ComboBox::from_id_salt("training_guard_mode")
+                .selected_text(state.training.guard_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in GUARD_MODES {
+                        // After First Hit needs a hit signal to key off.
+                        if mode == GuardMode::AfterFirstHit && !feats.guard_after_hit {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::selectable(false, mode.label()),
+                            )
+                            .on_disabled_hover_text(
+                                "Needs a contact signal (hitstun_sources or contact_signal) \
+                                 in the profile — see the game's .md",
+                            );
+                            continue;
+                        }
+                        ui.selectable_value(&mut state.training.guard_mode, mode, mode.label());
+                    }
+                });
+            if state.training.guard_mode == GuardMode::Random {
+                ui.add(
+                    egui::DragValue::new(&mut state.training.guard_random_pct.0)
+                        .range(0..=100)
+                        .suffix("%"),
+                )
+                .on_hover_text("Chance the dummy guards each opportunity (rolled once per attack)");
+            }
+        });
+        let hint = if reactive {
+            match crate::training::guard_range() {
+                Some(r) => format!(
+                    "Reactive: stands neutral, holds away only while the opponent is \
+                     attacking within {r} units. Never crouch-guards (down-back blocks \
+                     nothing here)."
+                ),
+                None => "Reactive: stands neutral, holds away only while the opponent is \
+                         attacking (no guard_range mapped — no distance gate)."
+                    .to_string(),
+            }
+        } else {
+            "Holds the block button while guarding — positionally inert.".to_string()
+        };
+        ui.label(egui::RichText::new(hint).small().color(egui::Color32::DARK_GRAY));
     }
 
     /// BlockPunish option pool (MACRO_ACTIONS §6): the char-aware legal list

@@ -30,8 +30,28 @@
 //! (FBNeo System RAM fallback) are written in place. `freeze` does NOT land
 //! on the latter (mk2.md) — per-frame re-assertion here is the workaround.
 
-use crate::debug::{DebugState, DummyMode};
+use crate::debug::{DebugState, DummyMode, GuardMode};
 use crate::profile::GameProfile;
+
+/// RETRO joypad direction bits used by the guard hold (RETRO_DEVICE_ID order).
+const BIT_LEFT: usize = 6;
+const BIT_RIGHT: usize = 7;
+
+/// The dummy occupies fighter block 2: it is injected on controller port 1,
+/// and port 1 drives block 2 (asurabld.md verified this live; MK2's `p2_*`
+/// globals are the same pairing). Deriving it from live X instead — as this
+/// used to — mis-attributes the dummy the moment the fighters cross up.
+const DUMMY_BLOCK: u8 = 2;
+
+/// Frames the reactive guard keeps holding away after the commitment signal
+/// clears. The `attacking` FIELD is exact, so this only covers our own
+/// one-frame read/inject latency.
+const GUARD_FIELD_TAIL: u64 = 4;
+
+/// Frames the reactive guard holds away after an attack PRESS when the only
+/// commitment source is the opponent's input mask (§9.2 fallback): the press
+/// is an instant, so this stands in for startup + active.
+const GUARD_INPUT_TAIL: u64 = 20;
 
 /// Which training features the loaded profile supports — the panel uses this
 /// to disable individual controls with honest hints instead of hiding the
@@ -43,9 +63,13 @@ pub struct Features {
     pub position_reset: bool,
     pub finish_round: bool,
     pub block_dummy: bool,
-    /// BlockPunish needs a guard AND a contact signal (`hitstun_sources` or
-    /// `contact_signal`) — MACRO_ACTIONS §6.
+    /// BlockPunish needs a guard AND a trigger: a contact signal
+    /// (`hitstun_sources`/`contact_signal`, MACRO_ACTIONS §6) for button
+    /// families, or the attack-commitment window for back-hold families
+    /// (§9.3 — blocked contact is undetectable there).
     pub block_punish: bool,
+    /// `GuardMode::AfterFirstHit` needs a contact signal to know a hit landed.
+    pub guard_after_hit: bool,
 }
 
 impl Features {
@@ -72,6 +96,9 @@ impl Features {
         }
         if !self.block_punish {
             m.push("Block-punish dummy");
+        }
+        if !self.guard_after_hit {
+            m.push("guard After First Hit");
         }
         m
     }
@@ -118,15 +145,61 @@ struct Resolved {
     reset: Option<Reset>,
     finish: Option<u32>,
     x_pair: Option<XPair>,
-    /// For button-block families (MK): the held RETRO buttons that block,
-    /// resolved from `family.block.class` through `attack_chords`.
-    block_chord: Option<[bool; 12]>,
+    /// The family's guard POLICY (MACRO_ACTIONS §9.1) — how the dummy blocks.
+    guard: Guard,
     /// The BlockPunish trigger source (MACRO_ACTIONS §6): per-block hitstun
     /// globals where mapped (asurabld), else the port's global contact signal
     /// (MK2 arcade's hit_counter). None → the mode degrades to plain Block.
     contact: Option<Contact>,
     /// Cooldown window: the signal must be quiet this long to re-arm.
     hitstun_window: u64,
+}
+
+/// The guard policy, resolved from `family.block.style` (MACRO_ACTIONS §9.1).
+///
+/// `button` is positionally inert — the chord can be held forever. `back_hold`
+/// is NOT: a continuously-guarding asurabld dummy walked itself 165 → 286
+/// units into the corner in ~1 s (live-measured, §9). So back-hold families
+/// guard REACTIVELY: neutral by default, away-direction only inside the guard
+/// window.
+enum Guard {
+    /// Hold this chord for as long as we are guarding (MK).
+    Button([bool; 12]),
+    /// Reactive away-hold. `range` = max |opp.x − me.x| for the window to open
+    /// (None = unmapped, no distance gate); `commit` = the attack-commitment
+    /// source; `tail` = frames the window stays open after it clears.
+    BackHold { range: Option<i32>, commit: Commit, tail: u64 },
+    /// The profile maps neither a block chord nor a usable window — the dummy
+    /// stands still and the panel greys the guard modes (house degradation).
+    Inert,
+}
+
+/// Attack-commitment sources in MACRO_ACTIONS §9.2 preference order (we SHIP
+/// the field path where the port maps one; the input mask is the zero-RE
+/// fallback that works on any family).
+enum Commit {
+    /// Per-fighter "committing an attack" flag, (block1 addr, block2 addr) —
+    /// asurabld's `attacking` (+0x6F): 0 at rest, 1 for the full live duration
+    /// of any attack. Read the OPPONENT's.
+    Field(u32, u32),
+    /// The opponent port's live input mask: any attack-class chord fully down.
+    InputMask(Vec<u16>),
+}
+
+/// One frame of guard-policy output.
+struct GuardOut {
+    /// What the dummy holds this frame (empty = stand neutral).
+    bits: [bool; 12],
+    /// The opponent is committed to an attack inside `guard_range` — the §9.3
+    /// punish event. Independent of the guard MODE: it describes the opponent,
+    /// not our choice. Always true for button families (no window).
+    commit: bool,
+    /// Rising edge of `commit` — one opportunity, one trigger.
+    commit_edge: bool,
+    /// The mode took this opportunity and we are asserting the guard.
+    guarding: bool,
+    /// Where the opponent stands, for macro direction resolution.
+    opp_right: bool,
 }
 
 /// Resolved contact-signal addresses. Change = contact (hit OR blocked hit).
@@ -184,19 +257,63 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
         Some(Reset { x, left, right, y })
     })();
 
-    let block_chord = if p.family.block.style == "button" {
-        p.family.block.class.as_deref().and_then(|class| {
-            // An empty chord (block button not yet verified for this port)
-            // must not resolve into a hold-nothing "block" — fall through.
-            let chord = p.port.attack_chords.get(class).filter(|c| !c.is_empty())?;
-            let mut bits = [false; 12];
-            for name in chord {
-                bits[crate::profile::retro_button_bit(name)? as usize] = true;
-            }
-            Some(bits)
-        })
+    // ── the guard policy (§9.1) ────────────────────────────────────────────
+    let guard = if p.family.block.style == "button" {
+        p.family
+            .block
+            .class
+            .as_deref()
+            .and_then(|class| {
+                // An empty chord (block button not yet verified for this port)
+                // must not resolve into a hold-nothing "block" — fall through.
+                let chord = p.port.attack_chords.get(class).filter(|c| !c.is_empty())?;
+                let mut bits = [false; 12];
+                for name in chord {
+                    bits[crate::profile::retro_button_bit(name)? as usize] = true;
+                }
+                Some(Guard::Button(bits))
+            })
+            .unwrap_or(Guard::Inert)
     } else {
-        None
+        // Reactive guard: needs X (for the away direction AND the distance
+        // gate) plus an attack-commitment source.
+        (|| {
+            x_pair?;
+            let commit = field("attacking")
+                .map(|off| (Commit::Field(p.block1() + off, p.block2() + off), GUARD_FIELD_TAIL))
+                .or_else(|| {
+                    // §9.2 fallback: the opponent's live input mask. The block
+                    // class itself is never an attack (button families only).
+                    let block_class = p.family.block.class.as_deref();
+                    let masks: Vec<u16> = p
+                        .port
+                        .attack_chords
+                        .iter()
+                        .filter(|(class, buttons)| {
+                            !buttons.is_empty() && Some(class.as_str()) != block_class
+                        })
+                        .filter_map(|(_, buttons)| {
+                            let mut m = 0u16;
+                            for b in buttons {
+                                m |= 1 << crate::profile::retro_button_bit(b)?;
+                            }
+                            Some(m)
+                        })
+                        .collect();
+                    (!masks.is_empty()).then(|| (Commit::InputMask(masks), GUARD_INPUT_TAIL))
+                })?;
+            Some(Guard::BackHold {
+                range: p
+                    .port
+                    .block
+                    .as_ref()
+                    .and_then(|b| b.guard_range)
+                    .map(|r| r as i32),
+                commit: commit.0,
+                tail: commit.1,
+            })
+        })()
+        .unwrap_or(Guard::Inert)
     };
 
     // `contact_signal` FIRST: it is the purpose-built "was struck" signal.
@@ -229,7 +346,7 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
         reset,
         finish: g("round_state"),
         x_pair,
-        block_chord,
+        guard,
         contact,
         hitstun_window: p.calibration("HITSTUN_RECENT_FRAMES").unwrap_or(20.0) as u64,
     })
@@ -269,7 +386,11 @@ pub fn features() -> Option<Features> {
 
 fn features_of(p: &GameProfile) -> Option<Features> {
     let r = resolve(p)?;
-    let block_dummy = r.block_chord.is_some() || r.x_pair.is_some();
+    let block_dummy = !matches!(r.guard, Guard::Inert);
+    // Back-hold families trigger on the commitment window, not on contact
+    // (§9.3: blocked contact is undetectable there), so a resolved reactive
+    // guard IS the trigger.
+    let has_trigger = r.contact.is_some() || matches!(r.guard, Guard::BackHold { .. });
     Some(Features {
         refill: r.refill.is_some(),
         timer_hold: r.timer.is_some(),
@@ -277,30 +398,147 @@ fn features_of(p: &GameProfile) -> Option<Features> {
         position_reset: r.reset.is_some(),
         finish_round: r.finish.is_some(),
         block_dummy,
-        block_punish: block_dummy && r.contact.is_some(),
+        block_punish: block_dummy && has_trigger,
+        guard_after_hit: r.contact.is_some(),
     })
 }
 
-/// The dummy's guard hold and which block it occupies. The dummy is the
-/// RIGHT fighter when X is mapped (correct for freshly started VS rounds),
-/// else block 2. Button-block families hold the chord; back-hold families
-/// hold away (Right, since the dummy is the right fighter); no X and no
-/// chord degrades to standing still.
-fn guard_hold(ds: &DebugState, r: &Resolved) -> ([bool; 12], u8) {
-    let mut block = 2u8;
-    if let Some(xp) = r.x_pair {
-        let x1 = rd16(ds, xp.p1, r.little) as i32;
-        let x2 = rd16(ds, xp.p2, r.little) as i32;
-        block = if x1 >= x2 { 1 } else { 2 };
+/// Wall-clock entropy, so nothing the dummy samples is deterministic (§6's
+/// number-one survey finding).
+fn entropy() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Poll the profile's contact signal for the DUMMY (it is the victim of the
+/// punish drill): `(changed this frame, current value)`. Also stamps the
+/// quiet-window bookkeeping the punish cooldown and the guard modes read.
+fn poll_contact(ds: &mut DebugState, r: &Resolved, frame: u64) -> (bool, u8) {
+    let Some(contact) = &r.contact else {
+        return (false, 0);
+    };
+    let addr = match contact {
+        Contact::Global(a) => *a,
+        Contact::PerBlock(b1, b2) => {
+            if DUMMY_BLOCK == 1 {
+                *b1
+            } else {
+                *b2
+            }
+        }
+    };
+    let cur = rd8(ds, addr);
+    let changed = ds.training.punish_prev_signal.is_some_and(|prev| prev != cur);
+    ds.training.punish_prev_signal = Some(cur);
+    if changed {
+        ds.training.punish_last_change = frame;
     }
-    if let Some(chord) = r.block_chord {
-        return (chord, block);
+    (changed, cur)
+}
+
+/// One frame of the guard policy (MACRO_ACTIONS §9): decide whether there is a
+/// guard opportunity (style-dependent), whether the MODE takes it, and what to
+/// hold. Shared by `DummyMode::Block` and `DummyMode::BlockPunish` — one
+/// policy, so both dummies behave identically about spacing.
+fn guard_frame(ds: &mut DebugState, r: &Resolved, frame: u64, contact_changed: bool) -> GuardOut {
+    // Live geometry (both styles want `opp_right` for macro playback).
+    let geom = r.x_pair.map(|xp| {
+        let me = rd16(ds, xp.p2, r.little) as i32;
+        let opp = rd16(ds, xp.p1, r.little) as i32;
+        (me, opp)
+    });
+    let opp_right = geom.map(|(me, opp)| opp > me).unwrap_or(false);
+
+    // ── (a) Is there a guard opportunity this frame? ──────────────────────
+    let (raw, away) = match &r.guard {
+        // A held button is positionally inert, so a button family has no
+        // window to open: the opportunity is simply always (today's
+        // behaviour, unchanged).
+        Guard::Button(_) => (true, None),
+        Guard::Inert => (false, None),
+        Guard::BackHold { range, commit, tail } => {
+            let (me, opp) = geom.expect("BackHold only resolves with an x pair");
+            // Away = the direction that increases the gap. NEVER Down:
+            // down-back blocks nothing on asurabld (0/4, reproduced) — the
+            // guard hold is PURE standing back.
+            let away = Some(if me >= opp { BIT_RIGHT } else { BIT_LEFT });
+            let live = match commit {
+                Commit::Field(b1, b2) => {
+                    rd8(ds, if DUMMY_BLOCK == 1 { *b2 } else { *b1 }) != 0
+                }
+                Commit::InputMask(masks) => {
+                    let mask = crate::record::pack_mask(&ds.input_state);
+                    masks.iter().any(|m| mask & m == *m)
+                }
+            };
+            if live {
+                ds.training.guard_commit_until = frame + tail;
+            }
+            let committed = live || frame < ds.training.guard_commit_until;
+            // The distance gate is what keeps the dummy from reacting to far
+            // whiffs (and from drifting on them).
+            let in_range = range.is_none_or(|rg| (me - opp).abs() <= rg);
+            (committed && in_range, away)
+        }
+    };
+
+    // ── (b) String bookkeeping for the modes that need a hit signal ───────
+    if contact_changed {
+        ds.training.guard_hit_seen = true;
+        ds.training.guard_last_hit = frame;
+    } else if ds.training.guard_hit_seen
+        && frame.saturating_sub(ds.training.guard_last_hit) > r.hitstun_window
+    {
+        // The string ended: After First Hit re-arms, Random re-rolls.
+        ds.training.guard_hit_seen = false;
+        ds.training.guard_roll = None;
     }
-    let mut b = [false; 12];
-    if r.x_pair.is_some() {
-        b[7] = true; // away from the opponent = Right
+    // One opportunity = one sticky decision; it expires with the window (for
+    // button families, whose window never closes, the string end above is what
+    // expires it).
+    if !raw {
+        ds.training.guard_roll = None;
     }
-    (b, block)
+
+    // ── (c) The MODE decides whether we take it (§9.4) ────────────────────
+    let allow = match ds.training.guard_mode {
+        GuardMode::All => true,
+        GuardMode::None => false,
+        GuardMode::AfterFirstHit => ds.training.guard_hit_seen,
+        GuardMode::Random => match ds.training.guard_roll {
+            Some(v) => v,
+            None if raw => {
+                let pct = ds.training.guard_random_pct.0.min(100);
+                let seed = frame ^ (entropy() << 13) ^ 0x9E37_79B9;
+                let v = crate::macros::weighted_pick(&[(true, pct), (false, 100 - pct)], seed)
+                    .copied()
+                    .unwrap_or(false);
+                ds.training.guard_roll = Some(v);
+                v
+            }
+            None => false,
+        },
+    };
+
+    let commit_edge = raw && !ds.training.guard_prev_commit;
+    ds.training.guard_prev_commit = raw;
+
+    let guarding = raw && allow;
+    let mut bits = [false; 12];
+    if guarding {
+        match &r.guard {
+            Guard::Button(chord) => bits = *chord,
+            Guard::BackHold { .. } => {
+                if let Some(b) = away {
+                    bits[b] = true;
+                }
+            }
+            Guard::Inert => {}
+        }
+    }
+    GuardOut { bits, commit: raw, commit_edge, guarding, opp_right }
 }
 
 /// Run one training-mode frame. Called from `Frontend::run_frame` after the
@@ -353,10 +591,14 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
                 bits = Some(if ds.training.punish_wait < PUNISH_RELEASE {
                     [false; 12]
                 } else {
-                    guard_hold(ds, &r).0
+                    // Same reactive policy as in-gate (x reads are ungated).
+                    guard_frame(ds, &r, frame, false).bits
                 });
-            } else if let Some(ex) = ds.training.punish_exec.as_mut() {
-                bits = ex.next(false); // dummy-is-right default; x is ungated reads
+            } else {
+                let opp_right = guard_frame(ds, &r, frame, false).opp_right;
+                if let Some(ex) = ds.training.punish_exec.as_mut() {
+                    bits = ex.next(opp_right);
+                }
                 if bits.is_none() {
                     ds.training.punish_exec = None;
                 }
@@ -440,11 +682,18 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
         }
         // Guard per family block style: the chord for button-block families
         // (MK), hold-away for back-hold families (see `guard_hold`).
-        DummyMode::Block => Some(guard_hold(ds, &r).0),
-        // Guard, and on each guarded contact sample the weighted punish pool
-        // (MACRO_ACTIONS §6). No contact signal mapped → plain guarding (the
+        DummyMode::Block => {
+            let (changed, _) = poll_contact(ds, &r, frame);
+            Some(guard_frame(ds, &r, frame, changed).bits)
+        }
+        // Guard, and on each trigger sample the weighted punish pool
+        // (MACRO_ACTIONS §6/§9.3). No trigger mapped → plain guarding (the
         // panel greys the mode with the reason).
-        DummyMode::BlockPunish => Some(block_punish(ds, frame, p, &r)),
+        DummyMode::BlockPunish => {
+            let contact = poll_contact(ds, &r, frame);
+            let g = guard_frame(ds, &r, frame, contact.0);
+            Some(block_punish(ds, frame, p, &r, g, contact))
+        }
     };
     if let Some(bits) = dummy_bits {
         for (i, on) in bits.iter().enumerate() {
@@ -480,35 +729,50 @@ const PUNISH_REARM_FRAMES: u64 = 8;
 
 const PUNISH_GATE_GRACE: u64 = 60;
 
-/// One BlockPunish frame: guard by default; when the contact signal changes
-/// while armed, sample the weighted pool and play the pick through
-/// [`crate::macros::MacroExec`] on the dummy port. The cooldown re-arms only
-/// after the signal has been quiet ≥ HITSTUN_RECENT_FRAMES (§6), so one
-/// blocked string triggers one punish, not one per chip hit.
-fn block_punish(ds: &mut DebugState, frame: u64, p: &GameProfile, r: &Resolved) -> [bool; 12] {
+/// One BlockPunish frame: guard by policy; on each TRIGGER sample the weighted
+/// pool and play the pick through [`crate::macros::MacroExec`] on the dummy
+/// port. The trigger is family-dependent:
+/// - button families: the contact signal changing while guarding (§6) — the
+///   dummy knows it was actually struck;
+/// - back-hold families: the guard window OPENING (§9.3) — blocked contact is
+///   undetectable there (zero chip, quiet counters), so the honest trigger is
+///   "the opponent committed an attack inside `guard_range`". That is a
+///   SUPERSET drill (block-punish AND whiff-punish) and the phase string says
+///   "punishing (commit)" so nothing implies confirmed contact.
+///
+/// The cooldown re-arms only after the trigger source has been quiet
+/// ≥ [`PUNISH_REARM_FRAMES`], so one attack (or one blocked string) triggers
+/// one punish, not one per frame.
+fn block_punish(
+    ds: &mut DebugState,
+    frame: u64,
+    p: &GameProfile,
+    r: &Resolved,
+    g: GuardOut,
+    contact: (bool, u8),
+) -> [bool; 12] {
     use crate::macros::PunishOption;
-    let (guard_bits, dummy_block) = guard_hold(ds, r);
-    let Some(contact) = &r.contact else {
-        return guard_bits; // no signal mapped — degrade to plain Block
-    };
-    let sig_addr = match contact {
-        Contact::Global(a) => *a,
-        Contact::PerBlock(b1, b2) => if dummy_block == 1 { *b1 } else { *b2 },
-    };
-    let cur = rd8(ds, sig_addr);
-    let changed = ds.training.punish_prev_signal.is_some_and(|prev| prev != cur);
-    ds.training.punish_prev_signal = Some(cur);
-    if changed {
+    let guard_bits = g.bits;
+    let dummy_block = DUMMY_BLOCK;
+    // §9.3: back-hold families trigger on commitment, button families on contact.
+    let on_commit = matches!(r.guard, Guard::BackHold { .. });
+    let (changed, cur) = contact;
+    let trigger = if on_commit { g.commit_edge } else { changed };
+    if on_commit && g.commit {
+        // The open window is this path's "signal is live"; the cooldown counts
+        // quiet frames from the moment it closes.
         ds.training.punish_last_change = frame;
+    }
+    if !on_commit && r.contact.is_none() {
+        return guard_bits; // no trigger mapped — degrade to plain Block
     }
     if !ds.training.punish_armed
         && frame.saturating_sub(ds.training.punish_last_change) >= PUNISH_REARM_FRAMES
     {
         ds.training.punish_armed = true;
     }
-    // The dummy is the right fighter (guard_hold), so its opponent is left.
     // Re-derived every frame — a side switch mid-macro flips "back" with it.
-    let opp_right = false;
+    let opp_right = g.opp_right;
 
     // An in-flight punish: guard out the post-contact delay, then play the
     // macro to completion.
@@ -536,28 +800,40 @@ fn block_punish(ds: &mut DebugState, frame: u64, p: &GameProfile, r: &Resolved) 
     }
 
     if ds.training.punish_exec.is_none() {
+        let mode = ds.training.guard_mode;
         ds.training.punish_phase = if frame < ds.training.punish_hold_until {
-            "guarding — holding block".to_string()
-        } else if ds.training.punish_armed {
-            "guarding — ARMED".to_string()
-        } else {
+            // ContinueBlock: keep guarding (reactively, where that is the
+            // policy) and decline to punish until the hold expires.
+            if on_commit {
+                "guarding — continue block".to_string()
+            } else {
+                "guarding — holding block".to_string()
+            }
+        } else if !ds.training.punish_armed {
             let quiet = frame.saturating_sub(ds.training.punish_last_change);
             format!("cooling — {}f", PUNISH_REARM_FRAMES.saturating_sub(quiet))
+        } else if g.guarding {
+            // "(window)" is only meaningful where the guard is reactive.
+            if on_commit { "guarding (window) — ARMED".into() } else { "guarding — ARMED".into() }
+        } else if g.commit {
+            // An opportunity the MODE declined — say so, don't look broken.
+            format!("not guarding ({}) — ARMED", mode.label())
+        } else {
+            "neutral — ARMED".to_string()
         };
     }
 
     if ds.training.punish_exec.is_none()
-        && changed
+        && trigger
         && ds.training.punish_armed
         && frame >= ds.training.punish_hold_until
     {
         ds.training.punish_armed = false;
+        // A commit trigger never confirmed contact — the phase must not
+        // pretend it did (§9.3).
+        let verb = if on_commit { "punishing (commit)" } else { "punishing" };
         // Never deterministic (§6): wall-clock entropy in the seed.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u64)
-            .unwrap_or(0);
-        let seed = frame ^ ((cur as u64) << 32) ^ nanos;
+        let seed = frame ^ ((cur as u64) << 32) ^ entropy();
         let pick = crate::macros::weighted_pick(&ds.training.punish_pool, seed).cloned();
         // Scheduled, not stepped: the macro's first input lands PUNISH_DELAY
         // frames from now, after hit-freeze + blockstun have passed.
@@ -579,7 +855,7 @@ fn block_punish(ds: &mut DebugState, frame: u64, p: &GameProfile, r: &Resolved) 
                 match steps.and_then(|s| crate::macros::compile(&name, &s, p).ok()) {
                     Some(m) => {
                         start(m, ds);
-                        ds.training.punish_phase = format!("punishing: {name}");
+                        ds.training.punish_phase = format!("{verb}: {name}");
                         ds.log(format!("🎯 punish: {name}"));
                         eprintln!("[training] punish: {name}"); // headless-visible twin
                     }
@@ -595,7 +871,7 @@ fn block_punish(ds: &mut DebugState, frame: u64, p: &GameProfile, r: &Resolved) 
                 };
                 if let Ok(m) = crate::macros::compile(&class, &[spec], p) {
                     start(m, ds);
-                    ds.training.punish_phase = format!("punishing: {class}");
+                    ds.training.punish_phase = format!("{verb}: {class}");
                     ds.log(format!("🎯 punish: {class}"));
                     eprintln!("[training] punish: {class}"); // headless-visible twin
                 }
@@ -615,10 +891,25 @@ fn block_punish(ds: &mut DebugState, frame: u64, p: &GameProfile, r: &Resolved) 
 /// or the port maps no `char_id`.
 pub fn punish_dummy_char(ds: &DebugState) -> Option<u8> {
     let p = crate::profile::current();
-    let r = resolve(p)?;
-    let (_, block) = guard_hold(ds, &r);
-    let (addr, _) = p.field_addr(block, "char_id")?;
+    resolve(p)?;
+    let (addr, _) = p.field_addr(DUMMY_BLOCK, "char_id")?;
     Some(p.canon_char_id(rd8(ds, addr)))
+}
+
+/// Whether the loaded family guards REACTIVELY (back-hold) — the panel words
+/// its hints differently for the two styles.
+pub fn guard_is_reactive() -> bool {
+    resolve(crate::profile::current())
+        .map(|r| matches!(r.guard, Guard::BackHold { .. }))
+        .unwrap_or(false)
+}
+
+/// The port's guard range in `x` units, when the reactive guard uses one.
+pub fn guard_range() -> Option<i32> {
+    match resolve(crate::profile::current())?.guard {
+        Guard::BackHold { range, .. } => range,
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -673,7 +964,9 @@ mod tests {
         assert_eq!(all.len(), 4, "struct pair + HUD pair: {all:x?}");
         // MK is button-block: the dummy must hold the Block chord (L), not
         // walk backward.
-        let chord = r.block_chord.expect("mk2 dummy blocks with a button");
+        let Guard::Button(chord) = r.guard else {
+            panic!("mk2 must resolve a button guard policy");
+        };
         let held: Vec<usize> = chord.iter().enumerate().filter(|(_, on)| **on).map(|(i, _)| i).collect();
         assert_eq!(held, vec![10], "Block = RETRO L");
     }
@@ -793,7 +1086,279 @@ mod tests {
     fn asurabld_blocks_by_holding_back_not_a_chord() {
         let p = crate::profile::init_for_tests();
         let r = resolve(p).unwrap();
-        assert!(r.block_chord.is_none(), "back_hold family must use X-relative block");
         assert!(r.x_pair.is_some());
+        // back_hold → the REACTIVE policy, keyed on the `attacking` field
+        // (the port maps it) and gated by the live-measured guard range.
+        match r.guard {
+            Guard::BackHold { range, commit, tail } => {
+                assert_eq!(range, Some(175), "asurabld.md guard_range");
+                assert!(matches!(commit, Commit::Field(..)), "attacking (+0x6F) is mapped");
+                assert_eq!(tail, GUARD_FIELD_TAIL);
+            }
+            _ => panic!("asurabld must resolve a reactive back-hold guard"),
+        }
+    }
+
+    // ── the reactive guard (MACRO_ACTIONS §9) ───────────────────────────────
+
+    /// asurabld staged in a bus window with an OPEN gate: the scenario every
+    /// guard test drives by moving x / `attacking` around.
+    fn asurabld_scene() -> (GameProfile, DebugState) {
+        let p = GameProfile::load(Path::new("library/asurabld")).expect("asurabld loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-guard-test".into(),
+            addr: 0x400000,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr(p.global("round_timer").unwrap() as usize, 1, 0x99));
+        assert!(crate::gate::eval_gate(&ds, &p), "gate must be open for the guard tests");
+        ds.training.enabled = true;
+        ds.training.refill = false;
+        (p, ds)
+    }
+
+    /// Place the fighters (big-endian words) and set the OPPONENT's (block 1's)
+    /// attack-commitment flag.
+    fn stage(ds: &mut DebugState, p: &GameProfile, opp_x: u16, me_x: u16, attacking: u8) {
+        let xoff = p.field_off("x").unwrap().0;
+        let aoff = p.field_off("attacking").unwrap().0;
+        assert!(ds.write_addr((p.block1() + xoff) as usize, 2, opp_x.swap_bytes() as u32));
+        assert!(ds.write_addr((p.block2() + xoff) as usize, 2, me_x.swap_bytes() as u32));
+        assert!(ds.write_addr((p.block1() + aoff) as usize, 1, attacking as u32));
+    }
+
+    fn held(ds: &DebugState) -> Vec<usize> {
+        ds.injected_input2.iter().enumerate().filter(|(_, v)| **v > 0).map(|(i, _)| i).collect()
+    }
+
+    /// THE acceptance property (§9.1): a back-hold dummy that is not being
+    /// attacked asserts NOTHING, so it cannot walk itself into the corner —
+    /// the bug that motivated this whole section (165 → 286 units in ~1 s).
+    #[test]
+    fn back_hold_guard_asserts_nothing_while_the_opponent_idles() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::Block;
+        stage(&mut ds, &p, 200, 300, 0);
+        for f in 1..=300 {
+            tick_with(&mut ds, f, &p);
+            assert!(held(&ds).is_empty(), "frame {f}: reactive guard must stand neutral");
+        }
+    }
+
+    /// The guard window: opponent attacking AND inside `guard_range` → hold
+    /// away, PURE standing back (never Down — down-back blocks nothing here,
+    /// 0/4 reproduced). Out of range → nothing. Released when the attack ends.
+    #[test]
+    fn back_hold_guard_opens_only_on_a_committed_attack_in_range() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::Block;
+        let mut f = 0u64;
+        let mut step = |ds: &mut DebugState, f: &mut u64| {
+            *f += 1;
+            tick_with(ds, *f, &p);
+        };
+
+        // In range (gap 100 ≤ 175), attacking → away = Right (dummy on the right).
+        stage(&mut ds, &p, 200, 300, 1);
+        step(&mut ds, &mut f);
+        assert_eq!(held(&ds), vec![BIT_RIGHT], "guarding: pure standing back");
+
+        // Attack ends: the window closes after the (latency-only) tail.
+        stage(&mut ds, &p, 200, 300, 0);
+        for _ in 0..=GUARD_FIELD_TAIL {
+            step(&mut ds, &mut f);
+        }
+        assert!(held(&ds).is_empty(), "released once the opponent recovers");
+
+        // Same attack, but OUT of range (gap 250 > 175): far whiffs are ignored.
+        stage(&mut ds, &p, 200, 450, 1);
+        for _ in 0..5 {
+            step(&mut ds, &mut f);
+        }
+        assert!(held(&ds).is_empty(), "out of guard_range → no window, no drift");
+
+        // Sides swapped (dummy on the LEFT): away = Left, still never Down.
+        stage(&mut ds, &p, 300, 200, 1);
+        step(&mut ds, &mut f);
+        assert_eq!(held(&ds), vec![BIT_LEFT], "away follows live sides");
+    }
+
+    /// Guard modes (§9.4). None never guards; After First Hit guards only once
+    /// a contact signal has fired, for the rest of the string; Random is
+    /// weighted (statistically, and exactly at the 0 %/100 % edges).
+    #[test]
+    fn guard_modes_gate_the_window() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::Block;
+        stage(&mut ds, &p, 200, 300, 1); // a permanent guard opportunity
+
+        // None: never.
+        ds.training.guard_mode = GuardMode::None;
+        for f in 1..=30 {
+            tick_with(&mut ds, f, &p);
+            assert!(held(&ds).is_empty(), "GuardMode::None must never guard");
+        }
+
+        // After First Hit: nothing until the dummy's contact signal moves.
+        ds.training.guard_mode = GuardMode::AfterFirstHit;
+        for f in 31..=60 {
+            tick_with(&mut ds, f, &p);
+            assert!(held(&ds).is_empty(), "no hit yet → no guard");
+        }
+        let sig = p.global("combo_on_b2").unwrap() as usize; // block 2 = the dummy
+        assert!(ds.write_addr(sig, 1, 1));
+        tick_with(&mut ds, 61, &p);
+        assert_eq!(held(&ds), vec![BIT_RIGHT], "first hit landed → guard the rest of the string");
+        for f in 62..=70 {
+            tick_with(&mut ds, f, &p);
+            assert_eq!(held(&ds), vec![BIT_RIGHT], "still inside the string");
+        }
+        // The string ends once the contact signal has been quiet longer than
+        // the hitstun window — the dummy eats the next first hit again.
+        for f in 71..=140 {
+            tick_with(&mut ds, f, &p);
+        }
+        assert!(held(&ds).is_empty(), "string over → back to eating the first hit");
+
+        // Random at the deterministic edges.
+        ds.training.guard_mode = GuardMode::Random;
+        ds.training.guard_random_pct = crate::debug::GuardPct(0);
+        for f in 141..=170 {
+            tick_with(&mut ds, f, &p);
+            assert!(held(&ds).is_empty(), "0 % never guards");
+        }
+        ds.training.guard_random_pct = crate::debug::GuardPct(100);
+        ds.training.guard_roll = None;
+        tick_with(&mut ds, 171, &p);
+        assert_eq!(held(&ds), vec![BIT_RIGHT], "100 % always guards");
+    }
+
+    /// Random is a WEIGHTED coin per opportunity (not per frame): each attack
+    /// is guarded or not, wholesale. Statistical assertion — loose bounds.
+    #[test]
+    fn guard_mode_random_is_weighted_per_opportunity() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::Block;
+        ds.training.guard_mode = GuardMode::Random;
+        ds.training.guard_random_pct = crate::debug::GuardPct(50);
+        let mut f = 0u64;
+        let (mut guarded, mut trials) = (0u32, 0u32);
+        for _ in 0..300 {
+            // One opportunity: the attack starts, is held, then recovers.
+            stage(&mut ds, &p, 200, 300, 1);
+            let mut taken = None;
+            for _ in 0..4 {
+                f += 1;
+                tick_with(&mut ds, f, &p);
+                let now = !held(&ds).is_empty();
+                // Sticky: the decision must not flicker inside one attack.
+                match taken {
+                    None => taken = Some(now),
+                    Some(prev) => assert_eq!(prev, now, "the roll must be sticky per attack"),
+                }
+            }
+            trials += 1;
+            if taken == Some(true) {
+                guarded += 1;
+            }
+            stage(&mut ds, &p, 200, 300, 0);
+            for _ in 0..=GUARD_FIELD_TAIL {
+                f += 1;
+                tick_with(&mut ds, f, &p);
+            }
+        }
+        assert!(
+            guarded > trials / 5 && guarded < trials * 4 / 5,
+            "≈50 % of {trials} opportunities should be guarded, got {guarded}"
+        );
+    }
+
+    /// §9.3: back-hold families punish on the guard window OPENING (blocked
+    /// contact is undetectable), and the phase string must say so.
+    #[test]
+    fn back_hold_punishes_on_attack_commitment_not_contact() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::BlockPunish;
+        ds.training.punish_pool = vec![(crate::macros::PunishOption::Attack("Medium".into()), 1)];
+        stage(&mut ds, &p, 200, 300, 0);
+
+        // Quiet frames arm the trigger while the dummy stands NEUTRAL.
+        for f in 1..=20 {
+            tick_with(&mut ds, f, &p);
+        }
+        assert!(ds.training.punish_armed);
+        assert!(held(&ds).is_empty(), "armed but not guarding: nothing is asserted");
+        assert_eq!(ds.training.punish_phase, "neutral — ARMED");
+
+        // The opponent commits an attack in range: guard + schedule the punish.
+        stage(&mut ds, &p, 200, 300, 1);
+        tick_with(&mut ds, 21, &p);
+        assert!(ds.training.punish_exec.is_some(), "commit edge schedules the punish");
+        assert_eq!(ds.training.punish_wait, PUNISH_DELAY);
+        assert!(
+            ds.training.punish_phase.starts_with("punishing (commit)"),
+            "must not imply confirmed contact: {}",
+            ds.training.punish_phase
+        );
+        assert_eq!(held(&ds), vec![BIT_RIGHT], "keeps guarding through the delay");
+
+        // Ride out the delay, then the macro presses Medium (RETRO a = bit 8).
+        let mut f = 22;
+        while ds.training.punish_wait > 0 {
+            tick_with(&mut ds, f, &p);
+            f += 1;
+        }
+        assert!(held(&ds).is_empty(), "released for a clean press");
+        tick_with(&mut ds, f, &p);
+        assert_eq!(held(&ds), vec![8], "Medium = RETRO a");
+
+        // One attack, one punish: the window stays open but never re-triggers.
+        while ds.training.punish_exec.is_some() {
+            f += 1;
+            tick_with(&mut ds, f, &p);
+        }
+        f += 1;
+        tick_with(&mut ds, f, &p);
+        assert!(!ds.training.punish_armed, "still cooling while the attack is live");
+        assert!(ds.training.punish_exec.is_none());
+    }
+
+    /// The button path's phase wording stays contact-flavoured (no "(commit)")
+    /// — the two families must never borrow each other's honesty claims.
+    #[test]
+    fn button_punish_phase_says_contact_not_commit() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let r = resolve(&p).unwrap();
+        assert!(matches!(r.guard, Guard::Button(_)));
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-phase-test".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
+        assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
+        ds.training.enabled = true;
+        ds.training.dummy = DummyMode::BlockPunish;
+        ds.training.punish_pool = vec![(crate::macros::PunishOption::Attack("HP".into()), 1)];
+        for f in 1..=20 {
+            tick_with(&mut ds, f, &p);
+        }
+        assert_eq!(ds.training.punish_phase, "guarding — ARMED");
+        let sig = p.global("p2_health_hud").unwrap() as usize;
+        assert!(ds.write_addr(sig, 1, 1));
+        tick_with(&mut ds, 21, &p);
+        assert_eq!(ds.training.punish_phase, "punishing: HP");
     }
 }

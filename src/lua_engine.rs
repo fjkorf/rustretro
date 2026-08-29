@@ -48,8 +48,10 @@
 //! training.punish_state()          -> string   (BlockPunish phase, same string the
 //!                                                panel shows: "guarding — ARMED" /
 //!                                                "cooling — Nf" / "punishing: slide")
+//! training.guard_mode()             -> string   ("all"/"after_first_hit"/"random"/"none")
 //! training.set_enabled(bool)                    (write-gated; on = refill on, F5 parity)
 //! training.set_dummy(mode)                      (write-gated; headless F1 — same mode strings)
+//! training.set_guard(mode [, pct])               (write-gated; guard mode + Random's percent)
 //! training.set_punish(pool)                     (write-gated; BlockPunish pool:
 //!                                                {{weight=3, move="slide"}, {weight=2, attack="HP"},
 //!                                                 {weight=1, continue_frames=30}, ...})
@@ -836,6 +838,22 @@ impl LuaEngine {
             })?;
             training.set("punish_state", f)?;
         }
+        // guard_mode() -> "all"/"after_first_hit"/"random"/"none" (§9.4).
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, ()| -> mlua::Result<String> {
+                use crate::debug::GuardMode;
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                Ok(match ds.training.guard_mode {
+                    GuardMode::All => "all",
+                    GuardMode::AfterFirstHit => "after_first_hit",
+                    GuardMode::Random => "random",
+                    GuardMode::None => "none",
+                }
+                .to_string())
+            })?;
+            training.set("guard_mode", f)?;
+        }
         // Setters — the headless twin of F5/F1/the panel's pool steppers
         // (agents drive training over run_lua; hotkeys need a window). All
         // behind the ONE write gate (`--training` arms it, MCP enable_writes
@@ -882,6 +900,39 @@ impl LuaEngine {
                 Ok(())
             })?;
             training.set("set_dummy", f)?;
+        }
+        {
+            // set_guard(mode [, percent]) — the guard-mode selector's headless
+            // twin (§9.4); `percent` is Random's take-probability.
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(
+                move |_, (name, pct): (String, Option<u8>)| -> mlua::Result<()> {
+                    use crate::debug::{GuardMode, GuardPct};
+                    let mode = match name.as_str() {
+                        "all" => GuardMode::All,
+                        "after_first_hit" => GuardMode::AfterFirstHit,
+                        "random" => GuardMode::Random,
+                        "none" => GuardMode::None,
+                        other => {
+                            return Err(mlua::Error::external(format!(
+                                "unknown guard mode '{other}' (all/after_first_hit/random/none)"
+                            )))
+                        }
+                    };
+                    let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                    if !ds.lua_writes_enabled {
+                        return Err(mlua::Error::external(
+                            "training.set_guard blocked: writes disabled (enable_writes)",
+                        ));
+                    }
+                    ds.training.guard_mode = mode;
+                    if let Some(p) = pct {
+                        ds.training.guard_random_pct = GuardPct(p.min(100));
+                    }
+                    Ok(())
+                },
+            )?;
+            training.set("set_guard", f)?;
         }
         {
             let dbg = SharedDebugState::clone(debug);

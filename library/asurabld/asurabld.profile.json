@@ -26,7 +26,8 @@
       { "name": "char_id", "off": "0x639", "size": 1 },
       { "name": "wins", "off": "0xA4C", "size": 1 },
       { "name": "opp_right_hold", "off": "0x28", "size": 2 },
-      { "name": "opp_left_hold", "off": "0x2A", "size": 2 }
+      { "name": "opp_left_hold", "off": "0x2A", "size": 2 },
+      { "name": "attacking", "off": "0x6F", "size": 1 }
     ],
     "globals": {
       "round_state": "0x400000",
@@ -84,5 +85,11 @@
     "round_start_x_left": 84,
     "round_start_x_right": 232,
     "round_start_y": 216
+  },
+  "block": {
+    "guard_range": 175,
+    "guard_range_evidence": "max observed connect gap ~162 (Medium, the longest-reaching tested attack) + margin; per-move connect boundaries (mapped x units): Light ~96-98, Toss ~96-98, Launcher ~151, Heavy ~157, Medium ~162. See asurabld.md 'Guard policy RE' section, 2026-08-28.",
+    "overhead_verdict": "no true overheads found among Light/Medium/Heavy/Launcher/Toss, but down-back ALSO does not block them (0/4, 3x reproduced) -- this build has no working crouch-guard state; only pure standing-back (hold away, no Down) blocks. Toss was blocked by both standing-back and down-back in one trial (less certain, narrow hit window). Guard implementation must never add Down to the guard hold.",
+    "charge_hazard_verdict": "no charge-based specials found on Goat or Rose Mary for back-charge + forward + Light/Medium/Heavy (a promising 'projectile' sighting for Goat charge+Medium did not reproduce across repeats and was disproven by a decisive range test at gap=200, well past Medium's normal ~162 whiff threshold: charged and uncharged both whiffed identically). Not tested on the other 6 roster characters."
   }
 }

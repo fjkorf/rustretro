@@ -1,0 +1,272 @@
+[
+  {
+    "name": "slide_chord_zero_stagger",
+    "description": "Slide (back+LK+LP+Block) with all buttons pressed on the same frame",
+    "macro": [
+      {
+        "dirs": ["back"],
+        "press": ["LK", "LP", "Block"],
+        "frames": 4
+      }
+    ],
+    "facing": "right",
+    "frames": [
+      "0x0",
+      "0x541"
+    ],
+    "expected": [
+      {
+        "frame": 1,
+        "move": "slide"
+      }
+    ]
+  },
+  {
+    "name": "slide_chord_two_frame_stagger",
+    "description": "Slide with LK pressed 2 frames after LP (within CHORD_TOLERANCE=3)",
+    "macro": [
+      {
+        "dirs": ["back"],
+        "press": ["LK", "LP", "Block"],
+        "frames": 4
+      }
+    ],
+    "facing": "right",
+    "frames": [
+      "0x0",
+      "0x441",
+      "0x541",
+      "0x541"
+    ],
+    "expected": [
+      {
+        "frame": 2,
+        "move": "slide"
+      }
+    ]
+  },
+  {
+    "name": "slide_chord_five_frame_stagger_still_matches",
+    "description": "Slide with LK pressed 5 frames after LP, while LP stays held throughout. The chord is satisfied the instant both are simultaneously down (frame 6) -- how far apart their onsets landed is irrelevant, since the game reads button STATE per frame, not press history.",
+    "note": "Pins rule 1 (simultaneity, no trailing window): a step is satisfied when its full press chord is down AT the current frame, however long ago each class's onset happened, as long as it is still held now.",
+    "macro": [
+      {
+        "dirs": ["back"],
+        "press": ["LK", "LP", "Block"],
+        "frames": 4
+      }
+    ],
+    "facing": "right",
+    "frames": [
+      "0x0",
+      "0x441",
+      "0x441",
+      "0x441",
+      "0x441",
+      "0x441",
+      "0x541"
+    ],
+    "expected": [
+      {
+        "frame": 6,
+        "move": "slide"
+      }
+    ]
+  },
+  {
+    "name": "slide_chord_never_overlaps_no_match",
+    "description": "LP pressed and released (frames 1-2), THEN LK pressed (frames 4-5); Block+back held throughout. LK and LP never share a frame, so the full chord never comes down together -- two separate taps of different classes are two inputs, not one chord.",
+    "note": "Pins the boundary of rule 1: overlap is required, not just co-occurrence within some window. No overlap ever -> no match, ever.",
+    "macro": [
+      {
+        "dirs": ["back"],
+        "press": ["LK", "LP", "Block"],
+        "frames": 4
+      }
+    ],
+    "facing": "right",
+    "frames": [
+      "0x440",
+      "0x441",
+      "0x441",
+      "0x440",
+      "0x540",
+      "0x540"
+    ],
+    "expected": []
+  },
+  {
+    "name": "bare_lp_not_chord",
+    "description": "Bare LP without back direction must NOT match slide chord",
+    "macro": [
+      {
+        "dirs": ["back"],
+        "press": ["LK", "LP", "Block"],
+        "frames": 4
+      }
+    ],
+    "facing": "right",
+    "frames": [
+      "0x0",
+      "0x1",
+      "0x1"
+    ],
+    "expected": []
+  },
+  {
+    "name": "acid_spit_two_step_gap_within_max",
+    "description": "Two-step motion (F, gap 6f, F+HP) with gap within MAX_GAP=12",
+    "macro": [
+      {
+        "dirs": ["forward"],
+        "frames": 3
+      },
+      {
+        "dirs": ["forward"],
+        "press": ["HP"],
+        "frames": 3
+      }
+    ],
+    "facing": "right",
+    "frames": [
+      "0x0",
+      "0x80",
+      "0x80",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x82",
+      "0x82"
+    ],
+    "expected": [
+      {
+        "frame": 9,
+        "move": "acid_spit"
+      }
+    ]
+  },
+  {
+    "name": "acid_spit_gap_exceeds_max",
+    "description": "Same motion with gap of 13 frames (exceeds MAX_GAP=12, no match)",
+    "macro": [
+      {
+        "dirs": ["forward"],
+        "frames": 3
+      },
+      {
+        "dirs": ["forward"],
+        "press": ["HP"],
+        "frames": 3
+      }
+    ],
+    "facing": "right",
+    "frames": [
+      "0x0",
+      "0x80",
+      "0x80",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x82",
+      "0x82"
+    ],
+    "expected": []
+  },
+  {
+    "name": "slide_facing_left_resolves_back_correctly",
+    "description": "When opponent is left (side=-1), 'back' resolves to RIGHT physical button. Slide completes.",
+    "macro": [
+      {
+        "dirs": ["back"],
+        "press": ["LK", "LP", "Block"],
+        "frames": 4
+      }
+    ],
+    "facing": "left",
+    "frames": [
+      "0x0",
+      "0x581"
+    ],
+    "expected": [
+      {
+        "frame": 1,
+        "move": "slide"
+      }
+    ]
+  },
+  {
+    "name": "held_chord_fires_once_not_per_tolerance_window",
+    "description": "Slide chord held for 11 straight frames. It fires exactly once, on the rising edge where the chord first comes down (frame 1) -- holding the buttons is one slide, not a slide replayed every few frames, so re-firing on a still-held chord would multiply-count a single input in training labels.",
+    "note": "Pins rule 2 (rising-edge completion + release-based re-arm): a macro completes once when its final step's satisfaction transitions false->true, and only re-arms after that step stops being satisfied.",
+    "macro": [
+      {
+        "dirs": ["back"],
+        "press": ["LK", "LP", "Block"],
+        "frames": 4
+      }
+    ],
+    "facing": "right",
+    "frames": [
+      "0x0",
+      "0x541",
+      "0x541",
+      "0x541",
+      "0x541",
+      "0x541",
+      "0x541",
+      "0x541",
+      "0x541",
+      "0x541",
+      "0x541",
+      "0x541"
+    ],
+    "expected": [
+      {
+        "frame": 1,
+        "move": "slide"
+      }
+    ]
+  },
+  {
+    "name": "back_to_back_distinct_completions",
+    "description": "Two separate chord presses (release between them)",
+    "macro": [
+      {
+        "dirs": ["back"],
+        "press": ["LK", "LP", "Block"],
+        "frames": 4
+      }
+    ],
+    "facing": "right",
+    "frames": [
+      "0x0",
+      "0x541",
+      "0x541",
+      "0x0",
+      "0x0",
+      "0x541",
+      "0x541"
+    ],
+    "expected": [
+      {
+        "frame": 1,
+        "move": "slide"
+      },
+      {
+        "frame": 5,
+        "move": "slide"
+      }
+    ]
+  }
+]

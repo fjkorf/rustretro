@@ -56,10 +56,15 @@ plays them back; both read the same profile data.
 - Facing: `back`/`forward` resolve against live side = sign(opp.x − me.x)
   (fighter field `facing` MAY refine this when mapped). Both matcher and
   executor MUST use the same resolution.
-- Matcher tolerance: within a step, all of `press` must be down simultaneously
-  for ≥1 frame while `dirs` are held (chord tolerance: presses may arrive up
-  to 3 frames apart); between steps, at most `max_gap` = 12 frames. A macro
-  with a single step is a chord (the slide); multi-step is a motion.
+- Matcher semantics: a step is satisfied at frame `i` when `dirs` are held at
+  `i` and every `press` class's full chord is down AT `i` — simultaneously,
+  in that one frame; the game reads button state per frame, so simultaneity
+  is the rule, not a trailing "recently pressed" window. A macro completes on
+  the rising edge of its final step's satisfaction (satisfied now, not
+  satisfied the frame before) — one input is one move, so a chord held for
+  many frames fires once, not once per frame; it re-arms only once that final
+  step releases. Between steps, at most `max_gap` = 12 frames (unchanged). A
+  macro with a single step is a chord (the slide); multi-step is a motion.
 
 ### Reference data this phase ships (Reptile, both MK2 ports)
 
@@ -175,3 +180,80 @@ State-free tracking, per the review's findings (no state word needed):
    record: event detection + measured per-move duration tables (probe-poke
    protocol) replaces live state detection; the tables are the frame-data
    DB's first contents.
+
+## 9. Guard policy — back-to-block families (added after the back-hold research pass)
+
+MK2's dummy guards with a BUTTON, which is positionally inert. Asura Blade
+(and SF-style families) block by HOLDING AWAY, which is not: measured live,
+a continuously-guarding asurabld dummy widened the gap 165 → 286 units in
+~1 s and then sat cornered. Three further live results shape this section:
+holding away DOES block (0 dmg vs 42 standing, 3/3); blocked attacks deal
+ZERO chip; and the combo counters (`hitstun_sources`) do NOT fire on blocked
+contact (3/3 quiet). A full-struct diff found 8 bytes that fire on blocked
+contact but ALL of them also fire on whiffs — because a back-holding dummy
+is walking, so its struct never sits still. Contact detection and spacing
+fail for the same root cause.
+
+### 9.1 `guard_policy` (family-level, `family.json` `block`)
+
+- `"style": "button"` → today's behaviour: hold the block chord. Inert.
+- `"style": "back_hold"` → **reactive** guard. The dummy stands NEUTRAL and
+  asserts away-direction ONLY inside a guard window. This is the pattern
+  every surveyed trainer uses (peon2/fbneo-training-mode `AutoBlock`, which
+  releases the direction the moment the attacker is neutral, and gates on
+  distance so it never reacts to far whiffs). Holding unconditionally is
+  forbidden — it destroys spacing within a second.
+
+### 9.2 The guard window
+
+Open when BOTH hold: (a) the opponent is committing an attack, and (b) the
+opponent is within `guard_range` (port profile, units of the mapped `x`).
+Close otherwise, and release the direction fully.
+
+Attack-commitment source, in preference order:
+1. **The opponent's live input mask** — we already capture both ports, so
+   this needs ZERO new RE, is frame-exact, and works on any family. Hold for
+   `guard_hold_frames` after the press to cover startup + active.
+2. Attacker `action`/`anim` state values (asurabld maps both) — a refinement
+   that also covers CPU opponents and ends the window when the animation
+   does. Requires a per-port list of attacking action values.
+Ship (1); (2) is an upgrade, not a prerequisite.
+
+### 9.3 Punish trigger for back_hold families
+
+Blocked contact is UNDETECTABLE on asurabld today (zero chip, quiet
+counters, and the defender's struct churns while walking). So the trigger is
+**"the opponent committed an attack inside `guard_range`"** — the same event
+that opened the guard window. This is a SUPERSET drill (block-punish AND
+whiff-punish) and is honest about what it detects: the panel/phase must say
+"punishing (commit)" rather than implying blocked contact was confirmed.
+Distinguishing blocked from whiffed is deferred; the most promising lead is
+pushback (a blocked hit shoves the defender, and a reactive dummy is static
+enough for that to read).
+
+### 9.4 Guard modes (the vocabulary players expect)
+
+`Guard All` / `After First Hit` / `Random (weighted)` / `None` — matching
+SF6, GGST, and fbneo-training-mode's own selector. `After First Hit` needs a
+hit signal, which asurabld HAS (the combo counters fire on hits, just not on
+blocks), so it is implementable there.
+
+### 9.5 Hazards to check before shipping asurabld
+
+- **Charge moves**: holding back genuinely accumulates charge (confirmed —
+  fbneo-training-mode pokes charge-timer bytes precisely because of this).
+  If any asurabld character is charge-based, a guard hold silently arms
+  their specials. Reactive guard mostly avoids this by construction; verify.
+- **Lows vs overheads**: down-back blocks everything in SF2-era engines, so
+  those trainers just add `Down` for grounded attacks. Unverified for
+  asurabld — check whether true overheads exist before choosing the rule.
+- **No guard-state byte**: no surveyed trainer found one; blocking is always
+  driven by real input. Do NOT spend RE time hunting for that shortcut.
+
+### 9.6 Third-party cross-validation
+
+`peon2/fbneo-training-mode`'s `games/asurabld/asurabld.lua` carries
+independently-derived addresses; its combo counters (`0x4041E7`/`0x40470B`)
+MATCH ours exactly. Cross-check facing (`0x4037F9`/`0x4045AD`), health,
+meter, and character-id against our profile — free verification. It
+implements no AutoBlock for this game; we are first.
