@@ -81,14 +81,17 @@ description: Launch a headless RustRetro instance and run a live memory-RE sessi
 
 ## Known platform quirks
 
-- **`press_buttons(frames=N)` does NOT reliably sustain a HELD input.** A
-  single long call (e.g. frames=180) fails game logic that requires a
-  continuous hold — guard checks especially. Proven 3/3 by A/B: only
-  repeated short re-presses (~every 40 ms) or the native `DummyMode::Block`
-  sustain it. This ALREADY caused one wrong conclusion (a "contact signal"
-  that was really the guard being dropped and re-entered, generating action
-  transitions). If an experiment depends on something being held, verify the
-  hold is actually live before trusting the result.
+- **Use `hold_buttons` / `release_buttons` for anything that must stay held.**
+  `press_buttons(frames=N)` is a per-button COUNTDOWN and loses the hold two
+  ways, both observed: (1) it decrements on the headless loop's wall-clock
+  cadence even while PAUSED, so pause→step work loses the input before the
+  step consumes it; (2) any active training dummy rewrites port 1's
+  injection EVERY frame (`training.rs`), zeroing buttons it isn't asserting
+  — so a guard hold injected on port 1 while a dummy mode is on gets
+  stomped. Both produced wrong RE conclusions (a "contact signal" that was
+  really a guard dropping and re-entering). The held mask is a separate
+  field ORed in at fold time, so it survives pause AND the dummy.
+  `get_input(port)` shows what is asserted vs what the game last folded.
 
 - `freeze` does not land on direct-pointer regions (FBNeo fallback RAM) — periodic writes
   (or a profile `pin`) are the mechanism.

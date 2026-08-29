@@ -34,6 +34,7 @@ use crate::debug::panels::{
     help::HelpPanel,
     hex_dump::HexDump,
     matchup::MatchupPanel,
+    hunt::HuntPanel,
     input_monitor::InputMonitor,
     ram_search::RamSearchPanel,
     regions::RegionsPanel,
@@ -69,13 +70,14 @@ pub enum Tab {
     State,
     Training,
     Matchup,
+    Hunt,
 }
 
 /// Every Tab variant. Drives layout reconciliation (`load_layout` appends any
 /// variant missing from a saved sidecar) and the toolbar Panels menu — adding
 /// a variant without extending this list is a compile-time-invisible bug, so
 /// the `default_layout_contains_all_tabs` test cross-checks it.
-pub const ALL_TABS: [Tab; 16] = [
+pub const ALL_TABS: [Tab; 17] = [
     Tab::FrameInspector,
     Tab::HexDump,
     Tab::TileViewer,
@@ -92,6 +94,7 @@ pub const ALL_TABS: [Tab; 16] = [
     Tab::State,
     Tab::Training,
     Tab::Matchup,
+    Tab::Hunt,
 ];
 
 impl Tab {
@@ -113,6 +116,7 @@ impl Tab {
             Tab::State => "💾 State",
             Tab::Training => "🎯 Training",
             Tab::Matchup => "🥊 Matchup",
+            Tab::Hunt => "🔍 Signal Hunt",
         }
     }
 }
@@ -135,6 +139,7 @@ pub struct Panels {
     pub state_panel: StatePanel,
     pub training_panel: TrainingPanel,
     pub matchup_panel: MatchupPanel,
+    pub hunt_panel: HuntPanel,
 }
 
 impl Panels {
@@ -155,6 +160,7 @@ impl Panels {
             state_panel: StatePanel::new(),
             training_panel: TrainingPanel::new(),
             matchup_panel: MatchupPanel::new(),
+            hunt_panel: HuntPanel::new(),
         }
     }
 }
@@ -247,6 +253,13 @@ impl<'a> egui_dock::TabViewer for DockViewer<'a> {
                     ui.label("Error: Could not acquire debug state lock");
                 }
             }
+            Tab::Hunt => {
+                if let Ok(mut ds) = self.state.lock() {
+                    self.panels.hunt_panel.show(ui, &mut ds);
+                } else {
+                    ui.label("Error: Could not acquire debug state lock");
+                }
+            }
 
             // shape: &mut self, ui, &mut DebugState
             Tab::Disasm => {
@@ -321,6 +334,7 @@ pub fn default_layout() -> DockState<Tab> {
         0.70,
         vec![
             Tab::RamSearch,
+            Tab::Hunt,
             Tab::Triggers,
             Tab::Regions,
                     Tab::FrameLog,

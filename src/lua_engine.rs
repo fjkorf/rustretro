@@ -25,6 +25,11 @@
 //! savestate.load(slot_or_path)      -> true     (queued)
 //! input.set(port, mask_or_table)                (port 0/1; 2-frame hold)
 //! input.get(port)                   -> integer  (12-bit mask, last folded state)
+//! input.hold(port, mask_or_table)               (port 0/1; asserted every fold
+//!                                                until input.release — survives
+//!                                                pause, unlike input.set's countdown)
+//! input.release(port [, mask_or_table])         (clear held buttons named in the
+//!                                                arg, or all of them if omitted)
 //! gui.drawBox(x1,y1,x2,y2, fill, line)
 //! gui.drawText(x,y, str [, color [, scale]])
 //! gui.text(x,y, str [, color [, scale]])        (drawText + 1px drop shadow)
@@ -205,7 +210,7 @@ const INPUT_SET_HOLD_FRAMES: u16 = 2;
 fn buttons_from_mask(mask: i64) -> Result<[bool; 12], String> {
     if !(0..=0xFFF).contains(&mask) {
         return Err(format!(
-            "input.set: mask must be 0..=0xFFF (12 buttons), got {mask}"
+            "input: mask must be 0..=0xFFF (12 buttons), got {mask}"
         ));
     }
     let mut bits = [false; 12];
@@ -223,12 +228,38 @@ fn buttons_from_pairs(pairs: &[(String, bool)]) -> Result<[bool; 12], String> {
     for (name, pressed) in pairs {
         let Some(i) = crate::mcp::server::joypad_button_index(name) else {
             return Err(format!(
-                "input.set: unknown button '{name}' (valid: b y select start up down left right a x l r)"
+                "input: unknown button '{name}' (valid: b y select start up down left right a x l r)"
             ));
         };
         bits[i] = *pressed;
     }
     Ok(bits)
+}
+
+/// Decode an `input.set`/`input.hold`/`input.release` second argument — an
+/// integer mask or a `{name=bool, ...}` table — into a 12-button bitmap. Shared
+/// so `input.hold`'s table/mask acceptance matches `input.set` exactly.
+fn decode_button_spec(spec: &mlua::Value) -> Result<[bool; 12], String> {
+    match spec {
+        mlua::Value::Integer(m) => buttons_from_mask(*m),
+        mlua::Value::Number(f) if f.fract() == 0.0 => buttons_from_mask(*f as i64),
+        mlua::Value::Table(t) => {
+            let mut pairs = Vec::new();
+            for kv in t.clone().pairs::<String, mlua::Value>() {
+                let (k, v) = kv.map_err(|e| {
+                    format!("input: button table keys must be strings: {e}")
+                })?;
+                // Lua truthiness: only false/nil mean released.
+                let pressed = !matches!(v, mlua::Value::Nil | mlua::Value::Boolean(false));
+                pairs.push((k, pressed));
+            }
+            buttons_from_pairs(&pairs)
+        }
+        other => Err(format!(
+            "input: expected an integer mask or a button table, got {}",
+            other.type_name()
+        )),
+    }
 }
 
 /// Pack a 12-button state into the `input.get` mask (bit i = button i pressed).
@@ -502,30 +533,8 @@ impl LuaEngine {
                         "input.set: port must be 0 (P1) or 1 (P2)".to_string(),
                     ));
                 }
-                let bits = match &spec {
-                    mlua::Value::Integer(m) => buttons_from_mask(*m),
-                    mlua::Value::Number(f) if f.fract() == 0.0 => buttons_from_mask(*f as i64),
-                    mlua::Value::Table(t) => {
-                        let mut pairs = Vec::new();
-                        for kv in t.clone().pairs::<String, mlua::Value>() {
-                            let (k, v) = kv.map_err(|e| {
-                                mlua::Error::RuntimeError(format!(
-                                    "input.set: button table keys must be strings: {e}"
-                                ))
-                            })?;
-                            // Lua truthiness: only false/nil mean released.
-                            let pressed =
-                                !matches!(v, mlua::Value::Nil | mlua::Value::Boolean(false));
-                            pairs.push((k, pressed));
-                        }
-                        buttons_from_pairs(&pairs)
-                    }
-                    other => Err(format!(
-                        "input.set: expected an integer mask or a button table, got {}",
-                        other.type_name()
-                    )),
-                }
-                .map_err(mlua::Error::RuntimeError)?;
+                let bits = decode_button_spec(&spec)
+                    .map_err(|e| mlua::Error::RuntimeError(e.replace("input:", "input.set:")))?;
                 let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
                 let arr = if port == 1 {
                     &mut ds.injected_input2
@@ -556,6 +565,56 @@ impl LuaEngine {
                 Ok(mask_from_buttons(&bits))
             })?;
             input.set("get", f)?;
+        }
+
+        // hold(port, mask_or_table) — assert buttons on EVERY fold until
+        // input.release clears them, independent of set's 2-frame countdown.
+        // Accepts the same mask/table shapes as set. Idempotent: REPLACES the
+        // port's held set (does not OR with whatever was held before), so
+        // calling with a lesser set drops the buttons no longer named.
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, (port, spec): (u32, mlua::Value)| {
+                if port > 1 {
+                    return Err(mlua::Error::RuntimeError(
+                        "input.hold: port must be 0 (P1) or 1 (P2)".to_string(),
+                    ));
+                }
+                let bits = decode_button_spec(&spec)
+                    .map_err(|e| mlua::Error::RuntimeError(e.replace("input:", "input.hold:")))?;
+                let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                ds.set_held_input(port as usize, bits);
+                Ok(())
+            })?;
+            input.set("hold", f)?;
+        }
+
+        // release(port [, mask_or_table]) — clear the named buttons from the
+        // held set (same mask/table shapes as hold), or the WHOLE held set
+        // when the second argument is omitted. Never touches an in-flight
+        // input.set countdown.
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, (port, spec): (u32, Option<mlua::Value>)| {
+                if port > 1 {
+                    return Err(mlua::Error::RuntimeError(
+                        "input.release: port must be 0 (P1) or 1 (P2)".to_string(),
+                    ));
+                }
+                let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                match spec {
+                    None => ds.clear_held_input(port as usize, None),
+                    Some(v) => {
+                        let bits = decode_button_spec(&v).map_err(|e| {
+                            mlua::Error::RuntimeError(e.replace("input:", "input.release:"))
+                        })?;
+                        let idxs: Vec<usize> = (0..12).filter(|&i| bits[i]).collect();
+                        ds.clear_held_input(port as usize, Some(&idxs));
+                    }
+                }
+                Ok(())
+            })?;
+            input.set("release", f)?;
         }
 
         globals.set("input", input)?;
@@ -785,6 +844,40 @@ impl LuaEngine {
         }
 
         globals.set("game", game)?;
+
+        // ── hunt.* ────────────────────────────────────────────────────────────
+        // Signal hunt (docs/signal-hunt.md §8): scripted marking from a
+        // per-frame callback, for events a human cannot click fast enough —
+        //   event.onframeend(function()
+        //     if contact_edge() then hunt.mark("event") end
+        //   end)
+        // Marking is judgement, and §1 is explicit that the judgement stays the
+        // human's; this binding only lets that judgement be EXPRESSED as code.
+        // It is NOT behind the write gate — a mark reads memory, never pokes it.
+        let hunt = lua.create_table()?;
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, label: String| -> mlua::Result<String> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                crate::hunt::mark_with(&ds, &label).map_err(mlua::Error::external)
+            })?;
+            hunt.set("mark", f)?;
+        }
+        // hunt.status() -> JSON string (region, ring fill, per-label mark
+        // counts) so a script can log or overlay how the hunt is going.
+        {
+            let f = lua.create_function(|_, ()| -> mlua::Result<String> {
+                Ok(crate::hunt::status().to_string())
+            })?;
+            hunt.set("status", f)?;
+        }
+        {
+            let f = lua.create_function(|_, ()| -> mlua::Result<String> {
+                Ok(crate::hunt::reset())
+            })?;
+            hunt.set("reset", f)?;
+        }
+        globals.set("hunt", hunt)?;
 
         // ── training.* ────────────────────────────────────────────────────────
         // Read-only view of the NATIVE training-mode control block (F5 / the
@@ -1607,6 +1700,44 @@ mod tests {
         assert_eq!(eng.eval_to_string("input.get(0)").unwrap(), "128");
         assert_eq!(eng.eval_to_string("input.get(1)").unwrap(), "1");
         assert!(eng.eval_to_string("input.get(2)").is_err());
+    }
+
+    #[test]
+    fn input_hold_release_round_trip_through_get() {
+        let (eng, dbg) = engine_with_ram();
+        eng.eval_to_string("input.hold(0, {right=true})").unwrap();
+        // Simulate the run loop's fold (main.rs/read_input): take_injected_input
+        // folds held+countdown into the controller bitmap, then the frontend
+        // mirrors that into input_state, which input.get reads.
+        let fold = |dbg: &crate::debug::SharedDebugState| {
+            let mut ds = dbg.lock().unwrap();
+            ds.input_state = ds.take_injected_input();
+        };
+        fold(&dbg);
+        assert_eq!(eng.eval_to_string("input.get(0)").unwrap(), "128"); // Right bit
+        // Held survives MANY folds with no decay, unlike input.set's countdown.
+        for _ in 0..20 {
+            let mut ds = dbg.lock().unwrap();
+            assert!(ds.take_injected_input()[7]);
+        }
+        // Table-form release clears just `right`.
+        eng.eval_to_string("input.release(0, {right=true})").unwrap();
+        fold(&dbg);
+        assert_eq!(eng.eval_to_string("input.get(0)").unwrap(), "0");
+        // Bare release (no second arg) clears the whole held set.
+        eng.eval_to_string("input.hold(0, 0x90)").unwrap(); // Up+Right
+        eng.eval_to_string("input.release(0)").unwrap();
+        fold(&dbg);
+        assert_eq!(eng.eval_to_string("input.get(0)").unwrap(), "0");
+        // Port 1 independent of port 0; bad port rejected on both.
+        eng.eval_to_string("input.hold(1, {b=true})").unwrap();
+        {
+            let mut ds = dbg.lock().unwrap();
+            assert!(ds.take_injected_input2()[0]);
+            assert!(!ds.take_injected_input()[0]);
+        }
+        assert!(eng.eval_to_string("input.hold(2, 0)").is_err());
+        assert!(eng.eval_to_string("input.release(2)").is_err());
     }
 
     #[test]

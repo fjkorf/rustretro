@@ -13,6 +13,7 @@ mod shadow_runner;
 mod training;
 mod input_config;
 mod gate;
+mod hunt;
 
 use anyhow::Result;
 use audio::AudioOutput;
@@ -330,7 +331,7 @@ fn main() -> Result<()> {
         .insert_resource(debug::panels::controls::ControlsPanel::new())
         .init_resource::<TutorialPages>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (calibrate_wizard, read_input, run_emulation, run_scripts, drain_lua_requests, sync_video, queue_audio, update_title).chain())
+        .add_systems(Update, (calibrate_wizard, read_input, run_emulation, hunt_sample, run_scripts, drain_lua_requests, sync_video, queue_audio, update_title).chain())
         .add_systems(EguiPrimaryContextPass, (show_debug, show_script_panel, debug::panels::controls::show_controls_panel, show_tutorial_pages))
         .run();
 
@@ -408,6 +409,12 @@ fn run_headless(
         // (a) Tick the core one frame. run_frame() honours pause/step/trigger
         //     flags in DebugState internally, so MCP pause/resume/step work.
         let _ = frontend.run_frame();
+
+        // (a1) Signal hunt: snapshot the scoped hunt region into the ring
+        //      (docs/signal-hunt.md §3). Before the Lua callbacks so a
+        //      `hunt.mark()` from a per-frame script marks a frame that already
+        //      has a snapshot. No-ops when the frame counter didn't advance.
+        hunt::sample(&debug_state);
 
         // (b) Lua per-frame callbacks, then composite their draw commands into
         //     `fb_rgba` — exactly like the GUI's run_scripts system. There IS a
@@ -683,6 +690,10 @@ pub const KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
         ("F4", "finish round"),
         ("Shift+F5", "toggle shadow bot (needs --shadow)"),
     ]),
+    ("Signal hunt", &[
+        ("F9", "mark this frame as an 'event' (🔍 Signal Hunt panel)"),
+        ("Shift+F9", "mark this frame as a 'control' (a near-miss)"),
+    ]),
 ];
 
 fn read_input(
@@ -873,6 +884,22 @@ fn read_input(
             panel.open = !panel.open;
         }
     }
+    // Signal hunt (docs/signal-hunt.md §2): mark THIS frame without leaving the
+    // game. Marking has to be possible at the instant you SEE the event — a
+    // mouse trip to the panel is several frames of drift — so the hotkey is the
+    // primary marking surface during a live hunt.
+    if keys.just_pressed(F9) {
+        let control = keys.pressed(ShiftLeft) || keys.pressed(ShiftRight);
+        let label = if control { "control" } else { "event" };
+        let msg = {
+            let ds = debug_state.0.lock().unwrap();
+            hunt::mark_with(&ds, label)
+        };
+        match msg {
+            Ok(m) => eprintln!("[hunt] {m}"),
+            Err(e) => eprintln!("[hunt] mark failed: {e}"),
+        }
+    }
 }
 
 // ─── Emulation ───────────────────────────────────────────────────────────────
@@ -900,6 +927,16 @@ fn run_emulation(
     }
     budget = budget.min(frame * MAX_BURST as f64);
     *acc = Some((now, budget));
+}
+
+/// Signal hunt (docs/signal-hunt.md §3): push one snapshot of the scoped hunt
+/// region into the ring, right after the emulator ran. Sits between
+/// `run_emulation` and `run_scripts` so a Lua `hunt.mark()` in a per-frame
+/// callback marks a frame whose snapshot already exists. `hunt::sample` no-ops
+/// when the frame counter did not advance (paused), so this is free while
+/// stepping or idling.
+fn hunt_sample(debug_state: Res<DebugStateRes>) {
+    hunt::sample(&debug_state.0);
 }
 
 // ─── Scripting ───────────────────────────────────────────────────────────────

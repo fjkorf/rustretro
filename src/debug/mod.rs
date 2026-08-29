@@ -698,6 +698,20 @@ pub struct DebugState {
     /// (P2), consumed via [`take_injected_input2`](Self::take_injected_input2).
     /// Drives the second fighter slot (e.g. the shadow bot / a training dummy).
     pub injected_input2: [u16; 12],
+    /// HELD injection for port 0 — asserted on EVERY fold until explicitly
+    /// released (MCP `release_buttons` / Lua `input.release`), independent of
+    /// [`injected_input`](Self::injected_input)'s countdown. The countdown
+    /// idiom (`press_buttons(frames=N)`) does not reliably sustain a continuous
+    /// hold: it decrements on every fold INCLUDING GUI frames while the
+    /// emulation is paused, so it can drain to zero before a paused
+    /// pause→step sequence ever consumes it, and a long single-shot hold can
+    /// read as a drop-then-reassert to game logic that needs a true hold (e.g.
+    /// guard checks). `held_input` never decrements — it is OR'd into the
+    /// countdown's output at fold time ([`take_injected_input`]) and stays
+    /// asserted across any number of takes.
+    pub held_input: [bool; 12],
+    /// Port-1 (P2) counterpart of [`held_input`](Self::held_input).
+    pub held_input2: [bool; 12],
     /// Training-mode controls (shadow PLAN Wave 2b) — flipped by `--training`
     /// and hotkeys in the GUI, consumed by `training::tick` each frame.
     pub training: TrainingConfig,
@@ -892,6 +906,8 @@ impl DebugState {
             step_one: false,
             injected_input: [0; 12],
             injected_input2: [0; 12],
+            held_input: [false; 12],
+            held_input2: [false; 12],
             training: TrainingConfig::default(),
             lua_writes_enabled: false,
             breakpoints: Vec::new(),
@@ -1207,31 +1223,80 @@ impl DebugState {
         self.input_state = state;
     }
 
-    /// Fold the MCP-injected input into a controller bitmap for THIS frame and
-    /// decrement the per-button hold counters. A button is "held" while its
-    /// counter is > 0. Call once per frame from the run loop; returns the 12-button
-    /// held state to hand to the core (OR it with any keyboard input in GUI mode).
+    /// Fold the MCP-injected input into a controller bitmap for THIS frame:
+    /// decrement the per-button countdown (a button is "held" while its counter
+    /// is > 0) and OR in [`held_input`](Self::held_input), which never
+    /// decrements. Call once per frame from the run loop; returns the 12-button
+    /// state to hand to the core (OR it with any keyboard input in GUI mode).
     pub fn take_injected_input(&mut self) -> [bool; 12] {
-        let mut held = [false; 12];
+        let mut out = [false; 12];
         for i in 0..12 {
             if self.injected_input[i] > 0 {
-                held[i] = true;
+                out[i] = true;
                 self.injected_input[i] -= 1;
             }
+            out[i] |= self.held_input[i];
         }
-        held
+        out
     }
 
     /// Port-1 (P2) counterpart of [`take_injected_input`](Self::take_injected_input).
     pub fn take_injected_input2(&mut self) -> [bool; 12] {
-        let mut held = [false; 12];
+        let mut out = [false; 12];
         for i in 0..12 {
             if self.injected_input2[i] > 0 {
-                held[i] = true;
+                out[i] = true;
                 self.injected_input2[i] -= 1;
             }
+            out[i] |= self.held_input2[i];
         }
-        held
+        out
+    }
+
+    /// Peek at what the NEXT [`take_injected_input`](Self::take_injected_input)
+    /// fold would assert for `port` (0/1), WITHOUT consuming anything: countdown
+    /// entries still > 0, OR'd with the held mask. Used by the MCP `get_input`
+    /// tool to report "what's currently queued" alongside `input_state`/
+    /// `input_state2` ("what the game actually received on the last fold").
+    pub fn peek_injected_input(&self, port: usize) -> [bool; 12] {
+        let (countdown, held) = if port == 1 {
+            (&self.injected_input2, &self.held_input2)
+        } else {
+            (&self.injected_input, &self.held_input)
+        };
+        let mut out = [false; 12];
+        for i in 0..12 {
+            out[i] = countdown[i] > 0 || held[i];
+        }
+        out
+    }
+
+    /// Replace the HELD set for `port` (0/1) with `bits` wholesale — the MCP
+    /// `hold_buttons` tool and Lua `input.hold` are idempotent: calling again
+    /// with a different set simply replaces the previous one, it does not OR
+    /// with it. Held buttons are asserted on every fold until released; see
+    /// [`held_input`](Self::held_input) for why this differs from the
+    /// countdown path.
+    pub fn set_held_input(&mut self, port: usize, bits: [bool; 12]) {
+        let arr = if port == 1 { &mut self.held_input2 } else { &mut self.held_input };
+        *arr = bits;
+    }
+
+    /// Clear buttons from `port`'s held set: the buttons at `only`'s indices,
+    /// or the whole set when `only` is `None`. Used by MCP `release_buttons`
+    /// (bare call = release all) and Lua `input.release`.
+    pub fn clear_held_input(&mut self, port: usize, only: Option<&[usize]>) {
+        let arr = if port == 1 { &mut self.held_input2 } else { &mut self.held_input };
+        match only {
+            Some(idxs) => {
+                for &i in idxs {
+                    if i < 12 {
+                        arr[i] = false;
+                    }
+                }
+            }
+            None => *arr = [false; 12],
+        }
     }
 }
 
@@ -1563,6 +1628,84 @@ mod tests {
         assert_eq!(ds.nav.history_idx, 2);
         assert_eq!(ds.nav.current_address, Some(0x400));
         assert!(!ds.can_go_forward());
+    }
+
+    #[test]
+    fn held_input_persists_while_countdown_expires() {
+        let mut ds = DebugState::new();
+        ds.injected_input[3] = 2; // start: 2-frame countdown
+        ds.held_input[7] = true; // right: held
+        // Both asserted while the countdown is still alive.
+        let f = ds.take_injected_input();
+        assert!(f[3] && f[7]);
+        let f = ds.take_injected_input();
+        assert!(f[3] && f[7]);
+        // Countdown has now expired; held keeps asserting across MANY more
+        // takes (simulating GUI frames folded while paused) with no decay.
+        for _ in 0..50 {
+            let f = ds.take_injected_input();
+            assert!(!f[3], "countdown must expire and stay released");
+            assert!(f[7], "held must persist indefinitely until released");
+        }
+        assert_eq!(ds.injected_input[3], 0);
+        assert!(ds.held_input[7], "held_input itself is never decremented");
+    }
+
+    #[test]
+    fn held_input_ports_are_independent_and_replace_not_or() {
+        let mut ds = DebugState::new();
+        ds.set_held_input(0, {
+            let mut b = [false; 12];
+            b[7] = true; // right
+            b
+        });
+        ds.set_held_input(1, {
+            let mut b = [false; 12];
+            b[6] = true; // left
+            b
+        });
+        assert!(ds.take_injected_input()[7]);
+        assert!(!ds.take_injected_input()[6]);
+        assert!(!ds.take_injected_input2()[7]);
+        assert!(ds.take_injected_input2()[6]);
+
+        // Replacing port 0's held set drops the old button (not OR'd).
+        ds.set_held_input(0, {
+            let mut b = [false; 12];
+            b[4] = true; // up
+            b
+        });
+        let f = ds.take_injected_input();
+        assert!(f[4] && !f[7], "set_held_input replaces, it does not OR");
+    }
+
+    #[test]
+    fn clear_held_input_releases_named_or_all() {
+        let mut ds = DebugState::new();
+        ds.held_input[7] = true; // right
+        ds.held_input[4] = true; // up
+        ds.clear_held_input(0, Some(&[7]));
+        let f = ds.take_injected_input();
+        assert!(!f[7] && f[4], "only `right` released");
+        ds.clear_held_input(0, None);
+        let f = ds.take_injected_input();
+        assert!(!f[4], "bare release clears the whole port");
+    }
+
+    #[test]
+    fn peek_injected_input_does_not_consume() {
+        let mut ds = DebugState::new();
+        ds.injected_input[3] = 2; // countdown
+        ds.held_input2[7] = true; // held, port 1
+        // Peeking repeatedly must not decrement the countdown or clear held.
+        for _ in 0..5 {
+            assert!(ds.peek_injected_input(0)[3]);
+            assert!(ds.peek_injected_input(1)[7]);
+        }
+        assert_eq!(ds.injected_input[3], 2, "peek must not decrement");
+        // A real take still sees the untouched countdown.
+        assert!(ds.take_injected_input()[3]);
+        assert_eq!(ds.injected_input[3], 1);
     }
 
     #[test]

@@ -977,6 +977,184 @@ impl RetroMcpServer {
         })
     }
 
+    /// `hold_buttons`: assert one or more controller buttons on `port` on EVERY
+    /// fold until [`release_buttons`](Self::release_buttons) clears them —
+    /// unlike `press_buttons`'s frame-countdown, a held button does not expire
+    /// and does not drain while the emulation is paused (see
+    /// `DebugState::held_input`). Idempotent: calling this again REPLACES the
+    /// port's held set rather than adding to it, so `hold_buttons(0, [])`
+    /// releases everything on that port. Safe — input-only, no memory writes —
+    /// so like `press_buttons` it is NOT behind the write gate.
+    fn hold_buttons(&self, names: &[&str], port: usize) -> Value {
+        if port > 1 {
+            return json!({ "ok": false, "error": "`port` must be 0 (P1) or 1 (P2)" });
+        }
+        let mut bits = [false; 12];
+        let mut set = Vec::new();
+        let mut unknown = Vec::new();
+        for n in names {
+            match joypad_button_index(n) {
+                Some(i) => {
+                    bits[i] = true;
+                    set.push(n.to_ascii_lowercase());
+                }
+                None => unknown.push(n.to_string()),
+            }
+        }
+        if !unknown.is_empty() {
+            return json!({
+                "ok": false,
+                "error": format!("unknown button(s): {}. Valid: {}", unknown.join(", "), JOYPAD_BUTTON_LIST),
+            });
+        }
+        match self.debug.lock() {
+            Ok(mut ds) => ds.set_held_input(port, bits),
+            Err(_) => return json!({ "ok": false, "error": "lock poisoned" }),
+        }
+        json!({
+            "ok": true,
+            "held": set,
+            "port": port,
+            "note": "asserted on every fold until release_buttons clears it",
+        })
+    }
+
+    /// `release_buttons`: clear the named buttons (or, when `names` is empty,
+    /// the ENTIRE held set) from `port`'s held mask. Does not touch any
+    /// in-flight `press_buttons` countdown.
+    fn release_buttons(&self, names: &[&str], port: usize) -> Value {
+        if port > 1 {
+            return json!({ "ok": false, "error": "`port` must be 0 (P1) or 1 (P2)" });
+        }
+        if names.is_empty() {
+            match self.debug.lock() {
+                Ok(mut ds) => ds.clear_held_input(port, None),
+                Err(_) => return json!({ "ok": false, "error": "lock poisoned" }),
+            }
+            return json!({ "ok": true, "released": "all", "port": port });
+        }
+        let mut idxs = Vec::new();
+        let mut set = Vec::new();
+        let mut unknown = Vec::new();
+        for n in names {
+            match joypad_button_index(n) {
+                Some(i) => {
+                    idxs.push(i);
+                    set.push(n.to_ascii_lowercase());
+                }
+                None => unknown.push(n.to_string()),
+            }
+        }
+        if !unknown.is_empty() {
+            return json!({
+                "ok": false,
+                "error": format!("unknown button(s): {}. Valid: {}", unknown.join(", "), JOYPAD_BUTTON_LIST),
+            });
+        }
+        match self.debug.lock() {
+            Ok(mut ds) => ds.clear_held_input(port, Some(&idxs)),
+            Err(_) => return json!({ "ok": false, "error": "lock poisoned" }),
+        }
+        json!({ "ok": true, "released": set, "port": port })
+    }
+
+    /// `get_input`: report `port`'s input state two ways — `asserted` is what
+    /// the NEXT fold will feed the core (held ORed with any live `press_buttons`
+    /// countdown, via `DebugState::peek_injected_input`, non-consuming), and
+    /// `folded` is what the game actually received on the LAST fold
+    /// (`input_state`/`input_state2`, which also includes keyboard/pad input in
+    /// windowed mode). The two can legitimately differ (e.g. paused: `asserted`
+    /// still shows a hold, `folded` is stale until the next `step`).
+    fn get_input(&self, port: usize) -> Value {
+        if port > 1 {
+            return json!({ "ok": false, "error": "`port` must be 0 (P1) or 1 (P2)" });
+        }
+        let ds = match self.debug.lock() {
+            Ok(g) => g,
+            Err(_) => return json!({ "ok": false, "error": "lock poisoned" }),
+        };
+        let asserted = ds.peek_injected_input(port);
+        let folded = if port == 1 { ds.input_state2 } else { ds.input_state };
+        let held = if port == 1 { ds.held_input2 } else { ds.held_input };
+        drop(ds);
+        json!({
+            "ok": true,
+            "port": port,
+            "asserted_mask": format!("0x{:03X}", mask_from_bits(&asserted)),
+            "asserted_buttons": button_names(&asserted),
+            "held_buttons": button_names(&held),
+            "folded_mask": format!("0x{:03X}", mask_from_bits(&folded)),
+            "folded_buttons": button_names(&folded),
+            "note": "asserted = what the NEXT fold will feed the core (held + any press_buttons \
+                     countdown remaining); folded = what the game ACTUALLY received on the LAST \
+                     fold (input_state/input_state2 — also includes keyboard/pad in windowed mode)",
+        })
+    }
+
+    // ── signal hunt (docs/signal-hunt.md — NORMATIVE) ──────────────────────
+    //
+    // The four tools below automate the event-marked differential RAM protocol
+    // that had been hand-scripted once per hunt. None of them writes anything
+    // to the game or to a profile, so none is behind the write gate: marking
+    // reads the frame counter and the gate, analysis is pure arithmetic over
+    // snapshots the sampler already took.
+
+    /// `hunt_mark`: record a labeled moment (§2). Pins the `mark-PRE` snapshot
+    /// out of the ring immediately and schedules the `mark+POST` capture.
+    fn hunt_mark(&self, label: &str) -> Value {
+        match crate::hunt::mark(&self.debug, label) {
+            Ok(msg) => json!({ "ok": true, "message": msg, "status": crate::hunt::status() }),
+            Err(e) => json!({ "ok": false, "error": e }),
+        }
+    }
+
+    /// `hunt_configure`: scope the hunt region and set the window knobs (§3).
+    #[allow(clippy::too_many_arguments)]
+    fn hunt_configure(
+        &self,
+        blocks: bool,
+        extra: Option<(u32, u32)>,
+        ring_frames: Option<usize>,
+        pre: Option<u64>,
+        post: Option<u64>,
+        include_idle: Option<bool>,
+        enabled: Option<bool>,
+    ) -> Value {
+        match crate::hunt::configure(blocks, extra, ring_frames, pre, post, include_idle, enabled) {
+            Ok(msg) => json!({ "ok": true, "message": msg, "status": crate::hunt::status() }),
+            // §3: a refusal is a first-class answer, not a fallback to a
+            // truncated region.
+            Err(e) => json!({ "ok": false, "error": e }),
+        }
+    }
+
+    /// `hunt_analyze`: the §4 kernel plus the §5 evidence-doc export and the
+    /// §6 honesty fields, all in one payload.
+    fn hunt_analyze(&self, event_label: &str, control_label: Option<&str>) -> Value {
+        match crate::hunt::run_analysis(event_label, control_label) {
+            Ok(a) => {
+                let md = crate::hunt::export_markdown(&a);
+                let mut v = serde_json::to_value(&a).unwrap_or_else(|e| json!({ "error": e.to_string() }));
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("ok".into(), json!(true));
+                    obj.insert("evidence_markdown".into(), json!(md));
+                    obj.insert(
+                        "profile_note".into(),
+                        json!("This tool NEVER writes a profile. Candidates are hypotheses; \
+                               promotion requires a write-test."),
+                    );
+                }
+                v
+            }
+            Err(e) => json!({ "ok": false, "error": e }),
+        }
+    }
+
+    /// `hunt_reset`: drop every mark and the ring; keep the configuration.
+    fn hunt_reset(&self) -> Value {
+        json!({ "ok": true, "message": crate::hunt::reset(), "status": crate::hunt::status() })
+    }
+
     /// Request a single-frame step: clear pause-edge by arming `step_one`.
     fn step(&self) -> Value {
         if let Ok(mut ds) = self.debug.lock() {
@@ -1594,6 +1772,81 @@ impl RetroMcpServer {
             });
             Arc::new(schema.as_object().unwrap().clone())
         };
+        // Schema for { buttons:[string], port? } (hold_buttons).
+        let hold_buttons_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "buttons": { "type": "array", "items": { "type": "string" }, "description": "Buttons to hold simultaneously (a, b, x, y, l, r, start, select, up, down, left, right). REPLACES the port's whole held set; [] releases everything." },
+                    "port": { "type": "integer", "description": "Controller port: 0 = P1 (default), 1 = P2 (the second fighter / dummy slot)" }
+                },
+                "required": ["buttons"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+        // Schema for { buttons?:[string], port? } (release_buttons).
+        let release_buttons_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "buttons": { "type": "array", "items": { "type": "string" }, "description": "Buttons to release; omit (or []) to release the whole port's held set" },
+                    "port": { "type": "integer", "description": "Controller port: 0 = P1 (default), 1 = P2 (the second fighter / dummy slot)" }
+                },
+                "required": []
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+        // Schema for { port? } (get_input).
+        let get_input_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "port": { "type": "integer", "description": "Controller port: 0 = P1 (default), 1 = P2 (the second fighter / dummy slot)" }
+                },
+                "required": []
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+        // ── signal hunt (docs/signal-hunt.md §8) ───────────────────────────
+        let hunt_mark_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "label": { "type": "string", "description": "Free-form label. Convention: \"event\" for the thing you are hunting, \"control\" for a near-miss that must NOT produce the signal. Multiple labels may be in play." }
+                },
+                "required": ["label"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+        let hunt_configure_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "blocks": { "type": "boolean", "description": "Include both fighter structs (profile block1/block2 + stride). Default true — this is the §3 default scope." },
+                    "start":  { "type": ["integer", "string"], "description": "Extra window start (guest address; integer or hex string \"0xBC00\"). Use for values OUTSIDE the fighter structs, e.g. MK2's HUD health pair." },
+                    "len":    { "type": ["integer", "string"], "description": "Extra window length in bytes. Required with `start`." },
+                    "ring_frames": { "type": "integer", "description": "Snapshots retained in the rolling ring (default 60, min 2)." },
+                    "pre":  { "type": "integer", "description": "Frames BEFORE a mark forming the 'before' side of its changed-set (default 4)." },
+                    "post": { "type": "integer", "description": "Frames AFTER a mark forming the 'after' side (default 12)." },
+                    "include_idle": { "type": "boolean", "description": "Subtract the idle-churn set from candidates (default true). The analysis reports the result BOTH ways regardless." },
+                    "enabled": { "type": "boolean", "description": "Turn per-frame sampling on/off (default on — the ring must already be running before the first mark)." }
+                },
+                "required": []
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+        let hunt_analyze_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "event_label":   { "type": "string", "description": "Label of the marks that ARE the event (default \"event\")." },
+                    "control_label": { "type": "string", "description": "Label of the near-miss marks. OMITTING THIS IS DANGEROUS — the report will warn prominently, because a hunt with no control is how a swing counter was mistaken for a contact signal." }
+                },
+                "required": []
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+
         // Schema for { addr, len, value } (write_memory).
         let write_memory_schema = || -> Arc<Map<String, Value>> {
             let schema = json!({
@@ -1779,6 +2032,79 @@ impl RetroMcpServer {
                  second fighter / dummy slot). Emulation must be running (resume) for frames to \
                  advance. Safe — only feeds the controller, cannot corrupt memory (no write gate).",
                 press_buttons_schema(),
+            ),
+            Tool::new(
+                "hold_buttons",
+                "Drive the game with a SUSTAINED hold: assert controller buttons on `port` on \
+                 EVERY frame until release_buttons clears them, independent of press_buttons' \
+                 frame countdown. Use this instead of press_buttons whenever game logic needs a \
+                 CONTINUOUS hold to read correctly (e.g. guard checks) — the countdown decrements \
+                 on every GUI frame including while paused, so it can drop out from under a \
+                 pause→step sequence or a long single hold before it's actually consumed; a held \
+                 button never decays. Idempotent: calling again REPLACES the port's held set \
+                 (does not OR with the previous one) — pass [] to release everything on that \
+                 port. `port`: 0 = P1 (default), 1 = P2. Safe — input-only, no memory writes \
+                 (no write gate, same as press_buttons).",
+                hold_buttons_schema(),
+            ),
+            Tool::new(
+                "release_buttons",
+                "Clear buttons asserted by hold_buttons. With `buttons`, releases just those \
+                 names; omit `buttons` (or pass []) to release the ENTIRE held set for `port`. \
+                 Does not touch an in-flight press_buttons countdown. Safe — no write gate.",
+                release_buttons_schema(),
+            ),
+            Tool::new(
+                "get_input",
+                "Inspect `port`'s input pipeline: `asserted_*` is what the NEXT frame fold will \
+                 feed the core (hold_buttons' held set OR'd with any live press_buttons \
+                 countdown — non-consuming peek), `folded_*` is what the game ACTUALLY received \
+                 on the LAST fold (also includes keyboard/pad in windowed mode). The two can \
+                 legitimately differ while paused (asserted keeps showing the hold; folded is \
+                 stale until the next step). Read-only, no write gate.",
+                get_input_schema(),
+            ),
+            // ── signal hunt ────────────────────────────────────────────────
+            Tool::new(
+                "hunt_configure",
+                "Signal hunt (docs/signal-hunt.md §3): scope the RAM region that is snapshotted \
+                 every frame, and set the analysis window. Default scope is the two fighter \
+                 structs from the game profile; add `start`+`len` for a value that lives outside \
+                 them (HUD mirrors, object arrays). REFUSES — by name and size — any region whose \
+                 ring footprint would blow the budget, because a silently truncated hunt produces \
+                 confident wrong answers. Changing the REGION discards marks captured under the \
+                 old layout (their snapshots are not comparable); changing only ring/pre/post \
+                 keeps them. Read-only, no write gate.",
+                hunt_configure_schema(),
+            ),
+            Tool::new(
+                "hunt_mark",
+                "Signal hunt (§2): mark THIS frame with a label — \"event\" when the thing you are \
+                 hunting just happened, \"control\" for a deliberate near-miss where it did NOT. \
+                 Records frame, wall-clock, and the profile gate state, pins the snapshot from \
+                 PRE frames ago, and schedules the POST capture. Marks are cheap; over-marking is \
+                 fine. Judging 'that was a blocked hit' is YOUR job and cannot be automated — \
+                 pretending otherwise is how false signals get shipped. Read-only, no write gate.",
+                hunt_mark_schema(),
+            ),
+            Tool::new(
+                "hunt_analyze",
+                "Signal hunt (§4-§6): intersect the changed-sets of every event mark, subtract \
+                 the union of the control marks' changed-sets plus idle churn, and rank what \
+                 survives (fires-on-all, then small values, then counter-like, then \
+                 byte-over-word). Returns per-mark value transitions for EVERY candidate so you \
+                 can overrule the ranking, an evidence-doc markdown export, and the honesty \
+                 fields: the settings used, gate-closed marks, unusable marks, and how many \
+                 bytes each subtraction removed. ZERO CANDIDATES IS A RESULT. Addresses are \
+                 profile-relative (block2+0x6F). This tool NEVER writes a profile — candidates \
+                 are hypotheses until a write-test confirms them.",
+                hunt_analyze_schema(),
+            ),
+            Tool::new(
+                "hunt_reset",
+                "Signal hunt: discard every mark and the snapshot ring (the region/window \
+                 configuration survives). Read-only, no write gate.",
+                no_params(),
             ),
             Tool::new(
                 "run_lua",
@@ -2286,6 +2612,112 @@ impl ServerHandler for RetroMcpServer {
                         &this.press_buttons(&refs, frames, port),
                     )?]))
                 }
+                "hold_buttons" => {
+                    let buttons: Vec<String> = args
+                        .get("buttons")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let port = get_u("port").unwrap_or(0) as usize;
+                    let refs: Vec<&str> = buttons.iter().map(|s| s.as_str()).collect();
+                    Ok(CallToolResult::success(vec![Self::json_content(
+                        &this.hold_buttons(&refs, port),
+                    )?]))
+                }
+                "release_buttons" => {
+                    let buttons: Vec<String> = args
+                        .get("buttons")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let port = get_u("port").unwrap_or(0) as usize;
+                    let refs: Vec<&str> = buttons.iter().map(|s| s.as_str()).collect();
+                    Ok(CallToolResult::success(vec![Self::json_content(
+                        &this.release_buttons(&refs, port),
+                    )?]))
+                }
+                "get_input" => {
+                    let port = get_u("port").unwrap_or(0) as usize;
+                    Ok(CallToolResult::success(vec![Self::json_content(
+                        &this.get_input(port),
+                    )?]))
+                }
+                // ── signal hunt ─────────────────────────────────────────────
+                "hunt_configure" => {
+                    // start/len accept a JSON integer or a hex string, like
+                    // map_bus_window — hunt regions are naturally hexadecimal.
+                    let num_arg = |key: &str| -> Option<u64> {
+                        match args.get(key)? {
+                            Value::Number(n) => n.as_u64(),
+                            Value::String(s) => {
+                                let t = s.trim();
+                                let h = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))
+                                    .unwrap_or(t);
+                                u64::from_str_radix(h, 16).ok()
+                            }
+                            _ => None,
+                        }
+                    };
+                    let blocks = args.get("blocks").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let extra = match (num_arg("start"), num_arg("len")) {
+                        (Some(a), Some(l)) => {
+                            if a > u32::MAX as u64 || l > u32::MAX as u64 {
+                                return Err(ErrorData::invalid_params(
+                                    "`start`/`len` must fit in the 32-bit bus",
+                                    None,
+                                ));
+                            }
+                            Some((a as u32, l as u32))
+                        }
+                        (None, None) => None,
+                        _ => {
+                            return Err(ErrorData::invalid_params(
+                                "`start` and `len` must be given together",
+                                None,
+                            ))
+                        }
+                    };
+                    let v = this.hunt_configure(
+                        blocks,
+                        extra,
+                        get_u("ring_frames").map(|n| n as usize),
+                        get_u("pre"),
+                        get_u("post"),
+                        args.get("include_idle").and_then(|v| v.as_bool()),
+                        args.get("enabled").and_then(|v| v.as_bool()),
+                    );
+                    Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
+                }
+                "hunt_mark" => {
+                    let label = args
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ErrorData::invalid_params("missing/invalid `label`", None))?;
+                    Ok(CallToolResult::success(vec![Self::json_content(
+                        &this.hunt_mark(label),
+                    )?]))
+                }
+                "hunt_analyze" => {
+                    let event = args
+                        .get("event_label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("event");
+                    let control = args.get("control_label").and_then(|v| v.as_str());
+                    Ok(CallToolResult::success(vec![Self::json_content(
+                        &this.hunt_analyze(event, control),
+                    )?]))
+                }
+                "hunt_reset" => {
+                    Ok(CallToolResult::success(vec![Self::json_content(&this.hunt_reset())?]))
+                }
                 "run_lua" => {
                     let script = args
                         .get("script")
@@ -2488,6 +2920,24 @@ pub(crate) fn joypad_button_index(name: &str) -> Option<usize> {
         "r" | "rb" | "r1" => Some(11),
         _ => None,
     }
+}
+
+/// The friendly names for RETRO_DEVICE_ID_JOYPAD indices 0..=11, in index order
+/// — the inverse of [`joypad_button_index`]. Used to decode a `[bool; 12]`
+/// bitmap back into a human-readable button list for `get_input`.
+const JOYPAD_NAMES: [&str; 12] =
+    ["b", "y", "select", "start", "up", "down", "left", "right", "a", "x", "l", "r"];
+
+/// Pack a `[bool; 12]` button bitmap into a `RETRO_DEVICE_ID_JOYPAD`-ordered
+/// integer mask (bit i = button i), for hex display in `get_input`.
+fn mask_from_bits(bits: &[bool; 12]) -> u32 {
+    bits.iter().enumerate().fold(0u32, |m, (i, b)| m | ((*b as u32) << i))
+}
+
+/// Decode a `[bool; 12]` bitmap into the list of pressed buttons' names, in
+/// `RETRO_DEVICE_ID_JOYPAD` order.
+fn button_names(bits: &[bool; 12]) -> Vec<&'static str> {
+    (0..12).filter(|&i| bits[i]).map(|i| JOYPAD_NAMES[i]).collect()
 }
 
 /// Map a case-insensitive format string to a [`WatchFormat`]. Accepts the names
@@ -2725,6 +3175,7 @@ mod tests {
     use super::{append_region_block, next_ai_id, normalize_addr, scaffold_rom_map};
     use super::{parse_state_target, parse_watch_format, RetroMcpServer};
     use crate::debug::{DebugState, WatchFormat};
+    use serde_json::Value;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -2885,6 +3336,90 @@ mod tests {
         assert_eq!(ds.injected_input[3], 1);
         assert_eq!(ds.take_injected_input()[3], true);
         assert_eq!(ds.take_injected_input()[3], false); // released
+    }
+
+    #[test]
+    fn hold_buttons_asserts_until_release_and_replaces_not_ors() {
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let v = srv.hold_buttons(&["right"], 0);
+        assert_eq!(v["ok"], true, "{v}");
+        {
+            let mut ds = srv.debug.lock().unwrap();
+            // Survives MANY takes with no decay (unlike press_buttons' countdown).
+            for _ in 0..20 {
+                assert!(ds.take_injected_input()[7]);
+            }
+            assert_eq!(ds.take_injected_input2(), [false; 12], "P2 untouched");
+        }
+        // Calling again REPLACES the held set (does not OR with `right`).
+        let v = srv.hold_buttons(&["up"], 0);
+        assert_eq!(v["ok"], true, "{v}");
+        {
+            let mut ds = srv.debug.lock().unwrap();
+            let f = ds.take_injected_input();
+            assert!(f[4] && !f[7], "hold_buttons replaces, does not OR");
+        }
+        // Bad port / unknown button rejected without side effects.
+        assert_eq!(srv.hold_buttons(&["a"], 2)["ok"], false);
+        let e = srv.hold_buttons(&["triangle"], 0);
+        assert_eq!(e["ok"], false);
+        assert!(e["error"].as_str().unwrap().contains("unknown"));
+    }
+
+    #[test]
+    fn release_buttons_clears_named_or_whole_port() {
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        srv.hold_buttons(&["right", "up"], 0);
+        let v = srv.release_buttons(&["right"], 0);
+        assert_eq!(v["ok"], true, "{v}");
+        {
+            let mut ds = srv.debug.lock().unwrap();
+            let f = ds.take_injected_input();
+            assert!(!f[7] && f[4], "only right released");
+        }
+        let v = srv.release_buttons(&[], 0);
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["released"], "all");
+        {
+            let mut ds = srv.debug.lock().unwrap();
+            assert_eq!(ds.take_injected_input(), [false; 12]);
+        }
+        assert_eq!(srv.release_buttons(&["a"], 2)["ok"], false);
+    }
+
+    #[test]
+    fn get_input_reports_asserted_and_folded_separately() {
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        srv.hold_buttons(&["right"], 0);
+        srv.press_buttons(&["b"], 4, 0);
+        {
+            // `folded` mirrors what the run loop actually fed the core last —
+            // simulate one fold the way main.rs/read_input do.
+            let mut ds = srv.debug.lock().unwrap();
+            ds.input_state = ds.take_injected_input();
+        }
+        let v = srv.get_input(0);
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["held_buttons"].as_array().unwrap(), &vec![Value::from("right")]);
+        // asserted still includes `b`'s countdown (3 frames left after the fold above).
+        let asserted: Vec<String> = v["asserted_buttons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect();
+        assert!(asserted.contains(&"right".to_string()));
+        assert!(asserted.contains(&"b".to_string()));
+        // folded reflects the ONE fold already consumed above (both were live then).
+        let folded: Vec<String> = v["folded_buttons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect();
+        assert!(folded.contains(&"right".to_string()));
+        assert!(folded.contains(&"b".to_string()));
+        assert_eq!(srv.get_input(2)["ok"], false);
     }
 
     #[test]
