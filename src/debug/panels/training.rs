@@ -13,8 +13,10 @@ pub struct TrainingPanel {
     /// Cached `shadow/models/*` listing (dirs containing cases.npz).
     models: Vec<(String, PathBuf)>,
     models_refreshed: Option<Instant>,
-    /// Cached `shadow/arenas/*.state` listing: (display name, path, age).
-    arenas: Vec<(String, PathBuf, String)>,
+    /// Cached `shadow/arenas/*.state` listing: (display name, path, age,
+    /// sidecar — `None` when the arena predates the `.meta.json` feature or
+    /// the file failed to parse; rendered as "unknown", never fabricated).
+    arenas: Vec<(String, PathBuf, String, Option<crate::frontend::ArenaMeta>)>,
     arenas_refreshed: Option<Instant>,
     /// "Save new arena" name field.
     arena_name: String,
@@ -143,8 +145,11 @@ fn age_str(mtime: SystemTime) -> String {
     }
 }
 
-/// `shadow/arenas/*.state`, `current` first, then alphabetical.
-fn scan_arenas() -> Vec<(String, PathBuf, String)> {
+/// `shadow/arenas/*.state`, `current` first, then alphabetical. Each entry
+/// carries its `.meta.json` sidecar when one exists (`None` = unknown —
+/// arenas saved before the sidecar feature, or under a still-unbuilt
+/// probe).
+fn scan_arenas() -> Vec<(String, PathBuf, String, Option<crate::frontend::ArenaMeta>)> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(arenas_dir()) {
         for e in entries.flatten() {
@@ -160,7 +165,8 @@ fn scan_arenas() -> Vec<(String, PathBuf, String)> {
                 .and_then(|m| m.modified())
                 .map(age_str)
                 .unwrap_or_default();
-            out.push((name, path, age));
+            let meta = crate::frontend::load_arena_meta(&path);
+            out.push((name, path, age, meta));
         }
     }
     out.sort_by(|a, b| {
@@ -508,7 +514,8 @@ impl TrainingPanel {
             );
         }
         let mut promote: Option<PathBuf> = None;
-        for (name, path, age) in &self.arenas {
+        let profile = crate::profile::current();
+        for (name, path, age, meta) in &self.arenas {
             ui.horizontal(|ui| {
                 if *name == CURRENT_ARENA {
                     ui.label(egui::RichText::new("📌 current").strong());
@@ -516,8 +523,43 @@ impl TrainingPanel {
                     ui.monospace(name);
                 }
                 ui.label(egui::RichText::new(age).small().color(egui::Color32::DARK_GRAY));
+                match meta {
+                    Some(m) => {
+                        let matchup = format!(
+                            "{} vs {}",
+                            m.char_id_block1.map(|id| profile.char_name(id)).unwrap_or_else(|| "?".into()),
+                            m.char_id_block2.map(|id| profile.char_name(id)).unwrap_or_else(|| "?".into()),
+                        );
+                        ui.label(egui::RichText::new(matchup).small().color(egui::Color32::GRAY));
+                        if m.inputs_live.p1 == Some(false) {
+                            ui.label(
+                                egui::RichText::new("⚠ 1P vs CPU — the dummy cannot be driven here")
+                                    .small()
+                                    .color(egui::Color32::from_rgb(230, 180, 90)),
+                            );
+                        }
+                    }
+                    None => {
+                        ui.label(
+                            egui::RichText::new("(unknown — no sidecar)")
+                                .small()
+                                .color(egui::Color32::DARK_GRAY),
+                        );
+                    }
+                }
                 if ui.small_button("📂 Load").clicked() {
                     state.pending_state_op = Some(StateOp::Load(path.clone()));
+                    // The dummy has nothing to drive on a CPU-owned port —
+                    // warn now rather than let a later "why won't it move"
+                    // verification cycle rediscover this the hard way.
+                    if let Some(m) = meta {
+                        if m.inputs_live.p1 == Some(false) && state.training.dummy != crate::debug::DummyMode::Free {
+                            self.arena_note = Some(format!(
+                                "loaded {name}: 1P-vs-CPU arena — dummy mode {:?} has nothing to drive on port 1",
+                                state.training.dummy
+                            ));
+                        }
+                    }
                 }
                 if *name != CURRENT_ARENA && ui.small_button("📌 Make current").clicked() {
                     promote = Some(path.clone());
@@ -574,10 +616,16 @@ impl TrainingPanel {
     fn make_current(&mut self, src: &PathBuf) {
         let dst = arenas_dir().join(format!("{CURRENT_ARENA}.state"));
         self.arena_note = Some(match std::fs::copy(src, &dst) {
-            Ok(_) => format!(
-                "current ← {}",
-                src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
-            ),
+            Ok(_) => {
+                // Best-effort: carry the sidecar along so current.state stays
+                // self-describing too. A missing source sidecar (pre-feature
+                // arena) is not an error — `current.state` just has none either.
+                let _ = std::fs::copy(src.with_extension("meta.json"), dst.with_extension("meta.json"));
+                format!(
+                    "current ← {}",
+                    src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                )
+            }
             Err(e) => format!("make current FAILED: {e}"),
         });
         self.arenas_refreshed = None; // relist next frame

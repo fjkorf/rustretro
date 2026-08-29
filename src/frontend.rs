@@ -2,7 +2,7 @@ use crate::debug::{Bookmark, SharedDebugState};
 use crate::libretro::*;
 use anyhow::{anyhow, Result};
 use std::ffi::{CString, c_uint, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicPtr, Ordering}};
 
 // Global static for callback context access during libretro callbacks
@@ -437,6 +437,187 @@ impl Frontend {
         }
     }
 
+    /// Snapshot the fighter blocks + gate + run the liveness probe, then
+    /// write `<name>.meta.json` next to `path` (mission: make arenas
+    /// self-describing — see [`ArenaMeta`]). Best-effort: a lock or I/O
+    /// failure just skips the sidecar, never fails the save itself.
+    fn write_arena_sidecar(&mut self, path: &Path) {
+        let profile = crate::profile::current();
+        let (gate_open, char1, char2, health1, health2) = match self.debug_state.lock() {
+            Ok(ds) => {
+                let gate_open = crate::gate::eval_gate(&ds, profile);
+                let rd = |ba: Option<(u32, u8)>| {
+                    ba.and_then(|(a, s)| ds.read_addr(a as usize, s as usize))
+                };
+                let char1 = rd(profile.field_addr(1, "char_id")).map(|v| profile.canon_char_id(v as u8));
+                let char2 = rd(profile.field_addr(2, "char_id")).map(|v| profile.canon_char_id(v as u8));
+                let health1 = rd(profile.field_addr(1, "health")).map(|v| v as u8);
+                let health2 = rd(profile.field_addr(2, "health")).map(|v| v as u8);
+                (gate_open, char1, char2, health1, health2)
+            }
+            Err(_) => return,
+        };
+
+        let inputs_live = self.probe_arena_liveness(path, profile, gate_open);
+
+        let meta = ArenaMeta {
+            format: "arena-meta-v1".to_string(),
+            family: profile.family.family.clone(),
+            port: profile.port.port.clone(),
+            char_id_block1: char1,
+            char_id_block2: char2,
+            health_block1: health1,
+            health_block2: health2,
+            gate_open,
+            inputs_live,
+            saved_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        };
+        let meta_path = path.with_extension("meta.json");
+        match serde_json::to_string_pretty(&meta) {
+            Ok(json) => match std::fs::write(&meta_path, json) {
+                Ok(()) => {
+                    if let Ok(mut ds) = self.debug_state.lock() {
+                        ds.log(format!("🏟 Arena sidecar written: {}", meta_path.display()));
+                    }
+                }
+                Err(e) => eprintln!("[arena] failed to write sidecar {}: {e}", meta_path.display()),
+            },
+            Err(e) => eprintln!("[arena] sidecar serialization failed: {e}"),
+        }
+    }
+
+    /// The liveness probe (mission task 2): empirically determine whether
+    /// controller ports 0/1 each drive a fighter in the state just saved to
+    /// `path`. Degrades honestly to `None` (unknown) — never guesses — when
+    /// a recording is active, the gate is closed, or the profile maps no
+    /// `x` field for a block (see [`liveness_precheck`]).
+    ///
+    /// Every side effect is undone before returning: pause state, the
+    /// training enforcer's `enabled` flag, and the shadow bot's `enabled`
+    /// flag are restored, the frame counter is rewound, and — the actual
+    /// "leaves no trace" mechanism — the exact bytes just saved to `path`
+    /// are reloaded, discarding whatever the probe's injected input did to
+    /// the live RAM.
+    fn probe_arena_liveness(
+        &mut self,
+        path: &Path,
+        profile: &crate::profile::GameProfile,
+        gate_open: bool,
+    ) -> InputsLive {
+        let x1 = profile.field_addr(1, "x");
+        let x2 = profile.field_addr(2, "x");
+        if let Some(skip) = liveness_precheck(self.recorder.is_some(), gate_open, x1, x2) {
+            return skip;
+        }
+
+        let frame_count_before = self.frame_count;
+        let (was_paused, was_training) = match self.debug_state.lock() {
+            Ok(mut ds) => {
+                let p = ds.paused;
+                let t = ds.training.enabled;
+                ds.paused = false;
+                // Disable the training enforcer / dummy for the probe's
+                // duration — its position resets and dummy AI would
+                // confound "did MY injected input move this fighter".
+                ds.training.enabled = false;
+                (p, t)
+            }
+            Err(_) => return InputsLive::default(),
+        };
+        let was_shadow_enabled = self.shadow.as_ref().map(|s| s.enabled);
+        if let Some(sh) = self.shadow.as_mut() {
+            // Same reason: the shadow bot also drives port 1.
+            sh.enabled = false;
+        }
+
+        let p0 = x1.map(|(addr, size)| self.probe_one_port(0, addr, size));
+        let p1 = x2.map(|(addr, size)| self.probe_one_port(1, addr, size));
+
+        // Leave no trace: reload the exact bytes just saved, clear any input
+        // still "held" from the probe, and restore every flag we touched.
+        let _ = self.do_load_state(path);
+        self.refresh_bus_windows(Some(0));
+        self.set_input([false; 12]);
+        self.set_input2([false; 12]);
+        self.frame_count = frame_count_before;
+        if let Ok(mut ds) = self.debug_state.lock() {
+            ds.paused = was_paused;
+            ds.training.enabled = was_training;
+        }
+        if let Some(sh) = self.shadow.as_mut() {
+            sh.enabled = was_shadow_enabled.unwrap_or(false);
+        }
+
+        InputsLive { p0, p1 }
+    }
+
+    /// Drive `port` (0 or 1) with an alternating movement probe and report
+    /// whether the fighter's `x` field (at `addr`/`size`) shows real
+    /// variation across the window, rather than a single before/after read.
+    ///
+    /// Longer and more careful than the naive version on purpose: a live-RE
+    /// session on this exact field (mk2.md, "Input-liveness verification")
+    /// found that a short before/after window is unreliable two ways — (a)
+    /// it can land entirely inside hitstun/knockdown, where `x` is
+    /// genuinely frozen despite live, landing input, and (b) some ports'
+    /// `x` lives in a dynamic object-pool slot that can itself go stale
+    /// across boots. The documented fix is what this implements: force both
+    /// fighters' health up every frame (removes the KO/hitstun confound),
+    /// hold alternating left/right for several seconds, and judge by the
+    /// SPREAD across many samples — "a genuinely live P1 traces a real
+    /// path... where a truly dead/wrong-slot address stays bit-for-bit
+    /// constant across the whole window".
+    fn probe_one_port(&mut self, port: u8, addr: u32, size: u8) -> bool {
+        const TOTAL_FRAMES: u32 = 180; // ~3s emulated at 60fps
+        const BURST_FRAMES: u32 = 20; // direction flip cadence — avoids a wall/corner false-negative
+        const SAMPLE_EVERY: u32 = 6;
+        let threshold: i64 = if size >= 2 { 8 } else { 4 };
+
+        let profile = crate::profile::current();
+        let health_max = profile.port.enforcement.health_max;
+        let h1 = profile.field_addr(1, "health");
+        let h2 = profile.field_addr(2, "health");
+        let right = crate::profile::retro_button_bit("right");
+        let left = crate::profile::retro_button_bit("left");
+
+        let mut samples: Vec<u32> = Vec::new();
+        for frame in 0..TOTAL_FRAMES {
+            if let Ok(mut ds) = self.debug_state.lock() {
+                if let Some((a, s)) = h1 {
+                    ds.write_addr(a as usize, s as usize, health_max as u32);
+                }
+                if let Some((a, s)) = h2 {
+                    ds.write_addr(a as usize, s as usize, health_max as u32);
+                }
+            }
+            let going_right = (frame / BURST_FRAMES) % 2 == 0;
+            let mut bits = [false; 12];
+            if let Some(bit) = if going_right { right } else { left } {
+                bits[bit as usize] = true;
+            }
+            if port == 0 {
+                self.set_input(bits);
+            } else {
+                self.set_input2(bits);
+            }
+            let _ = self.run_frame();
+            if frame % SAMPLE_EVERY == 0 {
+                if let Ok(ds) = self.debug_state.lock() {
+                    if let Some(v) = ds.read_addr(addr as usize, size as usize) {
+                        samples.push(v);
+                    }
+                }
+            }
+        }
+
+        if samples.len() < 2 {
+            return false;
+        }
+        let min = *samples.iter().min().unwrap();
+        let max = *samples.iter().max().unwrap();
+        (max as i64 - min as i64) >= threshold
+    }
+
     /// Drain a queued save/load-state request (hotkeys / --load-state / MCP).
     ///
     /// SAFETY / PLACEMENT: retro_serialize and retro_unserialize must run on the
@@ -459,11 +640,16 @@ impl Frontend {
         let Some(op) = op else { return };
 
         use crate::debug::StateOp;
-        let (is_load, path) = match op {
-            StateOp::Save(p) => (false, p),
-            StateOp::Load(p) => (true, p),
-            StateOp::SaveSlot(n) => (false, self.slot_path(n)),
-            StateOp::LoadSlot(n) => (true, self.slot_path(n)),
+        // `is_named_save` distinguishes an explicit-path Save (MCP
+        // save_state with a path, the Arena panel, the State panel's path
+        // box) from a numbered slot save (F6 / quick-save) — only the
+        // former can be an arena path, and slot saves must NEVER trigger
+        // the sidecar/probe below.
+        let (is_load, path, is_named_save) = match op {
+            StateOp::Save(p) => (false, p, true),
+            StateOp::Load(p) => (true, p, false),
+            StateOp::SaveSlot(n) => (false, self.slot_path(n), false),
+            StateOp::LoadSlot(n) => (true, self.slot_path(n), false),
         };
 
         let result = if is_load {
@@ -520,6 +706,18 @@ impl Frontend {
                 ),
             });
             ds.state_op_result = Some(published);
+        }
+
+        // Arena self-description: write `<name>.meta.json` next to every
+        // state saved to an `arenas/` path (never for slot saves, never for
+        // loads — see `is_arena_path`). Runs the empirical port-liveness
+        // probe (advances real frames, then reloads to leave no trace).
+        // Deliberately AFTER `state_op_result` is published above, so an MCP
+        // `save_state` roundtrip returns as soon as the save itself lands —
+        // the probe (up to a few hundred extra frames) then runs without
+        // making that caller wait on it.
+        if is_named_save && !is_load && result.is_ok() && is_arena_path(&path) {
+            self.write_arena_sidecar(&path);
         }
     }
 
@@ -1685,6 +1883,86 @@ fn save_busmap_sidecar(path: &std::path::Path, debug_state: &SharedDebugState) {
     }
 }
 
+/// `<name>.meta.json` sidecar written next to every state saved to an
+/// `arenas/` path (see [`Frontend::write_arena_sidecar`]) — the mission this
+/// module implements: nobody should burn a verification cycle on a save
+/// state whose dummy cannot be driven, ever again. Follows the recorder's
+/// sidecar CONVENTION (`record.rs`'s `.meta.json`: same extension swap via
+/// `Path::with_extension`, same "everything the reader needs without the
+/// live profile" spirit) without sharing its code.
+///
+/// Arenas saved before this feature existed simply have no sidecar —
+/// [`load_arena_meta`] returns `None` for those, and callers render that as
+/// "unknown", never as a fabricated answer.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct ArenaMeta {
+    /// Schema tag, mirroring the recorder's `"format": "jsonl-v3"` field.
+    pub format: String,
+    pub family: String,
+    pub port: String,
+    /// Canonical roster ids (`GameProfile::canon_char_id`) for each fighter
+    /// block, `None` if the block's `char_id` wasn't readable at save time.
+    pub char_id_block1: Option<u8>,
+    pub char_id_block2: Option<u8>,
+    pub health_block1: Option<u8>,
+    pub health_block2: Option<u8>,
+    /// The controllable gate, evaluated at save time.
+    pub gate_open: bool,
+    pub inputs_live: InputsLive,
+    /// RFC 3339 timestamp (UTC), matching the recorder's `"created"`.
+    pub saved_at: String,
+}
+
+/// Per-controller-port empirical drivability (mission task 2). `None` means
+/// "unknown, honestly" — see [`liveness_precheck`] for the three reasons a
+/// port never gets probed.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputsLive {
+    pub p0: Option<bool>,
+    pub p1: Option<bool>,
+}
+
+/// Whether `path` lives under an `arenas` directory component — the signal
+/// that gates the sidecar + liveness probe. Matches the `shadow/arenas/
+/// <family>/` convention the Arena panel writes to; a caller that routes a
+/// verification copy through any other `.../arenas/...` path (e.g. a temp
+/// dir) gets the same treatment. Deliberately NOT keyed off `StateOp`
+/// variant alone — `StateOp::Save` is also how the generic State panel and
+/// MCP `save_state --path` name an arbitrary file, and only slot saves
+/// (`StateOp::SaveSlot`, F6/quick-save) are unconditionally excluded by the
+/// caller before this is even consulted.
+fn is_arena_path(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "arenas")
+}
+
+/// The three honest-degradation reasons from mission task 2, factored out as
+/// a pure function so they're testable without a live core: a recording in
+/// progress, a closed gate, or a profile that maps no `x` field for either
+/// block. Returns `Some(InputsLive::default())` (both `None`) when the probe
+/// must be skipped, or `None` when it's safe to proceed — the caller then
+/// probes whichever of `x1`/`x2` individually resolved.
+fn liveness_precheck(
+    recording_active: bool,
+    gate_open: bool,
+    x1: Option<(u32, u8)>,
+    x2: Option<(u32, u8)>,
+) -> Option<InputsLive> {
+    if recording_active || !gate_open || (x1.is_none() && x2.is_none()) {
+        return Some(InputsLive::default());
+    }
+    None
+}
+
+/// Read `<state>.meta.json` for a saved arena, if one exists. Returns `None`
+/// for a missing file (no sidecar — an arena saved before this feature, or
+/// simply not under `arenas/`) or a corrupt one; callers render both as
+/// "unknown", never as a fabricated answer (per-file house rule).
+pub fn load_arena_meta(state_path: &Path) -> Option<ArenaMeta> {
+    let meta_path = state_path.with_extension("meta.json");
+    let data = std::fs::read_to_string(&meta_path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
 /// Compute the SHA-1 of `data` and return it as a lowercase hex string.
 ///
 /// A small self-contained implementation (RFC 3174) so we can stamp the ROM-map
@@ -1818,5 +2096,107 @@ mod sha1_tests {
             sha1_hex(b"The quick brown fox jumps over the lazy dog"),
             "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12"
         );
+    }
+}
+
+#[cfg(test)]
+mod arena_sidecar_tests {
+    use super::{is_arena_path, liveness_precheck, load_arena_meta, ArenaMeta, InputsLive};
+    use std::path::Path;
+
+    #[test]
+    fn arena_meta_serializes_with_the_expected_shape() {
+        let meta = ArenaMeta {
+            format: "arena-meta-v1".into(),
+            family: "mk2".into(),
+            port: "arcade".into(),
+            char_id_block1: Some(9),
+            char_id_block2: None,
+            health_block1: Some(161),
+            health_block2: None,
+            gate_open: true,
+            inputs_live: InputsLive { p0: Some(true), p1: Some(false) },
+            saved_at: "2026-08-28T00:00:00Z".into(),
+        };
+        let json = serde_json::to_value(&meta).unwrap();
+        assert_eq!(json["format"], "arena-meta-v1");
+        assert_eq!(json["family"], "mk2");
+        assert_eq!(json["port"], "arcade");
+        assert_eq!(json["char_id_block1"], 9);
+        assert!(json["char_id_block2"].is_null());
+        assert_eq!(json["gate_open"], true);
+        assert_eq!(json["inputs_live"]["p0"], true);
+        assert_eq!(json["inputs_live"]["p1"], false);
+
+        // Round-trips losslessly — the panel reads this back via `load_arena_meta`.
+        let back: ArenaMeta = serde_json::from_value(json).unwrap();
+        assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn load_arena_meta_is_none_for_a_missing_sidecar() {
+        // Every arena committed before this feature has no `.meta.json` —
+        // this must render as "unknown", never panic or fabricate a value.
+        assert_eq!(
+            load_arena_meta(Path::new("/tmp/rustretro_definitely_missing_arena.state")),
+            None
+        );
+    }
+
+    #[test]
+    fn load_arena_meta_is_none_for_a_corrupt_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustretro_arena_meta_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("bad.state");
+        std::fs::write(state_path.with_extension("meta.json"), b"not json").unwrap();
+        assert_eq!(load_arena_meta(&state_path), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_arena_path_matches_the_arenas_directory_convention() {
+        assert!(is_arena_path(Path::new("shadow/arenas/mk2/r-v-r.state")));
+        assert!(is_arena_path(Path::new("/tmp/jobs/verify/arenas/copy.state")));
+        assert!(!is_arena_path(Path::new("saves/mk2.state1")));
+        assert!(!is_arena_path(Path::new("shadow/recordings/mk2/session.state")));
+    }
+
+    /// The three honest-degradation reasons (mission task 2): a recording in
+    /// progress, a closed gate, or no `x` mapped for either block all must
+    /// skip the probe and report BOTH ports unknown — never a guess.
+    #[test]
+    fn liveness_precheck_degrades_to_null_when_recording_active() {
+        assert_eq!(
+            liveness_precheck(true, true, Some((0x1000, 2)), Some((0x2000, 2))),
+            Some(InputsLive::default())
+        );
+    }
+
+    #[test]
+    fn liveness_precheck_degrades_to_null_when_gate_closed() {
+        assert_eq!(
+            liveness_precheck(false, false, Some((0x1000, 2)), Some((0x2000, 2))),
+            Some(InputsLive::default())
+        );
+    }
+
+    #[test]
+    fn liveness_precheck_degrades_to_null_when_no_x_mapped_for_either_block() {
+        assert_eq!(liveness_precheck(false, true, None, None), Some(InputsLive::default()));
+    }
+
+    #[test]
+    fn liveness_precheck_proceeds_when_open_recorder_idle_and_one_block_maps_x() {
+        // Only block1 maps `x` (e.g. a port that hasn't mapped block2 yet) —
+        // the precheck still says "proceed"; the per-port `None` for the
+        // unmapped block happens downstream (`x2.map(...)` on `None`).
+        assert_eq!(liveness_precheck(false, true, Some((0x1000, 2)), None), None);
     }
 }
