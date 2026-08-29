@@ -1091,6 +1091,70 @@ impl RetroMcpServer {
         })
     }
 
+    // ── signal hunt (docs/signal-hunt.md — NORMATIVE) ──────────────────────
+    //
+    // The four tools below automate the event-marked differential RAM protocol
+    // that had been hand-scripted once per hunt. None of them writes anything
+    // to the game or to a profile, so none is behind the write gate: marking
+    // reads the frame counter and the gate, analysis is pure arithmetic over
+    // snapshots the sampler already took.
+
+    /// `hunt_mark`: record a labeled moment (§2). Pins the `mark-PRE` snapshot
+    /// out of the ring immediately and schedules the `mark+POST` capture.
+    fn hunt_mark(&self, label: &str) -> Value {
+        match crate::hunt::mark(&self.debug, label) {
+            Ok(msg) => json!({ "ok": true, "message": msg, "status": crate::hunt::status() }),
+            Err(e) => json!({ "ok": false, "error": e }),
+        }
+    }
+
+    /// `hunt_configure`: scope the hunt region and set the window knobs (§3).
+    #[allow(clippy::too_many_arguments)]
+    fn hunt_configure(
+        &self,
+        blocks: bool,
+        extra: Option<(u32, u32)>,
+        ring_frames: Option<usize>,
+        pre: Option<u64>,
+        post: Option<u64>,
+        include_idle: Option<bool>,
+        enabled: Option<bool>,
+    ) -> Value {
+        match crate::hunt::configure(blocks, extra, ring_frames, pre, post, include_idle, enabled) {
+            Ok(msg) => json!({ "ok": true, "message": msg, "status": crate::hunt::status() }),
+            // §3: a refusal is a first-class answer, not a fallback to a
+            // truncated region.
+            Err(e) => json!({ "ok": false, "error": e }),
+        }
+    }
+
+    /// `hunt_analyze`: the §4 kernel plus the §5 evidence-doc export and the
+    /// §6 honesty fields, all in one payload.
+    fn hunt_analyze(&self, event_label: &str, control_label: Option<&str>) -> Value {
+        match crate::hunt::run_analysis(event_label, control_label) {
+            Ok(a) => {
+                let md = crate::hunt::export_markdown(&a);
+                let mut v = serde_json::to_value(&a).unwrap_or_else(|e| json!({ "error": e.to_string() }));
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("ok".into(), json!(true));
+                    obj.insert("evidence_markdown".into(), json!(md));
+                    obj.insert(
+                        "profile_note".into(),
+                        json!("This tool NEVER writes a profile. Candidates are hypotheses; \
+                               promotion requires a write-test."),
+                    );
+                }
+                v
+            }
+            Err(e) => json!({ "ok": false, "error": e }),
+        }
+    }
+
+    /// `hunt_reset`: drop every mark and the ring; keep the configuration.
+    fn hunt_reset(&self) -> Value {
+        json!({ "ok": true, "message": crate::hunt::reset(), "status": crate::hunt::status() })
+    }
+
     /// Request a single-frame step: clear pause-edge by arming `step_one`.
     fn step(&self) -> Value {
         if let Ok(mut ds) = self.debug.lock() {
@@ -1743,6 +1807,46 @@ impl RetroMcpServer {
             });
             Arc::new(schema.as_object().unwrap().clone())
         };
+        // ── signal hunt (docs/signal-hunt.md §8) ───────────────────────────
+        let hunt_mark_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "label": { "type": "string", "description": "Free-form label. Convention: \"event\" for the thing you are hunting, \"control\" for a near-miss that must NOT produce the signal. Multiple labels may be in play." }
+                },
+                "required": ["label"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+        let hunt_configure_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "blocks": { "type": "boolean", "description": "Include both fighter structs (profile block1/block2 + stride). Default true — this is the §3 default scope." },
+                    "start":  { "type": ["integer", "string"], "description": "Extra window start (guest address; integer or hex string \"0xBC00\"). Use for values OUTSIDE the fighter structs, e.g. MK2's HUD health pair." },
+                    "len":    { "type": ["integer", "string"], "description": "Extra window length in bytes. Required with `start`." },
+                    "ring_frames": { "type": "integer", "description": "Snapshots retained in the rolling ring (default 60, min 2)." },
+                    "pre":  { "type": "integer", "description": "Frames BEFORE a mark forming the 'before' side of its changed-set (default 4)." },
+                    "post": { "type": "integer", "description": "Frames AFTER a mark forming the 'after' side (default 12)." },
+                    "include_idle": { "type": "boolean", "description": "Subtract the idle-churn set from candidates (default true). The analysis reports the result BOTH ways regardless." },
+                    "enabled": { "type": "boolean", "description": "Turn per-frame sampling on/off (default on — the ring must already be running before the first mark)." }
+                },
+                "required": []
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+        let hunt_analyze_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "event_label":   { "type": "string", "description": "Label of the marks that ARE the event (default \"event\")." },
+                    "control_label": { "type": "string", "description": "Label of the near-miss marks. OMITTING THIS IS DANGEROUS — the report will warn prominently, because a hunt with no control is how a swing counter was mistaken for a contact signal." }
+                },
+                "required": []
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+
         // Schema for { addr, len, value } (write_memory).
         let write_memory_schema = || -> Arc<Map<String, Value>> {
             let schema = json!({
@@ -1959,6 +2063,48 @@ impl RetroMcpServer {
                  legitimately differ while paused (asserted keeps showing the hold; folded is \
                  stale until the next step). Read-only, no write gate.",
                 get_input_schema(),
+            ),
+            // ── signal hunt ────────────────────────────────────────────────
+            Tool::new(
+                "hunt_configure",
+                "Signal hunt (docs/signal-hunt.md §3): scope the RAM region that is snapshotted \
+                 every frame, and set the analysis window. Default scope is the two fighter \
+                 structs from the game profile; add `start`+`len` for a value that lives outside \
+                 them (HUD mirrors, object arrays). REFUSES — by name and size — any region whose \
+                 ring footprint would blow the budget, because a silently truncated hunt produces \
+                 confident wrong answers. Changing the REGION discards marks captured under the \
+                 old layout (their snapshots are not comparable); changing only ring/pre/post \
+                 keeps them. Read-only, no write gate.",
+                hunt_configure_schema(),
+            ),
+            Tool::new(
+                "hunt_mark",
+                "Signal hunt (§2): mark THIS frame with a label — \"event\" when the thing you are \
+                 hunting just happened, \"control\" for a deliberate near-miss where it did NOT. \
+                 Records frame, wall-clock, and the profile gate state, pins the snapshot from \
+                 PRE frames ago, and schedules the POST capture. Marks are cheap; over-marking is \
+                 fine. Judging 'that was a blocked hit' is YOUR job and cannot be automated — \
+                 pretending otherwise is how false signals get shipped. Read-only, no write gate.",
+                hunt_mark_schema(),
+            ),
+            Tool::new(
+                "hunt_analyze",
+                "Signal hunt (§4-§6): intersect the changed-sets of every event mark, subtract \
+                 the union of the control marks' changed-sets plus idle churn, and rank what \
+                 survives (fires-on-all, then small values, then counter-like, then \
+                 byte-over-word). Returns per-mark value transitions for EVERY candidate so you \
+                 can overrule the ranking, an evidence-doc markdown export, and the honesty \
+                 fields: the settings used, gate-closed marks, unusable marks, and how many \
+                 bytes each subtraction removed. ZERO CANDIDATES IS A RESULT. Addresses are \
+                 profile-relative (block2+0x6F). This tool NEVER writes a profile — candidates \
+                 are hypotheses until a write-test confirms them.",
+                hunt_analyze_schema(),
+            ),
+            Tool::new(
+                "hunt_reset",
+                "Signal hunt: discard every mark and the snapshot ring (the region/window \
+                 configuration survives). Read-only, no write gate.",
+                no_params(),
             ),
             Tool::new(
                 "run_lua",
@@ -2503,6 +2649,74 @@ impl ServerHandler for RetroMcpServer {
                     Ok(CallToolResult::success(vec![Self::json_content(
                         &this.get_input(port),
                     )?]))
+                }
+                // ── signal hunt ─────────────────────────────────────────────
+                "hunt_configure" => {
+                    // start/len accept a JSON integer or a hex string, like
+                    // map_bus_window — hunt regions are naturally hexadecimal.
+                    let num_arg = |key: &str| -> Option<u64> {
+                        match args.get(key)? {
+                            Value::Number(n) => n.as_u64(),
+                            Value::String(s) => {
+                                let t = s.trim();
+                                let h = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))
+                                    .unwrap_or(t);
+                                u64::from_str_radix(h, 16).ok()
+                            }
+                            _ => None,
+                        }
+                    };
+                    let blocks = args.get("blocks").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let extra = match (num_arg("start"), num_arg("len")) {
+                        (Some(a), Some(l)) => {
+                            if a > u32::MAX as u64 || l > u32::MAX as u64 {
+                                return Err(ErrorData::invalid_params(
+                                    "`start`/`len` must fit in the 32-bit bus",
+                                    None,
+                                ));
+                            }
+                            Some((a as u32, l as u32))
+                        }
+                        (None, None) => None,
+                        _ => {
+                            return Err(ErrorData::invalid_params(
+                                "`start` and `len` must be given together",
+                                None,
+                            ))
+                        }
+                    };
+                    let v = this.hunt_configure(
+                        blocks,
+                        extra,
+                        get_u("ring_frames").map(|n| n as usize),
+                        get_u("pre"),
+                        get_u("post"),
+                        args.get("include_idle").and_then(|v| v.as_bool()),
+                        args.get("enabled").and_then(|v| v.as_bool()),
+                    );
+                    Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
+                }
+                "hunt_mark" => {
+                    let label = args
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ErrorData::invalid_params("missing/invalid `label`", None))?;
+                    Ok(CallToolResult::success(vec![Self::json_content(
+                        &this.hunt_mark(label),
+                    )?]))
+                }
+                "hunt_analyze" => {
+                    let event = args
+                        .get("event_label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("event");
+                    let control = args.get("control_label").and_then(|v| v.as_str());
+                    Ok(CallToolResult::success(vec![Self::json_content(
+                        &this.hunt_analyze(event, control),
+                    )?]))
+                }
+                "hunt_reset" => {
+                    Ok(CallToolResult::success(vec![Self::json_content(&this.hunt_reset())?]))
                 }
                 "run_lua" => {
                     let script = args

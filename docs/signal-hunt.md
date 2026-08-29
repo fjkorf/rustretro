@@ -106,3 +106,54 @@ The feature is done when it reproduces findings we already made by hand:
 - MCP: `hunt_mark`, `hunt_analyze`, `hunt_configure`, `hunt_reset` — so agents
   can run the whole protocol headlessly.
 - Lua: `hunt.mark(label)` for scripted marking from a per-frame callback.
+
+## 9. Implementation notes — decisions the contract left open
+
+Implemented in `src/hunt.rs` (kernel + live state), `src/debug/panels/hunt.rs`
+(panel), `src/mcp/server.rs` (tools), `src/lua_engine.rs` (`hunt.*`),
+`src/main.rs` (per-frame sampler + hotkeys). Everything below is a choice the
+sections above did not pin down; where it *narrows* the contract it is marked
+**DEVIATION**.
+
+- **Marks own their evidence.** §3's ring is 60 frames but a real hunt spans
+  minutes, so a mark cannot be analyzed "out of the ring" later. `hunt_mark`
+  PINS the `mark-PRE` snapshot immediately and the sampler pins `mark+POST`
+  when that frame arrives. A mark whose POST never arrived is reported as
+  UNUSABLE and excluded, never silently treated as unchanged.
+- **The §2 hotkey is F9 / Shift+F9** (event / control). It is the primary
+  marking surface during a live hunt — a mouse trip to the panel costs frames.
+- **DEVIATION — "quiet" means input-quiet too.** §4 defines idle churn over
+  "consecutive quiet snapshots with no mark nearby". Frames-far-from-a-mark
+  alone is not enough: an operator walking into range, or performing an
+  UNMARKED instance of the event, folds the signal itself into the idle set and
+  disqualifies it (observed live). A frame therefore contributes to idle churn
+  only if it is ≥30 frames outside every mark's `[frame-PRE, frame+POST]` span
+  AND neither controller port asserted anything on it or its predecessor.
+  Consequence to know about: a dummy that holds a button every frame (MK2's
+  button-style Block) makes every frame non-quiet, so idle churn is empty and
+  the report says so — the control marks then do all the work.
+- **DEVIATION — discontinuities are not churn.** A save-state load rewrites the
+  whole region in one "frame". Folding that into idle churn disqualifies
+  everything; it produced a spurious zero-candidate result on the first MK2
+  acceptance run. A one-frame diff touching >¼ of the region, or a diff across
+  non-adjacent frames, is dropped from idle-churn accumulation and counted in
+  `discontinuities_skipped`.
+- **The budget in §3 is 8 MiB of ring footprint** (region bytes × ring frames),
+  ~20× the default two-fighter-struct scope on both shipped games. MK2 arcade's
+  whole 2.3 MB exposed region is refused by name and size.
+- **Reporting both ways.** Alongside `candidates` the analysis always returns
+  `candidates_ignoring_idle` (event − control marks, with idle churn NOT
+  subtracted) and the counts eliminated by each subtraction, so "idle churn ate
+  my signal" is distinguishable from "there was no signal". Same reason §6
+  exists.
+- **`hunt_configure` discards evidence when the REGION changes** (snapshots
+  taken under a different layout are not comparable); changing only
+  ring/pre/post keeps the marks and clears just the ring. Each mark records the
+  PRE/POST it was actually taken with, and the report warns if they are not
+  uniform.
+- **Endpoint diffing is literal** (§4 says "differing between the snapshot at
+  `mark-PRE` and `mark+POST`"), so a byte that toggles and returns inside the
+  window is invisible, and a byte's survival can depend on exactly where the
+  window lands. That is why §4 also requires the per-mark transitions to be
+  printed for every candidate: the reader can see whether the endpoints landed
+  where they meant them to. In practice, verify each mark as you take it.

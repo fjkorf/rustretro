@@ -845,6 +845,40 @@ impl LuaEngine {
 
         globals.set("game", game)?;
 
+        // ── hunt.* ────────────────────────────────────────────────────────────
+        // Signal hunt (docs/signal-hunt.md §8): scripted marking from a
+        // per-frame callback, for events a human cannot click fast enough —
+        //   event.onframeend(function()
+        //     if contact_edge() then hunt.mark("event") end
+        //   end)
+        // Marking is judgement, and §1 is explicit that the judgement stays the
+        // human's; this binding only lets that judgement be EXPRESSED as code.
+        // It is NOT behind the write gate — a mark reads memory, never pokes it.
+        let hunt = lua.create_table()?;
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, label: String| -> mlua::Result<String> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                crate::hunt::mark_with(&ds, &label).map_err(mlua::Error::external)
+            })?;
+            hunt.set("mark", f)?;
+        }
+        // hunt.status() -> JSON string (region, ring fill, per-label mark
+        // counts) so a script can log or overlay how the hunt is going.
+        {
+            let f = lua.create_function(|_, ()| -> mlua::Result<String> {
+                Ok(crate::hunt::status().to_string())
+            })?;
+            hunt.set("status", f)?;
+        }
+        {
+            let f = lua.create_function(|_, ()| -> mlua::Result<String> {
+                Ok(crate::hunt::reset())
+            })?;
+            hunt.set("reset", f)?;
+        }
+        globals.set("hunt", hunt)?;
+
         // ── training.* ────────────────────────────────────────────────────────
         // Read-only view of the NATIVE training-mode control block (F5 / the
         // Training panel / --training). Scripts ask these instead of keeping
