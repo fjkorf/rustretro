@@ -507,6 +507,37 @@ pub enum DummyMode {
     BlockPunish,
 }
 
+/// WHEN the guarding dummy takes a guard opportunity (MACRO_ACTIONS §9.4 —
+/// the vocabulary SF6/GGST/fbneo-training-mode all use). Orthogonal to the
+/// family's guard STYLE (button chord vs reactive back-hold): the style says
+/// how to guard, the mode says whether to.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GuardMode {
+    /// Guard every opportunity.
+    #[default]
+    All,
+    /// Stand there until a contact signal fires, then guard for the rest of
+    /// the string (string end = the contact signal going quiet). Needs a
+    /// contact signal mapped — greyed otherwise.
+    AfterFirstHit,
+    /// Guard each opportunity with probability `guard_random_pct`; the roll is
+    /// sticky for the whole opportunity (no mid-attack flicker).
+    Random,
+    /// Never guard.
+    None,
+}
+
+impl GuardMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            GuardMode::All => "Guard All",
+            GuardMode::AfterFirstHit => "After First Hit",
+            GuardMode::Random => "Random",
+            GuardMode::None => "None",
+        }
+    }
+}
+
 /// Training-mode control block (shadow PLAN Wave 2b). GUI hotkeys flip these
 /// under the DebugState lock; `training::tick` consumes them on the emulation
 /// thread. `reset_positions`/`finish_round` are one-shots (cleared by tick).
@@ -543,6 +574,29 @@ pub struct TrainingConfig {
     /// `training.punish_state()`, and any overlay all read it) so a silent
     /// dummy explains itself instead of looking broken.
     pub punish_phase: String,
+    /// WHEN the guarding dummy guards (§9.4). Applies to both guard styles.
+    pub guard_mode: GuardMode,
+    /// `GuardMode::Random`'s probability, in percent.
+    pub guard_random_pct: GuardPct,
+    /// Guard runtime (not UI): the reactive window's hold tail, the sticky
+    /// Random roll for the current opportunity, and After-First-Hit's
+    /// "a hit has landed in this string" latch.
+    pub guard_commit_until: u64,
+    pub guard_prev_commit: bool,
+    pub guard_roll: Option<bool>,
+    pub guard_hit_seen: bool,
+    pub guard_last_hit: u64,
+}
+
+/// `GuardMode::Random`'s take-probability in percent. A newtype purely so the
+/// derived `TrainingConfig::default()` yields a sane 50 % instead of "never".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GuardPct(pub u8);
+
+impl Default for GuardPct {
+    fn default() -> Self {
+        GuardPct(50)
+    }
 }
 
 pub struct DebugState {

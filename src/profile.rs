@@ -133,6 +133,33 @@ pub struct PortProfile {
     /// hit_counter). Neither mapped → BlockPunish degrades per-feature.
     #[serde(default)]
     pub contact_signal: Option<ContactSignal>,
+    /// Port-level guard tuning for back-to-block families (MACRO_ACTIONS §9).
+    /// Absent → the reactive guard falls back to its built-in default range.
+    #[serde(default)]
+    pub block: Option<PortBlock>,
+}
+
+/// Port-level guard data (MACRO_ACTIONS §9.2). `guard_range` is the only
+/// value code reads; the `*_verdict`/`*_evidence` strings are the live-RE
+/// provenance the schema carries deliberately (the .md holds the long form)
+/// so a future port can't silently inherit asurabld's conclusions.
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
+pub struct PortBlock {
+    /// Max |opp.x − me.x| (units of the mapped `x`) at which the guard window
+    /// may open. Beyond it the dummy ignores the attack — that is what keeps
+    /// it from reacting to far whiffs.
+    #[serde(default)]
+    pub guard_range: Option<u32>,
+    #[serde(default)]
+    pub guard_range_evidence: Option<String>,
+    /// Whether crouch-guard (down-back) works on this port. asurabld: it does
+    /// NOT (0/4, reproduced) — the guard hold must never add Down.
+    #[serde(default)]
+    pub overhead_verdict: Option<String>,
+    /// Whether holding away silently charges specials (§9.5).
+    #[serde(default)]
+    pub charge_hazard_verdict: Option<String>,
 }
 
 /// The contact-signal declaration: something whose CHANGE means "this
