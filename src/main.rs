@@ -14,6 +14,7 @@ mod training;
 mod input_config;
 mod gate;
 mod hunt;
+mod playback;
 
 use anyhow::Result;
 use audio::AudioOutput;
@@ -331,7 +332,7 @@ fn main() -> Result<()> {
         .insert_resource(debug::panels::controls::ControlsPanel::new())
         .init_resource::<TutorialPages>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (calibrate_wizard, read_input, run_emulation, hunt_sample, run_scripts, drain_lua_requests, sync_video, queue_audio, update_title).chain())
+        .add_systems(Update, (calibrate_wizard, read_input, run_emulation, hunt_sample, input_log_sample, run_scripts, drain_lua_requests, sync_video, queue_audio, update_title).chain())
         .add_systems(EguiPrimaryContextPass, (show_debug, show_script_panel, debug::panels::controls::show_controls_panel, show_tutorial_pages))
         .run();
 
@@ -415,6 +416,14 @@ fn run_headless(
         //      `hunt.mark()` from a per-frame script marks a frame that already
         //      has a snapshot. No-ops when the frame counter didn't advance.
         hunt::sample(&debug_state);
+
+        // (a1b) Input log (task A1): one frame-exact sample of both ports'
+        //       already-folded button masks — same hook point as hunt::sample
+        //       (right after run_frame, before pause/step can re-offer this
+        //       frame), so pause/resume dedup identically. See
+        //       debug/panels/input_log.rs's module doc for the fold and
+        //       save-state-load contract.
+        debug::panels::input_log::sample(&debug_state);
 
         // (b) Lua per-frame callbacks, then composite their draw commands into
         //     `fb_rgba` — exactly like the GUI's run_scripts system. There IS a
@@ -937,6 +946,12 @@ fn run_emulation(
 /// stepping or idling.
 fn hunt_sample(debug_state: Res<DebugStateRes>) {
     hunt::sample(&debug_state.0);
+}
+
+/// Input log (task A1): mirrors `hunt_sample`'s hook point exactly — see
+/// `debug/panels/input_log.rs`'s module doc.
+fn input_log_sample(debug_state: Res<DebugStateRes>) {
+    debug::panels::input_log::sample(&debug_state.0);
 }
 
 // ─── Scripting ───────────────────────────────────────────────────────────────

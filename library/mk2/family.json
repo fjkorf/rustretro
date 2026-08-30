@@ -4,13 +4,18 @@
   "roster": [
     { "id": 0, "name": "kunglao", "select_slot": 1 },
     { "id": 1, "name": "liukang", "select_slot": 0 },
+    { "id": 2, "name": "johnnycage", "select_slot": null },
     { "id": 3, "name": "baraka", "select_slot": null },
     { "id": 4, "name": "kitana", "select_slot": null },
+    { "id": 5, "name": "mileena", "select_slot": null },
+    { "id": 6, "name": "shangtsung", "select_slot": null },
     { "id": 7, "name": "raiden", "select_slot": null },
+    { "id": 8, "name": "subzero", "select_slot": null },
     { "id": 9, "name": "reptile", "select_slot": null },
     { "id": 10, "name": "scorpion", "select_slot": null },
     { "id": 11, "name": "jax", "select_slot": null }
   ],
+  "_roster_provenance": "all 12 selectable ids read live from block1+0x0 at character select, 2026-08-29 (mk2.md). 0xFF = no selection. BOSSES (kintaro, shaokahn) are NOT in this list and their ids are unknown — the id space does not stop at 11; read block2+0x0 during a 1P ladder boss fight to map them.",
   "move_classes": [
     "Neutral", "Forward", "Back", "Up", "Down",
     "UpForward", "UpBack", "DownForward", "DownBack"
@@ -22,6 +27,11 @@
       { "name": "slide",      "tags": ["special", "low"] },
       { "name": "acid_spit",  "tags": ["special", "projectile"] },
       { "name": "force_ball", "tags": ["special", "projectile"] }
+    ],
+    "mileena": [
+      { "name": "sai_throw",     "tags": ["special", "projectile", "charge"] },
+      { "name": "teleport_kick", "tags": ["special", "side_swap"] },
+      { "name": "roll",          "tags": ["special", "low", "knockdown"] }
     ]
   }
 }

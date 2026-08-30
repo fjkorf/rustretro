@@ -1091,6 +1091,128 @@ impl RetroMcpServer {
         })
     }
 
+    // ── input-slot record/playback (task A2) ────────────────────────────────
+    //
+    // Named slots capturing both ports' folded per-frame input, replayable
+    // deterministically — the frame lab's determinism instrument AND a
+    // reproducible bug-repro format. See `playback.rs`'s module doc for the
+    // precedence rule against the training dummy and exactly what is/isn't
+    // guaranteed deterministic. GATED behind enable_writes per task A2's
+    // explicit requirement — unlike hold_buttons/press_buttons (which predate
+    // this feature and stay ungated), these are asked-for as gated tools.
+
+    /// `record_inputs`: start or stop capturing BOTH ports into a named slot
+    /// (`shadow/inputs/<family>/<name>.slot.json`).
+    fn record_inputs(&self, action: &str, name: Option<&str>) -> Value {
+        if let Err(e) = self.check_writes_armed() {
+            return json!({ "ok": false, "error": e });
+        }
+        let mut ds = match self.debug.lock() {
+            Ok(g) => g,
+            Err(_) => return json!({ "ok": false, "error": "lock poisoned" }),
+        };
+        match action {
+            "start" => {
+                let Some(name) = name else {
+                    return json!({ "ok": false, "error": "`name` is required for action=\"start\"" });
+                };
+                match crate::playback::start_recording(&mut ds, name, crate::profile::current()) {
+                    Ok(()) => {
+                        ds.recording_note = Some(format!("recording '{name}'"));
+                        json!({ "ok": true, "recording": name })
+                    }
+                    Err(e) => json!({ "ok": false, "error": e }),
+                }
+            }
+            "stop" => match crate::playback::stop_recording(&mut ds) {
+                Ok((path, frames)) => {
+                    let path_s = path.display().to_string();
+                    ds.recording_note = Some(format!("stopped — {frames} frames → {path_s}"));
+                    json!({ "ok": true, "path": path_s, "frames": frames })
+                }
+                Err(e) => json!({ "ok": false, "error": e }),
+            },
+            other => json!({
+                "ok": false,
+                "error": format!("`action` must be \"start\" or \"stop\", got '{other}'")
+            }),
+        }
+    }
+
+    /// `play_inputs`: start or stop replaying a named slot onto one or both
+    /// ports. `trigger` is `"manual"` (begins on the next real frame — frame-
+    /// exact only when paired with pause→step, see `playback.rs`'s module
+    /// doc) or `"round_start"` (begins on the fight gate's next closed→open
+    /// transition — deterministic from a pre-round save state).
+    fn play_inputs(&self, action: &str, name: Option<&str>, port: &str, trigger: &str) -> Value {
+        if let Err(e) = self.check_writes_armed() {
+            return json!({ "ok": false, "error": e });
+        }
+        let mut ds = match self.debug.lock() {
+            Ok(g) => g,
+            Err(_) => return json!({ "ok": false, "error": "lock poisoned" }),
+        };
+        match action {
+            "start" => {
+                let Some(name) = name else {
+                    return json!({ "ok": false, "error": "`name` is required for action=\"start\"" });
+                };
+                let port = match port {
+                    "p1" => crate::debug::PlaybackPort::P1,
+                    "p2" => crate::debug::PlaybackPort::P2,
+                    "both" | "" => crate::debug::PlaybackPort::Both,
+                    other => {
+                        return json!({
+                            "ok": false,
+                            "error": format!("`port` must be \"p1\", \"p2\", or \"both\", got '{other}'")
+                        })
+                    }
+                };
+                let trigger = match trigger {
+                    "manual" | "" => crate::debug::PlaybackTrigger::Manual,
+                    "round_start" => crate::debug::PlaybackTrigger::RoundStart,
+                    other => {
+                        return json!({
+                            "ok": false,
+                            "error": format!("`trigger` must be \"manual\" or \"round_start\", got '{other}'")
+                        })
+                    }
+                };
+                match crate::playback::start_playback(&mut ds, name, port, trigger, crate::profile::current()) {
+                    Ok(frames) => {
+                        ds.playback_note = Some(format!("armed '{name}' ({frames} frames)"));
+                        json!({ "ok": true, "name": name, "frames": frames })
+                    }
+                    Err(e) => json!({ "ok": false, "error": e }),
+                }
+            }
+            "stop" => match crate::playback::stop_playback(&mut ds) {
+                Ok(()) => {
+                    ds.playback_note = Some("stopped".to_string());
+                    json!({ "ok": true, "stopped": true })
+                }
+                Err(e) => json!({ "ok": false, "error": e }),
+            },
+            other => json!({
+                "ok": false,
+                "error": format!("`action` must be \"start\" or \"stop\", got '{other}'")
+            }),
+        }
+    }
+
+    /// `list_input_slots`: list every slot under the loaded family's
+    /// `shadow/inputs/<family>/` directory. Read-only, UNGATED.
+    fn list_input_slots(&self) -> Value {
+        let family = crate::profile::current().family.family.clone();
+        let slots = crate::playback::list_slots(&family);
+        json!({
+            "ok": true,
+            "family": family,
+            "dir": crate::playback::slots_dir(&family).display().to_string(),
+            "slots": serde_json::to_value(&slots).unwrap_or_else(|_| json!([])),
+        })
+    }
+
     // ── signal hunt (docs/signal-hunt.md — NORMATIVE) ──────────────────────
     //
     // The four tools below automate the event-marked differential RAM protocol
@@ -1807,6 +1929,32 @@ impl RetroMcpServer {
             });
             Arc::new(schema.as_object().unwrap().clone())
         };
+        // Schema for { action, name? } (record_inputs).
+        let record_inputs_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "description": "\"start\" or \"stop\"" },
+                    "name": { "type": "string", "description": "Slot name (required for action=\"start\"); becomes shadow/inputs/<family>/<name>.slot.json" }
+                },
+                "required": ["action"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
+        // Schema for { action, name?, port?, trigger? } (play_inputs).
+        let play_inputs_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "description": "\"start\" or \"stop\"" },
+                    "name": { "type": "string", "description": "Slot name to play (required for action=\"start\")" },
+                    "port": { "type": "string", "description": "\"p1\", \"p2\", or \"both\" (default \"both\")" },
+                    "trigger": { "type": "string", "description": "\"manual\" (begin on the next real frame — pair with pause/step for frame-exact timing) or \"round_start\" (begin on the fight gate's next closed→open transition; deterministic from a pre-round save state). Default \"manual\"." }
+                },
+                "required": ["action"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
         // ── signal hunt (docs/signal-hunt.md §8) ───────────────────────────
         let hunt_mark_schema = || -> Arc<Map<String, Value>> {
             let schema = json!({
@@ -2063,6 +2211,37 @@ impl RetroMcpServer {
                  legitimately differ while paused (asserted keeps showing the hold; folded is \
                  stale until the next step). Read-only, no write gate.",
                 get_input_schema(),
+            ),
+            // ── input-slot record/playback (task A2) ────────────────────────
+            Tool::new(
+                "record_inputs",
+                "Capture BOTH controller ports' folded per-frame input into a named slot \
+                 (shadow/inputs/<family>/<name>.slot.json) — the frame lab's determinism \
+                 instrument and a reproducible bug-repro format. `action=\"start\"` needs \
+                 `name`; `action=\"stop\"` saves and returns {path, frames}. Captures exactly \
+                 what the game received each REAL emulated frame (post keyboard/pad/MCP-\
+                 injected/dummy fold), never on paused GUI frames. REQUIRES enable_writes.",
+                record_inputs_schema(),
+            ),
+            Tool::new(
+                "play_inputs",
+                "Replay a slot saved by record_inputs deterministically onto one or both \
+                 ports. `action=\"start\"` needs `name`; `port` (p1/p2/both, default both) \
+                 chooses what it drives; `trigger` chooses when it begins (manual = next real \
+                 frame — pair with pause/step for frame-exact timing; round_start = the fight \
+                 gate's next closed→open transition, deterministic from a pre-round save \
+                 state). If a training-mode dummy is also driving the targeted port, PLAYBACK \
+                 WINS — the dummy's write is suppressed for that port, never blended. \
+                 `action=\"stop\"` cancels an active/armed playback and releases its ports. \
+                 REQUIRES enable_writes.",
+                play_inputs_schema(),
+            ),
+            Tool::new(
+                "list_input_slots",
+                "List every input slot saved for the CURRENTLY LOADED family under \
+                 shadow/inputs/<family>/ — name, frame count, created_at, and the best-effort \
+                 save-state provenance recorded at capture time. Read-only, no enable_writes.",
+                no_params(),
             ),
             // ── signal hunt ────────────────────────────────────────────────
             Tool::new(
@@ -2650,6 +2829,26 @@ impl ServerHandler for RetroMcpServer {
                         &this.get_input(port),
                     )?]))
                 }
+                // ── input-slot record/playback ───────────────────────────────
+                "record_inputs" => {
+                    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = args.get("name").and_then(|v| v.as_str());
+                    Ok(CallToolResult::success(vec![Self::json_content(
+                        &this.record_inputs(action, name),
+                    )?]))
+                }
+                "play_inputs" => {
+                    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = args.get("name").and_then(|v| v.as_str());
+                    let port = args.get("port").and_then(|v| v.as_str()).unwrap_or("both");
+                    let trigger = args.get("trigger").and_then(|v| v.as_str()).unwrap_or("manual");
+                    Ok(CallToolResult::success(vec![Self::json_content(
+                        &this.play_inputs(action, name, port, trigger),
+                    )?]))
+                }
+                "list_input_slots" => Ok(CallToolResult::success(vec![Self::json_content(
+                    &this.list_input_slots(),
+                )?])),
                 // ── signal hunt ─────────────────────────────────────────────
                 "hunt_configure" => {
                     // start/len accept a JSON integer or a hex string, like
@@ -3652,5 +3851,170 @@ Title tilemap, drawn by `title_draw`. DO NOT TOUCH THIS PROSE.\n\
         assert!(out.contains(
             "::: region kind=game_loop id=ai01 addr=0x000400 author=ai confidence=confirmed"
         ));
+    }
+
+    // ── input-slot record/playback MCP tools (task A2) ──────────────────────
+
+    #[test]
+    fn record_inputs_requires_writes_armed() {
+        crate::profile::init_for_tests();
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let v = srv.record_inputs("start", Some("locked-test"));
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "writes are locked; call enable_writes first");
+        assert!(srv.debug.lock().unwrap().recording_slot.is_none(), "must not queue while locked");
+    }
+
+    #[test]
+    fn play_inputs_requires_writes_armed() {
+        crate::profile::init_for_tests();
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let v = srv.play_inputs("start", Some("nope"), "both", "manual");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "writes are locked; call enable_writes first");
+    }
+
+    #[test]
+    fn list_input_slots_is_ungated() {
+        crate::profile::init_for_tests();
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        // No enable_writes call at all — must still succeed (read-only).
+        let v = srv.list_input_slots();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["family"], "asurabld");
+    }
+
+    #[test]
+    fn record_inputs_start_stop_round_trips_a_slot_via_mcp() {
+        crate::profile::init_for_tests();
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let _ = srv.enable_writes();
+
+        let start = srv.record_inputs("start", Some("mcp-record-test"));
+        assert_eq!(start["ok"], true, "{start}");
+
+        // Advance two REAL frames the same way `training::tick` does
+        // (`playback::tick`), exercising the MCP round-trip rather than
+        // re-testing frame-driving mechanics already covered in
+        // playback.rs's own unit tests.
+        {
+            let mut ds = srv.debug.lock().unwrap();
+            ds.input_state[7] = true; // P1 Right
+            crate::playback::tick(&mut ds, 1, crate::profile::current());
+            ds.input_state = [false; 12];
+            crate::playback::tick(&mut ds, 2, crate::profile::current());
+        }
+
+        let stop = srv.record_inputs("stop", None);
+        assert_eq!(stop["ok"], true, "{stop}");
+        assert_eq!(stop["frames"], 2);
+        let path = stop["path"].as_str().unwrap().to_string();
+        assert!(std::path::Path::new(&path).is_file());
+
+        let list = srv.list_input_slots();
+        assert_eq!(list["ok"], true);
+        let names: Vec<String> = list["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"mcp-record-test".to_string()), "{names:?}");
+
+        // A second start with the same MCP server now works again (proves
+        // `stop` actually cleared the in-flight recording).
+        let restart = srv.record_inputs("start", Some("mcp-record-test-2"));
+        assert_eq!(restart["ok"], true);
+        let stop2 = srv.record_inputs("stop", None);
+        assert_eq!(stop2["frames"], 0, "no frames ticked — an empty slot is still valid");
+        let path2 = stop2["path"].as_str().unwrap().to_string();
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn record_inputs_stop_without_start_errors() {
+        crate::profile::init_for_tests();
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let _ = srv.enable_writes();
+        let v = srv.record_inputs("stop", None);
+        assert_eq!(v["ok"], false);
+    }
+
+    #[test]
+    fn record_inputs_start_needs_a_name() {
+        crate::profile::init_for_tests();
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let _ = srv.enable_writes();
+        let v = srv.record_inputs("start", None);
+        assert_eq!(v["ok"], false);
+    }
+
+    #[test]
+    fn play_inputs_rejects_bad_port_and_trigger_before_touching_disk() {
+        crate::profile::init_for_tests();
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let _ = srv.enable_writes();
+        // The named slot need not even exist — validation runs before load.
+        let v = srv.play_inputs("start", Some("whatever"), "p3", "manual");
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("port"), "{v}");
+        let v = srv.play_inputs("start", Some("whatever"), "both", "sometime");
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("trigger"), "{v}");
+    }
+
+    #[test]
+    fn play_inputs_missing_slot_errors_gracefully() {
+        crate::profile::init_for_tests();
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let _ = srv.enable_writes();
+        let v = srv.play_inputs("start", Some("this-slot-does-not-exist-anywhere"), "both", "manual");
+        assert_eq!(v["ok"], false);
+        assert!(srv.debug.lock().unwrap().playback_slot.is_none());
+    }
+
+    #[test]
+    fn play_inputs_stop_without_one_active_errors() {
+        crate::profile::init_for_tests();
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let _ = srv.enable_writes();
+        let v = srv.play_inputs("stop", None, "both", "manual");
+        assert_eq!(v["ok"], false);
+    }
+
+    #[test]
+    fn record_then_play_round_trips_the_exact_sequence_via_mcp() {
+        crate::profile::init_for_tests();
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let _ = srv.enable_writes();
+
+        assert_eq!(srv.record_inputs("start", Some("mcp-e2e"))["ok"], true);
+        {
+            let mut ds = srv.debug.lock().unwrap();
+            ds.input_state2[8] = true; // P2 A
+            crate::playback::tick(&mut ds, 1, crate::profile::current());
+            ds.input_state2 = [false; 12];
+            crate::playback::tick(&mut ds, 2, crate::profile::current());
+        }
+        let stop = srv.record_inputs("stop", None);
+        let path = stop["path"].as_str().unwrap().to_string();
+
+        let play = srv.play_inputs("start", Some("mcp-e2e"), "p2", "manual");
+        assert_eq!(play["ok"], true, "{play}");
+        assert_eq!(play["frames"], 2);
+
+        {
+            let mut ds = srv.debug.lock().unwrap();
+            crate::playback::tick(&mut ds, 3, crate::profile::current());
+            assert!(ds.held_input2[8], "frame 1's P2 A came back out of the slot");
+            crate::playback::tick(&mut ds, 4, crate::profile::current());
+            assert!(!ds.held_input2[8], "frame 2 was idle");
+            crate::playback::tick(&mut ds, 5, crate::profile::current());
+            assert!(ds.playback_slot.is_none(), "one-shot playback finished and cleared itself");
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 }

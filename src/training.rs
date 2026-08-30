@@ -551,6 +551,14 @@ pub fn tick(ds: &mut DebugState, frame: u64) {
 /// [`tick`] against an explicit profile — the testable seam (the process
 /// profile is a OnceLock, so per-game tick tests pass their own).
 fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
+    // Input-slot record/playback (task A2) is its own feature, independent
+    // of `TrainingConfig::enabled` — it runs even when training mode itself
+    // is off. This is the ONE place per real emulated frame that already
+    // gets called unconditionally from `Frontend::run_frame` (see `tick`'s
+    // doc), which is exactly the frame-exact hook `playback::tick` needs
+    // (docs/frames.md §3/§4 determinism — see `playback.rs`'s module doc).
+    crate::playback::tick(ds, frame, p);
+
     if !ds.training.enabled {
         return;
     }
@@ -603,9 +611,15 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
                     ds.training.punish_exec = None;
                 }
             }
+            // Playback wins (task A2 §4): if an input-slot playback is
+            // actively driving P2 this frame, the punish macro's write is
+            // skipped entirely rather than blended with it — see
+            // `playback.rs`'s precedence doc.
             if let Some(bits) = bits {
-                for (i, on) in bits.iter().enumerate() {
-                    ds.injected_input2[i] = if *on { 2 } else { 0 };
+                if !crate::playback::active_on_port(ds, 1) {
+                    for (i, on) in bits.iter().enumerate() {
+                        ds.injected_input2[i] = if *on { 2 } else { 0 };
+                    }
                 }
             }
         }
@@ -695,9 +709,17 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
             Some(block_punish(ds, frame, p, &r, g, contact))
         }
     };
+    // Playback wins over the training dummy (task A2 §4): an input-slot
+    // playback actively driving P2 this frame suppresses the dummy's write
+    // entirely (never blended via the fold's OR) — see `playback.rs`'s
+    // precedence doc and `active_on_port`'s doc for why `started && !done`
+    // is the right cutover point (a merely-ARMED `RoundStart` playback
+    // leaves the dummy untouched until it actually triggers).
     if let Some(bits) = dummy_bits {
-        for (i, on) in bits.iter().enumerate() {
-            ds.injected_input2[i] = if *on { 2 } else { 0 };
+        if !crate::playback::active_on_port(ds, 1) {
+            for (i, on) in bits.iter().enumerate() {
+                ds.injected_input2[i] = if *on { 2 } else { 0 };
+            }
         }
     }
 }
@@ -705,11 +727,49 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
 /// Frames between the contact trigger and the macro's first input: the
 /// dummy keeps guarding through hit-freeze + its own blockstun, then
 /// punishes — inputs played into the freeze are eaten by the game
-/// (live-observed on MK2 arcade, 2026-08-28).
-/// 26 ≈ hit-freeze (~10) + jab blockstun (~14) + slack: a chord played at
-/// +16 was still eaten while a motion whose chord lands at +21 came out —
-/// live-calibrated on MK2 arcade 2026-08-28.
-const PUNISH_DELAY: u64 = 26;
+/// (live-observed on MK2 arcade, 2026-08-28). This is
+/// [`crate::debug::ReversalTiming`]'s DEFAULT (`Explicit(PUNISH_DELAY)`) —
+/// unchanged behaviour on a fresh install: 26 ≈ hit-freeze (~10) + jab
+/// blockstun (~14) + slack — a chord played at +16 was still eaten while a
+/// motion whose chord lands at +21 came out — live-calibrated on MK2 arcade
+/// 2026-08-28. See [`PUNISH_DELAY_FAST`]/[`PUNISH_DELAY_LATE`] for
+/// `ReversalTiming::Fast`/`Late`.
+pub const PUNISH_DELAY: u64 = 26;
+
+/// `ReversalTiming::Fast`'s floor: one frame below this (+16 — see
+/// [`PUNISH_DELAY`]'s note) was live-observed to get eaten by hit-freeze/
+/// blockstun, so this is the FASTEST a reversal can start and still
+/// actually come out. `Fast` carries no user-supplied frame count — it
+/// always resolves to this — so the "first possible frame" mode can never
+/// silently pick a value that never fires (unlike `Explicit`, which is an
+/// unclamped power-user knob).
+pub const PUNISH_DELAY_FAST: u64 = 21;
+
+/// `ReversalTiming::Late`'s value: comfortably later than the fitted
+/// [`PUNISH_DELAY`] default (roughly double its slack margin over
+/// [`PUNISH_DELAY_FAST`]) while staying well inside `PUNISH_GATE_GRACE`.
+/// This is a GLOBAL calibration, not a per-move "last safe frame" — a true
+/// per-move value needs the frames.json measurement table (docs/frames.md
+/// §6), which does not exist yet (see docs/frames.md §10, "Stated
+/// limitations").
+pub const PUNISH_DELAY_LATE: u64 = 34;
+
+/// Resolve a [`crate::debug::ReversalTiming`] mode to actual wait-frames for
+/// ONE punish event. `seed` is wall-clock entropy (§6: "never deterministic")
+/// so `Delay` re-rolls independently on every scheduled punish — pass a seed
+/// distinct from whatever seeded the punish-POOL pick made in the same frame.
+fn resolve_reversal_delay(timing: crate::debug::ReversalTiming, seed: u64) -> u64 {
+    use crate::debug::ReversalTiming::*;
+    match timing {
+        Fast => PUNISH_DELAY_FAST,
+        Late => PUNISH_DELAY_LATE,
+        Explicit(frames) => frames,
+        Delay { min, max } => {
+            let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+            if hi <= lo { lo } else { lo + seed % (hi - lo + 1) }
+        }
+    }
+}
 
 /// Neutral frames at the tail of the delay: a still-held guard bleeds into
 /// the macro's chord (MK's held Block eats attack buttons — live-observed:
@@ -835,11 +895,14 @@ fn block_punish(
         // Never deterministic (§6): wall-clock entropy in the seed.
         let seed = frame ^ ((cur as u64) << 32) ^ entropy();
         let pick = crate::macros::weighted_pick(&ds.training.punish_pool, seed).cloned();
-        // Scheduled, not stepped: the macro's first input lands PUNISH_DELAY
-        // frames from now, after hit-freeze + blockstun have passed.
-        let start = |m: crate::macros::CompiledMacro, ds: &mut DebugState| {
+        // Scheduled, not stepped: the macro's first input lands `delay`
+        // frames from now (ReversalTiming-resolved: Fast/Late/Explicit are
+        // fixed, Delay re-rolls right here on a seed distinct from the pool
+        // pick above), after hit-freeze + blockstun have passed.
+        let delay = resolve_reversal_delay(ds.training.reversal_timing, seed ^ 0xD1B5_4A32_D192_ED03);
+        let start = move |m: crate::macros::CompiledMacro, ds: &mut DebugState| {
             ds.training.punish_exec = Some(crate::macros::MacroExec::new(m));
-            ds.training.punish_wait = PUNISH_DELAY;
+            ds.training.punish_wait = delay;
         };
         match pick {
             Some(PunishOption::Move(name)) => {
@@ -1360,5 +1423,200 @@ mod tests {
         assert!(ds.write_addr(sig, 1, 1));
         tick_with(&mut ds, 21, &p);
         assert_eq!(ds.training.punish_phase, "punishing: HP");
+    }
+
+    // ── ReversalTiming (Fast / Delay / Late / Explicit) ─────────────────────
+
+    /// Pure resolution logic, no scene needed: every mode maps to the
+    /// expected frame count, and `Delay` clamps into `[min, max]` regardless
+    /// of argument order (a reversed pair is swapped, not rejected).
+    #[test]
+    fn resolve_reversal_delay_covers_every_mode() {
+        use crate::debug::ReversalTiming::*;
+        assert_eq!(resolve_reversal_delay(Fast, 0), PUNISH_DELAY_FAST);
+        assert_eq!(resolve_reversal_delay(Late, 12345), PUNISH_DELAY_LATE);
+        assert_eq!(resolve_reversal_delay(Explicit(99), 0), 99);
+        for seed in 0..50u64 {
+            let v = resolve_reversal_delay(Delay { min: 30, max: 10 }, seed);
+            assert!((10..=30).contains(&v), "seed {seed} -> {v} out of [10,30]");
+        }
+        assert_eq!(resolve_reversal_delay(Delay { min: 5, max: 5 }, 999), 5);
+    }
+
+    /// `Fast` resolves to the measured floor AND the floor still actually
+    /// produces a live punish press — i.e. the floor is not below what the
+    /// game accepts (a lower value would be eaten by hit-freeze/blockstun,
+    /// per `PUNISH_DELAY_FAST`'s doc comment).
+    #[test]
+    fn reversal_timing_fast_uses_the_floor_and_still_punishes() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::BlockPunish;
+        ds.training.reversal_timing = crate::debug::ReversalTiming::Fast;
+        ds.training.punish_pool = vec![(crate::macros::PunishOption::Attack("Medium".into()), 1)];
+        stage(&mut ds, &p, 200, 300, 0);
+        for f in 1..=20 {
+            tick_with(&mut ds, f, &p);
+        }
+        assert!(ds.training.punish_armed);
+
+        stage(&mut ds, &p, 200, 300, 1); // commit edge triggers the punish
+        tick_with(&mut ds, 21, &p);
+        assert!(ds.training.punish_exec.is_some(), "commit edge schedules the punish");
+        assert_eq!(ds.training.punish_wait, PUNISH_DELAY_FAST, "Fast resolves to the measured floor");
+
+        let mut f = 22;
+        while ds.training.punish_wait > 0 {
+            tick_with(&mut ds, f, &p);
+            f += 1;
+        }
+        assert!(held(&ds).is_empty(), "released for a clean press");
+        tick_with(&mut ds, f, &p);
+        assert_eq!(held(&ds), vec![8], "Fast's floor still produces a live punish press (Medium = RETRO a)");
+    }
+
+    /// `Late` resolves to its configured (global-calibration) ceiling value.
+    #[test]
+    fn reversal_timing_late_resolves_to_the_configured_ceiling() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::BlockPunish;
+        ds.training.reversal_timing = crate::debug::ReversalTiming::Late;
+        ds.training.punish_pool = vec![(crate::macros::PunishOption::Attack("Medium".into()), 1)];
+        stage(&mut ds, &p, 200, 300, 0);
+        for f in 1..=20 {
+            tick_with(&mut ds, f, &p);
+        }
+        assert!(ds.training.punish_armed);
+
+        stage(&mut ds, &p, 200, 300, 1);
+        tick_with(&mut ds, 21, &p);
+        assert!(ds.training.punish_exec.is_some());
+        assert_eq!(ds.training.punish_wait, PUNISH_DELAY_LATE);
+    }
+
+    /// `Delay` re-rolls a fresh value in `[min, max]` on every scheduled
+    /// punish, end to end through `block_punish` (live entropy, not the pure
+    /// `resolve_reversal_delay` unit test above).
+    #[test]
+    fn reversal_timing_delay_stays_within_its_range_across_repeated_punishes() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::BlockPunish;
+        let (min, max) = (10u64, 20u64);
+        ds.training.reversal_timing = crate::debug::ReversalTiming::Delay { min, max };
+        ds.training.punish_pool = vec![(crate::macros::PunishOption::Attack("Medium".into()), 1)];
+
+        let mut f = 0u64;
+        let mut waits = Vec::new();
+        for _ in 0..12 {
+            // Quiet long enough to (re)arm the trigger — the previous trial's
+            // commit window has a `GUARD_FIELD_TAIL`-frame hangover after
+            // `attacking` drops back to 0, so this needs real margin beyond
+            // `PUNISH_REARM_FRAMES` (matches the generous 20f used by the
+            // single-shot fixtures above).
+            stage(&mut ds, &p, 200, 300, 0);
+            for _ in 0..20 {
+                f += 1;
+                tick_with(&mut ds, f, &p);
+            }
+            assert!(ds.training.punish_armed);
+            // Commit edge triggers the punish.
+            stage(&mut ds, &p, 200, 300, 1);
+            f += 1;
+            tick_with(&mut ds, f, &p);
+            assert!(ds.training.punish_exec.is_some());
+            waits.push(ds.training.punish_wait);
+            // Drain to completion before the next trial.
+            while ds.training.punish_exec.is_some() {
+                f += 1;
+                tick_with(&mut ds, f, &p);
+            }
+        }
+
+        assert!(waits.iter().all(|&w| (min..=max).contains(&w)), "{waits:?} out of [{min},{max}]");
+        assert!(
+            waits.iter().any(|&w| w != waits[0]),
+            "Delay must re-roll per punish, not stick to one value: {waits:?}"
+        );
+    }
+
+    // ── input-slot playback precedence (task A2 §4) ─────────────────────────
+
+    /// When an input-slot playback is actively driving P2, the training
+    /// dummy's write to `injected_input2` must be suppressed entirely — not
+    /// blended with playback's `held_input2` via the fold's OR. This is the
+    /// explicit "one must win, visibly" precedence task A2 requires.
+    #[test]
+    fn playback_wins_over_the_dummy_on_p2() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-playback-precedence-test".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
+        assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
+        assert!(crate::gate::eval_gate(&ds, &p), "gate must be open for this test");
+
+        ds.training.enabled = true;
+        // MK2 is button-block: with no playback, the dummy holds Block (L,
+        // bit 10) unconditionally — see `mk2_degrades_per_feature`.
+        ds.training.dummy = DummyMode::Block;
+
+        // Arm a MANUAL playback targeting P2 that presses Up (bit 4) — a
+        // button the dummy would never press on its own, so the two writes
+        // are trivially distinguishable.
+        let slot = crate::playback::InputSlot {
+            version: crate::playback::SLOT_VERSION,
+            family: p.family.family.clone(),
+            port: p.port.port.clone(),
+            created_at: 1,
+            state_note_at_start: None,
+            frames: vec![[0, 1 << 4], [0, 1 << 4]],
+        };
+        let path = crate::playback::save_slot(&slot, "precedence-test").unwrap();
+        crate::playback::start_playback(
+            &mut ds,
+            "precedence-test",
+            crate::debug::PlaybackPort::P2,
+            crate::debug::PlaybackTrigger::Manual,
+            &p,
+        )
+        .expect("start_playback");
+
+        tick_with(&mut ds, 1, &p);
+        assert!(ds.held_input2[4], "playback's Up came through via held_input2");
+        assert_eq!(
+            ds.injected_input2[10], 0,
+            "the dummy's Block write must be SUPPRESSED, not blended in alongside playback"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// With NO playback active, the precedence check is a no-op: the dummy
+    /// behaves exactly as before this feature existed.
+    #[test]
+    fn dummy_is_unaffected_when_no_playback_is_active() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-no-playback-test".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        ds.training.enabled = true;
+        ds.training.dummy = DummyMode::Block;
+        tick_with(&mut ds, 1, &p);
+        assert_eq!(ds.injected_input2[10], 2, "Block chord asserted normally with no playback");
     }
 }
