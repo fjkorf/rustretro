@@ -490,7 +490,7 @@ pub struct ShadowModelInfo {
 }
 
 /// What the training-mode dummy (controller port 1) does each frame.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum DummyMode {
     /// No injection — a human (or the shadow bot) drives port 1.
     #[default]
@@ -511,7 +511,7 @@ pub enum DummyMode {
 /// the vocabulary SF6/GGST/fbneo-training-mode all use). Orthogonal to the
 /// family's guard STYLE (button chord vs reactive back-hold): the style says
 /// how to guard, the mode says whether to.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum GuardMode {
     /// Guard every opportunity.
     #[default]
@@ -586,17 +586,278 @@ pub struct TrainingConfig {
     pub guard_roll: Option<bool>,
     pub guard_hit_seen: bool,
     pub guard_last_hit: u64,
+    /// WHEN a scheduled BlockPunish reversal starts (MACRO_ACTIONS §6's
+    /// `training::PUNISH_DELAY` knob, exposed as MK-style Fast/Delay/Late/
+    /// Explicit). Persisted (see [`TrainingConfig::merge_persisted`]).
+    pub reversal_timing: ReversalTiming,
 }
 
 /// `GuardMode::Random`'s take-probability in percent. A newtype purely so the
 /// derived `TrainingConfig::default()` yields a sane 50 % instead of "never".
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GuardPct(pub u8);
 
 impl Default for GuardPct {
     fn default() -> Self {
         GuardPct(50)
     }
+}
+
+/// WHEN a scheduled BlockPunish reversal starts, relative to its trigger —
+/// MK11 practice mode's "Block Attack: Fast / Delay / Late" vocabulary
+/// (docs/frames.md §3 calls the same idea "first possible frame", the
+/// frame-measurement lab's zero point). Orthogonal to the guard STYLE/MODE:
+/// this only governs the punish macro's start delay once a punish has
+/// already been decided.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ReversalTiming {
+    /// First possible frame — the measured floor (`training::PUNISH_DELAY_FAST`).
+    /// Not user-adjustable: a value below the floor is silently eaten by
+    /// hit-freeze/blockstun (live-observed on MK2 arcade), so there is
+    /// nothing lower to expose.
+    Fast,
+    /// Random within `[min, max]` (inclusive; order-independent — a reversed
+    /// pair is swapped, not rejected), re-rolled on every scheduled punish.
+    Delay { min: u64, max: u64 },
+    /// The last frame that still reliably punishes
+    /// (`training::PUNISH_DELAY_LATE`) — a global calibration, NOT a
+    /// per-move "last safe frame" (that needs the frames.json measurement
+    /// table, docs/frames.md §6, which does not exist yet).
+    Late,
+    /// A literal frame count — the power-user knob, unclamped.
+    Explicit(u64),
+}
+
+impl Default for ReversalTiming {
+    fn default() -> Self {
+        // Unchanged behaviour on a fresh install: the historical fitted value.
+        ReversalTiming::Explicit(crate::training::PUNISH_DELAY)
+    }
+}
+
+/// The `PunishOption` pool entry can't derive Serialize/Deserialize itself
+/// (it lives in `crate::macros`, outside this feature's file scope), so the
+/// settings sidecar round-trips it through this tagged mirror instead of the
+/// enum directly.
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind")]
+enum PersistedPunishOption {
+    Move { name: String },
+    Attack { class: String },
+    ContinueBlock { frames: u16 },
+}
+
+impl From<&crate::macros::PunishOption> for PersistedPunishOption {
+    fn from(o: &crate::macros::PunishOption) -> Self {
+        use crate::macros::PunishOption as P;
+        match o {
+            P::Move(name) => PersistedPunishOption::Move { name: name.clone() },
+            P::Attack(class) => PersistedPunishOption::Attack { class: class.clone() },
+            P::ContinueBlock(frames) => PersistedPunishOption::ContinueBlock { frames: *frames },
+        }
+    }
+}
+
+impl From<PersistedPunishOption> for crate::macros::PunishOption {
+    fn from(o: PersistedPunishOption) -> Self {
+        use crate::macros::PunishOption as P;
+        match o {
+            PersistedPunishOption::Move { name } => P::Move(name),
+            PersistedPunishOption::Attack { class } => P::Attack(class),
+            PersistedPunishOption::ContinueBlock { frames } => P::ContinueBlock(frames),
+        }
+    }
+}
+
+/// The user-facing SETTINGS subset of [`TrainingConfig`] — `enabled`,
+/// `refill`, one-shots, and all punish/guard RUNTIME bookkeeping are
+/// deliberately excluded (CLI-flag/hotkey-driven or session-scoped, not a
+/// "preference"), mirroring how `dock::LAYOUT_PATH` only stores what the
+/// user arranged, not live debugger state.
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedTrainingConfig {
+    dummy: DummyMode,
+    guard_mode: GuardMode,
+    guard_random_pct: GuardPct,
+    reversal_timing: ReversalTiming,
+    #[serde(default)]
+    punish_pool: Vec<(PersistedPunishOption, u8)>,
+}
+
+/// Cwd-relative sidecar for training-mode SETTINGS (not layout) — same
+/// pattern as `dock::LAYOUT_PATH`: a fixed name in the launch directory,
+/// gitignored, absent on a fresh install.
+pub const TRAINING_CONFIG_PATH: &str = "rustretro_training_v1.json";
+
+impl TrainingConfig {
+    fn to_persisted(&self) -> PersistedTrainingConfig {
+        PersistedTrainingConfig {
+            dummy: self.dummy,
+            guard_mode: self.guard_mode,
+            guard_random_pct: self.guard_random_pct,
+            reversal_timing: self.reversal_timing,
+            punish_pool: self.punish_pool.iter().map(|(o, w)| (o.into(), *w)).collect(),
+        }
+    }
+
+    fn apply_persisted(&mut self, p: PersistedTrainingConfig) {
+        self.dummy = p.dummy;
+        self.guard_mode = p.guard_mode;
+        self.guard_random_pct = p.guard_random_pct;
+        self.reversal_timing = p.reversal_timing;
+        self.punish_pool = p.punish_pool.into_iter().map(|(o, w)| (o.into(), w)).collect();
+    }
+
+    /// JSON snapshot of the persisted subset, used by the Training panel to
+    /// detect "did any SAVED setting actually change" without re-reading the
+    /// sidecar every frame (cheap string compare against the last write).
+    pub fn persisted_snapshot_json(&self) -> String {
+        serde_json::to_string(&self.to_persisted()).unwrap_or_default()
+    }
+
+    /// Load [`TRAINING_CONFIG_PATH`] and overlay it onto `self`'s settings
+    /// fields — leaves `enabled`/`refill`/one-shots/runtime bookkeeping
+    /// untouched, so a `--training` flag or F5/F3 hotkey applied before this
+    /// call is never clobbered. A missing sidecar is not an error (fresh
+    /// install: `self` keeps whatever it already had, i.e. defaults, if
+    /// called right after `TrainingConfig::default()`); a present-but-corrupt
+    /// one logs a warning and falls back the same way — never panics.
+    pub fn merge_persisted(&mut self) {
+        self.merge_persisted_from(std::path::Path::new(TRAINING_CONFIG_PATH));
+    }
+
+    fn merge_persisted_from(&mut self, path: &std::path::Path) {
+        let json = match std::fs::read_to_string(path) {
+            Ok(j) => j,
+            Err(_) => return, // no sidecar yet — keep current settings
+        };
+        match serde_json::from_str::<PersistedTrainingConfig>(&json) {
+            Ok(p) => self.apply_persisted(p),
+            Err(e) => {
+                eprintln!("[training] failed to parse {}: {e}; keeping defaults", path.display());
+            }
+        }
+    }
+
+    /// Persist the settings subset to [`TRAINING_CONFIG_PATH`]. Errors are
+    /// logged, not fatal — same posture as `dock::save_layout`.
+    pub fn save(&self) {
+        self.save_to(std::path::Path::new(TRAINING_CONFIG_PATH));
+    }
+
+    fn save_to(&self, path: &std::path::Path) {
+        match serde_json::to_string_pretty(&self.to_persisted()) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(path, json) {
+                    eprintln!("[training] failed to write {}: {e}", path.display());
+                }
+            }
+            Err(e) => eprintln!("[training] failed to serialize training settings: {e}"),
+        }
+    }
+}
+
+// ── input-slot record/playback (task A2) ────────────────────────────────────
+//
+// Control/runtime state for named record/playback slots — see `playback.rs`
+// for the logic (`playback::tick`, called from `training::tick` every REAL
+// emulated frame) and its module doc for the determinism argument and the
+// precedence rule against the training dummy. This lives on `DebugState`
+// itself (not a process-wide static like `debug/panels/input_log.rs`'s ring)
+// because every test builds its own isolated `DebugState`, and this feature's
+// start/stop/tick MUST be exercisable test-by-test without a shared global
+// leaking frames between unrelated concurrently-running tests — the same
+// reasoning that put `TrainingConfig`/`RecordControl` here rather than in a
+// singleton.
+
+/// Which controller port(s) an input-slot playback drives. A RECORDING always
+/// captures BOTH ports regardless of what a later playback targets (task A2
+/// §1) — this enum only exists for playback's §2 "chosen port" knob.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum PlaybackPort {
+    P1,
+    P2,
+    Both,
+}
+
+impl PlaybackPort {
+    /// Whether this target includes the given zero-indexed RETRO port (0/1),
+    /// matching `hold_buttons`'/`press_buttons`' port convention.
+    pub fn drives(self, port: usize) -> bool {
+        matches!(
+            (self, port),
+            (PlaybackPort::P1 | PlaybackPort::Both, 0) | (PlaybackPort::P2 | PlaybackPort::Both, 1)
+        )
+    }
+}
+
+impl Default for PlaybackPort {
+    fn default() -> Self {
+        PlaybackPort::Both
+    }
+}
+
+/// WHEN an armed playback begins consuming its recorded frames (task A2 §2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum PlaybackTrigger {
+    /// Begin on the very next real emulated frame after `play_inputs`/the
+    /// panel's Play is called. NOT guaranteed frame-exact across repeated
+    /// runs unless the call itself is frame-pinned (e.g. issued while
+    /// paused, then stepped) — see `playback.rs`'s module doc.
+    Manual,
+    /// Begin on the fight gate's next closed→open transition (the SAME gate
+    /// `training`/`record`/Lua `game.controllable()` share). Deterministic
+    /// across replays from an identical PRE-round save state. If armed while
+    /// already mid-round, it waits for the NEXT round, not the current one —
+    /// see `playback.rs`'s module doc for why that is the honest behaviour.
+    RoundStart,
+}
+
+impl Default for PlaybackTrigger {
+    fn default() -> Self {
+        PlaybackTrigger::Manual
+    }
+}
+
+/// An in-progress capture of both ports' folded per-frame input (task A2).
+/// `None` on `DebugState::recording_slot` = not recording.
+pub struct RecordingSlot {
+    pub name: String,
+    pub family: String,
+    pub port: String,
+    /// `DebugState::state_note` as of the moment recording started — best-
+    /// effort provenance of what save state (if any) this was recorded
+    /// against ("loaded shadow/arenas/…" or a save note, or `None` if no
+    /// state op had run yet this session). A human-readable breadcrumb, not
+    /// a content hash or a guarantee the file is unchanged.
+    pub state_note_at_start: Option<String>,
+    /// `[p1_mask, p2_mask]` per frame, RETRO_DEVICE_ID bit order
+    /// (`record::pack_mask`'s layout).
+    pub frames: Vec<[u16; 2]>,
+}
+
+/// An in-progress (or armed) replay of a loaded slot (task A2). `None` on
+/// `DebugState::playback_slot` = nothing playing.
+pub struct PlaybackSlot {
+    pub name: String,
+    pub port: PlaybackPort,
+    pub trigger: PlaybackTrigger,
+    pub frames: Vec<[u16; 2]>,
+    /// True once the trigger has fired and frames are actively being played.
+    /// While `false` (armed, waiting), the training dummy is UNAFFECTED —
+    /// the precedence rule only suppresses the dummy once playback is
+    /// actually asserting bits (see `playback::active_on_port`).
+    pub started: bool,
+    /// Index of the NEXT frame to play.
+    pub idx: usize,
+    /// True once every frame has been played; `playback::tick` then releases
+    /// both driven ports and clears this slot on the same tick.
+    pub done: bool,
+    /// `RoundStart` edge-detection: the gate's value as of the last tick this
+    /// playback was armed-but-not-started (`None` until first observed —
+    /// the first observation only seeds the baseline, it can never itself be
+    /// "the start", so arming mid-round correctly waits for the NEXT round).
+    pub gate_baseline: Option<bool>,
 }
 
 pub struct DebugState {
@@ -847,6 +1108,17 @@ pub struct DebugState {
     /// "stopped — N frames").
     pub record_note: Option<String>,
 
+    // --- Input-slot record/playback (task A2) ---
+    /// Active capture; `playback::start_recording`/`stop_recording` set/clear
+    /// this directly under the shared lock — no cross-thread queue is needed
+    /// (unlike `pending_record` above) because `playback::tick` runs on the
+    /// emulation thread already, via `training::tick`, every real frame.
+    pub recording_slot: Option<RecordingSlot>,
+    pub recording_note: Option<String>,
+    /// Active or armed replay; `None` = nothing playing.
+    pub playback_slot: Option<PlaybackSlot>,
+    pub playback_note: Option<String>,
+
     // --- Input descriptors (core-provided per-game button names) ---
     /// `input_descriptors[port][retro_id]` = the core's label for that button
     /// in THIS game (RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS), e.g. FBNeo's
@@ -908,6 +1180,13 @@ impl DebugState {
             injected_input2: [0; 12],
             held_input: [false; 12],
             held_input2: [false; 12],
+            // Deliberately `default()`, not `merge_persisted()`: this
+            // constructor is also every test's "give me a blank DebugState",
+            // and a real settings sidecar sitting in the test process's cwd
+            // would make test behaviour depend on the machine it runs on.
+            // The Training panel merges the sidecar in on its first render
+            // instead (see `panels/training.rs`'s `settings_loaded`), which
+            // is also the only place the settings can change.
             training: TrainingConfig::default(),
             lua_writes_enabled: false,
             breakpoints: Vec::new(),
@@ -947,6 +1226,10 @@ impl DebugState {
             pending_record: None,
             record_status: None,
             record_note: None,
+            recording_slot: None,
+            recording_note: None,
+            playback_slot: None,
+            playback_note: None,
             keymap_lines: Vec::new(),
             input_descriptors: Default::default(),
         }
@@ -1706,6 +1989,74 @@ mod tests {
         // A real take still sees the untouched countdown.
         assert!(ds.take_injected_input()[3]);
         assert_eq!(ds.injected_input[3], 1);
+    }
+
+    /// Round-trip the SETTINGS subset (dummy/guard/reversal-timing/punish
+    /// pool) through the sidecar file, and confirm the excluded runtime
+    /// fields (enabled, punish_armed) are NOT part of what comes back —
+    /// they must stay whatever the loading `TrainingConfig` already had.
+    #[test]
+    fn training_config_settings_round_trip() {
+        let path = std::env::temp_dir()
+            .join(format!("rustretro_training_test_{}_roundtrip.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut cfg = TrainingConfig::default();
+        cfg.dummy = DummyMode::BlockPunish;
+        cfg.guard_mode = GuardMode::Random;
+        cfg.guard_random_pct = GuardPct(73);
+        cfg.reversal_timing = ReversalTiming::Delay { min: 10, max: 40 };
+        cfg.punish_pool = vec![
+            (crate::macros::PunishOption::Move("slide".into()), 3),
+            (crate::macros::PunishOption::ContinueBlock(30), 1),
+        ];
+        // Distinctive runtime state that must NOT round-trip.
+        cfg.enabled = true;
+        cfg.punish_armed = true;
+        cfg.save_to(&path);
+
+        let mut loaded = TrainingConfig::default();
+        loaded.merge_persisted_from(&path);
+
+        assert_eq!(loaded.dummy, DummyMode::BlockPunish);
+        assert_eq!(loaded.guard_mode, GuardMode::Random);
+        assert_eq!(loaded.guard_random_pct, GuardPct(73));
+        assert_eq!(loaded.reversal_timing, ReversalTiming::Delay { min: 10, max: 40 });
+        assert_eq!(loaded.punish_pool, cfg.punish_pool);
+        assert!(!loaded.enabled, "enabled is not part of the persisted settings subset");
+        assert!(!loaded.punish_armed, "runtime bookkeeping must not be persisted");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A missing sidecar (fresh install) is not an error: `merge_persisted`
+    /// leaves the config exactly as it found it.
+    #[test]
+    fn training_config_missing_sidecar_keeps_current_settings() {
+        let path = std::env::temp_dir()
+            .join(format!("rustretro_training_test_{}_missing.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut cfg = TrainingConfig::default();
+        cfg.merge_persisted_from(&path);
+        assert_eq!(cfg.dummy, DummyMode::Free);
+        assert_eq!(cfg.reversal_timing, ReversalTiming::default());
+    }
+
+    /// A corrupt/unreadable sidecar must fall back to whatever the config
+    /// already had (defaults, in the real startup path) instead of panicking.
+    #[test]
+    fn training_config_corrupt_sidecar_falls_back_without_panicking() {
+        let path = std::env::temp_dir()
+            .join(format!("rustretro_training_test_{}_corrupt.json", std::process::id()));
+        std::fs::write(&path, b"{ this is not valid json").unwrap();
+
+        let mut cfg = TrainingConfig::default();
+        cfg.dummy = DummyMode::Crouch; // distinctive pre-existing value
+        cfg.merge_persisted_from(&path); // must not panic
+        assert_eq!(cfg.dummy, DummyMode::Crouch, "corrupt sidecar must not clobber current settings");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

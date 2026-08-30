@@ -16,6 +16,7 @@
 # Per-run sidecars and machine-local state
 *.regions.json
 rustretro_layout*.json
+rustretro_training*.json
 *.srm
 *.nv
 nvram/
@@ -39,6 +40,9 @@ scripts/re/revenv/
 shadow/recordings/
 shadow/models/
 shadow/arenas/*/current.state
+shadow/arenas/*/current.meta.json
+shadow/inputs/
 scratchpad/
 .DS_Store
 .claude/settings.local.json
+.claude/worktrees/

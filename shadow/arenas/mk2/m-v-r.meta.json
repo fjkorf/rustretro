@@ -1,0 +1,15 @@
+{
+  "format": "arena-meta-v1",
+  "family": "mk2",
+  "port": "arcade",
+  "char_id_block1": 5,
+  "char_id_block2": 9,
+  "health_block1": 161,
+  "health_block2": 161,
+  "gate_open": true,
+  "inputs_live": {
+    "p0": true,
+    "p1": true
+  },
+  "saved_at": "2026-08-30T04:29:06Z"
+}

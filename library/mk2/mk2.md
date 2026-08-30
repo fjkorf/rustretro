@@ -798,3 +798,314 @@ into `DrvGfxROM`, midtunit.cpp:346) per `midtunit_dma.h`.
 `char_id 10 = scorpion`, added to family.json: block2 `+0x0` read `0x0A` while
 the health bar drew "SCORPION" (screenshot) — the same standard as the other
 verified roster entries.
+### Roster: Mileena = char_id 5 (live, 2026-08-29)
+
+Read from the user's own paused session (MCP 4025) at the character-select
+screen with P1 on Mileena and P2 on Reptile:
+
+| addr | value | reading |
+|---|---|---|
+| `0xC050` (block1 `+0x0`) | `0x05` | **Mileena = 5** |
+| `0xC1CA` (block2 `+0x0`) | `0x09` | Reptile = 9 — MATCHES the existing roster |
+
+The Reptile agreement is the corroboration: the same read that yields 5 for
+the unknown character independently reproduces a known id for the other
+slot, so the bytes reflect the SELECTED characters and not stale round data.
+Confidence **VERIFIED** — promoted the same day. The promotion criterion
+stated here was "confirm the id persists into the fight", and the user's own
+arena capture supplied it: `shadow/arenas/mk2/m-v-r.meta.json` records
+`char_id_block1: 5, char_id_block2: 9, gate_open: true`, both fighters at
+full health with `inputs_live` on both ports — i.e. the app's own
+profile-driven capture read Mileena as 5 during a live fight, independently
+of the character-select read. `select_slot` still unmapped for her.
+
+**Johnny Cage = char_id 2** (same method, same session, P1 on Johnny Cage
+with P2 unselected). `0xFF` is the NO-SELECTION sentinel — block2 read `0xFF`
+while P2's cursor was not confirmed, which is a useful liveness check in its
+own right: a char_id of 255 means "nobody chosen yet", not a character.
+
+**Sub-Zero = char_id 8** (same method, P1 on Sub-Zero, P2 unselected =
+`0xFF`). This read also VALIDATES the 1:1 gap argument below: the prediction
+was that the three unmapped characters must occupy exactly ids 6, 8 and 10,
+and the read landed on 8 — a value the prediction could not force. A stale
+or unrelated byte had ~9 chances in 12 of falsifying it.
+
+**Shang Tsung = char_id 6** (same method). Eleven of twelve now read
+directly: 0 kunglao, 1 liukang, 2 johnnycage, 3 baraka, 4 kitana, 5 mileena,
+6 shangtsung, 7 raiden, 8 subzero, 9 reptile, 11 jax.
+
+**Scorpion = char_id 10 — READ, not deduced.** It was briefly shipped as a
+deduction (only unclaimed id, only unmapped character) and then confirmed by
+direct read minutes later. The full selectable roster is now 12/12 measured.
+
+**The elimination argument that produced it was UNSOUND, and the read is the
+only reason it landed.** MK2 has two boss characters, Kintaro and Shao Kahn,
+which are not selectable and were therefore invisible to the "12 selectable
+fighters must fill ids 0-11" premise. Bosses must occupy ids somewhere; had
+one taken a low id, a selectable character would have sat above 11 and the
+deduction would have been confidently wrong. **Do not run this style of
+elimination argument on a roster again without first establishing the full
+id space, bosses included.** (Same failure shape as the `action_counter`
+over-claim: a clean-looking inference from an incomplete control set.)
+
+**Open: boss ids are unmapped.** Read `block2+0x0` during a 1P-ladder
+Kintaro or Shao Kahn fight. They are wanted for the Matchup panel's
+force-matchup buttons, which already special-case bosses on asurabld. MK2 has 12 selectable fighters, so
+ids 0-11 are the full selectable set and no id is spare. Three char-select
+reads of `block1+0x0` close it; do NOT guess the assignment, the select
+grid order does not match id order (kunglao=0 sits at select_slot 1, while
+liukang=1 sits at slot 0).
+
+**`screen_state` reads 260 (`0x0104`) at CHARACTER SELECT.** 260 is pinned in
+`src/gate.rs`'s regression test as an in-fight value (observed live in a
+2-human fight), so `screen_state` alone does NOT discriminate phase — the
+combination does. The gate correctly stayed CLOSED here on the other two
+conditions (`round_over` = 1, block2 health = 0). This is evidence FOR the
+bitfield reading (display/2P-ness bits, not a phase enum) and against ever
+adding another screen_state value to the enum; do not "fix" the mask.
+
+## Stable per-fighter position: the object POINTER at `block-0x0C` (2026-08-29, P1)
+
+**RESULT: acceptable-outcome #2 — a stable indirection.** The fighter struct
+carries a pointer to that fighter's entry in the `0x42`-stride object pool.
+Follow the pointer and you get x, y and a char_id cross-check for the right
+fighter, on every boot, through round resets and through pool-slot moves.
+Session: headless FBNeo on MCP port **4030** (the user's 4025 was never
+touched), rig `shadow/arenas/mk2/r-v-r.state` (2-human Reptile mirror) plus
+three from-scratch cold boots.
+
+### The finding
+
+| what | address | form |
+|---|---|---|
+| **P1 object pointer** | **`0xC044`** = `block1 - 0x0C` | u32 LE, a TMS34010 **bit address** |
+| **P2 object pointer** | **`0xC1BE`** = `block2 - 0x0C` | ditto (`0xC1BE - 0xC044 = 0x17A`, exactly the fighter stride) |
+
+```
+obj  = (u32_le(block - 0x0C) - 0x01000000) >> 3     # the doc's master formula
+x    = u16_le(obj + 0x12)      # world X, 1 unit = 1 pixel
+y    = s16_le(obj + 0x16)      # SIGNED; resting ~83-89, smaller = higher
+cid  =  u8   (obj + 0x3E)      # char id — must equal block+0x0 (cross-check)
+link =  u32  (obj + 0x00)      # pointer to another pool entry (display list)
+```
+
+Object stride is `0x42`, as the old notes said — the pool is real, only the
+*slot* was never stable. This also retro-explains two old entries:
+`0x6CBA - 0x12 = 0x6CA8` and `0x6CFC - 0x12 = 0x6CEA = 0x6CA8 + 0x42`, i.e.
+the write-verified `p1_x`/`p2_x` of the original session were exactly this
+same `obj+0x12` — for the two objects that happened to sit at `0x6CA8` /
+`0x6CEA` **that run**. And the "disproven" `0x6D3E` ("monotone-increasing
+position-like — not camera, not a fighter") is `0x6D2C + 0x12`; `0x6D2C` is
+a base this session actually observed P1 occupying. It WAS a fighter's x.
+Nothing was wrong with those addresses except the assumption that a slot
+belongs to a player.
+
+### Per-criterion results (all five)
+
+**1. Monotone under a held direction — PASS.** `hold_buttons` / 30-ish frames
+per direction, resolved x sampled every ~0.16 s. 2-human rig, Reptile mirror:
+
+| hold | P1 x | P2 x |
+|---|---|---|
+| port 0 `right` | 469 → 491 → 516 → 541 → 569 | (constant 661) |
+| port 0 `left` | 569 → 553 → 531 → 511 → 491 | (constant 661) |
+| port 1 `right` | (constant 489) | 661 → 679 → 699 → 719 → 739 |
+| port 1 `left` | (constant 489) | 739 → 718 → 691 → 666 → 641 |
+
+Cold boot, 1P Liu Kang vs CPU Scorpion, no state loaded: `right`
+469 → 484 → 504 → 524 → 541; `left` (after retreating out of the CPU's
+range first) 755 → 746 → 729 → 709 → 703. Walking into the far corner
+bottoms out at x = 357 with the fighter visibly against the wall
+(screenshot), and 357 vs the opponent's 661 = a 304-unit gap that measures
+~300 px on the 400-px screen — **x is in pixels, 1:1**, which is exactly
+what the pixel-gap keys of `docs/frames.md` need.
+
+**2. Correct fighter — PASS.** See the table above: eight samples of P1
+motion left P2's resolved x bit-identical, and eight samples of P2 motion
+left P1's untouched. Independently, `obj+0x3E` matched `block+0x0` in every
+matchup observed across three boots: 9/9 (Reptile mirror), 1/3 (Liu Kang vs
+Baraka), 1/10 (vs Scorpion), 1/9 (vs Reptile).
+
+**3. Survives a round reset — PASS.** P2 KO'd by writing 0 to `0xC1D8` +
+`0xBC88`; waited out FINISH HIM / WINS / ROUND 2. After the reset
+`round_num 0xC35E` = 2, both healths back to 161, `round_over` back to 0 —
+and both pointers still read `0x69D2` / `0x6A14` with x back at the
+round-start 469 / 661. (Meanwhile `0x6CBA`/`0x6CFC` read 214 / 232.)
+
+**4. Survives a fresh boot — PASS, including a live slot MOVE.** Three cold
+launches (process killed between each), each driven from the CMOS screen
+through coin/coin/start/select into a real fight. The pointer resolved
+correctly every time. Better than that: within one boot, after the first
+match ended and a second began on a different stage, the pool slot **moved
+from `0x69D2` to `0x6D2C`** (Δ `0x35A` = 21 × `0x42`) and the pointers at
+`0xC044`/`0xC1BE` had already followed — resolved x/char stayed correct
+(Liu Kang 1201, Reptile 1085) while the fixed addresses went to garbage.
+That is the whole point of the indirection, observed happening.
+
+**5. Disagrees with `0x6CBA` when that slot is stale — PASS, and the stale
+condition was easy to reproduce (three independent ways).**
+
+| situation | `0x6CBA` / `0x6CFC` | resolved truth |
+|---|---|---|
+| `r-v-r.state`, both fighters walked visibly in both directions on both ports | **frozen 215 / 233** through every sample | 469→569 / 661→739 |
+| cold boot, Liu Kang vs Baraka | 546 / 241 | 409 / 478 |
+| …a few seconds later, same match | 240 / 546 (**the two swapped**) | — |
+| cold boot, 2nd match, Liu Kang vs Reptile | 1312 / 34004 (garbage) | 1201 / 1085 |
+
+The swap is the tell: `0x6CBA`/`0x6CFC` are not broken addresses, they are
+*pool slots* that hold whatever object is currently parked there.
+
+**Write authority (bonus, both write-verified with screenshots).**
+`write_memory(obj+0x12, 900)` teleported P1 across the stage and the game
+kept walking from the written value. `write_memory(obj+0x16, 0xFFC0)` (−64)
+left Reptile hanging in mid-air with his shadow on the ground below. Unlike
+the previously-tested Y candidates these are authoritative stores, not
+recomputed outputs.
+
+Confidence: **VERIFIED**.
+
+### Player Y — FOUND (`obj+0x16`), the long-open item
+
+`obj+0x16` is a **signed** 16-bit height. A held-`up`+`right` jump (Reptile,
+2-human rig, ~18 ms polling) traced a clean symmetric arc:
+
+```
+85 75 66 58 50 42 35 29 23 17 12 8 4 0 -3 -5 -7 -9 -10 -10 -10 -10
+-9 -7 -5 -3 0 4 8 12 17 23 29 35 42 50 58 66 75 85
+```
+
+~0.74 s of airtime (≈40 frames @ 54.71 Hz), a 4-sample hang at the apex, and
+an exact return to the resting value. x advanced linearly throughout (jump
+arc + forward drift), so the two fields are independent. **Smaller = higher**
+and it goes negative above a certain height, so any "airborne" test must be
+signed. Write-verified (levitation screenshot above).
+
+**Honest limit on GROUND_Y**: the resting value is NOT one constant. Observed
+resting values: Reptile 85 and Liu Kang 83 on the Dead Pool-style stage,
+Liu Kang 87 / Reptile 89 on the second stage of the ladder, Scorpion 85.
+So it is character- *and* stage-dependent (both a per-fighter sprite-origin
+offset and a per-stage floor). Do **not** ship a scalar `GROUND_Y` for
+arcade — derive "airborne" as *y below this fighter's own resting y*
+(sample at round start, or treat any y < resting−4 as airborne), or
+calibrate per stage. Jump height above rest measured 95 units.
+
+### Disproven / dead ends from this session (do not re-chase)
+
+- **No position field inside the `0x17A` fighter struct** — DISPROVEN with a
+  byte-for-byte diff of all `0x17A` bytes of block1 across a 6-snapshot
+  held-`right` walk, and the same for block2 across a held-walk on port 1:
+  **0 bytes changed**, both fighters. This extends the earlier
+  "struct is static when untouched" finding to walking, and closes
+  acceptable-outcome #1 (the struct's only *link* to position is the
+  pointer at `-0x0C`).
+- `0xBA59`/`0xBA5A`/`0xBA5D`/`0xBA5E`/`0xBA61`/`0xBA62`/`0xBA69`/`0xBA6A` —
+  reverse cleanly under held direction and look like positions (`0xBA5A`
+  ran 359 → 370 / 359 → 296), but they respond to **either** player's
+  movement. Camera / scroll registers, not per-fighter. Not adopted.
+- `obj+0x18` (reads 80 for one fighter, 79 for the other) — **not facing**.
+  It did not flip when P1 was force-teleported to the far side of P2, and
+  the 80/79 assignment swapped between the two fighters after ordinary play
+  with no crossover. Unmapped, harmless.
+- The `0x3800-0x3F00` per-scanline sprite table produces ~55 reversing
+  monotone u16s under any walk. It is the rendered echo (the exact trap the
+  signal-hunt doc warns about); everything there was excluded by inspection.
+- `0xBE81` (the old LIKELY "P1 facing") read a constant **2** through a
+  forced crossover in this rig, not 1→0. Still unverified; leaving as-is.
+
+### Pointer hygiene (a null guard is required)
+
+The pointer is not always valid, and that is useful rather than a problem:
+
+| phase | `0xC044` | `0xC1BE` |
+|---|---|---|
+| attract / boot | `0x00000000` | `0x00000000` |
+| character select (P1 chosen, P2 not) | `0x01035F10` (valid) | `0x00000000` |
+| live fight | valid | valid |
+
+So: treat a value outside `0x01000000..0x01400000` as "no fighter object"
+and emit no x/y that frame. Cheap, and it makes the same field double as a
+liveness check — which is what `p1_x` was wrongly used for before.
+
+### Toolkit friction (new, worth adding to the RE skill)
+
+- **CORRECTED — `hold_buttons` DOES reach the core while stepping.** An
+  earlier draft of this section claimed the opposite ("60 frames of `step`
+  with `right` held produced zero movement"). That was a MISDIAGNOSIS, and it
+  would have forced the entire frame lab onto real-time measurement, which
+  `docs/frames.md` §2.4 forbids. The real cause is below.
+- **`step` is FIRE-AND-FORGET: rapid `step` calls silently collapse.**
+  Measured on a 2-human arena, P1 world X via the `block-0xC` pointer:
+
+  | trial | steps requested | frames landed | x delta |
+  |---|---|---|---|
+  | hold `right`, each step confirmed landed | 30 | 30 | **+72** |
+  | hold `right`, each step confirmed landed (repeat) | 30 | 30 | **+63** |
+  | no input, each step confirmed landed | 30 | 30 | **0** |
+  | hold `right`, rapid unconfirmed `step` calls | 30 | **1** | 0 |
+
+  The bottom row is the false negative: the input was fine, the FRAMES never
+  happened. Any stepping protocol MUST confirm each step landed by polling
+  `get_state`'s `frame_count` before issuing the next one. Independently hit
+  by two agents on the same day (the framelab calibration run measured "10
+  back-to-back steps moved frame_count by 0; the same 10 spaced 50 ms apart
+  moved it by exactly 10").
+- **`load_state` does not drain while paused**, same GUI-frame mechanism.
+  Resume, load, verify the load landed by reading a known field, then pause.
+  A probe that skips the verification silently measures the PREVIOUS state —
+  observed live while testing the above.
+- A 256 KiB `read_region` snapshot costs **~70 ms**, so a 5-6 snapshot
+  series across a walk is ~1 s of game time — plenty of resolution for
+  position work, and vastly cheaper than the whole 2.3 MB region.
+- 1P-vs-CPU is a *bad* rig for monotonicity: the CPU's pushback and
+  blockstun overrode a held direction repeatedly (a hold-`left` measured
+  541 → 613 because Scorpion was walking into P1). Health refills do not fix
+  it — pushback is not damage. Use the 2-human arena, or retreat first.
+
+### Bonus: Scorpion = char_id 10 is now READ, not deduced
+
+The cold-boot ladder put P1 (Liu Kang, `block1+0x0` = 1) against a CPU whose
+`block2+0x0` read **10** while the HUD bar drew **SCORPION** and the round
+end drew **SCORPION WINS** (screenshots). That closes the last roster
+deduction flagged above; `_roster_provenance` in `family.json` can be
+updated from "deduced" to "read" for Scorpion.
+
+### Controls used
+
+`hold_buttons` (ports 0 and 1: `right`, `left`, `up`, `y`, `start`,
+`select`), `release_buttons`, `read_memory`, `read_region` (via
+`shadow_train.re.Probe.snapshot`), `write_memory`, `load_state`,
+`save_state`, `pause` / `resume` / `step`, `screenshot`. `press_buttons` was
+not used. Analysis with `shadow_train.re` (`Probe`, `diff`) plus a local
+weak-monotone-reversal filter and a u32-pointer scan over the exposed
+region. No profile JSON was modified.
+
+### Proposed profile change (NOT applied — orchestrator's call)
+
+`mk2.profile.json` currently sources `x` from the globals `p1_x 0x6CBA` /
+`p2_x 0x6CFC`, which this session shows are wrong on most runs. The proposal
+needs one new schema concept — a *pointer-relative* fighter field:
+
+1. Add to `memory.blocks` (or alongside `fighter_fields`) an object-pointer
+   declaration: `object_ptr: {"off": "-0xC", "size": 4, "encoding":
+   "tms34010_bitaddr"}` — i.e. `block1` resolves via `0xC044`, `block2` via
+   `0xC1BE`, decoded as `(v - 0x01000000) >> 3`, invalid outside
+   `0x01000000..0x01400000`.
+2. Change `fighter_fields` `x` from its `globals` form to
+   `{"name": "x", "via": "object_ptr", "off": "0x12", "size": 2}`.
+3. Add `{"name": "y", "via": "object_ptr", "off": "0x16", "size": 2,
+   "signed": true}` — arcade gets a `y` for the first time.
+4. Optionally add `{"name": "char_id_obj", "via": "object_ptr",
+   "off": "0x3E", "size": 1}` as a runtime consistency check against
+   `char_id`; a mismatch means the pointer went stale and the frame should
+   be dropped.
+5. Keep `p1_x`/`p2_x`/`p1_screen_x` in `globals` **only** if something still
+   reads them, and mark them DISPROVEN in `_STATUS`; nothing should use them
+   for position or for liveness.
+6. `calibration.GROUND_Y` must stay **0** / unused for arcade — see the
+   honest limit above; a per-fighter resting-y baseline is the right shape
+   and does not exist in the schema yet.
+
+Consequence if adopted: `src/training.rs` `resolve()` gains `x` and `y` at
+the fighter-block stride (its actual contract), so arcade training
+enforcement stops no-op'ing on the position side; `docs/frames.md` §10's
+first two stated limitations both close.

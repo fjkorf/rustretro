@@ -2,7 +2,9 @@ use bevy_egui::egui;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
-use crate::debug::{DebugState, DummyMode, GuardMode, RecordControl, StateOp};
+use crate::debug::{
+    DebugState, DummyMode, GuardMode, PlaybackPort, PlaybackTrigger, RecordControl, StateOp,
+};
 
 /// GUI face of the shadow lifecycle's two app-side stages — demonstrate
 /// (recorder start/stop + status) and deploy (model card, runtime model load,
@@ -30,6 +32,26 @@ pub struct TrainingPanel {
     arena_note: Option<String>,
     /// Style tag for the next recording ("rushdown", "zoning", …; empty = untagged).
     record_style: String,
+    /// Whether `state.training`'s settings sidecar has been merged in for
+    /// this panel instance yet (the first `show()` call does it once — see
+    /// `DebugState::new()`'s note on why this can't just happen at
+    /// construction: it would make every test's `DebugState::new()` sensitive
+    /// to a stray sidecar in the process's cwd).
+    settings_loaded: bool,
+    /// JSON snapshot of the settings subset as of the last write to the
+    /// sidecar (or the just-loaded value) — cheap per-frame diff so the
+    /// panel only touches disk when something the user can save actually
+    /// changed (dummy/guard/reversal-timing/punish pool).
+    settings_last_saved: Option<String>,
+    /// New-recording name field (🎮 Input slots section, task A2).
+    slot_name: String,
+    /// Cached `shadow/inputs/<family>/*.slot.json` listing.
+    slots: Vec<crate::playback::SlotSummary>,
+    slots_refreshed: Option<Instant>,
+    /// Port target for the next "▶ Play" click.
+    play_port: PlaybackPort,
+    /// Trigger for the next "▶ Play" click.
+    play_trigger: PlaybackTrigger,
 }
 
 const DUMMY_MODES: [DummyMode; 6] = [
@@ -54,6 +76,17 @@ fn dummy_label(mode: DummyMode, reactive: bool) -> &'static str {
         (DummyMode::Block, false) => "Block (hold block button)",
         (DummyMode::BlockPunish, true) => "Block + punish (on attack commit)",
         (DummyMode::BlockPunish, false) => "Block + punish (on contact)",
+    }
+}
+
+/// MK-style vocabulary for `crate::debug::ReversalTiming`'s combo box.
+fn reversal_timing_label(t: &crate::debug::ReversalTiming) -> &'static str {
+    use crate::debug::ReversalTiming::*;
+    match t {
+        Fast => "Fast (first possible frame)",
+        Delay { .. } => "Delay (randomized)",
+        Late => "Late (last frame that still punishes)",
+        Explicit(_) => "Explicit (frame count)",
     }
 }
 
@@ -187,10 +220,38 @@ impl TrainingPanel {
             pending_current: None,
             arena_note: None,
             record_style: String::new(),
+            settings_loaded: false,
+            settings_last_saved: None,
+            slot_name: String::new(),
+            slots: Vec::new(),
+            slots_refreshed: None,
+            play_port: PlaybackPort::default(),
+            play_trigger: PlaybackTrigger::default(),
+        }
+    }
+
+    /// Write `state.training`'s settings subset to the sidecar iff it
+    /// differs from the last write (or the just-loaded snapshot) — call at
+    /// every exit point of `show()` so a settings change is captured
+    /// regardless of which branch rendered this frame.
+    fn autosave_settings(&mut self, state: &DebugState) {
+        let snap = state.training.persisted_snapshot_json();
+        if self.settings_last_saved.as_deref() != Some(snap.as_str()) {
+            state.training.save();
+            self.settings_last_saved = Some(snap);
         }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DebugState) {
+        if !self.settings_loaded {
+            // First render this session: pull in whatever the user last
+            // configured (see `TrainingConfig::merge_persisted`'s doc for
+            // exactly what is/isn't touched — never `enabled`/`refill`, so a
+            // `--training` startup flag is never clobbered).
+            state.training.merge_persisted();
+            self.settings_last_saved = Some(state.training.persisted_snapshot_json());
+            self.settings_loaded = true;
+        }
         ui.heading("🎯 Training mode");
         let profile = crate::profile::current();
         ui.label(
@@ -210,6 +271,7 @@ impl TrainingPanel {
             );
             ui.separator();
             self.shadow_section(ui, state);
+            self.autosave_settings(state);
             return;
         };
         let was_enabled = state.training.enabled;
@@ -297,6 +359,7 @@ impl TrainingPanel {
                          as contact, so the dummy correctly stays armed."
                     });
                 }
+                self.reversal_section(ui, state);
                 self.punish_section(ui, state, feats.block_punish);
             }
             ui.add_enabled(feats.refill, egui::Checkbox::new(&mut state.training.refill, "Health refill (F3)"));
@@ -319,9 +382,74 @@ impl TrainingPanel {
         ui.separator();
         self.record_section(ui, state);
         ui.separator();
+        self.playback_section(ui, state);
+        ui.separator();
         self.shadow_section(ui, state);
         ui.separator();
         self.arena_section(ui, state);
+        self.autosave_settings(state);
+    }
+
+    /// Reversal timing (MK-style "Block Attack: Fast / Delay / Late", plus an
+    /// explicit-frames power-user knob) — WHEN the scheduled BlockPunish
+    /// macro starts relative to its trigger. `training::PUNISH_DELAY` used to
+    /// be a single hardcoded constant; this is that same knob, now a setting.
+    fn reversal_section(&mut self, ui: &mut egui::Ui, state: &mut DebugState) {
+        use crate::debug::ReversalTiming;
+        ui.horizontal(|ui| {
+            ui.label("Reversal timing:");
+            let cur = state.training.reversal_timing;
+            egui::ComboBox::from_id_salt("training_reversal_timing")
+                .selected_text(reversal_timing_label(&cur))
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(matches!(cur, ReversalTiming::Fast), "Fast").clicked() {
+                        state.training.reversal_timing = ReversalTiming::Fast;
+                    }
+                    if ui.selectable_label(matches!(cur, ReversalTiming::Delay { .. }), "Delay").clicked()
+                        && !matches!(cur, ReversalTiming::Delay { .. })
+                    {
+                        state.training.reversal_timing = ReversalTiming::Delay {
+                            min: crate::training::PUNISH_DELAY_FAST,
+                            max: crate::training::PUNISH_DELAY_LATE,
+                        };
+                    }
+                    if ui.selectable_label(matches!(cur, ReversalTiming::Late), "Late").clicked() {
+                        state.training.reversal_timing = ReversalTiming::Late;
+                    }
+                    if ui
+                        .selectable_label(matches!(cur, ReversalTiming::Explicit(_)), "Explicit")
+                        .clicked()
+                        && !matches!(cur, ReversalTiming::Explicit(_))
+                    {
+                        state.training.reversal_timing =
+                            ReversalTiming::Explicit(crate::training::PUNISH_DELAY);
+                    }
+                });
+        })
+        .response
+        .on_hover_text(
+            "When the scheduled punish starts after the trigger. Fast/Late use \
+             measured floor/ceiling frame counts (never below what the game \
+             actually accepts); Delay re-rolls a random frame count in its \
+             range on every punish; Explicit is a literal frame count.",
+        );
+        match &mut state.training.reversal_timing {
+            ReversalTiming::Delay { min, max } => {
+                ui.horizontal(|ui| {
+                    ui.label("  range:");
+                    ui.add(egui::DragValue::new(min).range(1..=200).suffix("f"));
+                    ui.label("–");
+                    ui.add(egui::DragValue::new(max).range(1..=200).suffix("f"));
+                });
+            }
+            ReversalTiming::Explicit(frames) => {
+                ui.horizontal(|ui| {
+                    ui.label("  frames:");
+                    ui.add(egui::DragValue::new(frames).range(0..=200));
+                });
+            }
+            ReversalTiming::Fast | ReversalTiming::Late => {}
+        }
     }
 
     /// Guard mode (MACRO_ACTIONS §9.4) — the selector every trainer has:
@@ -691,6 +819,224 @@ impl TrainingPanel {
             };
             ui.label(egui::RichText::new(format!("Last: {note}")).small().color(color));
         }
+    }
+
+    /// Named input-slot record/playback (task A2): capture both ports'
+    /// folded per-frame input into a slot on disk, and replay a slot
+    /// deterministically onto one or both ports. Distinct from "⏺ Record
+    /// demonstrations" above (that's the shadow-ML jsonl trace recorder) —
+    /// this is the frame-lab / bug-repro instrument. See `playback.rs`'s
+    /// module doc for the precedence rule against the training dummy and
+    /// the determinism guarantees per trigger.
+    fn playback_section(&mut self, ui: &mut egui::Ui, state: &mut DebugState) {
+        ui.heading("🎮 Input slots");
+
+        // ── record ──────────────────────────────────────────────────────
+        // Pull what the closure needs out BEFORE matching, so the borrow of
+        // `state.recording_slot` ends here — the closure below calls
+        // `crate::playback::stop_recording(state)`, which needs `state`
+        // whole, and that can't coexist with a live borrow of one of its
+        // fields (disjoint closure capture doesn't help once a function call
+        // needs the whole reference).
+        let rec_info = state.recording_slot.as_ref().map(|rec| (rec.name.clone(), rec.frames.len()));
+        match rec_info {
+            Some((rec_name, rec_frames)) => {
+                let secs = rec_frames as u64 / 60;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("● REC")
+                            .color(egui::Color32::from_rgb(230, 90, 90))
+                            .strong(),
+                    );
+                    ui.monospace(format!(
+                        "{}  {} frames ({}:{:02})",
+                        rec_name,
+                        rec_frames,
+                        secs / 60,
+                        secs % 60,
+                    ));
+                    if ui.button("⏹ Stop").clicked() {
+                        match crate::playback::stop_recording(state) {
+                            Ok((path, n)) => {
+                                state.recording_note =
+                                    Some(format!("stopped — {n} frames → {}", path.display()));
+                                self.slots_refreshed = None; // relist next frame
+                            }
+                            Err(e) => state.recording_note = Some(format!("stop FAILED: {e}")),
+                        }
+                    }
+                });
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("○ not recording").color(egui::Color32::DARK_GRAY));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.slot_name)
+                            .desired_width(120.0)
+                            .hint_text("slot name"),
+                    );
+                    let name = self.slot_name.trim().to_string();
+                    if ui.add_enabled(!name.is_empty(), egui::Button::new("⏺ Start")).clicked() {
+                        match crate::playback::start_recording(state, &name, crate::profile::current()) {
+                            Ok(()) => {
+                                state.recording_note = Some(format!("recording '{name}'"));
+                                self.slot_name.clear();
+                            }
+                            Err(e) => state.recording_note = Some(format!("start FAILED: {e}")),
+                        }
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Captures BOTH ports' folded input every real frame — deterministic \
+                         playback later (round-trip guaranteed for the round_start trigger; \
+                         see the Play controls below).",
+                    )
+                    .small()
+                    .color(egui::Color32::DARK_GRAY),
+                );
+            }
+        }
+        if let Some(note) = &state.recording_note {
+            let color = if note.contains("FAILED") {
+                egui::Color32::from_rgb(230, 120, 120)
+            } else {
+                egui::Color32::GRAY
+            };
+            ui.label(egui::RichText::new(format!("Last: {note}")).small().color(color));
+        }
+
+        ui.separator();
+
+        // ── slot list + play controls ──────────────────────────────────
+        let family = crate::profile::current().family.family.clone();
+        let stale = self
+            .slots_refreshed
+            .map(|t| t.elapsed().as_secs_f64() > MODELS_REFRESH_SECS)
+            .unwrap_or(true);
+        if stale {
+            self.slots = crate::playback::list_slots(&family);
+            self.slots_refreshed = Some(Instant::now());
+        }
+        if self.slots.is_empty() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "No slots under {}/ yet.",
+                    crate::playback::slots_dir(&family).display()
+                ))
+                .color(egui::Color32::DARK_GRAY),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label("Port:");
+            egui::ComboBox::from_id_salt("playback_port")
+                .selected_text(match self.play_port {
+                    PlaybackPort::P1 => "P1",
+                    PlaybackPort::P2 => "P2",
+                    PlaybackPort::Both => "Both",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.play_port, PlaybackPort::P1, "P1");
+                    ui.selectable_value(&mut self.play_port, PlaybackPort::P2, "P2");
+                    ui.selectable_value(&mut self.play_port, PlaybackPort::Both, "Both");
+                });
+            ui.label("Trigger:");
+            egui::ComboBox::from_id_salt("playback_trigger")
+                .selected_text(match self.play_trigger {
+                    PlaybackTrigger::Manual => "Manual (now)",
+                    PlaybackTrigger::RoundStart => "Round start",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.play_trigger, PlaybackTrigger::Manual, "Manual (now)")
+                        .on_hover_text("Begins on the next real frame — pair with pause/step for frame-exact timing");
+                    ui.selectable_value(&mut self.play_trigger, PlaybackTrigger::RoundStart, "Round start")
+                        .on_hover_text("Begins on the fight gate's next closed→open transition — deterministic from a pre-round save state");
+                });
+        });
+        let mut to_play: Option<String> = None;
+        for s in &self.slots {
+            ui.horizontal(|ui| {
+                ui.monospace(&s.name);
+                ui.label(
+                    egui::RichText::new(format!("{} frames", s.frame_count))
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+                if ui
+                    .add_enabled(state.playback_slot.is_none(), egui::Button::new("▶ Play"))
+                    .clicked()
+                {
+                    to_play = Some(s.name.clone());
+                }
+            });
+        }
+        if let Some(name) = to_play {
+            match crate::playback::start_playback(
+                state,
+                &name,
+                self.play_port,
+                self.play_trigger,
+                crate::profile::current(),
+            ) {
+                Ok(n) => {
+                    state.playback_note =
+                        Some(format!("armed '{name}' ({n} frames, {:?} / {:?})", self.play_port, self.play_trigger))
+                }
+                Err(e) => state.playback_note = Some(format!("play FAILED: {e}")),
+            }
+        }
+
+        // ── active playback status ──────────────────────────────────────
+        // Same extract-before-match reasoning as the record section above.
+        let pb_info = state
+            .playback_slot
+            .as_ref()
+            .map(|pb| (pb.name.clone(), pb.done, pb.started, pb.idx, pb.frames.len()));
+        if let Some((pb_name, pb_done, pb_started, pb_idx, pb_total)) = pb_info {
+            let phase = if pb_done {
+                "finishing…"
+            } else if pb_started {
+                "▶ playing"
+            } else {
+                "⏳ armed — waiting for round start"
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{pb_name} — {phase} ({pb_idx}/{pb_total})")).strong(),
+                );
+                if ui.button("⏹ Stop").clicked() {
+                    let _ = crate::playback::stop_playback(state);
+                    state.playback_note = Some("stopped".to_string());
+                }
+            });
+        }
+        if let Some(note) = &state.playback_note {
+            let color = if note.contains("FAILED") {
+                egui::Color32::from_rgb(230, 120, 120)
+            } else {
+                egui::Color32::GRAY
+            };
+            ui.label(egui::RichText::new(format!("Last: {note}")).small().color(color));
+        }
+
+        // ── who is driving each port right now (task A2 §4) ──────────────
+        let active = state.playback_slot.as_ref().filter(|pb| pb.started && !pb.done);
+        let (p1_drive, p2_drive) = match active {
+            Some(pb) => (
+                if pb.port.drives(0) { format!("▶ playback '{}'", pb.name) } else { "free".to_string() },
+                if pb.port.drives(1) {
+                    format!("▶ playback '{}' (dummy suppressed)", pb.name)
+                } else {
+                    format!("{:?}", state.training.dummy)
+                },
+            ),
+            None => ("free".to_string(), format!("{:?}", state.training.dummy)),
+        };
+        ui.label(
+            egui::RichText::new(format!("Driving — P1: {p1_drive}   P2: {p2_drive}"))
+                .small()
+                .color(egui::Color32::DARK_GRAY),
+        );
     }
 
     /// Deploy stage: loaded-model card, enable toggle, runtime model picker.

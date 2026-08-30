@@ -257,3 +257,51 @@ independently-derived addresses; its combo counters (`0x4041E7`/`0x40470B`)
 MATCH ours exactly. Cross-check facing (`0x4037F9`/`0x4045AD`), health,
 meter, and character-id against our profile — free verification. It
 implements no AutoBlock for this game; we are first.
+
+## 10. Step vocabulary extensions (added after the MK2 Mileena audit)
+
+The published MK2 arcade movelists break two assumptions baked into §2. Both
+are contract amendments, not data gaps — the current DSL cannot express
+these moves at all.
+
+### 10.1 Release-triggered and charged steps
+
+Mileena's Sai Throw is **hold HP for ~3 seconds, then release**. Reptile's
+Invisibility is **hold BLK across a whole directional sequence, then release
+and press HP**. §2's matcher fires on the RISING EDGE with re-arm on
+release, so a move whose defining moment is a RELEASE is invisible to it.
+
+Two new step kinds, both expressible in the existing ordered-step model:
+
+- `{"hold": ["HP"], "min_frames": 150}` — the step is satisfied while the
+  chord stays down, and is only COMPLETE once it has been held at least
+  `min_frames`. A release before `min_frames` fails the macro.
+- `{"release": ["HP"]}` — satisfied on the FALLING edge of that chord.
+
+Consequences that must be honored by both the Rust matcher and the Python
+twin, or the two halves diverge:
+
+- Completion for a macro whose final step is a `release` fires on the
+  falling edge, not the rising one. The "rising edge with re-arm on release"
+  rule in §2 becomes: **completion fires on the edge the FINAL step names.**
+- A `hold` step spanning other steps (Reptile's `[BLK] U U D HP`) means
+  chords are no longer strictly sequential. Model it as a step-scoped
+  `while_held` chord on the intervening steps rather than inventing nesting.
+- Charge accumulation is a live hazard, not just a matching concern
+  (§9.5): a dummy or executor that parks on a button silently arms these
+  moves. The executor MUST release held chords when a macro aborts.
+
+### 10.2 Side-swapping moves
+
+Mileena's Teleport Kick crosses the opponent mid-move. §2 resolves
+`back`/`forward` against live facing, which is correct frame by frame and
+therefore WRONG across a swap: the same macro's later steps resolve against
+the flipped side.
+
+- **Matcher**: semantic directions resolve against the facing at the frame
+  the macro STARTED, pinned for the macro's duration. Otherwise a teleport
+  retroactively invalidates its own inputs.
+- **Executor**: same pin, for the same reason.
+- **Downstream**: gap-keyed data (frames.md §5) is discontinuous across a
+  swap. A side change between anchor and probe invalidates that measurement;
+  the harness must detect the facing flip and discard, not record.

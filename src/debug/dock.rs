@@ -35,6 +35,7 @@ use crate::debug::panels::{
     hex_dump::HexDump,
     matchup::MatchupPanel,
     hunt::HuntPanel,
+    input_log::InputLogPanel,
     input_monitor::InputMonitor,
     ram_search::RamSearchPanel,
     regions::RegionsPanel,
@@ -58,6 +59,7 @@ pub enum Tab {
     HexDump,
     TileViewer,
     InputMonitor,
+    InputLog,
     FrameLog,
     Triggers,
     CpuState,
@@ -77,11 +79,12 @@ pub enum Tab {
 /// variant missing from a saved sidecar) and the toolbar Panels menu — adding
 /// a variant without extending this list is a compile-time-invisible bug, so
 /// the `default_layout_contains_all_tabs` test cross-checks it.
-pub const ALL_TABS: [Tab; 17] = [
+pub const ALL_TABS: [Tab; 18] = [
     Tab::FrameInspector,
     Tab::HexDump,
     Tab::TileViewer,
     Tab::InputMonitor,
+    Tab::InputLog,
     Tab::FrameLog,
     Tab::Triggers,
     Tab::CpuState,
@@ -104,6 +107,7 @@ impl Tab {
             Tab::HexDump => "📋 Hex",
             Tab::TileViewer => "🧩 Tiles",
             Tab::InputMonitor => "🕹 Input",
+            Tab::InputLog => "📜 Input Log",
             Tab::FrameLog => "🧾 Log",
             Tab::Triggers => "⏸ Triggers",
             Tab::CpuState => "🔧 CPU",
@@ -127,6 +131,7 @@ pub struct Panels {
     pub frame_inspector: FrameInspector,
     pub hex_dump: HexDump,
     pub input_monitor: InputMonitor,
+    pub input_log_panel: InputLogPanel,
     pub tile_viewer: TileViewer,
     pub frame_log: FrameLog,
     pub triggers: Triggers,
@@ -148,6 +153,7 @@ impl Panels {
             frame_inspector: FrameInspector::new(),
             hex_dump: HexDump::new(),
             input_monitor: InputMonitor::new(),
+            input_log_panel: InputLogPanel::new(),
             tile_viewer: TileViewer::new(),
             frame_log: FrameLog::new(),
             triggers: Triggers::new(),
@@ -195,6 +201,7 @@ impl<'a> egui_dock::TabViewer for DockViewer<'a> {
             // shape: &mut self, ui, &Arc<Mutex<DebugState>>
             Tab::HexDump => self.panels.hex_dump.show(ui, self.state),
             Tab::InputMonitor => self.panels.input_monitor.show(ui, self.state),
+            Tab::InputLog => self.panels.input_log_panel.show(ui, self.state),
             Tab::FrameLog => self.panels.frame_log.show(ui, self.state),
             Tab::Triggers => self.panels.triggers.show(ui, self.state),
             Tab::CpuState => self.panels.cpu_state.show(ui, self.state),
@@ -294,7 +301,8 @@ impl<'a> egui_dock::TabViewer for DockViewer<'a> {
 /// +-------------------------------------------------------+
 /// |  toolbar (TopBottomPanel, rendered separately)        |
 /// +----------------------------+--------------------------+
-/// |  CANVAS (tabbed)           |  LIVE: Watch|CPU|Input   |
+/// |  CANVAS (tabbed)           |  LIVE: Watch|CPU|Input|  |
+/// |                            |        Input Log        |
 /// |  Frame|Disasm|Hex|Tiles    +--------------------------+
 /// |                            |  CONTROL: State|Training |
 /// |                            |           |Audio         |
@@ -319,7 +327,7 @@ pub fn default_layout() -> DockState<Tab> {
     let [_canvas, right] = surface.split_right(
         NodeIndex::root(),
         0.62,
-        vec![Tab::Watch, Tab::CpuState, Tab::InputMonitor],
+        vec![Tab::Watch, Tab::CpuState, Tab::InputMonitor, Tab::InputLog],
     );
     let [_live, _control] =
         surface.split_below(

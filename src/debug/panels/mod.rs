@@ -1,6 +1,7 @@
 pub mod frame_inspector;
 pub mod hex_dump;
 pub mod input_monitor;
+pub mod input_log;
 pub mod tile_viewer;
 pub mod frame_log;
 pub mod triggers;
