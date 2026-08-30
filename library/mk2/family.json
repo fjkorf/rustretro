@@ -8,6 +8,7 @@
     { "id": 4, "name": "kitana", "select_slot": null },
     { "id": 7, "name": "raiden", "select_slot": null },
     { "id": 9, "name": "reptile", "select_slot": null },
+    { "id": 10, "name": "scorpion", "select_slot": null },
     { "id": 11, "name": "jax", "select_slot": null }
   ],
   "move_classes": [

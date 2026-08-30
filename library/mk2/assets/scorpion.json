@@ -1,0 +1,537 @@
+{
+ "game": "mk2",
+ "port": "arcade",
+ "character": "scorpion",
+ "source": {
+  "mcp_port": 4026,
+  "mode": "step",
+  "coherent": true,
+  "samples": 120,
+  "step": 2,
+  "frame_first": 55359,
+  "frame_last": 55481
+ },
+ "video": {
+  "palette_off": "0x102100",
+  "vram_off": "0x142100",
+  "row_words": 512,
+  "rows": 254,
+  "visible_width": 400,
+  "index_mask": "0x7fff",
+  "capture_rows": 382
+ },
+ "display_origin": [
+  0,
+  56
+ ],
+ "mirror_dedupe": true,
+ "min_seen": 1,
+ "dropped_below_min_seen": 0,
+ "sheet": {
+  "file": "scorpion.png",
+  "width": 1009,
+  "height": 585,
+  "cols": 8,
+  "gutter": 1,
+  "cell_w": 125,
+  "cell_h": 145,
+  "anchor": "bottom-center",
+  "count": 26
+ },
+ "cels": [
+  {
+   "i": 0,
+   "sheet_x": 30,
+   "sheet_y": 5,
+   "w": 67,
+   "h": 141,
+   "px": 3650,
+   "bank": "0x03",
+   "screen_bbox": [
+    159,
+    90,
+    225,
+    230
+   ],
+   "first_frame": 55359,
+   "seen": 1,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 1,
+   "sheet_x": 156,
+   "sheet_y": 5,
+   "w": 67,
+   "h": 141,
+   "px": 3632,
+   "bank": "0x03",
+   "screen_bbox": [
+    154,
+    90,
+    220,
+    230
+   ],
+   "first_frame": 55360,
+   "seen": 2,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 2,
+   "sheet_x": 282,
+   "sheet_y": 7,
+   "w": 67,
+   "h": 139,
+   "px": 3614,
+   "bank": "0x03",
+   "screen_bbox": [
+    148,
+    94,
+    214,
+    232
+   ],
+   "first_frame": 55362,
+   "seen": 2,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 3,
+   "sheet_x": 408,
+   "sheet_y": 7,
+   "w": 67,
+   "h": 139,
+   "px": 3571,
+   "bank": "0x03",
+   "screen_bbox": [
+    143,
+    94,
+    209,
+    232
+   ],
+   "first_frame": 55364,
+   "seen": 2,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 4,
+   "sheet_x": 534,
+   "sheet_y": 6,
+   "w": 67,
+   "h": 140,
+   "px": 3600,
+   "bank": "0x03",
+   "screen_bbox": [
+    138,
+    93,
+    204,
+    232
+   ],
+   "first_frame": 55366,
+   "seen": 2,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 5,
+   "sheet_x": 660,
+   "sheet_y": 6,
+   "w": 67,
+   "h": 140,
+   "px": 3597,
+   "bank": "0x03",
+   "screen_bbox": [
+    133,
+    93,
+    199,
+    232
+   ],
+   "first_frame": 55368,
+   "seen": 2,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 6,
+   "sheet_x": 786,
+   "sheet_y": 6,
+   "w": 67,
+   "h": 140,
+   "px": 3653,
+   "bank": "0x03",
+   "screen_bbox": [
+    128,
+    93,
+    194,
+    232
+   ],
+   "first_frame": 55370,
+   "seen": 2,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 7,
+   "sheet_x": 912,
+   "sheet_y": 4,
+   "w": 67,
+   "h": 142,
+   "px": 3652,
+   "bank": "0x03",
+   "screen_bbox": [
+    124,
+    91,
+    190,
+    232
+   ],
+   "first_frame": 55372,
+   "seen": 2,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 8,
+   "sheet_x": 30,
+   "sheet_y": 150,
+   "w": 67,
+   "h": 142,
+   "px": 3636,
+   "bank": "0x03",
+   "screen_bbox": [
+    119,
+    91,
+    185,
+    232
+   ],
+   "first_frame": 55374,
+   "seen": 2,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 9,
+   "sheet_x": 156,
+   "sheet_y": 150,
+   "w": 66,
+   "h": 142,
+   "px": 3941,
+   "bank": "0x03",
+   "screen_bbox": [
+    97,
+    90,
+    162,
+    231
+   ],
+   "first_frame": 55376,
+   "seen": 6,
+   "player": 2,
+   "mirrored": false
+  },
+  {
+   "i": 10,
+   "sheet_x": 284,
+   "sheet_y": 167,
+   "w": 63,
+   "h": 125,
+   "px": 3149,
+   "bank": "0x03",
+   "screen_bbox": [
+    97,
+    101,
+    159,
+    225
+   ],
+   "first_frame": 55378,
+   "seen": 5,
+   "player": 2,
+   "mirrored": false
+  },
+  {
+   "i": 11,
+   "sheet_x": 379,
+   "sheet_y": 170,
+   "w": 125,
+   "h": 122,
+   "px": 3714,
+   "bank": "0x03",
+   "screen_bbox": [
+    39,
+    105,
+    163,
+    226
+   ],
+   "first_frame": 55380,
+   "seen": 19,
+   "player": 2,
+   "mirrored": false
+  },
+  {
+   "i": 12,
+   "sheet_x": 520,
+   "sheet_y": 177,
+   "w": 94,
+   "h": 115,
+   "px": 3250,
+   "bank": "0x03",
+   "screen_bbox": [
+    100,
+    112,
+    193,
+    226
+   ],
+   "first_frame": 55400,
+   "seen": 4,
+   "player": 2,
+   "mirrored": false
+  },
+  {
+   "i": 13,
+   "sheet_x": 657,
+   "sheet_y": 154,
+   "w": 72,
+   "h": 138,
+   "px": 3346,
+   "bank": "0x03",
+   "screen_bbox": [
+    123,
+    95,
+    194,
+    232
+   ],
+   "first_frame": 55408,
+   "seen": 4,
+   "player": 2,
+   "mirrored": false
+  },
+  {
+   "i": 14,
+   "sheet_x": 788,
+   "sheet_y": 151,
+   "w": 62,
+   "h": 141,
+   "px": 4090,
+   "bank": "0x03",
+   "screen_bbox": [
+    143,
+    91,
+    204,
+    231
+   ],
+   "first_frame": 55416,
+   "seen": 4,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 15,
+   "sheet_x": 912,
+   "sheet_y": 150,
+   "w": 67,
+   "h": 142,
+   "px": 4094,
+   "bank": "0x03",
+   "screen_bbox": [
+    144,
+    91,
+    210,
+    232
+   ],
+   "first_frame": 55420,
+   "seen": 6,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 16,
+   "sheet_x": 30,
+   "sheet_y": 295,
+   "w": 67,
+   "h": 143,
+   "px": 3996,
+   "bank": "0x03",
+   "screen_bbox": [
+    129,
+    89,
+    195,
+    231
+   ],
+   "first_frame": 55426,
+   "seen": 4,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 17,
+   "sheet_x": 156,
+   "sheet_y": 293,
+   "w": 67,
+   "h": 145,
+   "px": 3532,
+   "bank": "0x03",
+   "screen_bbox": [
+    119,
+    89,
+    185,
+    233
+   ],
+   "first_frame": 55430,
+   "seen": 6,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 18,
+   "sheet_x": 282,
+   "sheet_y": 297,
+   "w": 67,
+   "h": 141,
+   "px": 3695,
+   "bank": "0x03",
+   "screen_bbox": [
+    107,
+    90,
+    173,
+    230
+   ],
+   "first_frame": 55437,
+   "seen": 3,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 19,
+   "sheet_x": 408,
+   "sheet_y": 299,
+   "w": 67,
+   "h": 139,
+   "px": 3667,
+   "bank": "0x03",
+   "screen_bbox": [
+    106,
+    94,
+    172,
+    232
+   ],
+   "first_frame": 55440,
+   "seen": 4,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 20,
+   "sheet_x": 538,
+   "sheet_y": 299,
+   "w": 58,
+   "h": 139,
+   "px": 3306,
+   "bank": "0x03",
+   "screen_bbox": [
+    106,
+    94,
+    163,
+    232
+   ],
+   "first_frame": 55444,
+   "seen": 4,
+   "player": 2,
+   "mirrored": false
+  },
+  {
+   "i": 21,
+   "sheet_x": 653,
+   "sheet_y": 298,
+   "w": 80,
+   "h": 140,
+   "px": 3471,
+   "bank": "0x03",
+   "screen_bbox": [
+    98,
+    94,
+    177,
+    233
+   ],
+   "first_frame": 55448,
+   "seen": 8,
+   "player": 2,
+   "mirrored": false
+  },
+  {
+   "i": 22,
+   "sheet_x": 768,
+   "sheet_y": 299,
+   "w": 102,
+   "h": 139,
+   "px": 3757,
+   "bank": "0x03",
+   "screen_bbox": [
+    82,
+    95,
+    183,
+    233
+   ],
+   "first_frame": 55450,
+   "seen": 4,
+   "player": 2,
+   "mirrored": false
+  },
+  {
+   "i": 23,
+   "sheet_x": 895,
+   "sheet_y": 299,
+   "w": 100,
+   "h": 139,
+   "px": 3745,
+   "bank": "0x03",
+   "screen_bbox": [
+    91,
+    95,
+    190,
+    233
+   ],
+   "first_frame": 55454,
+   "seen": 8,
+   "player": 2,
+   "mirrored": false
+  },
+  {
+   "i": 24,
+   "sheet_x": 23,
+   "sheet_y": 444,
+   "w": 80,
+   "h": 140,
+   "px": 3867,
+   "bank": "0x03",
+   "screen_bbox": [
+    111,
+    93,
+    190,
+    232
+   ],
+   "first_frame": 55458,
+   "seen": 10,
+   "player": 2,
+   "mirrored": true
+  },
+  {
+   "i": 25,
+   "sheet_x": 140,
+   "sheet_y": 445,
+   "w": 98,
+   "h": 139,
+   "px": 4098,
+   "bank": "0x03",
+   "screen_bbox": [
+    93,
+    94,
+    190,
+    232
+   ],
+   "first_frame": 55462,
+   "seen": 4,
+   "player": 2,
+   "mirrored": false
+  }
+ ]
+}
