@@ -91,7 +91,16 @@ class FakeClient:
         self._held[port] = None
         return {"ok": True}
 
+    def _tool_get_input(self, port=0) -> dict:
+        # `asserted` vs `folded` (session.confirm_fold). No host loop here,
+        # so the fold is instantaneous and the confirmation returns at once.
+        mask = self._held[port] or ""
+        return {"ok": True, "port": port,
+                "asserted_mask": mask, "folded_mask": mask}
+
     def _tool_step(self) -> dict:
+        # Synchronous `step`: it returns only once the frame is finished, and
+        # reports that it landed (src/mcp/server.rs).
         self._frame += 1
         for port, direction in self._held.items():
             if (
@@ -100,7 +109,12 @@ class FakeClient:
                 and self._frame > self._probe_latency
             ):
                 self._position[port] += 1
-        return {"ok": True}
+        return {
+            "ok": True,
+            "stepped": True,
+            "landed": True,
+            "frame_count": self._frame,
+        }
 
     # ── observable / liveness callbacks for the test ────────────────────
     def position_of(self, port: int) -> int:
@@ -145,7 +159,7 @@ class ZeroPointCalibrationTest(unittest.TestCase):
         # Only the documented tool set was used.
         self.assertTrue(tool_names <= {
             "run_lua", "enable_writes", "load_state", "pause", "hold_buttons",
-            "release_buttons", "step", "get_state",
+            "release_buttons", "step", "get_state", "get_input",
         })
 
     def test_disables_training_enforcement_before_measuring(self):

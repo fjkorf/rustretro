@@ -354,9 +354,32 @@ def replay(
     `sample_from` are `None` (the sweep only needs the window, and skipping
     the reads elsewhere is most of the runtime).
 
-    Every step is confirmed (§3.5) and the load is confirmed + verified
+    Every frame is confirmed (§3.5) and the load is confirmed + verified
     (§3.4/§3.6) — both by `LabSession`, which is the only way this module
     touches the emulator.
+
+    ## Frames nothing observes are BATCHED, and that is not a shortcut
+
+    A replay only has to stop at frames that something looks at or acts on:
+    a frame the schedule changes an input at, and a frame the sampler reads.
+    Everything between two such frames is a fixed held mask running forward,
+    which `run_frames` does in ONE call for the whole segment (still
+    confirming that every requested frame landed — `LabSession.run_frames`
+    refuses a partial batch).
+
+    That is most of the lab's frame budget: a sweep at N=45 replays ~55
+    frames to reach the hold and then samples ~4, so 55 of 59 frames were
+    round trips that produced nothing.
+
+    A pending held-set change is applied by the call that runs the next
+    frames, through `LabSession.set_held` — which CONFIRMS the change reached
+    the core's input fold before any frame runs (`session.confirm_fold`). It
+    is deliberately NOT passed as one of `run_frames`' per-port masks: those
+    are applied under the same lock acquisition that arms the batch, leaving
+    no window for the host loop's fold, and the batch's first frame can then
+    run on the previous input. Measured at 13 wrong answers in 200 identical
+    evaluations — this is §3.6's flake, with a different cause than §3.6
+    assumed and a fix that is an oracle rather than a wait.
     """
     sched = _schedule(
         rig,
@@ -370,19 +393,40 @@ def replay(
     session.load_state(rig.arena)
 
     trace: list = [None] * (total_frames + 1)
+    sampling = sample_fn is not None
 
     def sample(f: int) -> None:
-        if sample_fn is not None and f >= sample_from:
+        if sampling and f >= sample_from:
             trace[f] = dict(sample_fn(session))
 
-    for port, buttons in sorted(sched.get(0, {}).items()):
-        session.set_held(port, buttons)
+    def next_stop(after: int) -> int:
+        """The first frame > `after` the replay must stop at: one the
+        schedule touches, or one the sampler reads. Frames strictly between
+        `after` and this can be run in a single batch."""
+        stop = total_frames
+        for f in sched:
+            if after < f < stop:
+                stop = f
+        if sampling and after < sample_from < stop:
+            stop = sample_from
+        if sampling and sample_from <= after:
+            stop = min(stop, after + 1)
+        return stop
+
+    # Pending held-set changes, applied by the next call that RUNS frames
+    # (folded into `run_frames`' masks, or issued via `set_held` before a
+    # single `step`). Deferring is safe because a hold cannot affect a read:
+    # it only changes what the NEXT frame folds in.
+    pending: Dict[int, Tuple[str, ...]] = dict(sched.get(0, {}))
     sample(0)
-    for f in range(total_frames):
-        session.step()
-        for port, buttons in sorted(sched.get(f + 1, {}).items()):
-            session.set_held(port, buttons)
-        sample(f + 1)
+    f = 0
+    while f < total_frames:
+        stop = next_stop(f)
+        session.run_frames(stop - f, holds=pending or None)
+        pending = {}
+        f = stop
+        pending.update(sched.get(f, {}))
+        sample(f)
     session.release_all_ports()
     return trace
 

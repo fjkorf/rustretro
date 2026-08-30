@@ -69,6 +69,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import observables as obs
+from .spec import FramelabSpec
 from .probe import (
     METHOD_LINEAR,
     Anchor,
@@ -103,12 +104,16 @@ __all__ = [
     "main",
 ]
 
-# The two observables §4.2 leaves standing on MK2 arcade, and the ONLY pair on
-# this port that lives in different data structures — which is what makes
-# §8.4's cross-method check a real check rather than two views of the same
-# bytes. `struct_divergence` (whole-struct) and `action_counter` are both
-# disqualified; see `observables.py`'s docstring for the measurements.
-DEFAULT_OBSERVABLES: Tuple[str, ...] = (obs.STRUCT_VELOCITY, obs.POINTER_X)
+# There is no module-level DEFAULT_OBSERVABLES here on purpose: §4.2's
+# ordered candidate list (MK2 arcade: struct_velocity then pointer_x, the
+# ONLY pair on this port that lives in different data structures, which is
+# what makes §8.4's cross-method check a real check rather than two views of
+# the same bytes) is now `FramelabSpec.default_observable_names()`, read from
+# the profile's `framelab` block. `calibrate_shapes`/`measure_cell`/
+# `cell_rows` below take `observables` as a required argument for exactly
+# this reason — a silent per-port default here is the mistake CLAUDE.md
+# forbids ("never hardcode a game address in code again") applied to an
+# observable list instead of an address.
 
 # Frames of contact-signal watching per anchor replay. Must exceed the slowest
 # move's contact frame plus `Rig.quiet_frames`, or `find_anchor` refuses to
@@ -273,22 +278,33 @@ def move_script(spec: MoveSpec) -> MoveScript:
 
 
 def make_rig(arena: str, *, guard_buttons: Sequence[str], attacker_port: int = 0,
-             defender_port: int = 1, quiet_frames: int = 20) -> Rig:
+             defender_port: int = 1, quiet_frames: int = 20,
+             walk_directions_by_port: Optional[Mapping[int, Sequence[str]]] = None,
+             ) -> Rig:
     """§4.2's blocked-direction hazard, wired: each port's FIRST walk
     candidate is AWAY from the opponent, because at contact range a fighter
     cannot walk into the other fighter's body and the probe would read that
-    as "not actionable". P1 stands on the left in every ladder arena
-    (`.gap.json`'s `facing`), so P1 walks left first and P2 right first; both
-    still fall through to the other direction."""
+    as "not actionable".
+
+    `walk_directions_by_port` is normally sourced from the profile's
+    `framelab.rig` block (`FramelabSpec.rig`, see `main()`), which is where
+    the actual per-port convention for a given ladder lives now. The
+    fallback below ("P1 stands on the left in every ladder arena", so P1
+    walks left first and P2 right first) is kept as a generic default for
+    callers that have not wired a profile through — every current unit test
+    exercises exactly this default, unchanged — not as a silently-reused
+    per-game assumption."""
+    wdbp = (
+        {p: tuple(ds) for p, ds in walk_directions_by_port.items()}
+        if walk_directions_by_port is not None
+        else {attacker_port: ("left", "right"), defender_port: ("right", "left")}
+    )
     return Rig(
         arena=arena,
         attacker_port=attacker_port,
         defender_port=defender_port,
         guard_buttons=tuple(guard_buttons),
-        walk_directions_by_port={
-            attacker_port: ("left", "right"),
-            defender_port: ("right", "left"),
-        },
+        walk_directions_by_port=wdbp,
         quiet_frames=quiet_frames,
     )
 
@@ -386,7 +402,7 @@ def calibrate_shapes(
     spec: MoveSpec,
     anchor: int,
     sample_fns: Mapping[int, Any],
-    observables: Sequence[str] = DEFAULT_OBSERVABLES,
+    observables: Sequence[str],
     at_n: int = 70,
     confirm_at_n: Optional[int] = 100,
     trials: int = 5,
@@ -482,13 +498,14 @@ def measure_cell(
     contact_read,
     sample_fns: Mapping[int, Any],
     latencies: Mapping[str, Mapping[str, int]],
-    observables: Sequence[str] = DEFAULT_OBSERVABLES,
+    observables: Sequence[str],
     max_search: int = DEFAULT_MAX_SEARCH,
     anchor_frames: int = DEFAULT_ANCHOR_FRAMES,
     window_margin: int = 2,
     variant: Optional[str] = None,
     scans: Optional[Tuple[Optional[ContactScan], Optional[ContactScan]]] = None,
     victim_y_read=None,
+    repeats: int = 1,
 ) -> CellMeasurement:
     """One (move, gap) cell: on_hit AND on_block, each measured by the full §4
     protocol, each from its OWN contact anchor.
@@ -499,6 +516,15 @@ def measure_cell(
     two moves connect on the same frame. (They did, on every cell measured so
     far; that agreement is evidence, and it is only evidence because it was
     not assumed.)
+
+    `repeats` is passed straight to `sweep_actionable`. It defaults to 1 for
+    the reason in this module's docstring — an exhaustive sweep already
+    refuses the flake's non-monotone signature for free, so paying 2x on
+    every N buys only the residual case. It is a PARAMETER rather than a
+    constant because "did any evaluation fail its repeat check" is the direct
+    evidence about whether the transport is flaky at all, and that question
+    is worth answering deliberately (e.g. after a transport change) even
+    though it is not worth answering on every run.
     """
     script = move_script(spec)
     cell = f"{spec.label}@{rung.gap_px}px"
@@ -547,7 +573,7 @@ def measure_cell(
             sample_fn=sample_fns[rig.attacker_port],
             input_latency_frames=latencies[shape_a], defender_guard=guard,
             window_margin=window_margin, max_search=max_search,
-            method=METHOD_LINEAR, exhaustive=True, repeats=1,
+            method=METHOD_LINEAR, exhaustive=True, repeats=repeats,
         )
         defender = sweep_actionable(
             session, rig=rig, script=script, port=rig.defender_port,
@@ -555,7 +581,7 @@ def measure_cell(
             sample_fn=sample_fns[rig.defender_port],
             input_latency_frames=latencies[shape_d], defender_guard=guard,
             window_margin=window_margin, max_search=max_search,
-            method=METHOD_LINEAR, exhaustive=True, repeats=1,
+            method=METHOD_LINEAR, exhaustive=True, repeats=repeats,
         )
         for o in observables:
             _check_sweep(attacker[o], who="attacker", cell=cell)
@@ -637,7 +663,7 @@ def cell_rows(
     char: str,
     core_id: str,
     rom_id: str,
-    observables: Sequence[str] = DEFAULT_OBSERVABLES,
+    observables: Sequence[str],
     confidence: str = "high",
 ) -> List[dict]:
     """One store row PER OBSERVABLE (§6: "a row measured by struct-divergence
@@ -722,14 +748,21 @@ def main() -> None:  # pragma: no cover - the live-rig path
     args = ap.parse_args()
 
     prof = game_profile.load(args.game)
+    # Everything §4.1/§4.2 measured for THIS port -- the anchor, the ordered
+    # observable list + addressing, and the per-shape calibration table --
+    # comes from the profile's `framelab` block from here on. A port with no
+    # block (asurabld, mk2 Genesis) raises `FramelabNotConfigured` right
+    # here, before anything touches the emulator.
+    flspec = FramelabSpec.from_profile(prof)
+    default_observables = flspec.default_observable_names()
     f1 = obs.resolve_fighter(prof, "block1", 0)
     f2 = obs.resolve_fighter(prof, "block2", 1)
-    sample_fns = {0: obs.make_sampler(f1, include=DEFAULT_OBSERVABLES),
-                  1: obs.make_sampler(f2, include=DEFAULT_OBSERVABLES)}
-    contact_read = obs.make_contact_read(f2)  # the DEFENDER is the victim
+    sample_fns = {0: obs.make_sampler(f1, flspec), 1: obs.make_sampler(f2, flspec)}
+    contact_read = obs.make_contact_read_from_spec(f2, flspec)  # DEFENDER is the victim
     client = McpClient(args.url)
     session = LabSession(client, verify_fn=obs.make_arena_verifier(prof, expect={}))
     session.enforce_preconditions()
+    rig_wdbp = flspec.rig.walk_directions_by_port if flspec.rig else None
 
     core_id, rom_id = compute_core_id(args.core), compute_rom_id(args.rom)
     specs = {name: MoveSpec(name=name, buttons=tuple(btns))
@@ -746,7 +779,8 @@ def main() -> None:  # pragma: no cover - the live-rig path
     latencies: Dict[str, Dict[str, int]] = {}
     if args.calibrate_on and not args.dry_run:
         move, arena = args.calibrate_on.split(":")
-        rig = make_rig(arena, guard_buttons=guard)
+        rig = make_rig(arena, guard_buttons=guard, quiet_frames=flspec.quiet_frames,
+                       walk_directions_by_port=rig_wdbp)
         scan = scan_contact(session, rig=rig, spec=specs[move], gap_px=None,
                             contact_read=contact_read, defender_guard=False)
         if not scan.connected:
@@ -754,33 +788,35 @@ def main() -> None:  # pragma: no cover - the live-rig path
         assert scan.anchor is not None
         latencies = calibrate_shapes(session, rig=rig, spec=specs[move],
                                      anchor=scan.anchor.contact_frame,
-                                     sample_fns=sample_fns)
+                                     sample_fns=sample_fns,
+                                     observables=default_observables)
         print("calibration:", json.dumps(latencies, sort_keys=True))
 
     out_rows: List[dict] = []
-    for spec, rung, variant in cells:
-        rig = make_rig(rung.arena, guard_buttons=guard)
+    for move_spec, rung, variant in cells:
+        rig = make_rig(rung.arena, guard_buttons=guard, quiet_frames=flspec.quiet_frames,
+                       walk_directions_by_port=rig_wdbp)
         if args.dry_run:
-            s = scan_contact(session, rig=rig, spec=spec, gap_px=rung.gap_px,
+            s = scan_contact(session, rig=rig, spec=move_spec, gap_px=rung.gap_px,
                              contact_read=contact_read, defender_guard=False)
-            print(f"{spec.label:>4} @ {rung.gap_px}px  connected={s.connected} "
+            print(f"{move_spec.label:>4} @ {rung.gap_px}px  connected={s.connected} "
                   f"contact={s.contact_frame} dmg={s.damage}")
             continue
-        m = measure_cell(session, rig=rig, spec=spec, rung=rung,
+        m = measure_cell(session, rig=rig, spec=move_spec, rung=rung,
                          contact_read=contact_read, sample_fns=sample_fns,
                          latencies=latencies, max_search=args.max_search,
-                         variant=variant)
+                         variant=variant, observables=default_observables)
         for note in m.notes:
             print("NOTE:", note)
         for label, got in (("on_hit", m.on_hit), ("on_block", m.on_block)):
             for o, meas in got.items():
-                print(f"{spec.label:>4} @ {rung.gap_px}px {label:>8} [{o:>15}] "
+                print(f"{move_spec.label:>4} @ {rung.gap_px}px {label:>8} [{o:>15}] "
                       f"att={meas.attacker.first_true} def={meas.defender.first_true} "
                       f"adv={meas.advantage:+d} "
                       f"att[{_fmt_predicate(meas.attacker)}] "
                       f"def[{_fmt_predicate(meas.defender)}]")
         out_rows += cell_rows(m, family=prof.family, port=prof.port, char=args.char,
-                              core_id=core_id, rom_id=rom_id)
+                              core_id=core_id, rom_id=rom_id, observables=default_observables)
 
     if out_rows:
         Path(args.db).parent.mkdir(parents=True, exist_ok=True)

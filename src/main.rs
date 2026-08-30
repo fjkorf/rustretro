@@ -398,9 +398,18 @@ fn run_headless(
         // (a0) Fold any MCP-injected controller input for this frame (headless has
         //      no keyboard) so an agent can drive menus/moves via press_buttons.
         //      Both ports: P1 for the agent/user, P2 for the shadow bot / dummy.
+        //      Bumps `fold_generation` (+ notifies `frame_cv`) so `run_frames`
+        //      can confirm a fold observed newly-set held masks before it arms
+        //      a batch — see `RetroMcpServer::run_frames`'s doc for the race
+        //      this closes. Runs every iteration regardless of `paused`.
         {
             let (injected, injected2) = match debug_state.lock() {
-                Ok(mut ds) => (ds.take_injected_input(), ds.take_injected_input2()),
+                Ok(mut ds) => {
+                    let f = (ds.take_injected_input(), ds.take_injected_input2());
+                    ds.fold_generation = ds.fold_generation.wrapping_add(1);
+                    ds.frame_cv.notify_all();
+                    f
+                }
                 Err(_) => ([false; 12], [false; 12]),
             };
             frontend.set_input(injected);
@@ -784,9 +793,13 @@ fn read_input(
     }
     // OR in any MCP-injected input (press_buttons) so an agent — or the shadow bot
     // on P2 — can drive either port in windowed mode alongside the keyboard.
+    // Bumps `fold_generation` (+ notifies `frame_cv`), same contract as the
+    // headless loop's step (a0) — see `RetroMcpServer::run_frames`'s doc.
     if let Ok(mut ds) = debug_state.0.lock() {
         let injected = ds.take_injected_input();
         let injected2 = ds.take_injected_input2();
+        ds.fold_generation = ds.fold_generation.wrapping_add(1);
+        ds.frame_cv.notify_all();
         for i in 0..12 {
             bits[i] |= injected[i];
             bits2[i] |= injected2[i];

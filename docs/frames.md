@@ -143,22 +143,40 @@ A measurement run that skips any of these is void.
 4. **Arena liveness re-verified after EVERY `load_state`**, not once at
    capture. The sidecar's `inputs_live` is a save-time assertion; the same
    object-pool instability that breaks `x` can invalidate it later.
-5. **Every `step` confirmed to have LANDED.** `step` is fire-and-forget:
-   30 rapid calls were measured landing **1** frame. Poll `get_state`'s
-   `frame_count` until it advances before issuing the next step. A protocol
-   that skips this measures a frame count that never happened, and it
-   produces a "the input did nothing" false negative that looks exactly like
-   a real result (it briefly convinced one agent that held input cannot
-   reach the core during stepping — it can: +72 and +63 units over 30
-   confirmed frames, control 0).
-6. **Let the frame FINISH before changing input.** Confirming a `step`
-   (frame_count moved) does NOT prove the emulated frame completed. Roughly
-   1 run in 50, a `hold_buttons` issued immediately after the confirmation
-   landed one frame EARLY — a single spurious TRUE below the real boundary,
-   never reproducing on re-run, silently moving the answer by several frames.
-   A/B over 14 identical pairs: 1 flake with no settle, 0 with an 8 ms
-   settle; before it one sweep failed its repeat check 5/5, after it all four
-   sweeps passed first try. Settle, or make `step` synchronous.
+5. **`step` is SYNCHRONOUS** — it returns only once the emulated frame is
+   fully complete, and reports `landed`. No polling, no sleeping.
+   (Historical: it used to be fire-and-forget, and 30 rapid calls landed
+   **1** frame. That false negative briefly convinced an agent that held
+   input cannot reach the core during stepping — it can. Measured after the
+   fix: 0.91 ms/step, 200/200 landing, against a 41.1 ms baseline.)
+   Use `run_frames(count)` to advance many frames in one call (~0.72
+   ms/frame).
+6. **Confirm the input FOLD, not just the write.** Asserting a hold does
+   not mean the core has seen it: the host loop folds input and checks the
+   frame gate in separate lock acquisitions, so a batch armed in one
+   acquisition can run its first frame on the PREVIOUS input. Poll
+   `get_input` until `folded` equals what was asserted. This is an ORACLE,
+   not a wait.
+
+   **The 8 ms "settle" that used to live here is RETIRED, and it was never
+   the mechanism.** Measured head-to-head on the same rig it was slightly
+   WORSE than nothing (16/100 spurious with it, 7/100 without); the original
+   A/B that justified it used 14 pairs per arm, far too small to see a ~7%
+   effect. The real failure mode is subtle enough to fool the rest of this
+   contract: the ATTACKER's move came out one frame late, contact moved
+   f11→f12, and the defender was genuinely free on the probe frame — so both
+   observables agreed with each other on the wrong answer and §8.4's
+   cross-method check could not see it.
+
+   | how the hold was asserted | spurious TRUE |
+   |---|---|
+   | batch per-port masks | 13 / 200 |
+   | `hold_buttons` then batch | 0 / 200 |
+   | `hold_buttons` + fold confirmation | 0 / 400 |
+
+   After the fold oracle: 52 exhaustive sweeps, 2,626 repeat-checked
+   evaluations, no settle — **0 repeat-check failures, 0 non-monotone
+   refusals**.
 7. **Every `load_state` confirmed to have LANDED.** Loads do not drain while
    paused. Resume, load, verify against a known field, then pause. Skipping
    this silently measures the PREVIOUS state.
@@ -338,8 +356,14 @@ neither diverges, record NULL rather than "never actionable".
 Advantage is then two probes from one anchor:
 
 ```
-advantage = actionable(defender, contact) − actionable(attacker, contact)
+advantage = manifest(defender, contact) − manifest(attacker, contact)
 ```
+
+where `manifest` is the RAW frame at which that side's probe first diverges
+from its control — **calibration is NOT subtracted here.** An earlier draft
+of this formula used the calibrated `actionable` on both sides, which is the
+9-frame error described immediately below; the two halves of this section
+contradicted each other until now.
 
 **Two rules learned by publishing a number that was wrong by 9 frames:**
 
@@ -541,9 +565,11 @@ the same protocol reproduces the same systematic error perfectly.
   exist — i.e. the auto-reversal dummy is the measuring instrument, not a
   separate feature. A live reading lacking a defender edge renders "—",
   never 0.
-- **MCP**: the harness drives `save_state`/`load_state`, `step`,
-  `hold_buttons`/`release_buttons`, `read_memory`, and `run_lua`; no new
-  tool is required to measure.
+- **MCP**: the harness drives `save_state`/`load_state`, `step` (now
+  synchronous), `run_frames`, `hold_buttons`/`release_buttons`,
+  `get_input` (the fold oracle of §3.6), `read_memory`, and `run_lua`.
+  An earlier draft claimed no new tool was required to measure; `run_frames`
+  and `get_input` are both required now.
 
 ## 10. Stated limitations
 
@@ -577,11 +603,13 @@ the same protocol reproduces the same systematic error perfectly.
   arena whose sidecar does not assert liveness, and a wrong sidecar is worse
   than an absent one. A `re-probe this arena` command would have fixed them
   in place; there isn't one.
-- **The walk-velocity word `block+0x0B..0x0D` is not in any profile.** It is
-  the cleanest act-again observable on MK2 arcade (§4.2) and currently lives
-  only in the harness. It should get a fighter-field slot.
-- **`first_active_frame` is NULL in every row measured so far.** §4.4 defines
-  it, nothing has measured it yet.
+- ~~The walk-velocity word `block+0x0B..0x0D` is not in any profile.~~
+  **CLOSED** — it, the anchor, the observable preference order, the probe-shape
+  calibrations and the collision floor now live in the port profile's
+  `framelab` block (`docs/game-profiles.md`). An uncalibrated port DECLINES
+  with a named reason instead of inheriting MK2's numbers.
+- ~~`first_active_frame` is NULL in every row.~~ **CLOSED** — the shipped
+  export carries 8 / 11 / 8 for the 62 px rows, and 12 for cLK.
 - **Hitstop is unmeasured**, though §1.2 reserves a column for it.
 
 ## 12. Schema gaps found by the first kit run (open)
@@ -589,8 +617,10 @@ the same protocol reproduces the same systematic error perfectly.
 - **No arena / evidence column.** A row does not record which arena it was
   measured on, so a reader cannot reproduce it without reading the prose.
 - **The export carries two rows per cell** (one per observable) with no
-  guidance on which a consumer should pick. Either collapse agreeing
-  observables into one row carrying both, or state the selection rule.
+  guidance on which a consumer should pick. Evidence now favours collapsing:
+  the two observables have agreed on every sweep across two independent full
+  runs (52 sweeps in the second alone). Collapse into one row carrying both,
+  and treat a DISAGREEMENT as the exceptional case it has never yet been.
 - **`hitstop`, `active`, `recovery`, `total`, `wakeup_window` and
   `guard_height` are NULL in every row measured so far.** The columns exist;
   nothing measures them yet.

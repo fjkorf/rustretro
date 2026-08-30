@@ -11,8 +11,11 @@ that broke real measurements before:
      reason.
   2. **A stun that outlives the pushback**, so the correct answer is
      strictly later than the naive one.
-  3. **Fire-and-forget transport.** `FakeGame` can be told to swallow steps
-     or loads, so the §3.5/§3.6 confirmations are tested rather than assumed.
+  3. **A transport that can drop frames.** `FakeGame` can be told to swallow
+     steps or loads, so the §3.5/§3.6 confirmations are tested rather than
+     assumed. It models the CURRENT server contract: `step` and `run_frames`
+     are synchronous and report `landed` themselves, and `run_frames` refuses
+     unless the emulator is paused.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ from shadow_train.framelab.probe import (
     calibrate_probe_latency,
     find_anchor,
     measure_advantage,
+    replay,
     sweep_actionable,
 )
 from shadow_train.framelab.session import (
@@ -44,6 +48,7 @@ from shadow_train.framelab.session import (
     LabSession,
     PreconditionError,
     call_ok,
+    confirm_fold,
 )
 
 
@@ -190,12 +195,64 @@ class FakeGame:
         self.held[port] = ()
         return {"ok": True}
 
+    def _tool_get_input(self, port=0):
+        """`asserted` (what the next fold will feed the core) and `folded`
+        (what the last one did). They agree instantly here — the fake has no
+        host loop to race — so `confirm_fold` returns on its first poll."""
+        mask = "|".join(sorted(self.held[port]))
+        return {"ok": True, "port": port,
+                "asserted_mask": mask, "folded_mask": mask}
+
     def _tool_step(self):
+        # The real `step` is SYNCHRONOUS: it returns only once the emulated
+        # frame is entirely finished, and says so (`landed`). A swallowed
+        # step is therefore not a silent no-op any more — it is the server's
+        # timeout shape, `ok: false` + `landed: false`.
         if self.swallow_steps > 0:
             self.swallow_steps -= 1
-            return {"ok": True}
+            return {
+                "ok": False,
+                "stepped": True,
+                "landed": False,
+                "error": "timed out waiting for the emulation thread",
+            }
         self._advance()
-        return {"ok": True}
+        return {
+            "ok": True,
+            "stepped": True,
+            "landed": True,
+            "frame_count": self.frame,
+        }
+
+    def _tool_run_frames(self, count, port0=None, port1=None):
+        """`step` batched: apply the per-port masks (replace, not OR), then
+        run `count` frames, reporting how many actually landed."""
+        if not self.paused:
+            return {
+                "ok": False,
+                "error": "run_frames requires the emulator to be paused first",
+            }
+        if port0 is not None:
+            self.held[0] = tuple(port0)
+        if port1 is not None:
+            self.held[1] = tuple(port1)
+        start = self.frame
+        landed = 0
+        for _ in range(count):
+            if self.swallow_steps > 0:
+                self.swallow_steps -= 1
+                break
+            self._advance()
+            landed += 1
+        return {
+            "ok": landed == count,
+            "start_frame": start,
+            "end_frame": self.frame,
+            "requested": count,
+            "landed": landed,
+            "all_landed": landed == count,
+            "error": None if landed == count else "timed out mid-batch",
+        }
 
     # ── the toy game ─────────────────────────────────────────────────────
     def _advance(self) -> None:
@@ -339,9 +396,73 @@ class PreconditionsTest(unittest.TestCase):
         s = make_session(game)
         s.load_state("fake.state")
         with self.assertRaises(LabError) as ctx:
-            s.step_timeout_s = 0.05
             s.step()
         self.assertIn("§3.5", str(ctx.exception))
+
+    def test_a_partially_landed_batch_raises_instead_of_miscounting(self):
+        # A batch that runs 3 of 10 frames is the same failure as a step that
+        # never landed, wholesale: the replay would believe 10 frames of game
+        # time that never happened.
+        game = FakeGame()
+        s = make_session(game)
+        s.load_state("fake.state")
+        game.swallow_steps = 3
+        with self.assertRaises(LabError) as ctx:
+            s.run_frames(10)
+        self.assertIn("§3.5", str(ctx.exception))
+
+    def test_run_frames_holds_the_mask_for_the_whole_batch(self):
+        # The mask REPLACES the port's held set and is applied before the
+        # first frame of the batch -- so all 5 frames walk.
+        game = FakeGame(pipeline=0)
+        s = make_session(game)
+        s.load_state("fake.state")
+        x0 = game.x[0]
+        s.run_frames(5, holds={0: ("right",)})
+        self.assertEqual(game.x[0] - x0, 10)   # 2 px/frame * 5 frames
+        self.assertEqual(game.held[0], ("right",))
+        self.assertEqual(s.steps_taken, 5, "batched frames still count as steps")
+
+    def test_an_input_change_is_confirmed_to_have_reached_the_fold(self):
+        # The host loop folds input BEFORE it checks the frame gate, so
+        # "held_input was written" is not "the next frame will see it".
+        # Measured live: passing the change as one of `run_frames`' own
+        # per-port masks put 13 wrong answers in 200 identical evaluations.
+        # Every input change therefore ends at the `get_input` oracle.
+        game = FakeGame()
+        s = make_session(game)
+        s.load_state("fake.state")
+        game.calls.clear()
+        s.set_held(0, ["right"])
+        s.run_frames(4, holds={1: ["left"]})
+        order = [t for t, _ in game.calls]
+        self.assertEqual(order[:2], ["hold_buttons", "get_input"])
+        # The batch's own masks are NOT used — the hold is a separate,
+        # confirmed call before `run_frames`.
+        batch = [kw for t, kw in game.calls if t == "run_frames"]
+        self.assertEqual(len(batch), 1)
+        self.assertNotIn("port0", batch[0])
+        self.assertNotIn("port1", batch[0])
+
+    def test_a_hold_that_never_reaches_the_fold_raises(self):
+        game = FakeGame()
+        s = make_session(game)
+        # A fold that never catches up: the game reports the port empty no
+        # matter what is asserted.
+        game._tool_get_input = lambda port=0: {
+            "ok": True, "asserted_mask": "right", "folded_mask": ""
+        }
+        with self.assertRaises(LabError) as ctx:
+            confirm_fold(game, 0, timeout_s=0.05)
+        self.assertIn("never reached", str(ctx.exception))
+
+    def test_run_frames_requires_a_paused_emulator(self):
+        game = FakeGame()
+        s = make_session(game)
+        s.load_state("fake.state")
+        game.paused = False
+        with self.assertRaises(LabError):
+            s.run_frames(5)
 
     def test_a_load_that_never_lands_raises_instead_of_measuring_the_old_state(self):
         game = FakeGame(swallow_loads=True)
@@ -370,6 +491,66 @@ class PreconditionsTest(unittest.TestCase):
         s.set_held(0, ["right"])
         s.step()
         self.assertNotIn("press_buttons", {t for t, _ in game.calls})
+
+
+# ── the replay engine: batching must not change what is measured ─────────
+
+
+class ReplayBatchingTest(unittest.TestCase):
+    """`replay` runs every frame nothing observes in ONE `run_frames` call.
+    That is a transport change, so it has to be shown to be invisible to the
+    measurement: the batched replay must produce the identical trace, and it
+    must still stop at every frame the schedule touches."""
+
+    def test_batched_replay_matches_a_fully_sampled_one_frame_for_frame(self):
+        # `sample_from=0` forces a stop at every frame (no batching possible);
+        # `sample_from=40` lets the first 40 frames collapse into one call.
+        # The overlapping window must be byte-identical, or batching moved
+        # the game.
+        full = replay(
+            make_session(FakeGame()), rig=make_rig(), script=SCRIPT,
+            total_frames=60, defender_guard=False, probe_port=1,
+            probe_buttons=("right",), probe_at=45,
+            sample_fn=sampler(1), sample_from=0,
+        )
+        batched = replay(
+            make_session(FakeGame()), rig=make_rig(), script=SCRIPT,
+            total_frames=60, defender_guard=False, probe_port=1,
+            probe_buttons=("right",), probe_at=45,
+            sample_fn=sampler(1), sample_from=40,
+        )
+        self.assertEqual(full[40:], batched[40:])
+        self.assertTrue(any(t is not None for t in batched[40:]))
+
+    def test_a_batch_never_runs_past_an_input_change(self):
+        # The probe hold at frame 45 must be asserted for frame 46 onward and
+        # NOT earlier -- a batch that overshot it would hold the walk during
+        # frames the fighter was supposed to be input-free, which is the
+        # one-frame-early hold in a new costume.
+        game = FakeGame()
+        s = make_session(game)
+        replay(
+            s, rig=make_rig(), script=SCRIPT, total_frames=50,
+            defender_guard=False, probe_port=1, probe_buttons=("right",),
+            probe_at=45, sample_fn=sampler(1), sample_from=46,
+        )
+        # `trail[i]` is the held set folded on frame i+1.
+        self.assertTrue(all("right" not in t[1] for t in game.trail[:45]))
+        self.assertTrue(all("right" in t[1] for t in game.trail[45:50]))
+
+    def test_batching_actually_happened(self):
+        # If this ever regresses to one call per frame the numbers stay right
+        # and the run takes hours, so the cost has to be asserted too.
+        game = FakeGame()
+        s = make_session(game)
+        replay(
+            s, rig=make_rig(), script=SCRIPT, total_frames=60,
+            defender_guard=False, probe_port=1, probe_buttons=("right",),
+            probe_at=55, sample_fn=sampler(1), sample_from=56,
+        )
+        self.assertEqual(s.steps_taken, 60)
+        self.assertGreater(s.frames_batched, 40)
+        self.assertLess(s.step_calls + s.batch_calls, 20)
 
 
 # ── §4.2: the differential comparison ─────────────────────────────────────

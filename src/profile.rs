@@ -1572,6 +1572,66 @@ mod tests {
         assert!(a.port.contact_signal.is_none());
     }
 
+    /// Task F2: the frame lab's `framelab` profile block (docs/frames.md
+    /// §3.1/§4.1/§4.2, docs/game-profiles.md "The framelab block") is
+    /// Python-only data — `PortProfile` has no field for it, deliberately,
+    /// the same way it has none for `_STATUS`. This proves the Rust loader
+    /// already TOLERATES an unrecognized top-level key rather than
+    /// rejecting the profile: serde ignores unmapped JSON object members by
+    /// default, and nothing in `profile.rs` opts into
+    /// `#[serde(deny_unknown_fields)]` (grepping the file finds none). If a
+    /// future change added that attribute to `PortProfile`, this test would
+    /// fail the moment mk2's shipped `framelab` block tried to load, which
+    /// is exactly the tripwire the task asked for.
+    #[test]
+    fn framelab_block_is_tolerated_as_an_unrecognized_top_level_key() {
+        // The shipped file: loads clean, AND actually carries the block —
+        // otherwise this test would be proving tolerance of a key that was
+        // never really there.
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let raw: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string("library/mk2/mk2.profile.json").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            raw.get("framelab").is_some(),
+            "mk2.profile.json should carry a framelab block for this test to mean anything"
+        );
+        // A few ordinary fields still resolve normally alongside it.
+        assert_eq!(p.block1(), 0xC050);
+        assert_eq!(p.field_off("health"), Some((0xE, 1)));
+
+        // A synthetic profile with a NOVEL unknown key (not just this
+        // task's own) also loads — the tolerance is general, not specific
+        // to the string "framelab".
+        let dir = make_test_dir("unknown_top_level_key").join("g");
+        fs::create_dir(&dir).unwrap();
+        fs::write(
+            dir.join("family.json"),
+            r#"{"family":"g","roster":[],"move_classes":[],"attack_classes":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("g.profile.json"),
+            r#"{"family":"g","port":"test",
+                "core":{"library_name":"","provenance_game":"g","provenance_core":"g"},
+                "memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},
+                          "fighter_fields":[],"globals":{}},
+                "gate":[],
+                "enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],
+                               "credits_target":0,"credits_min":0},
+                "calibration":{},"attack_chords":{},
+                "some_totally_unrelated_future_block":{"nested":[1,2,3]}}"#,
+        )
+        .unwrap();
+        let result = GameProfile::load(&dir);
+        assert!(
+            result.is_ok(),
+            "an unrecognized top-level key must not fail profile loading: {:?}",
+            result.err()
+        );
+    }
+
     /// Build a family+port pair with macro fields spliced in, and load it.
     fn load_with_macros(tag: &str, moves: &str, port_extra: &str) -> Result<GameProfile, String> {
         let dir = make_test_dir(tag).join("g");

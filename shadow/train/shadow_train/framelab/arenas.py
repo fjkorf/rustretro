@@ -57,11 +57,16 @@ this module cannot trust the object pointer for comes out as Python `None`
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
+
+# One implementation of "advance frames, confirmed landed" — and of "the held
+# input actually reached the core" — for the whole lab.
+from .session import confirm_fold as _confirm_fold
+from .session import confirm_step as _confirm_step
+from .session import run_frames as _run_frames
 
 __all__ = [
     "ArenaGenerationError",
@@ -88,11 +93,9 @@ _OBJ_MAX = 0x01400000             # valid pointer range ceiling (exclusive)
 _OBJ_X_OFF = 0x12                 # world X within the object entry, u16 LE
 _OBJ_CHARID_OFF = 0x3E            # char id within the object entry, u8
 
-# `step` is fire-and-forget server-side (docs/frames.md §3 precondition 5) --
-# poll `get_state` until `frame_count` actually advances instead of guessing
-# a sleep duration.
-_STEP_POLL_INTERVAL_S = 0.01
-_STEP_TIMEOUT_S = 2.0
+# `step` used to be fire-and-forget server-side, which forced a `get_state`
+# poll (docs/frames.md §3 precondition 5). It is synchronous now and reports
+# `landed` itself; see `_step`.
 
 # The liveness micro-probe (see `_probe_port_liveness`): how far a live port
 # must move, in its held direction's sign, per probe leg (1 unit = 1 pixel
@@ -166,10 +169,6 @@ def _pause(client: Any) -> None:
     _call_ok(client, "pause")
 
 
-def _frame_count(client: Any) -> Optional[int]:
-    return _call_ok(client, "get_state").get("frame_count")
-
-
 def _load_state_raw(client: Any, spec: Union[str, int]) -> None:
     """`load_state` does NOT drain while paused (docs/frames.md §3
     precondition 6 / CLAUDE.md's MCP workflow note): resume, load, then
@@ -195,28 +194,33 @@ def _release(client: Any, port: int) -> None:
 
 def _step(client: Any) -> None:
     """Advance exactly one core frame, confirmed landed (docs/frames.md §3
-    precondition 5) -- identical contract to `calibrate.py`'s `_step`."""
-    before = _frame_count(client)
-    _call_ok(client, "step")
-    if before is None:
-        return
-    deadline = time.monotonic() + _STEP_TIMEOUT_S
-    while time.monotonic() < deadline:
-        if _frame_count(client) != before:
-            return
-        time.sleep(_STEP_POLL_INTERVAL_S)
-    raise ArenaGenerationError(
-        f"step() did not advance frame_count within {_STEP_TIMEOUT_S}s -- "
-        "the session may be unresponsive, or the emulator isn't paused."
-    )
+    precondition 5) -- identical contract to `calibrate.py`'s `_step`, and
+    now the same one-call implementation: `step` is synchronous and reports
+    `landed`, so there is nothing left to poll."""
+    _confirm_step(client, error_cls=ArenaGenerationError)
 
 
 def _hold_step_release(client: Any, direction: str, port: int, frames: int) -> None:
+    """Walk `port` `frames` frames in `direction`.
+
+    Nothing samples the intermediate frames, so the whole walk is ONE
+    `run_frames` call instead of `frames` round trips — a ladder rung of 70
+    walk frames used to cost 70 confirmed steps.
+
+    The direction is asserted with `hold_buttons` and then CONFIRMED to have
+    reached the core's input fold before any frame runs (`confirm_fold`), not
+    passed as one of `run_frames`' per-port masks: those are applied under the
+    same lock acquisition that arms the batch, so the batch's first frame can
+    run on the previous input. On a walk that shows up as a rung landing one
+    frame short of its K — a silently wrong gap."""
     if frames <= 0:
         return
     _hold(client, [direction], port)
-    for _ in range(frames):
+    _confirm_fold(client, port, error_cls=ArenaGenerationError)
+    if frames == 1:
         _step(client)
+        return
+    _run_frames(client, frames, error_cls=ArenaGenerationError)
     _release(client, port)
 
 
