@@ -15,6 +15,22 @@
   "memory_regions": true,
   "save_states": true
  },
+ "video": {
+  "_NOTE": "Framebuffer + palette inside the one exposed region, for asset ripping (scripts/re/rip_mk2_cels.py). Offsets are FBNeo MemIndex() positions of DrvPalette/DrvVRAM within AllRam..RamEnd (src/burn/drv/midway/midtunit.cpp); layout verified live 2026-08-29 by reconstructing a paused frame and diffing it against app://screen (99.6% exact pixel agreement; colors must be expanded v<<3, NOT v*255/31, or agreement collapses to ~1%). A VRAM word is palette_bank<<8 | pixel; displayed color = palette[word & index_mask] (ScanlineRender :547). The blitter stamps DMA_PALETTE into the high byte (:469) and skips transparent pixels, so masking on the high byte isolates one sprite's opaque pixels. CAVEAT: the display ORIGIN (rowaddr/coladdr, ScanlineRender :531) is TMS34010 register state OUTSIDE this region and is not always (0,0) — measured (0,56) live — so a reader must search for it rather than assume it; rows_total is the addressable VRAM height, rows the visible height.",
+  "palette": {
+   "off": "0x102100",
+   "entries": 32768,
+   "format": "xrgb1555_le"
+  },
+  "vram": {
+   "off": "0x142100",
+   "row_words": 512,
+   "rows": 254,
+   "rows_total": 512,
+   "visible_width": 400,
+   "index_mask": "0x7FFF"
+  }
+ },
  "memory": {
   "cpu": "tms34010",
   "endianness": "little",

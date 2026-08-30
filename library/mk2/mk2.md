@@ -725,3 +725,76 @@ now reads "gate closed — not in a fight" instead of freezing on the stale
 "punishing: <move>" label. The old behaviour actively misled diagnosis —
 the mode was not running at all. (The in-flight punish grace was working
 correctly the whole time; only the label lied.)
+
+## Ripping character cels from VRAM (2026-08-29)
+
+**The finding: MK2 sprites can be extracted, in color and with clean alpha,
+from the ONE exposed RAM region — no graphics-ROM decoding required.**
+
+`get_state` reports `has_vram: false, has_rom: false` and warns that
+"sprite/ROM provenance [is] unavailable on this core". That is true about what
+libretro *labels*; it is not true about what the blob *contains*. FBNeo's
+`MemIndex()` puts three video structures inside `AllRam..RamEnd`:
+
+| blob offset | size | contents |
+|---|---|---|
+| `0x102100` | `0x20000` | `DrvPalette` — xRGB1555, little-endian, 2 B/color |
+| `0x122100` | `0x20000` | `DrvPaletteB` — the same colors pre-converted to host format |
+| `0x142100` | `0x100000` | `DrvVRAM` — the framebuffer, 512 words per row |
+
+### Why the pixels come pre-segmented
+
+`TUnitDmaWrite` (midtunit.cpp:469) writes every blitter pixel as
+`pixel | (DMA_PALETTE & 0xff) << 8`, and `ScanlineRender` (:547) displays
+`DrvPaletteB[word & 0x7FFF]`. So a VRAM word is `palette_bank<<8 | pixel`, and
+because the blitter SKIPS transparent pixels instead of writing them, masking
+on the high byte yields exactly one sprite's opaque pixels — alpha included,
+for free. In a live fight each fighter owns a bank (0x02 / 0x03 in the matches
+observed) while scenery layers own others.
+
+### Verified live
+
+Reconstructing a paused frame from `DrvVRAM` + `DrvPalette` and diffing it
+against `app://screen` scores **99.6%** pixel agreement. Masking bank 0x02 vs
+0x03 cleanly separates P1 from P2; bank 0x02's bbox began at x=159 while
+`p1_screen_x` (`0x3E40`) read 162.
+
+Three traps cost real time, all now handled in `scripts/re/rip_mk2_cels.py`:
+
+1. **Color expansion must be `v << 3`, not `v * 255 / 31`.** FBNeo's
+   `RGB555_2_888` masks with `0xF8` (:86), `BurnHighCol` packs to RGB565, and
+   rustretro's `decode_to_rgba` re-expands `r5<<3 / g6<<2 / b5<<3`
+   (src/debug/mod.rs:1333) — green survives as `(v<<1)<<2 == v<<3`. The chain
+   is the identity on `v<<3`, so ripped pixels compare EQUAL to a screenshot.
+   The `*255/31` rounding differs by ±1 on most colors and drops exact
+   agreement to ~1%, which reads exactly like a broken layout.
+2. **The display origin is NOT always (0, 0).** `ScanlineRender` starts at
+   `DrvVRAM16[(rowaddr << 9) & 0x3FE00]`, column `coladdr << 1` — TMS34010
+   display registers, i.e. CPU state OUTSIDE the exposed region. Measured
+   (0, 0) in one fight and **(0, 56)** on the same instance later. It cannot be
+   read, so it must be SEARCHED: reduce a screen row and every VRAM row to a
+   one-byte-per-pixel signature and `bytes.find` the screen row inside the
+   doubled VRAM row (doubling covers the `& 0x1FF` column wrap). Ripping at an
+   assumed origin silently produces shifted garbage.
+3. **Alignment must be measured PAUSED.** Running, the chunked VRAM read and
+   the screen grab are different instants and score near zero regardless of
+   correctness. The same tearing corrupts unpaused rips, which is why
+   `--watch` mode defaults to `--min-seen 2`: a torn read rarely repeats.
+
+Straight after a `load_state` the framebuffer and VRAM can disagree enough
+that no probe row matches; one `step` re-syncs them (the MCP `step` tool takes
+NO arguments — it advances exactly one frame per call).
+
+### Limits
+
+A cel is only ever captured AS DRAWN. Foreground scenery punches holes —
+Reptile ripped in front of the Dead Pool chains comes out with dashed vertical
+gaps — and poses the game never displays are simply absent. The complete asset
+set still requires decoding the twelve `*-vid` ROMs (4-way byte-interleaved
+into `DrvGfxROM`, midtunit.cpp:346) per `midtunit_dma.h`.
+
+### Roster addition
+
+`char_id 10 = scorpion`, added to family.json: block2 `+0x0` read `0x0A` while
+the health bar drew "SCORPION" (screenshot) — the same standard as the other
+verified roster entries.
