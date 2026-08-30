@@ -1109,3 +1109,42 @@ Consequence if adopted: `src/training.rs` `resolve()` gains `x` and `y` at
 the fighter-block stride (its actual contract), so arcade training
 enforcement stops no-op'ing on the position side; `docs/frames.md` §10's
 first two stated limitations both close.
+
+## First measured frame data — Reptile HP (2026-08-30)
+
+The frame lab's first real numbers, via the act-again probe
+(`docs/frames.md` §4). Rig: `shadow/arenas/mk2/r-v-r.state`, 2-human Reptile
+mirror, headless FBNeo. Move: **HP** thrown after a 44-frame walk-in, a FAR
+HP at a ~82 px gap (MK2 has proximity normals — this is not the close HP).
+43,712 confirmed steps, 507 verified loads.
+
+| outcome | attacker free | defender free | **advantage** |
+|---|---|---|---|
+| on block (P2 holds Block) | N*=9 | N*=13 | **+4** |
+| on hit (P2 holds nothing) | N*=9 | N*=13 | **+4** |
+
+Anchor `contact_frame=55, hits=1` from struct health `block+0x0E`
+(161→150 on hit, 161→158 on block — so both rigs genuinely connected, and
+genuinely differed).
+
+**Confidence is high for these two numbers specifically**: each was measured
+TWICE by two observables living in different data structures — the walk
+velocity word (`block+0x0B..0x0D`) and the pointer-resolved `x`
+(`obj+0x12`) — and they **agree to the frame on all four sweeps**. Every
+predicate was monotone; every sweep passed on first attempt with repeats=2;
+a third re-measurement from a FRESH EMULATOR PROCESS reproduced the
+defender's 13 exactly. This satisfies `docs/frames.md` §8.4, the criterion
+that tests accuracy rather than precision.
+
+**Open question for the full-kit run: `on_hit == on_block` here.** That is a
+legitimate measurement (the health deltas prove the two rigs differed), and
+old engines do often give hitstun and blockstun the same length — but it is
+also exactly what a rig bug would look like. Do NOT generalise from one
+move. If the whole kit comes back with `on_hit == on_block` everywhere,
+suspect the protocol; if it varies by move, this was real.
+
+Note the absolute frames carry a labelled margin that the ADVANTAGE does
+not: the on-block defender's absolute (23/24) includes the ~9-frame
+block-stance drop, which cancels out of the difference. The advantage is the
+trustworthy number; the absolutes are not directly comparable across
+different probe shapes.

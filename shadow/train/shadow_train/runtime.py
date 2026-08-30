@@ -34,11 +34,27 @@ polls that the offline dataset builder has full access to):
 Both approximations only affect *observation timing*, never the formulas
 (scales, thresholds, the side-agnostic transform) — those are reused/mirrored
 exactly from `dataset.py` and pinned by the parity test.
+
+A third thing this module has to handle that `dataset.py` does not: a fighter
+field can be POINTER-RESOLVED (docs/frames.md §2.5 -- MK2 arcade's world
+`x`/`y`), meaning it may be ABSENT from `me`/`opp` on any given tick (never
+zero-filled) when its pointer fails to dereference that frame. `dataset.py`'s
+offline fitter answers this by dropping and counting the affected DECISION
+(see its module docstring); a live loop is asked for a fresh action every
+tick and has no "drop a decision" option. `build_scalars`' `pointer_fields`
+guard and `RoundBuffers.compute_scalars`/`PointerStaleness` below are the
+streaming answer -- see the design note above `PointerStaleness` for the
+reasoning and `.meta.json`'s `pointer_resolved_fields` (`pointer_fields_from_meta`)
+for where the declared field set comes from. Empty for every model whose
+recordings declare no such fields (all of them today), which is the
+zero-added-cost fast path, mirroring `dataset.py`'s own framing of the same
+guarantee.
 """
 
 from __future__ import annotations
 
 import math
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -254,7 +270,26 @@ def build_scalars(
     back_hold: float,
     me_hitstun: bool,
     opp_hitstun: bool,
-) -> dict:
+    pointer_fields: frozenset[str] = frozenset(),
+) -> dict | None:
+    """`pointer_fields` (RECORDER_V3.md §1.2 rule 1 / docs/frames.md §2.5 --
+    the live-play analog of dataset.py's `pointer_resolved_fields`): names of
+    fighter fields that may be intermittently ABSENT from `me`/`opp` (never
+    zero-filled) because they are resolved through a live pointer that can
+    fail to dereference on any given tick. When any of them is missing from
+    either dict, this returns None instead of raising a KeyError or
+    computing on a fabricated value -- see the module docstring and the
+    design note above PointerStaleness for what a caller should do with
+    that (hold the previous action for this tick; never invent the missing
+    coordinate). Empty (the default -- every model that declares no
+    pointer-resolved fields) short-circuits the `and` below before either
+    generator runs, so this costs nothing on the common path and the
+    function always returns a dict, exactly as before this guard existed."""
+    if pointer_fields and (
+        any(f not in me for f in pointer_fields)
+        or any(f not in opp for f in pointer_fields)
+    ):
+        return None
     return {
         "dist_x": s * (opp["x"] - me["x"]) / X_SCALE,
         "dy": (opp["y"] - me["y"]) / Y_SCALE,
@@ -379,9 +414,120 @@ def check_calibration_drift(meta: dict) -> list[str]:
     return mismatches
 
 
+def pointer_fields_from_meta(meta: dict) -> frozenset[str]:
+    """The live-play read of a model's `.meta.json` `pointer_resolved_fields`
+    key (RECORDER_V3.md §1.2 rule 1): names of fighter fields this model's
+    recordings declared as possibly-absent-per-frame. Empty for every model
+    fit from recordings that name none (all of them today) -- the value to
+    hand to `RoundBuffers(pointer_fields=...)`/`build_scalars`' guard for the
+    zero-cost fast path."""
+    return frozenset(meta.get("pointer_resolved_fields", []))
+
+
+# ── pointer-resolved-field absence handling for LIVE play (see the module
+# docstring; this is the streaming analog of dataset.py's pointer_resolved_
+# fields drop-and-count) ────────────────────────────────────────────────────
+# The offline fitter's answer to a pointer that failed to resolve on a given
+# row is to drop the DECISION and count it. A live loop is asked for a fresh
+# action every tick and has no "drop a decision" option -- it must do
+# something every tick, or explicitly do nothing. The behaviour chosen here:
+#
+#   1. On a tick where a declared pointer-resolved field is missing,
+#      build_scalars() returns None -- the caller's signal to HOLD the
+#      previous action for this one tick (skip stacking, skip a fresh
+#      policy.predict, leave last_emitted_mask alone). A one-tick freeze is
+#      invisible to a human opponent; inventing the missing coordinate (a
+#      zeroed `x` reads as "cornered at the left edge") plays wrong in a way
+#      nobody can see, which is worse than doing nothing; raising the
+#      KeyError this guard replaces ends the match outright, which is worse
+#      still.
+#   2. A SUSTAINED run of missing-field ticks is a different situation: not
+#      a momentary hole but a broken pointer chain for the rest of the
+#      session, and holding position silently for that long is its own kind
+#      of lie -- a human watching would call that "the bot stopped playing",
+#      not "a dropped frame". PointerStaleness tracks the consecutive count
+#      and flips `escalated` the tick it crosses POINTER_STALE_FRAMES worth
+#      of ticks; RoundBuffers.compute_scalars fires exactly one
+#      `warnings.warn` (visible on stderr regardless of caller) per stale
+#      episode when that happens -- loud, but not spammed every tick.
+#
+# A model that declares no pointer-resolved fields (`pointer_fields` empty,
+# every model today) never touches any of this: build_scalars' guard is a
+# single `if pointer_fields and ...` truthiness check that short-circuits
+# before either generator runs, so the fast path costs nothing new and
+# behaves byte-for-byte like before this guard existed.
+POINTER_STALE_FRAMES = 300  # ~5s @ 60Hz -- see the design note above
+
+
+def stale_ticks_for_frames(frames: int, frames_per_tick: int) -> int:
+    """Frame-count threshold -> tick-granularity (same conversion pattern as
+    WINDOW_TICKS above for HITSTUN_RECENT_FRAMES). A caller that knows its
+    real --hz should use this to size PointerStaleness precisely; the
+    class's own default assumes the SPEC default ~7.5 Hz decision rate."""
+    return max(1, frames // max(1, frames_per_tick))
+
+
+class PointerStaleness:
+    """Tracks consecutive live-play ticks where a declared pointer-resolved
+    field failed to resolve (see the design note above). Owned by
+    RoundBuffers and deliberately NOT reset by RoundBuffers.reset() -- a
+    broken pointer chain is a property of the SESSION, not of any one round,
+    so a round boundary must not quietly clear an in-progress escalation."""
+
+    def __init__(self, stale_after_ticks: int | None = None) -> None:
+        # Default: POINTER_STALE_FRAMES at the SPEC default ~7.5 Hz decision
+        # rate (frames_per_decision(7.5) == 8 -> 300 // 8 == 37). A caller
+        # running at a different --hz should pass
+        # stale_ticks_for_frames(POINTER_STALE_FRAMES,
+        # frames_per_decision(actual_hz)) explicitly instead.
+        if stale_after_ticks is None:
+            stale_after_ticks = stale_ticks_for_frames(
+                POINTER_STALE_FRAMES, frames_per_decision(7.5)
+            )
+        self.stale_after_ticks = stale_after_ticks
+        self._consecutive = 0
+        self.total_dropped = 0
+        self.escalated = False
+
+    def reset(self) -> None:
+        self._consecutive = 0
+        self.total_dropped = 0
+        self.escalated = False
+
+    @property
+    def consecutive(self) -> int:
+        return self._consecutive
+
+    def observe(self, resolved: bool) -> bool:
+        """Record one tick's outcome (`resolved` = the declared fields were
+        all present this tick). Returns True exactly on the tick this call
+        newly crosses the escalation threshold (edge-triggered, so a caller
+        can warn/log without re-deriving the edge itself); `self.escalated`
+        stays True for as long as the run of missing ticks continues, for
+        any caller that wants to react further without re-checking counts."""
+        if resolved:
+            self._consecutive = 0
+            self.escalated = False
+            return False
+        self._consecutive += 1
+        self.total_dropped += 1
+        crossed_now = self._consecutive == self.stale_after_ticks and not self.escalated
+        if self._consecutive >= self.stale_after_ticks:
+            self.escalated = True
+        return crossed_now
+
+
 @dataclass
 class RoundBuffers:
-    """Everything that must reset at each round-start edge (requirement 4)."""
+    """Everything that must reset at each round-start edge (requirement 4).
+
+    `pointer_fields`/`pointer_staleness` are the exception: pointer
+    resolution health is a property of the whole SESSION (see
+    PointerStaleness's docstring), not of any one round, so `.reset()`
+    deliberately leaves them alone -- a round boundary must not quietly
+    clear an in-progress escalation. `pointer_fields` is normally set once,
+    from `pointer_fields_from_meta(meta)`, when a model is loaded.
+    """
 
     me_block: str | None = None
     stacker: FeatureStacker = field(default_factory=FeatureStacker)
@@ -391,6 +537,8 @@ class RoundBuffers:
     prev_opp_combo: int = 0
     last_emitted_mask: int = 0
     tick: int = 0
+    pointer_fields: frozenset[str] = field(default_factory=frozenset)
+    pointer_staleness: PointerStaleness = field(default_factory=PointerStaleness)
 
     def reset(self, me_block: str | None = None) -> None:
         self.me_block = me_block
@@ -401,3 +549,43 @@ class RoundBuffers:
         self.prev_opp_combo = 0
         self.last_emitted_mask = 0
         self.tick = 0
+
+    def compute_scalars(
+        self,
+        me: dict,
+        opp: dict,
+        s: int,
+        fwd_hold: float,
+        back_hold: float,
+        me_hitstun: bool,
+        opp_hitstun: bool,
+    ) -> dict | None:
+        """build_scalars(), guarded by self.pointer_fields, with the
+        sustained-failure escalation wired in (see the design note above
+        PointerStaleness). Returns None on ticks where a live caller should
+        hold its previous action -- never raises, never fabricates a
+        coordinate. Fires exactly one `warnings.warn` per stale episode, on
+        the first tick it crosses the escalation threshold;
+        `self.pointer_staleness.escalated` stays True for the rest of the
+        episode for any caller that wants to react further (e.g. stop
+        pressing buttons, surface a UI banner) without re-deriving the
+        threshold logic itself. Zero-cost, identical-dict-out fast path when
+        `self.pointer_fields` is empty (the default)."""
+        scal = build_scalars(
+            me, opp, s, fwd_hold, back_hold, me_hitstun, opp_hitstun,
+            pointer_fields=self.pointer_fields,
+        )
+        if self.pointer_staleness.observe(scal is not None):
+            warnings.warn(
+                f"pointer-resolved field(s) {sorted(self.pointer_fields)} "
+                f"have not resolved for {self.pointer_staleness.stale_after_ticks} "
+                "consecutive decision ticks -- this looks like a broken "
+                "pointer chain for the rest of the session, not a momentary "
+                "hole. The shadow is holding its last action instead of "
+                "inventing a position; it will resume normal play the tick "
+                "the field resolves again, but this session may need a "
+                "restart if it doesn't.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return scal

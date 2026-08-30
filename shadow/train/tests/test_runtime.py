@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -379,6 +380,207 @@ class FeatureParityTest(unittest.TestCase):
                 got, want, atol=1e-6,
                 err_msg=f"decision {n} scalar mismatch\ngot ={dict(zip(dataset.SCALAR_FEATURES, got))}\nwant={dict(zip(dataset.SCALAR_FEATURES, want))}",
             )
+
+
+def _full_fighter(**overrides) -> dict:
+    base = dict(x=100, y=216, anim=0, timer=0, health=200, meter=0, meter_max=100)
+    base.update(overrides)
+    return base
+
+
+class PointerResolvedFieldsTest(unittest.TestCase):
+    """B-rt: MK2 arcade's x/y (and any future pointer-resolved field) can be
+    ABSENT from `me`/`opp` on a live tick when the pointer fails to resolve
+    (never zero-filled -- RECORDER_V3.md §1.2 rule 1 / docs/frames.md §2.5).
+    Live play can't "drop a decision" like dataset.py's offline fitter, so
+    the chosen behaviour is: hold the previous action for a lone miss
+    (build_scalars/compute_scalars returns None, never raises, never
+    fabricates the missing coordinate), and escalate loudly (one
+    warnings.warn) once a run of misses is long enough to be a broken
+    session rather than a momentary hole. See the design note above
+    PointerStaleness in runtime.py for the full reasoning."""
+
+    def test_pointer_fields_from_meta_empty_by_default(self):
+        self.assertEqual(rt.pointer_fields_from_meta({}), frozenset())
+
+    def test_pointer_fields_from_meta_reads_declared_list(self):
+        meta = {"pointer_resolved_fields": ["x", "y"]}
+        self.assertEqual(rt.pointer_fields_from_meta(meta), frozenset({"x", "y"}))
+
+    def test_stale_ticks_for_frames(self):
+        self.assertEqual(rt.stale_ticks_for_frames(300, 8), 37)
+        self.assertEqual(rt.stale_ticks_for_frames(1, 8), 1)  # max(1, ...) floor
+
+    # ── build_scalars' guard ────────────────────────────────────────────
+    def test_missing_declared_field_returns_none_not_raise(self):
+        me = _full_fighter()
+        del me["x"]
+        opp = _full_fighter()
+        scal = rt.build_scalars(
+            me, opp, s=1, fwd_hold=0.0, back_hold=0.0,
+            me_hitstun=False, opp_hitstun=False,
+            pointer_fields=frozenset({"x"}),
+        )
+        self.assertIsNone(scal)
+
+    def test_missing_declared_field_on_opponent_also_returns_none(self):
+        me = _full_fighter()
+        opp = _full_fighter()
+        del opp["y"]
+        scal = rt.build_scalars(
+            me, opp, s=1, fwd_hold=0.0, back_hold=0.0,
+            me_hitstun=False, opp_hitstun=False,
+            pointer_fields=frozenset({"y"}),
+        )
+        self.assertIsNone(scal)
+
+    def test_present_declared_field_computes_normally(self):
+        me = _full_fighter(x=120)
+        opp = _full_fighter(x=200)
+        scal = rt.build_scalars(
+            me, opp, s=1, fwd_hold=0.0, back_hold=0.0,
+            me_hitstun=False, opp_hitstun=False,
+            pointer_fields=frozenset({"x"}),
+        )
+        self.assertIsNotNone(scal)
+        self.assertIn("dist_x", scal)
+
+    def test_fast_path_default_matches_no_kwarg_call(self):
+        """A model that declares NO pointer-resolved fields must take the
+        existing path with zero behaviour change: the default (no
+        pointer_fields at all) and an explicit empty frozenset produce
+        byte-identical output."""
+        me = _full_fighter(x=120)
+        opp = _full_fighter(x=200)
+        no_kwarg = rt.build_scalars(me, opp, 1, 0.5, 0.0, False, True)
+        explicit_empty = rt.build_scalars(
+            me, opp, 1, 0.5, 0.0, False, True, pointer_fields=frozenset()
+        )
+        self.assertEqual(no_kwarg, explicit_empty)
+
+    def test_fast_path_does_not_guard_undeclared_absence(self):
+        """The guard only ever looks at DECLARED fields -- an undeclared
+        missing key (pointer_fields empty, the fast path every model uses
+        today) must still surface exactly like it always has, not be
+        silently swallowed into a None."""
+        me = _full_fighter()
+        del me["x"]
+        opp = _full_fighter()
+        with self.assertRaises(KeyError):
+            rt.build_scalars(
+                me, opp, s=1, fwd_hold=0.0, back_hold=0.0,
+                me_hitstun=False, opp_hitstun=False,
+            )
+
+    # ── RoundBuffers.compute_scalars: hold + escalate ────────────────────
+    def test_single_miss_holds_without_warning(self):
+        buffers = rt.RoundBuffers(pointer_fields=frozenset({"x"}))
+        me = _full_fighter()
+        del me["x"]
+        opp = _full_fighter()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            scal = buffers.compute_scalars(me, opp, 1, 0.0, 0.0, False, False)
+        self.assertIsNone(scal)
+        self.assertEqual(caught, [])
+        self.assertFalse(buffers.pointer_staleness.escalated)
+        self.assertEqual(buffers.pointer_staleness.consecutive, 1)
+
+    def test_recovery_resets_consecutive_count(self):
+        buffers = rt.RoundBuffers(pointer_fields=frozenset({"x"}))
+        bad_me = _full_fighter()
+        del bad_me["x"]
+        good_me = _full_fighter()
+        opp = _full_fighter()
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            buffers.compute_scalars(bad_me, opp, 1, 0.0, 0.0, False, False)
+            buffers.compute_scalars(bad_me, opp, 1, 0.0, 0.0, False, False)
+            self.assertEqual(buffers.pointer_staleness.consecutive, 2)
+            scal = buffers.compute_scalars(good_me, opp, 1, 0.0, 0.0, False, False)
+        self.assertIsNotNone(scal)
+        self.assertEqual(buffers.pointer_staleness.consecutive, 0)
+        self.assertFalse(buffers.pointer_staleness.escalated)
+
+    def test_sustained_failure_escalates_exactly_once(self):
+        threshold = 5
+        buffers = rt.RoundBuffers(
+            pointer_fields=frozenset({"x"}),
+            pointer_staleness=rt.PointerStaleness(stale_after_ticks=threshold),
+        )
+        me = _full_fighter()
+        del me["x"]
+        opp = _full_fighter()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for i in range(threshold * 3):  # a long run, well past the threshold
+                scal = buffers.compute_scalars(me, opp, 1, 0.0, 0.0, False, False)
+                self.assertIsNone(scal)  # every tick holds -- never raises,
+                                          # never fabricates a value
+        runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        self.assertEqual(
+            len(runtime_warnings), 1,
+            "escalation must fire exactly once per stale episode, not every tick",
+        )
+        self.assertTrue(buffers.pointer_staleness.escalated)
+        self.assertEqual(buffers.pointer_staleness.total_dropped, threshold * 3)
+
+    def test_escalation_can_refire_after_a_fresh_stale_episode(self):
+        threshold = 3
+        buffers = rt.RoundBuffers(
+            pointer_fields=frozenset({"x"}),
+            pointer_staleness=rt.PointerStaleness(stale_after_ticks=threshold),
+        )
+        bad_me = _full_fighter()
+        del bad_me["x"]
+        good_me = _full_fighter()
+        opp = _full_fighter()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for _ in range(threshold):
+                buffers.compute_scalars(bad_me, opp, 1, 0.0, 0.0, False, False)
+            buffers.compute_scalars(good_me, opp, 1, 0.0, 0.0, False, False)  # recover
+            for _ in range(threshold):
+                buffers.compute_scalars(bad_me, opp, 1, 0.0, 0.0, False, False)
+        runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        self.assertEqual(len(runtime_warnings), 2, "a new stale episode after recovery re-warns")
+
+    def test_round_reset_does_not_clear_pointer_staleness(self):
+        """Pointer health is a SESSION property, not a round property: a
+        round-start edge must not quietly hide an in-progress escalation."""
+        threshold = 2
+        buffers = rt.RoundBuffers(
+            pointer_fields=frozenset({"x"}),
+            pointer_staleness=rt.PointerStaleness(stale_after_ticks=threshold),
+        )
+        me = _full_fighter()
+        del me["x"]
+        opp = _full_fighter()
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            for _ in range(threshold):
+                buffers.compute_scalars(me, opp, 1, 0.0, 0.0, False, False)
+        self.assertTrue(buffers.pointer_staleness.escalated)
+        buffers.reset(me_block="block1")
+        self.assertTrue(buffers.pointer_staleness.escalated)
+        self.assertEqual(buffers.pointer_staleness.consecutive, threshold)
+
+    def test_no_declared_fields_never_touches_the_guard(self):
+        """A model with no pointer-resolved fields (the default, every model
+        today) must behave identically to before this change existed:
+        RoundBuffers.compute_scalars is just build_scalars, full stop."""
+        buffers = rt.RoundBuffers()  # pointer_fields defaults to frozenset()
+        me = _full_fighter(x=120)
+        opp = _full_fighter(x=200)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            scal = buffers.compute_scalars(me, opp, 1, 0.5, 0.0, False, True)
+        self.assertEqual(
+            scal,
+            rt.build_scalars(me, opp, 1, 0.5, 0.0, False, True),
+        )
+        self.assertEqual(caught, [])
+        self.assertFalse(buffers.pointer_staleness.escalated)
 
 
 class CalibrationDriftTest(unittest.TestCase):

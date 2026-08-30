@@ -80,40 +80,86 @@ const BIT_RIGHT: u16 = 7;
 //   anything extra (corner only needs `x`, already covered), etc. Errors name
 //   both the feature that wants the data and the missing profile piece.
 
-/// Addresses/flags every model shares, resolved once at load.
+/// How the universal `x` field resolves: a fixed absolute address per block
+/// (covers both the plain block-offset form and the global-sourced form —
+/// `field_addr` already folds either into one absolute address), or
+/// `via: "object_ptr"` (task B-deploy / docs/frames.md §5, MK2 arcade): no
+/// fixed address exists at all — the object-pool slot moves every frame —
+/// so it's re-derived live, per block, through `GameProfile::object_ptr_field`
+/// on every read (see [`read_x`]).
 #[derive(Clone, Copy)]
+enum XSrc {
+    Fixed { addr1: u32, addr2: u32 },
+    Via,
+}
+
+/// Addresses/flags every model shares, resolved once at load.
 struct RunnerAddrs {
     block1: u32,
     block2: u32,
     little: bool,
-    /// Absolute per-block `x` addresses — universally required (see module
-    /// comment). Resolved via `field_addr`, so both the block-offset and the
-    /// global-sourced variants (MK2 arcade's p1_x/p2_x) work.
-    x1: u32,
-    x2: u32,
+    /// How to read `x` for either block — see [`XSrc`].
+    x: XSrc,
     /// `char_id` fighter-field offset, if the profile maps one (matchup-set
     /// switching; absent = the runner never switches models mid-set).
     char_id_off: Option<u32>,
+    /// Cloned once here (mirrors `record.rs`'s `FrameRecorder.profile`
+    /// snapshot): `via: "object_ptr"` fields need a live `GameProfile` to
+    /// re-derive their address every frame (`GameProfile::object_ptr_field`).
+    /// Pinning our OWN clone — rather than reaching for
+    /// `crate::profile::current()` on every read, as the rest of this file
+    /// does for provenance/attack-chord lookups — keeps the via-resolution
+    /// path testable against a synthetic profile independent of the
+    /// process-wide profile singleton (a `OnceLock` other tests in this
+    /// binary have already pinned to asurabld).
+    profile: crate::profile::GameProfile,
 }
 
 impl RunnerAddrs {
     fn from_profile(p: &crate::profile::GameProfile) -> Result<RunnerAddrs, String> {
-        let err = || {
-            "profile: shadow runner needs fighter field 'x' (dist_x + the round-start \
-             anchor probe — required by every fitted model)"
-                .to_string()
+        // `x` is either a fixed address (resolved once, as before) or
+        // `via: "object_ptr"` (MK2 arcade): `field_addr` deliberately
+        // returns `None` for the latter (no fixed address exists), so this
+        // must be checked FIRST — else every pointer-resolved-`x` profile
+        // would fail to construct a runner at all (the bug this task fixes).
+        let x = if p.field_is_object_ptr("x") {
+            XSrc::Via
+        } else {
+            let err = || {
+                "profile: shadow runner needs fighter field 'x' (dist_x + the round-start \
+                 anchor probe — required by every fitted model)"
+                    .to_string()
+            };
+            let (addr1, _size) = p.field_addr(1, "x").ok_or_else(err)?;
+            let (addr2, _size) = p.field_addr(2, "x").ok_or_else(err)?;
+            XSrc::Fixed { addr1, addr2 }
         };
-        let (x1, _size) = p.field_addr(1, "x").ok_or_else(err)?;
-        let (x2, _size) = p.field_addr(2, "x").ok_or_else(err)?;
         Ok(RunnerAddrs {
             block1: p.block1(),
             block2: p.block2(),
             little: p.port.memory.endianness == "little",
-            x1,
-            x2,
+            x,
             char_id_off: p.field_off("char_id").map(|(off, _)| off),
+            profile: p.clone(),
         })
     }
+}
+
+/// How one `FighterOffs` field resolves: a fixed block-relative offset
+/// (added to the block base at read time, as always), or
+/// `via: "object_ptr"` (task B-deploy / docs/frames.md §5 — MK2 arcade's
+/// `y` lives in the same pointer-resolved object as `x`): re-derived live,
+/// per block, through `GameProfile::object_ptr_field` every frame, no fixed
+/// offset at all. Mirrors `record.rs`'s `ViaField`/`FieldOrigin` split —
+/// same two-tier idea applied to the runner's per-block-per-frame READ
+/// instead of the recorder's per-frame-per-row WRITE; kept as a separate
+/// type from `record.rs`'s (this file owns no cross-module coupling, same
+/// rationale as the existing `rd8`/`rd16`/`endian_fix` duplication between
+/// the two files).
+#[derive(Clone, Copy)]
+enum FieldSrc {
+    Fixed(u32),
+    Via,
 }
 
 /// Fighter-block field offsets a SPECIFIC model's feature list needs.
@@ -121,17 +167,17 @@ impl RunnerAddrs {
 /// [`FeatureAddrs::from_profile`] would have already failed to load).
 #[derive(Clone, Copy, Default)]
 struct FighterOffs {
-    y: Option<u32>,
-    anim: Option<u32>,
-    timer: Option<u32>,
+    y: Option<FieldSrc>,
+    anim: Option<FieldSrc>,
+    timer: Option<FieldSrc>,
     /// Opportunistic, not gated by a specific feature: §4.2's fallback rule
     /// (`facing_sign = sign(opp.x - me.x)`) means `facing_sign` never fails
     /// to resolve — it just changes HOW it's computed when the profile has
     /// no `facing` field.
-    facing: Option<u32>,
-    health: Option<u32>,
-    meter: Option<u32>,
-    meter_max: Option<u32>,
+    facing: Option<FieldSrc>,
+    health: Option<FieldSrc>,
+    meter: Option<FieldSrc>,
+    meter_max: Option<FieldSrc>,
 }
 
 /// Per-model resolved addresses: fighter-field offsets this model's feature
@@ -153,8 +199,14 @@ impl FeatureAddrs {
         feature_names: &[String],
     ) -> Result<FeatureAddrs, String> {
         let want = |f: &str| feature_names.iter().any(|n| n == f);
-        let need_field = |name: &str, feats: &str| -> Result<u32, String> {
-            p.field_off(name).map(|(off, _)| off).ok_or_else(|| {
+        // `via: "object_ptr"` fields (task B-deploy) have no `field_off` —
+        // check that FIRST so a pointer-resolved field (MK2 arcade's `y`)
+        // resolves to `FieldSrc::Via` instead of the "doesn't map it" error.
+        let need_field = |name: &str, feats: &str| -> Result<FieldSrc, String> {
+            if p.field_is_object_ptr(name) {
+                return Ok(FieldSrc::Via);
+            }
+            p.field_off(name).map(|(off, _)| FieldSrc::Fixed(off)).ok_or_else(|| {
                 format!(
                     "profile: feature '{feats}' needs fighter field '{name}' — this \
                      profile doesn't map it"
@@ -183,7 +235,11 @@ impl FeatureAddrs {
             offs.meter = Some(need_field("meter", "me_meter/opp_meter")?);
             offs.meter_max = Some(need_field("meter_max", "me_meter/opp_meter")?);
         }
-        offs.facing = p.field_off("facing").map(|(off, _)| off);
+        offs.facing = if p.field_is_object_ptr("facing") {
+            Some(FieldSrc::Via)
+        } else {
+            p.field_off("facing").map(|(off, _)| FieldSrc::Fixed(off))
+        };
 
         let hitstun_globals = if want("me_hitstun") || want("opp_hitstun") {
             let hs = p.port.hitstun_sources.as_ref().ok_or_else(|| {
@@ -801,25 +857,111 @@ fn u8g(ds: &DebugState, addr: u32) -> u8 {
     ds.read_addr(addr as usize, 1).unwrap_or(0) as u8
 }
 
+/// Endian-correct a raw multi-byte read of `size` bytes (1/2/4) for the
+/// `via: "object_ptr"` live-read path: the pointer word itself is 4 bytes
+/// and the resolved field can be 1 or 2 — `rd8`/`rd16` above only cover the
+/// fixed-slot fast path's own widths. Mirrors `record.rs`'s private
+/// `endian_fix` (duplicated rather than shared — same rationale as this
+/// file's existing `rd16`/`u8g` duplication vs `record.rs`/`training.rs`:
+/// this file owns no cross-module coupling).
+fn endian_fix(v: u32, size: u8, little: bool) -> u32 {
+    if little {
+        return v;
+    }
+    match size {
+        2 => (v as u16).swap_bytes() as u32,
+        4 => v.swap_bytes(),
+        _ => v,
+    }
+}
+
+/// Read `x` for one block, honoring [`XSrc`]. `Via` returns `None` — ABSENT,
+/// never a synthesized 0 (docs/frames.md §2.5) — on any frame
+/// `GameProfile::object_ptr_field` can't resolve the pointer (out of
+/// `valid_range`, or the char-id cross-check fails that frame — the pool
+/// slot was reused by a different object).
+fn read_x(ds: &DebugState, ra: &RunnerAddrs, block: u8) -> Option<u16> {
+    match ra.x {
+        XSrc::Fixed { addr1, addr2 } => {
+            let addr = if block == 1 { addr1 } else { addr2 };
+            Some(rd16(ds, addr, ra.little))
+        }
+        XSrc::Via => ra
+            .profile
+            .object_ptr_field(block, "x", |addr, size| {
+                endian_fix(ds.read_addr(addr as usize, size as usize).unwrap_or(0), size, ra.little)
+            })
+            .map(|v| v as u16),
+    }
+}
+
+/// Read one `FighterOffs` u16 field for one block, honoring [`FieldSrc`].
+/// `None` (the field is unmapped by this profile) always reads 0 — that is
+/// NOT a per-frame miss, it's a permanent, load-time-known absence, already
+/// excluded from `feature_names` by [`FeatureAddrs::from_profile`]. `Via`
+/// returns `None` on a frame the pointer doesn't resolve — see [`read_x`].
+fn opt_via_u16(
+    ds: &DebugState,
+    block: u8,
+    base: u32,
+    ra: &RunnerAddrs,
+    name: &'static str,
+    src: Option<FieldSrc>,
+) -> Option<u16> {
+    match src {
+        None => Some(0),
+        Some(FieldSrc::Fixed(off)) => Some(rd16(ds, base + off, ra.little)),
+        Some(FieldSrc::Via) => ra
+            .profile
+            .object_ptr_field(block, name, |addr, size| {
+                endian_fix(ds.read_addr(addr as usize, size as usize).unwrap_or(0), size, ra.little)
+            })
+            .map(|v| v as u16),
+    }
+}
+
+/// `opt_via_u16`'s u8 twin (health/meter/meter_max/facing).
+fn opt_via_u8(
+    ds: &DebugState,
+    block: u8,
+    base: u32,
+    ra: &RunnerAddrs,
+    name: &'static str,
+    src: Option<FieldSrc>,
+) -> Option<u8> {
+    match src {
+        None => Some(0),
+        Some(FieldSrc::Fixed(off)) => Some(u8g(ds, base + off)),
+        Some(FieldSrc::Via) => ra
+            .profile
+            .object_ptr_field(block, name, |addr, size| {
+                endian_fix(ds.read_addr(addr as usize, size as usize).unwrap_or(0), size, ra.little)
+            })
+            .map(|v| v as u8),
+    }
+}
+
 /// Read one fighter block. `x` always comes from [`RunnerAddrs`] (universal);
 /// `char_id` is read SEPARATELY by [`read_char_id_pair`] (it drives matchup
 /// selection, not any scalar feature); everything else here is whatever this
-/// model's [`FeatureAddrs`] resolved — absent fields read as 0 (never
-/// consulted by [`build_scalars`] unless the model's `feature_names` asked
-/// for them).
-fn read_fighter(ds: &DebugState, base: u32, x_addr: u32, ra: &RunnerAddrs, o: &FighterOffs) -> Fighter {
-    let opt16 = |off: Option<u32>| off.map(|o| rd16(ds, base + o, ra.little)).unwrap_or(0);
-    let opt8 = |off: Option<u32>| off.map(|o| u8g(ds, base + o)).unwrap_or(0);
-    Fighter {
-        timer: opt16(o.timer),
-        anim: opt16(o.anim),
-        x: rd16(ds, x_addr, ra.little),
-        y: opt16(o.y),
-        facing: opt8(o.facing),
-        health: opt8(o.health),
-        meter: opt8(o.meter),
-        meter_max: opt8(o.meter_max),
-    }
+/// model's [`FeatureAddrs`] resolved. Returns `None` — ABSENT, never a
+/// synthesized 0 — the frame ANY field this model needs that happens to be
+/// `via: "object_ptr"` (x, or one of `o`'s fields, e.g. MK2 arcade's `y`)
+/// fails to dereference; a permanently-unmapped field (`o`'s `None` entries)
+/// always contributes 0 and never causes a miss (task B-deploy: hold rather
+/// than invent a coordinate — see [`ShadowRunner::tick`]).
+fn read_fighter(ds: &DebugState, block: u8, ra: &RunnerAddrs, o: &FighterOffs) -> Option<Fighter> {
+    let base = if block == 1 { ra.block1 } else { ra.block2 };
+    Some(Fighter {
+        timer: opt_via_u16(ds, block, base, ra, "timer", o.timer)?,
+        anim: opt_via_u16(ds, block, base, ra, "anim", o.anim)?,
+        x: read_x(ds, ra, block)?,
+        y: opt_via_u16(ds, block, base, ra, "y", o.y)?,
+        facing: opt_via_u8(ds, block, base, ra, "facing", o.facing)?,
+        health: opt_via_u8(ds, block, base, ra, "health", o.health)?,
+        meter: opt_via_u8(ds, block, base, ra, "meter", o.meter)?,
+        meter_max: opt_via_u8(ds, block, base, ra, "meter_max", o.meter_max)?,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -832,23 +974,30 @@ struct TickSnapshot {
     combo_on_b2: u8,
 }
 
-fn read_tick(ds: &DebugState, ra: &RunnerAddrs, fa: &FeatureAddrs) -> TickSnapshot {
+/// Returns `None` — never a partially-filled or zero-lied snapshot — the
+/// frame either block's read misses a `via: "object_ptr"` field (see
+/// [`read_fighter`]). [`ShadowRunner::tick`] treats that as "hold the
+/// previous action for this frame", the same policy
+/// `shadow_train.runtime.PointerStaleness` documents for the sibling Python
+/// deploy path.
+fn read_tick(ds: &DebugState, ra: &RunnerAddrs, fa: &FeatureAddrs) -> Option<TickSnapshot> {
     let (combo_on_b1, combo_on_b2) = fa
         .hitstun_globals
         .map(|(g1, g2)| (u8g(ds, g1), u8g(ds, g2)))
         .unwrap_or((0, 0));
-    TickSnapshot {
-        block1: read_fighter(ds, ra.block1, ra.x1, ra, &fa.offs),
-        block2: read_fighter(ds, ra.block2, ra.x2, ra, &fa.offs),
+    Some(TickSnapshot {
+        block1: read_fighter(ds, 1, ra, &fa.offs)?,
+        block2: read_fighter(ds, 2, ra, &fa.offs)?,
         combo_on_b1,
         combo_on_b2,
-    }
+    })
 }
 
 /// Read just the two `x` values — used for the round-anchor probe before any
 /// model's [`FeatureAddrs`] is consulted (x is universal; see [`RunnerAddrs`]).
-fn read_x_pair(ds: &DebugState, ra: &RunnerAddrs) -> (u16, u16) {
-    (rd16(ds, ra.x1, ra.little), rd16(ds, ra.x2, ra.little))
+/// `None` when either block's `x` doesn't resolve this frame (see [`read_x`]).
+fn read_x_pair(ds: &DebugState, ra: &RunnerAddrs) -> Option<(u16, u16)> {
+    Some((read_x(ds, ra, 1)?, read_x(ds, ra, 2)?))
 }
 
 /// Read the two `char_id` values, if the profile maps one.
@@ -948,7 +1097,28 @@ pub struct ShadowRunner {
     /// injector only writes port-1 holds from then on, so a not-yet-warmed-up
     /// shadow doesn't stomp other port-1 input sources with zeros.
     driving: bool,
+    /// Consecutive FRAMES (not decision ticks — the runner ticks every
+    /// emulated frame) where [`read_tick`] returned `None`: a declared
+    /// `via: "object_ptr"` fighter field failed to resolve (docs/frames.md
+    /// §5). Mirrors `shadow_train.runtime.PointerStaleness` — the sibling
+    /// Python deploy path's identical problem, solved the same way: hold the
+    /// previous action for a single missing tick (see `tick`'s `None` arm —
+    /// nothing here reads a fabricated 0 or panics), escalate with ONE loud
+    /// warning after a sustained run (`POINTER_STALE_FRAMES`, ~5s @ 60fps),
+    /// a good tick resets it. Deliberately NOT cleared by `reset_round` — a
+    /// broken pointer chain is a property of the SESSION, not of any one
+    /// round (same reasoning as `PointerStaleness`'s docstring).
+    pointer_miss_run: u64,
+    /// Whether the sustained-run warning has already fired for the CURRENT
+    /// miss streak (edge-triggered — fires once, not every frame past the
+    /// threshold).
+    pointer_miss_warned: bool,
 }
+
+/// ~5s @ 60 fps — mirrors `shadow_train.runtime.POINTER_STALE_FRAMES`
+/// exactly (frame-granular here since the native runner ticks every
+/// emulated frame, unlike `play.py`'s ~7.5 Hz decision-rate poll).
+const POINTER_STALE_FRAMES: u64 = 300;
 
 impl ShadowRunner {
     /// Load a model directory — either a single model (`cases.npz` +
@@ -1024,6 +1194,8 @@ impl ShadowRunner {
             last_emitted_mask: 0,
             latched_mask: 0,
             driving: false,
+            pointer_miss_run: 0,
+            pointer_miss_warned: false,
         })
     }
 
@@ -1249,6 +1421,30 @@ impl ShadowRunner {
         self.driving = false;
     }
 
+    /// One frame's declared `via` field failed to dereference — see
+    /// `pointer_miss_run`'s doc comment for the full policy.
+    fn note_pointer_miss(&mut self) {
+        self.pointer_miss_run += 1;
+        if self.pointer_miss_run == POINTER_STALE_FRAMES && !self.pointer_miss_warned {
+            self.pointer_miss_warned = true;
+            eprintln!(
+                "[shadow] WARNING: a pointer-resolved fighter field has not resolved for \
+                 {POINTER_STALE_FRAMES} consecutive frames (~5s) — this looks like a broken \
+                 pointer chain for the rest of the session, not a momentary hole. The shadow \
+                 is holding its last action instead of inventing a position; it will resume \
+                 normal play the frame it resolves again, but this session may need a restart \
+                 if it doesn't."
+            );
+        }
+    }
+
+    /// A frame's declared `via` field(s) all resolved — a good tick resets
+    /// the miss run (mirrors `PointerStaleness.observe(True)`).
+    fn note_pointer_ok(&mut self) {
+        self.pointer_miss_run = 0;
+        self.pointer_miss_warned = false;
+    }
+
     /// Run one emulated frame. Called from `Frontend::run_frame` after the
     /// bus-window refresh (reads see this frame's snapshot). Decisions happen
     /// every `P` frames while the gate is open; the chosen mask is re-injected
@@ -1285,9 +1481,17 @@ impl ShadowRunner {
 
         // Anchor probe: `x` is universal (every model needs it — RunnerAddrs),
         // so this is read independent of which model is active, BEFORE any
-        // matchup switch decides that.
-        let (x1, x2) = read_x_pair(ds, &self.addrs);
+        // matchup switch decides that. `read_x_pair` returns `None` — never
+        // a synthesized 0 — on a frame where a `via: "object_ptr"` `x` (MK2
+        // arcade) hasn't dereferenced yet; treated exactly like "positions
+        // not written yet" below (wait one more frame). We aren't driving
+        // yet at this point, so there's nothing to hold and no staleness
+        // accounting is needed until we are — that starts once `read_tick`
+        // becomes the steady-state check, right below.
         if self.me_block1.is_none() {
+            let Some((x1, x2)) = read_x_pair(ds, &self.addrs) else {
+                return;
+            };
             if x1 == x2 {
                 // Positions not written yet (or a dead heat) — wait a frame.
                 return;
@@ -1311,11 +1515,25 @@ impl ShadowRunner {
 
         // Read the full per-model feature snapshot AFTER any matchup switch
         // above, so it reflects the model that will actually consume it.
+        // `read_tick` returns `None` on a frame where a declared `via` field
+        // (x, or any `FeatureAddrs` field this model needs — e.g. MK2
+        // arcade's `y`) didn't resolve — the steady-state twin of the
+        // round-start wait above, now that we ARE (or are about to be)
+        // driving: HOLD (skip this decision; keep re-injecting whatever
+        // `latched_mask` already holds, below) rather than invent a
+        // coordinate or panic. `note_pointer_miss`/`note_pointer_ok` track
+        // consecutive misses and fire one loud warning on a sustained run —
+        // mirrors `shadow_train.runtime.PointerStaleness`, the sibling
+        // Python deploy path's identical problem.
         let fa = self.library[self.active].feature_addrs;
-        let snap = read_tick(ds, &self.addrs, &fa);
-
-        if self.frames_live % self.library[self.active].cal.P == 0 {
-            self.decide(&snap);
+        match read_tick(ds, &self.addrs, &fa) {
+            Some(snap) => {
+                self.note_pointer_ok();
+                if self.frames_live % self.library[self.active].cal.P == 0 {
+                    self.decide(&snap);
+                }
+            }
+            None => self.note_pointer_miss(),
         }
         self.frames_live += 1;
 
@@ -2079,5 +2297,146 @@ mod tests {
         runner.select_model(1, 3, &mut ds);
         assert_eq!(runner.info().name, "general");
         let _ = std::fs::remove_dir_all(&set);
+    }
+
+    // ── task B-deploy: `via: "object_ptr"` support (pointer-resolved x/y) ───
+
+    /// Regression for the bug this task fixes: `field_addr` returns `None`
+    /// for `x` on MK2 arcade (`via: "object_ptr"`), so before this change
+    /// `RunnerAddrs::from_profile` — and therefore `ShadowRunner::load`, and
+    /// therefore Shift+F5 — could never even construct on this game.
+    #[test]
+    fn runner_addrs_from_profile_succeeds_on_mk2_arcade_pointer_resolved_x() {
+        let mk2 = crate::profile::GameProfile::load(Path::new("library/mk2"))
+            .expect("library/mk2's arcade profile loads");
+        assert!(mk2.field_is_object_ptr("x"), "fixture assumption: mk2 arcade's x is via object_ptr");
+        assert_eq!(mk2.field_addr(1, "x"), None, "fixture assumption: field_addr can't resolve it");
+        let addrs = RunnerAddrs::from_profile(&mk2).expect(
+            "RunnerAddrs must resolve a pointer-resolved 'x' through object_ptr_field, \
+             not just field_addr — this is the construction the native runner needs",
+        );
+        assert!(matches!(addrs.x, XSrc::Via));
+    }
+
+    /// Build a standalone profile with `x`/`char_id`/`health` fixed and `y`
+    /// `via: "object_ptr"` (same shape as MK2 arcade's real profile, minus
+    /// the parts irrelevant to this test) — used to prove [`read_fighter`]
+    /// treats a resolving `via` field exactly like a fixed one, and returns
+    /// `None` (never a fabricated 0, never a panic) when the pointer chain
+    /// doesn't validate. Deliberately NOT installed as the process-global
+    /// profile (`crate::profile::current()`'s `OnceLock` is already pinned
+    /// to asurabld by other tests in this binary) — `RunnerAddrs` now owns
+    /// its own `GameProfile` clone specifically so this kind of test is
+    /// possible without racing the global.
+    fn load_via_test_profile(tag: &str) -> crate::profile::GameProfile {
+        let base = std::env::temp_dir()
+            .join(format!("shadow_runner_via_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("family.json"),
+            r#"{"family":"viatest","roster":[],"move_classes":[],"attack_classes":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("viatest.profile.json"),
+            r#"{
+                "family":"viatest","port":"test",
+                "core":{"library_name":"","provenance_game":"g","provenance_core":"g"},
+                "memory":{
+                    "cpu":"tms34010","endianness":"little",
+                    "blocks":{
+                        "block1":"0x100","block2":"0x200","stride":"0x100",
+                        "object_ptr":{
+                            "off":"-0xC","size":4,"encoding":"tms34010_bitaddr",
+                            "valid_range":["0x01000000","0x01400000"],"cid_check_off":"0x3E"
+                        }
+                    },
+                    "fighter_fields":[
+                        {"name":"char_id","off":"0x0","size":1},
+                        {"name":"health","off":"0x1","size":1},
+                        {"name":"x","off":"0x12","size":2},
+                        {"name":"y","via":"object_ptr","off":"0x16","size":2}
+                    ],
+                    "globals":{}
+                },
+                "gate":[],
+                "enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},
+                "calibration":{},"attack_chords":{}
+            }"#,
+        )
+        .unwrap();
+        crate::profile::GameProfile::load(&base).expect("via-test profile parses")
+    }
+
+    /// A `via: "object_ptr"` field that resolves drives the exact same
+    /// `Fighter` shape a fixed field would (no special-casing downstream of
+    /// `read_fighter`); one that doesn't (a stale pool slot — the char-id
+    /// cross-check disagrees) yields `None`, never a synthesized 0 or a
+    /// panic (task B-deploy / docs/frames.md §5).
+    #[test]
+    fn read_fighter_via_field_matches_fixed_field_when_resolved_and_holds_when_stale() {
+        let prof = load_via_test_profile("ok");
+        let addrs = RunnerAddrs::from_profile(&prof).unwrap();
+        assert!(matches!(addrs.x, XSrc::Fixed { .. }), "x is a plain off field in this fixture");
+
+        let mut offs = FighterOffs::default();
+        offs.y = Some(FieldSrc::Via);
+        offs.health = Some(FieldSrc::Fixed(prof.field_off("health").unwrap().0));
+
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "RAM".into(),
+            addr: 0,
+            len: 0x4000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        ds.write_addr(0x100, 1, 5); // block1's char_id
+        ds.write_addr(0x101, 1, 200); // block1's health (fixed)
+        ds.write_addr(0x112, 2, 123); // block1's x (fixed)
+        ds.write_addr(0xF4, 4, 0x0101_0000); // pointer word at block1 - 0xC
+        ds.write_addr(0x203E, 1, 5); // obj's cross-check byte — matches char_id
+        ds.write_addr(0x2016, 2, 77); // y at obj+0x16 (via object_ptr)
+
+        let fighter = read_fighter(&ds, 1, &addrs, &offs)
+            .expect("pointer validates and the char-id cross-check matches");
+        assert_eq!(fighter.x, 123, "fixed field reads normally");
+        assert_eq!(fighter.health, 200, "fixed field reads normally");
+        assert_eq!(fighter.y, 77, "a resolving via field reads exactly like a fixed one");
+
+        // Break the pointer chain: the cross-check byte no longer matches
+        // the fighter's own char_id (the pool slot was reused).
+        ds.write_addr(0x203E, 1, 9);
+        assert!(
+            read_fighter(&ds, 1, &addrs, &offs).is_none(),
+            "a stale pointer must hold (None), never read a fabricated 0"
+        );
+    }
+
+    /// `ShadowRunner`'s sustained-pointer-miss policy (task B-deploy):
+    /// hold silently for one tick, but a run that crosses
+    /// `POINTER_STALE_FRAMES` fires exactly one warning (edge-triggered,
+    /// not re-fired every subsequent frame), and a single good tick resets
+    /// the run completely — mirrors `shadow_train.runtime.PointerStaleness`.
+    #[test]
+    fn pointer_miss_tracker_warns_once_after_sustained_run_and_a_good_tick_resets_it() {
+        crate::profile::init_for_tests();
+        let mut runner = ShadowRunner::load(&goat_v2()).unwrap();
+        for _ in 0..(POINTER_STALE_FRAMES - 1) {
+            runner.note_pointer_miss();
+        }
+        assert!(!runner.pointer_miss_warned, "must not warn before the threshold");
+        runner.note_pointer_miss();
+        assert!(runner.pointer_miss_warned, "must warn exactly at the threshold");
+        assert_eq!(runner.pointer_miss_run, POINTER_STALE_FRAMES);
+        // Escalation doesn't re-fire every subsequent missing frame.
+        runner.note_pointer_miss();
+        assert_eq!(runner.pointer_miss_run, POINTER_STALE_FRAMES + 1);
+
+        // A good tick resets it completely.
+        runner.note_pointer_ok();
+        assert_eq!(runner.pointer_miss_run, 0);
+        assert!(!runner.pointer_miss_warned);
     }
 }

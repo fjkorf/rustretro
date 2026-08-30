@@ -71,6 +71,51 @@ fn read_sized(ds: &DebugState, addr: u32, size: u8, little: bool) -> u64 {
     }
 }
 
+/// Endian-correct a raw multi-byte read of `size` bytes (1/2/4) for the
+/// `via: "object_ptr"` live-read path (docs/frames.md §5): the pointer word
+/// itself is 4 bytes and the resolved field can be 1 or 2 — `rd8`/`rd16`
+/// above only cover the fixed-slot fast path's own widths. Mirrors
+/// `training.rs`'s private `endian_fix` (duplicated rather than shared —
+/// same rationale as the existing `rd8`/`rd16` duplication between the two
+/// files: this file owns no cross-module coupling).
+fn endian_fix(v: u32, size: u8, little: bool) -> u32 {
+    if little {
+        return v;
+    }
+    match size {
+        2 => (v as u16).swap_bytes() as u32,
+        4 => v.swap_bytes(),
+        _ => v,
+    }
+}
+
+/// One `via: "object_ptr"` fighter field, cached by NAME only (task B-fix,
+/// docs/frames.md §2.5/§5): unlike a fixed [`Slot`] there is no address to
+/// resolve once — `GameProfile::object_ptr_field` re-derives the live object
+/// address (dereference + char-id cross-check) fresh every frame, for each
+/// block, in [`FrameRecorder::record`]. Absent from a row (never 0) exactly
+/// on the frames it can't resolve — the RECORDER_V3 absence law extended to
+/// a value with no fixed address at all.
+struct ViaField {
+    name: String,
+    key: String,
+}
+
+/// Where one profile `fighter_fields` entry sits in the row's declared field
+/// ORDER (RECORDER_V3 §1.2 rule 6: "block keys in profile fighter_fields
+/// order"), pointing into whichever list actually resolves it: the
+/// fixed-slot list (index into `fields1`/`fields2`) or the live-resolved
+/// list (index into `via_fields`, paired with a per-frame `via1`/`via2`
+/// value in `record()`). Interleaving the two back into profile order at
+/// serialize time is what lets an ordinary field keep its zero-overhead
+/// fixed-slot read while a `via: "object_ptr"` field gets a live per-frame
+/// dereference — same row, same declared order, two different costs.
+#[derive(Clone, Copy)]
+enum FieldOrigin {
+    Fixed(usize),
+    Via(usize),
+}
+
 /// Where per-defender contact evidence lives (MACRO_ACTIONS.md §8, string/
 /// juggle stats): resolved once at [`FrameRecorder::create`], mirroring
 /// `training::resolve`'s `contact_signal`-then-`hitstun_sources` precedence
@@ -272,6 +317,15 @@ pub struct FrameRecorder {
     /// Same names/order in both; only addresses differ.
     fields1: Vec<Slot>,
     fields2: Vec<Slot>,
+    /// Live-resolved `via: "object_ptr"` fields (docs/frames.md §5): no
+    /// fixed address exists, so only the name/key are cached — the address
+    /// is re-derived through `GameProfile::object_ptr_field` every frame,
+    /// for each block, in `record()`.
+    via_fields: Vec<ViaField>,
+    /// How to interleave `fields1`/`fields2` and `via_fields` back into the
+    /// profile's declared `fighter_fields` order when serializing a row
+    /// (RECORDER_V3 §1.2 rule 6) — built once at `create()`.
+    order: Vec<FieldOrigin>,
     /// The recorded-globals union in §1.2-rule-2 order (`addr` absolute).
     globals: Vec<Slot>,
     /// Index into `fields` of `x` (the round-start anchor) and `char_id`
@@ -356,27 +410,84 @@ impl FrameRecorder {
             std::fs::create_dir_all(parent).ok();
         }
         let file = File::create(path)?;
-        // ABSOLUTE per-block addresses, resolved once — covers both field
-        // variants (block offset, or per-block globals like MK2 arcade's
-        // world X). Profile load validated that every field resolves.
+        // ABSOLUTE per-block addresses, resolved once — covers both STATIC
+        // field variants (block offset, or per-block globals like an
+        // asurabld-shaped `x`). Fields with `via: "object_ptr"`
+        // (docs/frames.md §5, docs/game-profiles.md) have no fixed address —
+        // the object pool slot moves every frame — so they're excluded from
+        // THIS fixed-slot mechanism; they get a live per-frame resolver
+        // instead (`via_fields`/`order` below, task B-fix). Profile load
+        // validated that every remaining (non-`via`) field resolves.
+        let recordable: Vec<&crate::profile::FieldSpec> = profile
+            .port
+            .memory
+            .fighter_fields
+            .iter()
+            .filter(|f| f.via.is_none())
+            .collect();
         let slots = |block: u8| -> Vec<Slot> {
-            profile
-                .port
-                .memory
-                .fighter_fields
+            recordable
                 .iter()
                 .map(|f| {
                     let (addr, size) = profile
                         .field_addr(block, &f.name)
-                        .expect("profile load validates fighter fields");
+                        .expect("profile load validates non-object_ptr fighter fields");
                     Slot { name: f.name.clone(), key: json_key(&f.name), addr, size }
                 })
                 .collect()
         };
         let (fields1, fields2) = (slots(1), slots(2));
+        // `via: "object_ptr"` fields (docs/frames.md §5): no fixed address
+        // to cache, so only name/key are kept — `record()` re-derives the
+        // live address through `GameProfile::object_ptr_field` every frame.
+        // `order` interleaves this list and `fields1`/`fields2` back into
+        // the profile's declared order (RECORDER_V3 §1.2 rule 6) for
+        // serialization; only "object_ptr" survives profile-load validation
+        // as a `via` value, so every non-`off` field lands in exactly one of
+        // the two lists.
+        let via_specs: Vec<&crate::profile::FieldSpec> = profile
+            .port
+            .memory
+            .fighter_fields
+            .iter()
+            .filter(|f| f.via.as_deref() == Some("object_ptr"))
+            .collect();
+        let via_fields: Vec<ViaField> = via_specs
+            .iter()
+            .map(|f| ViaField { name: f.name.clone(), key: json_key(&f.name) })
+            .collect();
+        let order: Vec<FieldOrigin> = {
+            let (mut fi, mut vi) = (0usize, 0usize);
+            profile
+                .port
+                .memory
+                .fighter_fields
+                .iter()
+                .filter_map(|f| {
+                    if f.via.is_none() {
+                        let i = fi;
+                        fi += 1;
+                        Some(FieldOrigin::Fixed(i))
+                    } else if f.via.as_deref() == Some("object_ptr") {
+                        let i = vi;
+                        vi += 1;
+                        Some(FieldOrigin::Via(i))
+                    } else {
+                        None // unreachable post-validation (unknown `via`)
+                    }
+                })
+                .collect()
+        };
         let globals = recorded_globals(profile);
-        let field_idx =
-            |name: &str| profile.port.memory.fighter_fields.iter().position(|f| f.name == name);
+        // Scoped to `recordable` (fixed-slot fields only) DELIBERATELY: the
+        // round anchor, matcher facing, and the x-liveness sentinel all need
+        // a value at a specific instant (a rising/falling edge, or "did this
+        // address change") and a `via: "object_ptr"` read can legitimately
+        // come back absent on that exact frame. Task B-fix scopes the live
+        // per-frame resolver to ROW OUTPUT only (the hard break); wiring it
+        // into these frame-exact consumers too is a follow-up, flagged here
+        // the same way the schema-change agent flagged this gap.
+        let field_idx = |name: &str| recordable.iter().position(|f| f.name == name);
         let x_idx = field_idx("x");
         let char_idx = field_idx("char_id");
         let health_idx = field_idx("health");
@@ -438,23 +549,42 @@ impl FrameRecorder {
                 "block2": format!("0x{:X}", blocks.block2.0),
                 "stride": format!("0x{:X}", blocks.stride.0),
             },
-            "fighter_fields": profile.port.memory.fighter_fields.iter().map(|f| {
-                match (&f.off, &f.globals) {
-                    (Some(off), _) => serde_json::json!({
+            // Verbatim-from-profile snapshot of EVERY fighter field this
+            // recorder emits, in profile order — including `via:
+            // "object_ptr"` entries now (task B-fix): their `"via":
+            // "object_ptr"` tag is itself the honest signal that the field
+            // has no fixed address and may be ABSENT on any given row (the
+            // pointer didn't validate, or the char-id cross-check failed
+            // that frame) — `pointer_resolved_fields` below repeats the same
+            // fact as a flat name list so a reader doesn't have to parse
+            // this nested shape just to know which fields can be ragged.
+            "fighter_fields": profile.port.memory.fighter_fields.iter().filter_map(|f| {
+                match (&f.off, &f.globals, f.via.as_deref()) {
+                    (Some(off), _, None) => Some(serde_json::json!({
                         "name": f.name,
                         "off": format!("0x{:X}", off.0),
                         "size": f.size,
-                    }),
+                    })),
                     // Global-sourced field (RECORDER_V3 §2.5): snapshot the
                     // per-block global names instead of an offset.
-                    (None, Some(g)) => serde_json::json!({
+                    (None, Some(g), None) => Some(serde_json::json!({
                         "name": f.name,
                         "globals": {"block1": g.block1, "block2": g.block2},
                         "size": f.size,
-                    }),
-                    (None, None) => unreachable!("profile load validates fighter fields"),
+                    })),
+                    // `via: "object_ptr"` (docs/frames.md §5): off is
+                    // relative to the DECODED object pointer, not the block.
+                    (Some(off), _, Some("object_ptr")) => Some(serde_json::json!({
+                        "name": f.name,
+                        "via": "object_ptr",
+                        "off": format!("0x{:X}", off.0),
+                        "size": f.size,
+                        "signed": f.signed,
+                    })),
+                    _ => None, // unreachable post-validation
                 }
             }).collect::<Vec<_>>(),
+            "pointer_resolved_fields": via_specs.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
             "globals_recorded": globals.iter().map(|s| {
                 serde_json::json!({"name": s.name, "size": if s.size == 2 { 2 } else { 1 }})
             }).collect::<Vec<_>>(),
@@ -472,6 +602,8 @@ impl FrameRecorder {
             little: profile.port.memory.endianness == "little",
             fields1,
             fields2,
+            via_fields,
+            order,
             globals,
             x_idx,
             char_idx,
@@ -595,6 +727,26 @@ impl FrameRecorder {
         };
         let b1 = read_block(&self.fields1);
         let b2 = read_block(&self.fields2);
+        // Live per-frame resolution for `via: "object_ptr"` fields (task
+        // B-fix, docs/frames.md §5): re-dereferences fresh every frame, for
+        // each block — `None` (ABSENT, never 0) when the pointer word falls
+        // outside its valid range or the char-id cross-check fails THIS
+        // frame. Cost is paid only per `via_fields` entry (empty for every
+        // profile except mk2 arcade today), not on the fixed-slot path.
+        let profile = &self.profile;
+        let little = self.little;
+        let read_via = |block: u8| -> Vec<Option<i64>> {
+            self.via_fields
+                .iter()
+                .map(|vf| {
+                    profile.object_ptr_field(block, &vf.name, |addr, size| {
+                        endian_fix(ds.read_addr(addr as usize, size as usize).unwrap_or(0), size, little)
+                    })
+                })
+                .collect()
+        };
+        let via1 = read_via(1);
+        let via2 = read_via(2);
         let gvals: Vec<u64> = self
             .globals
             .iter()
@@ -770,10 +922,39 @@ impl FrameRecorder {
             }
             None => line.push_str("null"),
         }
-        for (name, vals) in [("block1", &b1), ("block2", &b2)] {
+        // Interleaves the fixed-slot values (`b1`/`b2`, keyed by `self.
+        // fields1` — block1/block2 share names/order, only addresses
+        // differ) with the live-resolved `via1`/`via2` values back into the
+        // profile's declared `fighter_fields` order (`self.order`, RECORDER_V3
+        // §1.2 rule 6). A `via` field with no value this frame is skipped
+        // entirely — ABSENT, never a synthesized 0 (docs/frames.md §2.5).
+        for (name, vals, via_vals) in [("block1", &b1, &via1), ("block2", &b2, &via2)] {
             let _ = write!(line, ",\"{name}\":{{");
-            for (i, (f, v)) in self.fields1.iter().zip(vals.iter()).enumerate() {
-                let _ = write!(line, "{}{}:{v}", if i > 0 { "," } else { "" }, f.key);
+            let mut first = true;
+            for origin in &self.order {
+                match *origin {
+                    FieldOrigin::Fixed(i) => {
+                        let _ = write!(
+                            line,
+                            "{}{}:{}",
+                            if first { "" } else { "," },
+                            self.fields1[i].key,
+                            vals[i]
+                        );
+                        first = false;
+                    }
+                    FieldOrigin::Via(i) => {
+                        if let Some(v) = via_vals[i] {
+                            let _ = write!(
+                                line,
+                                "{}{}:{v}",
+                                if first { "" } else { "," },
+                                self.via_fields[i].key
+                            );
+                            first = false;
+                        }
+                    }
+                }
             }
             line.push('}');
         }
@@ -1000,6 +1181,18 @@ mod tests {
     /// G3: a partial profile (library/mk2) records ONLY its mapped fields —
     /// absent means absent, never 0 — with the fixed-slot anchor declared in
     /// the meta and canonical char ids in the rounds sidecar.
+    ///
+    /// Task B-prof (docs/frames.md §5) made mk2 arcade's `x`/`y`
+    /// `via: "object_ptr"` — pointer-resolved, no fixed address. Task B-fix
+    /// gave the recorder a live per-frame resolver for those, but this test's
+    /// synthetic `DebugState` never sets up the object-pool pointer word at
+    /// `block-0xC`, so the raw pointer reads 0 — outside `valid_range` — and
+    /// `x`/`y` are honestly ABSENT for this row (never a synthesized 0),
+    /// same class of degradation as any other field that fails to resolve
+    /// THIS frame. The round anchor still degrades to `fixed_slots`/
+    /// block1=P1 here: it's scoped to the fixed-slot fields only (see
+    /// `field_idx`'s doc in `create()`), independent of whether `x` happens
+    /// to resolve on any given frame.
     #[test]
     fn v3_partial_profile_records_only_mapped_fields() {
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
@@ -1032,15 +1225,15 @@ mod tests {
         assert!(text.starts_with("{\"v\":3,"));
         for block in ["block1", "block2"] {
             let keys: Vec<&str> = v[block].as_object().unwrap().keys().map(|k| k.as_str()).collect();
-            // Exactly the profile's fighter_fields — no zero-filled
-            // asurabld fields. (Parsed Value maps sort, so this is the
-            // alphabetical set; the serialized TEXT keeps profile order and
-            // is asserted separately below.) `x` is GLOBAL-SOURCED
-            // (p1_x/p2_x, §2.5) yet appears as a normal named field.
-            assert_eq!(keys, vec!["action_counter", "char_id", "health", "x"],
-                       "{block} carries only mapped fields");
+            // `x`/`y` are `via: "object_ptr"` and the synthetic state never
+            // sets up the object-pool pointer word, so they resolve to
+            // ABSENT this row — only the statically-addressed fields (plus
+            // whichever `via` fields DID resolve, none here) show up.
+            assert_eq!(keys, vec!["action_counter", "char_id", "health"],
+                       "{block} carries only the fields that resolved this row");
         }
-        assert!(v["block1"]["y"].is_null(), "unmapped field must be ABSENT");
+        assert!(v["block1"]["y"].is_null(), "unresolved object_ptr field must be ABSENT");
+        assert!(v["block1"]["x"].is_null(), "unresolved object_ptr field must be ABSENT, not 0");
         assert_eq!(v["block1"]["health"], 100);
         let gkeys: Vec<&str> = v["globals"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
         // Set membership (Value maps sort): gate globals + record_globals.
@@ -1054,24 +1247,37 @@ mod tests {
             "\"globals\":{\"screen_state\":0,\"round_over\":0,\
              \"p1_health_hud\":0,\"p2_health_hud\":0,\"hit_counter\":0}"
         ));
-        assert!(text.contains("\"block1\":{\"char_id\":7,\"health\":100,\"x\":0,\"action_counter\":0}"));
+        assert!(text.contains("\"block1\":{\"char_id\":7,\"health\":100,\"action_counter\":0}"));
         assert_eq!(v["controllable"], true);
-        assert_eq!(v["p1_block"], 1, "equal x (both unwritten) → block1 anchors as P1");
-        // Meta declares the smaller-x anchor (x is mapped, via globals) +
-        // mk2 provenance; the global-sourced field snapshots its names.
+        assert_eq!(v["p1_block"], 1, "anchor is scoped to fixed-slot x only → fixed_slots/block1=P1");
+        // Meta declares the fixed_slots anchor (the round anchor is scoped
+        // to fixed-slot fields, independent of `x` being live-resolvable)
+        // + mk2 provenance; `fighter_fields` now snapshots EVERY declared
+        // field, including the `via: "object_ptr"` ones (task B-fix) — the
+        // sidecar honestly says x/y are pointer-resolved and may be
+        // intermittently absent, even though this particular row dropped
+        // them.
         let meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path.with_extension("meta.json")).unwrap())
                 .unwrap();
         assert_eq!(meta["format"], "jsonl-v3");
-        assert_eq!(meta["anchor"], "smaller_x");
+        assert_eq!(meta["anchor"], "fixed_slots");
         assert_eq!(meta["family"], "mk2");
         assert_eq!(meta["port"], "arcade");
         assert_eq!(meta["profile_file"], "mk2.profile.json");
         let ff = meta["fighter_fields"].as_array().unwrap();
-        assert_eq!(ff.len(), 4);   // char_id, health, x, action_counter
-        assert_eq!(ff[2]["name"], "x");
-        assert!(ff[2]["off"].is_null(), "global-sourced field has no off");
-        assert_eq!(ff[2]["globals"]["block1"], "p1_x");
+        assert_eq!(ff.len(), 5); // char_id, health, x, y, action_counter
+        let x_entry = ff.iter().find(|f| f["name"] == "x").expect("x snapshot present");
+        assert_eq!(x_entry["via"], "object_ptr");
+        assert_eq!(x_entry["off"], "0x12");
+        let y_entry = ff.iter().find(|f| f["name"] == "y").expect("y snapshot present");
+        assert_eq!(y_entry["via"], "object_ptr");
+        assert_eq!(y_entry["signed"], true);
+        assert_eq!(
+            meta["pointer_resolved_fields"],
+            serde_json::json!(["x", "y"]),
+            "flat list mirrors the via-tagged entries, for a reader that doesn't want to parse fighter_fields"
+        );
         // Rounds sidecar: v3 marker, port, canonical ids (identity — no id_map).
         let rounds = std::fs::read_to_string(path.with_extension("rounds.jsonl")).unwrap();
         let r: serde_json::Value = serde_json::from_str(rounds.lines().next().unwrap()).unwrap();
@@ -1080,6 +1286,124 @@ mod tests {
         assert_eq!(r["block1_char"], 7);
         assert_eq!(r["block2_char"], 9);
         assert_eq!(r["p1_block"], 1);
+        cleanup(&path);
+    }
+
+    /// Sets up a live object-pool pointer + object entry for mk2 arcade's
+    /// block `b` (1 or 2) at synthetic pool address `obj`, so
+    /// `object_ptr_field` resolves: writes the pointer word at
+    /// `block-0xC`, the char-id cross-check byte at `obj+0x3E` (matching
+    /// `char_id`, which this also writes at the block's own offset 0), `x`
+    /// at `obj+0x12`, and `y` (signed) at `obj+0x16`.
+    fn install_mk2_object(ds: &mut DebugState, p: &GameProfile, block: u8, obj: u32, char_id: u8, x: u16, y: i16) {
+        let base = if block == 1 { p.block1() } else { p.block2() };
+        let coff = p.field_off("char_id").unwrap().0;
+        // Pointer word: obj = (raw - 0x01000000) >> 3  =>  raw = (obj << 3) + 0x01000000.
+        let raw_ptr: u32 = (obj << 3).wrapping_add(0x0100_0000);
+        assert!(ds.write_addr((base.wrapping_add_signed(-0xC)) as usize, 4, raw_ptr));
+        assert!(ds.write_addr((base + coff) as usize, 1, char_id as u32));
+        assert!(ds.write_addr((obj + 0x3E) as usize, 1, char_id as u32));
+        assert!(ds.write_addr((obj + 0x12) as usize, 2, x as u32));
+        assert!(ds.write_addr((obj + 0x16) as usize, 2, y as u16 as u32));
+    }
+
+    /// Task B-fix (docs/frames.md §5): a `via: "object_ptr"` field that
+    /// DOES resolve is written into the row like any other field, in profile
+    /// order, alongside the untouched fixed-slot fields — the fix for MK2's
+    /// dropped `x`/`y`.
+    #[test]
+    fn v3_object_ptr_field_records_when_it_resolves() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-mk2-objptr".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        install_mk2_object(&mut ds, &p, 1, 0x2000, 7, 222, -10);
+        install_mk2_object(&mut ds, &p, 2, 0x4000, 9, 400, -20);
+        assert!(crate::gate::eval_gate(&ds, &p));
+
+        let path = tmp("shadow_rec_objptr_ok");
+        {
+            let mut rec = FrameRecorder::create(&path, &p, "mk2", "fbneo", None).unwrap();
+            rec.record(&ds, 0, 0);
+            rec.finish();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        // Ordinary (fixed-slot) fields are unaffected: same values as ever.
+        assert_eq!(v["block1"]["char_id"], 7);
+        assert_eq!(v["block1"]["health"], 100);
+        assert_eq!(v["block2"]["char_id"], 9);
+        assert_eq!(v["block2"]["health"], 90);
+        // The live-resolved fields land in the row, per block, with the
+        // fighter's OWN object-pool values (never 0, never each other's).
+        assert_eq!(v["block1"]["x"], 222);
+        assert_eq!(v["block1"]["y"], -10);
+        assert_eq!(v["block2"]["x"], 400);
+        assert_eq!(v["block2"]["y"], -20);
+        // Profile field order preserved in the raw text: char_id, health,
+        // x, y, action_counter.
+        assert!(
+            text.contains("\"block1\":{\"char_id\":7,\"health\":100,\"x\":222,\"y\":-10,\"action_counter\":0}"),
+            "{text}"
+        );
+        cleanup(&path);
+    }
+
+    /// Task B-fix: a `via: "object_ptr"` field that does NOT resolve — here,
+    /// the char-id cross-check at `obj+0x3E` disagrees with the block's own
+    /// `char_id`, i.e. the pool slot went stale — is ABSENT for that row,
+    /// never a synthesized 0 (RECORDER_V3's absence law, extended to a value
+    /// with no fixed address at all). Ordinary fields in the SAME row are
+    /// unaffected.
+    #[test]
+    fn v3_object_ptr_field_absent_not_zero_when_stale() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-mk2-objptr-stale".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        // block1's object resolves cleanly; block2's pointer decodes to a
+        // valid address, but the cross-check byte is wrong (stale slot).
+        install_mk2_object(&mut ds, &p, 1, 0x2000, 7, 222, -10);
+        install_mk2_object(&mut ds, &p, 2, 0x4000, 9, 400, -20);
+        assert!(ds.write_addr(0x4000 + 0x3E, 1, 99)); // corrupt the cross-check for block2
+        assert!(crate::gate::eval_gate(&ds, &p));
+
+        let path = tmp("shadow_rec_objptr_stale");
+        {
+            let mut rec = FrameRecorder::create(&path, &p, "mk2", "fbneo", None).unwrap();
+            rec.record(&ds, 0, 0);
+            rec.finish();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        // block1 still resolves fine.
+        assert_eq!(v["block1"]["x"], 222);
+        assert_eq!(v["block1"]["y"], -10);
+        // block2's stale pointer must be ABSENT, never 0 or a stale value.
+        assert!(v["block2"]["x"].is_null(), "stale object_ptr field must be ABSENT, not 0");
+        assert!(v["block2"]["y"].is_null(), "stale object_ptr field must be ABSENT, not 0");
+        assert_ne!(v["block2"].get("x").map(|x| x.as_i64()), Some(Some(0)));
+        // Ordinary fields on the SAME row, SAME block, are unaffected.
+        assert_eq!(v["block2"]["char_id"], 9);
+        assert_eq!(v["block2"]["health"], 90);
+        let keys: Vec<&str> = v["block2"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, vec!["action_counter", "char_id", "health"], "x/y keys omitted entirely, not null-valued");
         cleanup(&path);
     }
 
@@ -1103,7 +1427,14 @@ mod tests {
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
         assert!(ds.write_addr((p.block1() + coff) as usize, 1, 9));
         assert!(ds.write_addr((p.block2() + coff) as usize, 1, 9));
-        // block1 left of block2 → p1 = block1, facing right; p2 faces left.
+        // These raw globals are DISPROVEN as a position source (task B-prof,
+        // docs/frames.md §5) and no fighter field references them anymore,
+        // so this recorder's `opp_right` has no x to read for mk2 and falls
+        // back to its "left fighter is P1" default (`record.rs`'s
+        // `opp_right` doc) — which happens to match the facing this test
+        // wants (block1 left/facing right, block2 right/facing left)
+        // WITHOUT these writes doing anything. Left in place as evidence
+        // that they are inert, not load-bearing, for this recorder version.
         assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
         assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
         assert!(crate::gate::eval_gate(&ds, &p));
@@ -1155,26 +1486,35 @@ mod tests {
     }
 
     /// The x-liveness sentinel (mk2.md: object-pool slots go stale between
-    /// boots): 300 controllable frames of byte-identical x warns once;
-    /// any variance proves liveness and suppresses it.
+    /// boots): 300 controllable frames of byte-identical x warns once; any
+    /// variance proves liveness and suppresses it.
+    ///
+    /// Task B-prof (docs/frames.md §5) moved mk2 arcade's `x` to
+    /// `via: "object_ptr"`, which this fixed-slot recorder can't record at
+    /// all yet (see `FrameRecorder::create`'s `recordable` doc) — so mk2 no
+    /// longer exercises this sentinel. It still applies to any
+    /// STATICALLY-addressed `x` (asurabld's off-based field, or a future
+    /// port's `globals` form), so this test retargets to the shipped
+    /// asurabld profile to keep the mechanism itself covered.
     #[test]
     fn frozen_x_warns_after_300_controllable_frames() {
-        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let p = crate::profile::init_for_tests();
         let mut ds = DebugState::new();
         assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
-            name: "wram-mk2-frozenx".into(),
-            addr: 0x0,
-            len: 0x10000,
+            name: "wram-frozenx".into(),
+            addr: 0x400000,
+            len: 0x7000,
             interval: 1,
             flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
         }));
-        let hoff = p.field_off("health").unwrap().0;
-        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
-        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
-        assert!(crate::gate::eval_gate(&ds, &p));
+        let off = |name: &str| p.field_off(name).unwrap().0;
+        assert!(ds.write_addr((p.block1() + off("health")) as usize, 1, 0xEF));
+        assert!(ds.write_addr((p.block2() + off("health")) as usize, 1, 0xEF));
+        assert!(ds.write_addr(p.global("round_timer").unwrap() as usize, 1, 0x90));
+        assert!(crate::gate::eval_gate(&ds, p));
 
         let path = tmp("shadow_rec_frozenx");
-        let mut rec = FrameRecorder::create(&path, &p, "mk2", "fbneo", None).unwrap();
+        let mut rec = FrameRecorder::create(&path, p, "test", "test", None).unwrap();
         for _ in 0..299 {
             rec.record(&ds, 0, 0);
         }
@@ -1184,9 +1524,9 @@ mod tests {
 
         // Variance before the threshold suppresses it for good.
         let path2 = tmp("shadow_rec_livex");
-        let mut rec2 = FrameRecorder::create(&path2, &p, "mk2", "fbneo", None).unwrap();
+        let mut rec2 = FrameRecorder::create(&path2, p, "test", "test", None).unwrap();
         rec2.record(&ds, 0, 0);
-        assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 7));
+        assert!(ds.write_addr((p.block1() + off("x")) as usize, 2, 7));
         for _ in 0..400 {
             rec2.record(&ds, 0, 0);
         }

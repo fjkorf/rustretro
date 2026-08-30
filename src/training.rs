@@ -125,6 +125,22 @@ struct XPair {
     p2: u32,
 }
 
+/// Where fighter field `x` (and, where mapped, `y`) comes from — resolved
+/// once per `resolve()` call (cheap; `resolve` itself is called fresh every
+/// tick, see [`Resolved`]'s doc).
+#[derive(Clone, Copy)]
+enum XSource {
+    /// A stable absolute address per block: the plain `off` form, or the
+    /// legacy per-block `globals` form.
+    Fixed(XPair),
+    /// Pointer-resolved (`via: "object_ptr"`, docs/frames.md §5): the object
+    /// pool slot moves every frame, so there is no address to cache — each
+    /// read dereferences fresh through [`GameProfile::object_ptr_field`] and
+    /// yields ABSENT (never 0) when the pointer is invalid or the char-id
+    /// cross-check fails THIS frame (RECORDER_V3 law).
+    ObjectPtr,
+}
+
 struct Reset {
     x: XPair,
     left: u16,
@@ -144,7 +160,7 @@ struct Resolved {
     credits: Option<(u32, u8, u8)>,
     reset: Option<Reset>,
     finish: Option<u32>,
-    x_pair: Option<XPair>,
+    x_pair: Option<XSource>,
     /// The family's guard POLICY (MACRO_ACTIONS §9.1) — how the dummy blocks.
     guard: Guard,
     /// The BlockPunish trigger source (MACRO_ACTIONS §6): per-block hitstun
@@ -221,9 +237,15 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
     let field = |name: &str| p.field_off(name).map(|(off, _)| off);
     let e = &p.port.enforcement;
 
-    let x_pair = field("x")
-        .map(|off| XPair { p1: p.block1() + off, p2: p.block2() + off })
-        .or_else(|| Some(XPair { p1: g("p1_x")?, p2: g("p2_x")? }));
+    let x_pair = if p.field_is_object_ptr("x") {
+        // Pointer-resolved (MK2 arcade, docs/frames.md §5): no fixed address
+        // — every read dereferences the object pool fresh (see `read_via_x`).
+        Some(XSource::ObjectPtr)
+    } else {
+        field("x")
+            .map(|off| XSource::Fixed(XPair { p1: p.block1() + off, p2: p.block2() + off }))
+            .or_else(|| Some(XSource::Fixed(XPair { p1: g("p1_x")?, p2: g("p2_x")? })))
+    };
 
     let refill = field("health").map(|off| {
         let side = |base: u32, hud: &str| {
@@ -244,7 +266,11 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
     });
 
     let reset = (|| {
-        let x = x_pair?;
+        // Position reset needs a WRITABLE fixed address — a pointer-resolved
+        // x (docs/frames.md §5) has none yet (a follow-up would need to
+        // dereference-then-write through the same live decode), so it
+        // declines here exactly like an unmapped field.
+        let XSource::Fixed(x) = x_pair? else { return None };
         // Explicit positions required — no silent asurabld-shaped defaults
         // teleporting an unmapped game to nonsense coordinates.
         let left = *p.port.positions.get("round_start_x_left")? as u16;
@@ -372,6 +398,42 @@ fn wr16(ds: &mut DebugState, addr: u32, v: u16, little: bool) {
     let _ = ds.write_addr(addr as usize, 2, v as u32);
 }
 
+/// Endian-correct a raw `read_addr` value of `size` bytes (1/2/4) — `rd8`/
+/// `rd16` inlined this for their own fixed widths; `object_ptr_field`'s
+/// reader closure needs it generically (the pointer word is 4 bytes).
+fn endian_fix(v: u32, size: u8, little: bool) -> u32 {
+    if little {
+        return v;
+    }
+    match size {
+        2 => (v as u16).swap_bytes() as u32,
+        4 => v.swap_bytes(),
+        _ => v,
+    }
+}
+
+/// Live-read a pointer-resolved fighter field (`x`/`y`, docs/frames.md §5)
+/// for one block. `None` — ABSENT, never 0 — when the object pointer is
+/// invalid or the char-id cross-check fails THIS frame (RECORDER_V3 law).
+fn read_object_ptr(ds: &DebugState, p: &GameProfile, little: bool, block: u8, name: &str) -> Option<i32> {
+    p.object_ptr_field(block, name, |addr, size| {
+        endian_fix(ds.read_addr(addr as usize, size as usize).unwrap_or(0), size, little)
+    })
+    .map(|v| v as i32)
+}
+
+/// Live-read fighter field `x` for `block`, honoring the resolved source
+/// (fixed address, or the pointer-resolved form).
+fn read_via_x(ds: &DebugState, p: &GameProfile, little: bool, xs: XSource, block: u8) -> Option<i32> {
+    match xs {
+        XSource::Fixed(xp) => {
+            let addr = if block == 1 { xp.p1 } else { xp.p2 };
+            Some(rd16(ds, addr, little) as i32)
+        }
+        XSource::ObjectPtr => read_object_ptr(ds, p, little, block, "x"),
+    }
+}
+
 /// Whether the loaded profile supports training at all (has an in-fight
 /// gate). Per-feature detail comes from [`features`].
 pub fn available() -> bool {
@@ -442,12 +504,22 @@ fn poll_contact(ds: &mut DebugState, r: &Resolved, frame: u64) -> (bool, u8) {
 /// guard opportunity (style-dependent), whether the MODE takes it, and what to
 /// hold. Shared by `DummyMode::Block` and `DummyMode::BlockPunish` — one
 /// policy, so both dummies behave identically about spacing.
-fn guard_frame(ds: &mut DebugState, r: &Resolved, frame: u64, contact_changed: bool) -> GuardOut {
-    // Live geometry (both styles want `opp_right` for macro playback).
-    let geom = r.x_pair.map(|xp| {
-        let me = rd16(ds, xp.p2, r.little) as i32;
-        let opp = rd16(ds, xp.p1, r.little) as i32;
-        (me, opp)
+fn guard_frame(
+    ds: &mut DebugState,
+    p: &GameProfile,
+    r: &Resolved,
+    frame: u64,
+    contact_changed: bool,
+) -> GuardOut {
+    // Live geometry (both styles want `opp_right` for macro playback). A
+    // pointer-resolved x (docs/frames.md §5) can transiently read ABSENT
+    // (invalid pointer / stale char-id this exact frame) — `None` here, same
+    // as an unmapped x, never a synthesized 0.
+    let opp_block = if DUMMY_BLOCK == 1 { 2 } else { 1 };
+    let geom = r.x_pair.and_then(|xs| {
+        let me = read_via_x(ds, p, r.little, xs, DUMMY_BLOCK)?;
+        let opp = read_via_x(ds, p, r.little, xs, opp_block)?;
+        Some((me, opp))
     });
     let opp_right = geom.map(|(me, opp)| opp > me).unwrap_or(false);
 
@@ -458,30 +530,36 @@ fn guard_frame(ds: &mut DebugState, r: &Resolved, frame: u64, contact_changed: b
         // behaviour, unchanged).
         Guard::Button(_) => (true, None),
         Guard::Inert => (false, None),
-        Guard::BackHold { range, commit, tail } => {
-            let (me, opp) = geom.expect("BackHold only resolves with an x pair");
-            // Away = the direction that increases the gap. NEVER Down:
-            // down-back blocks nothing on asurabld (0/4, reproduced) — the
-            // guard hold is PURE standing back.
-            let away = Some(if me >= opp { BIT_RIGHT } else { BIT_LEFT });
-            let live = match commit {
-                Commit::Field(b1, b2) => {
-                    rd8(ds, if DUMMY_BLOCK == 1 { *b2 } else { *b1 }) != 0
+        Guard::BackHold { range, commit, tail } => match geom {
+            // A fixed-address x always resolves once `x_pair` is Some — this
+            // is only reachable for a pointer-resolved x going transiently
+            // stale (no back_hold family ships one today; MK2 is `button`
+            // style). No window this frame, rather than a crash.
+            None => (false, None),
+            Some((me, opp)) => {
+                // Away = the direction that increases the gap. NEVER Down:
+                // down-back blocks nothing on asurabld (0/4, reproduced) —
+                // the guard hold is PURE standing back.
+                let away = Some(if me >= opp { BIT_RIGHT } else { BIT_LEFT });
+                let live = match commit {
+                    Commit::Field(b1, b2) => {
+                        rd8(ds, if DUMMY_BLOCK == 1 { *b2 } else { *b1 }) != 0
+                    }
+                    Commit::InputMask(masks) => {
+                        let mask = crate::record::pack_mask(&ds.input_state);
+                        masks.iter().any(|m| mask & m == *m)
+                    }
+                };
+                if live {
+                    ds.training.guard_commit_until = frame + tail;
                 }
-                Commit::InputMask(masks) => {
-                    let mask = crate::record::pack_mask(&ds.input_state);
-                    masks.iter().any(|m| mask & m == *m)
-                }
-            };
-            if live {
-                ds.training.guard_commit_until = frame + tail;
+                let committed = live || frame < ds.training.guard_commit_until;
+                // The distance gate is what keeps the dummy from reacting to
+                // far whiffs (and from drifting on them).
+                let in_range = range.is_none_or(|rg| (me - opp).abs() <= rg);
+                (committed && in_range, away)
             }
-            let committed = live || frame < ds.training.guard_commit_until;
-            // The distance gate is what keeps the dummy from reacting to far
-            // whiffs (and from drifting on them).
-            let in_range = range.is_none_or(|rg| (me - opp).abs() <= rg);
-            (committed && in_range, away)
-        }
+        },
     };
 
     // ── (b) String bookkeeping for the modes that need a hit signal ───────
@@ -600,10 +678,10 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
                     [false; 12]
                 } else {
                     // Same reactive policy as in-gate (x reads are ungated).
-                    guard_frame(ds, &r, frame, false).bits
+                    guard_frame(ds, p, &r, frame, false).bits
                 });
             } else {
-                let opp_right = guard_frame(ds, &r, frame, false).opp_right;
+                let opp_right = guard_frame(ds, p, &r, frame, false).opp_right;
                 if let Some(ex) = ds.training.punish_exec.as_mut() {
                     bits = ex.next(opp_right);
                 }
@@ -698,14 +776,14 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
         // (MK), hold-away for back-hold families (see `guard_hold`).
         DummyMode::Block => {
             let (changed, _) = poll_contact(ds, &r, frame);
-            Some(guard_frame(ds, &r, frame, changed).bits)
+            Some(guard_frame(ds, p, &r, frame, changed).bits)
         }
         // Guard, and on each trigger sample the weighted punish pool
         // (MACRO_ACTIONS §6/§9.3). No trigger mapped → plain guarding (the
         // panel greys the mode with the reason).
         DummyMode::BlockPunish => {
             let contact = poll_contact(ds, &r, frame);
-            let g = guard_frame(ds, &r, frame, contact.0);
+            let g = guard_frame(ds, p, &r, frame, contact.0);
             Some(block_punish(ds, frame, p, &r, g, contact))
         }
     };
@@ -1008,12 +1086,15 @@ mod tests {
 
     #[test]
     fn mk2_degrades_per_feature() {
-        // MK2's map is partial by honesty (mk2.md): gate + health + world X
-        // exist; timer store, credits (CMOS), Y, and round_state don't.
+        // MK2's map is partial by honesty (mk2.md): gate + health + world X/Y
+        // exist (X/Y now pointer-resolved, docs/frames.md §5); timer store,
+        // credits (CMOS), and round_state don't. `positions` (round-start
+        // teleport coordinates) is also unmapped, so position_reset stays
+        // declined regardless of x/y being resolvable.
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
         let f = features_of(&p).expect("mk2 must be training-available (has a gate)");
         assert!(f.refill, "health field + HUD pair are mapped");
-        assert!(f.block_dummy, "p1_x/p2_x globals are mapped");
+        assert!(f.block_dummy, "MK is button-block: the Block chord is mapped");
         assert!(f.block_punish, "hitstun_sources (HUD health pair) is mapped");
         assert!(!f.timer_hold && !f.credits && !f.position_reset && !f.finish_round);
         assert_eq!(
@@ -1044,6 +1125,19 @@ mod tests {
         assert!(crate::profile::init_for_tests().resolved_pins().is_empty());
     }
 
+    /// Stage a synthetic MK2-shaped object pool entry for `block`'s pointer
+    /// (docs/frames.md §5): writes the raw pointer word at `base - 0xC`, the
+    /// block's own `char_id`, the cross-check byte at `obj + 0x3E` (made to
+    /// match), and `x` at `obj + 0x12` — everything `read_object_ptr` needs
+    /// to resolve live through the real decode, not a hardcoded fallback.
+    fn stage_object_ptr(ds: &mut DebugState, base: u32, char_id: u8, obj: u32, x: u16) {
+        let raw_ptr = 0x0100_0000u32 + (obj << 3);
+        assert!(ds.write_addr(base.wrapping_sub(0xC) as usize, 4, raw_ptr));
+        assert!(ds.write_addr(base as usize, 1, char_id as u32));
+        assert!(ds.write_addr((obj + 0x3E) as usize, 1, char_id as u32));
+        assert!(ds.write_addr((obj + 0x12) as usize, 2, x as u32));
+    }
+
     /// The full §6 loop against the mk2 profile: arm on quiet, trigger on a
     /// hit_counter change while guarding, play the char-aware slide through
     /// MacroExec on the dummy port, return to the guard chord, and stay in
@@ -1063,12 +1157,14 @@ mod tests {
         // is Reptile; its contact signal is the block2 hitstun source
         // (p2_health_hud — the HUD accumulator that moves when P2 is struck).
         let hoff = p.field_off("health").unwrap().0;
-        let coff = p.field_off("char_id").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
-        assert!(ds.write_addr((p.block2() + coff) as usize, 1, 9)); // reptile
-        assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
-        assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
+        // x/y are pointer-resolved (docs/frames.md §5) — stage a real object
+        // pool entry per block so `opp_right` (used for the slide's "back"
+        // direction) resolves through the actual decode, not a fallback:
+        // block1 at x=100 (left), block2/dummy (Reptile) at x=200 (right).
+        stage_object_ptr(&mut ds, p.block1(), 0, 0x7000, 100);
+        stage_object_ptr(&mut ds, p.block2(), 9, 0x7100, 200);
         // The dummy is block2 (larger x); mk2 ships no contact_signal, so
         // the trigger falls back to hitstun_sources — block2's HUD health.
         // (A blocking MK2 fighter's struct is otherwise frozen and blocked
