@@ -486,11 +486,13 @@ impl Frontend {
         }
     }
 
-    /// The liveness probe (mission task 2): empirically determine whether
-    /// controller ports 0/1 each drive a fighter in the state just saved to
-    /// `path`. Degrades honestly to `None` (unknown) — never guesses — when
-    /// a recording is active, the gate is closed, or the profile maps no
-    /// `x` field for a block (see [`liveness_precheck`]).
+    /// The liveness probe (mission task 2, extended by task B-fix for
+    /// `via: "object_ptr"` ports): empirically determine whether controller
+    /// ports 0/1 each drive a fighter in the state just saved to `path`.
+    /// Degrades honestly to `None` (unknown) — never guesses — when a
+    /// recording is active, the gate is closed, or the profile can't resolve
+    /// `x` for a block AT ALL, fixed or pointer-resolved (see
+    /// [`liveness_precheck`], [`x_is_readable`]).
     ///
     /// Every side effect is undone before returning: pause state, the
     /// training enforcer's `enabled` flag, and the shadow bot's `enabled`
@@ -504,9 +506,9 @@ impl Frontend {
         profile: &crate::profile::GameProfile,
         gate_open: bool,
     ) -> InputsLive {
-        let x1 = profile.field_addr(1, "x");
-        let x2 = profile.field_addr(2, "x");
-        if let Some(skip) = liveness_precheck(self.recorder.is_some(), gate_open, x1, x2) {
+        let has_x1 = x_is_readable(profile, 1);
+        let has_x2 = x_is_readable(profile, 2);
+        if let Some(skip) = liveness_precheck(self.recorder.is_some(), gate_open, has_x1, has_x2) {
             return skip;
         }
 
@@ -530,8 +532,10 @@ impl Frontend {
             sh.enabled = false;
         }
 
-        let p0 = x1.map(|(addr, size)| self.probe_one_port(0, addr, size));
-        let p1 = x2.map(|(addr, size)| self.probe_one_port(1, addr, size));
+        // Block 1 ↔ port 0, block 2 ↔ port 1 (the 2-human-rig convention
+        // this probe assumes — same pairing the round anchor uses).
+        let p0 = has_x1.then(|| self.probe_one_port(0, profile, 1)).flatten();
+        let p1 = has_x2.then(|| self.probe_one_port(1, profile, 2)).flatten();
 
         // Leave no trace: reload the exact bytes just saved, clear any input
         // still "held" from the probe, and restore every flag we touched.
@@ -552,35 +556,117 @@ impl Frontend {
     }
 
     /// Drive `port` (0 or 1) with an alternating movement probe and report
-    /// whether the fighter's `x` field (at `addr`/`size`) shows real
-    /// variation across the window, rather than a single before/after read.
+    /// whether `block`'s fighter (1 or 2 — the block this port is assumed to
+    /// drive) shows real motion beyond what the SAME window shows with no
+    /// input at all (see [`judge_burst_motion_differential`]) — never a
+    /// single before/after read, a symmetric round-trip, or an absolute
+    /// "did it move" test.
     ///
-    /// Longer and more careful than the naive version on purpose: a live-RE
+    /// Longer and more careful than the naive version on purpose. A live-RE
     /// session on this exact field (mk2.md, "Input-liveness verification")
     /// found that a short before/after window is unreliable two ways — (a)
     /// it can land entirely inside hitstun/knockdown, where `x` is
     /// genuinely frozen despite live, landing input, and (b) some ports'
     /// `x` lives in a dynamic object-pool slot that can itself go stale
-    /// across boots. The documented fix is what this implements: force both
-    /// fighters' health up every frame (removes the KO/hitstun confound),
-    /// hold alternating left/right for several seconds, and judge by the
-    /// SPREAD across many samples — "a genuinely live P1 traces a real
-    /// path... where a truly dead/wrong-slot address stays bit-for-bit
-    /// constant across the whole window".
-    fn probe_one_port(&mut self, port: u8, addr: u32, size: u8) -> bool {
-        const TOTAL_FRAMES: u32 = 180; // ~3s emulated at 60fps
+    /// across boots — resolved live here through `GameProfile::object_ptr_field`
+    /// (docs/frames.md §5) exactly like the recorder and training dummy, so
+    /// a stale/invalid pointer on a given sampled frame just yields a
+    /// missing sample rather than a wrong one.
+    ///
+    /// A THIRD failure mode, found live while verifying task B-fix against
+    /// `shadow/arenas/mk2/reptile-vs-reptile.state` (a documented 1P-vs-CPU
+    /// rig, mk2.md "Arena recapture"): an absolute "did it move while I held
+    /// a direction" test reports the CPU-driven block's port as live too,
+    /// because the CPU's OWN autonomous movement satisfies the same
+    /// threshold regardless of injected input — exactly the docs/frames.md
+    /// §4.2 warning about absolute observables during "any scripted motion".
+    /// The fix mirrors that section's mandatory differential form: snapshot
+    /// the exact starting state, measure a CONTROL run with NO input on
+    /// either port (`run_liveness_window` with `inject_port: None`), restore
+    /// the identical snapshot, then measure the PROBE run with the
+    /// alternating hold — only a margin the control run didn't already show
+    /// counts as live, which cancels out autonomous/AI motion the same way
+    /// a differential probe cancels pushback and hitstop.
+    ///
+    /// Within each run, bursts are judged per-direction from their own
+    /// start→latest delta — walk speeds are measured ASYMMETRIC on MK2
+    /// (+12px/6f forward vs +5px/6f backward, docs/frames.md §5), so a
+    /// shared magnitude after a round trip would produce false negatives on
+    /// the slower direction.
+    ///
+    /// Returns `None` — honestly unknown, never a guessed `false` — when not
+    /// one sample resolved in the PROBE run (e.g. an object-pointer port
+    /// whose pointer never validated).
+    fn probe_one_port(&mut self, port: u8, profile: &crate::profile::GameProfile, block: u8) -> Option<bool> {
         const BURST_FRAMES: u32 = 20; // direction flip cadence — avoids a wall/corner false-negative
-        const SAMPLE_EVERY: u32 = 6;
-        let threshold: i64 = if size >= 2 { 8 } else { 4 };
 
-        let profile = crate::profile::current();
+        let little = profile.port.memory.endianness == "little";
+        let is_obj = profile.field_is_object_ptr("x");
+        let fixed = (!is_obj).then(|| profile.field_addr(block, "x")).flatten();
+        // Same size-scaled floor as the original single-shot spread check
+        // (8 for a 2-byte field, 4 for 1 byte) — now applied per burst, and
+        // to the PROBE-minus-CONTROL excess rather than a raw delta.
+        let field_size: u8 = if is_obj {
+            profile
+                .port
+                .memory
+                .fighter_fields
+                .iter()
+                .find(|f| f.name == "x")
+                .map(|f| f.size)
+                .unwrap_or(2)
+        } else {
+            fixed.map(|(_, s)| s).unwrap_or(2)
+        };
+        let delta_threshold: i64 = if field_size >= 2 { 8 } else { 4 };
+
+        // Snapshot → CONTROL (no input anywhere) → restore → PROBE (the
+        // alternating hold on `port`) → restore. Both runs see an IDENTICAL
+        // starting state, so any difference between them is attributable to
+        // the injected input, not autonomous CPU behavior (which a
+        // deterministic core reproduces identically from the same bytes).
+        let snapshot = self.core.serialize();
+        let control = self.run_liveness_window(profile, block, is_obj, fixed, little, BURST_FRAMES, None);
+        if let Some(bytes) = &snapshot {
+            self.core.unserialize(bytes);
+            self.refresh_bus_windows(Some(0));
+        }
+        let probe =
+            self.run_liveness_window(profile, block, is_obj, fixed, little, BURST_FRAMES, Some(port));
+        if let Some(bytes) = &snapshot {
+            self.core.unserialize(bytes);
+            self.refresh_bus_windows(Some(0));
+        }
+
+        judge_burst_motion_differential(&probe, &control, BURST_FRAMES as usize, delta_threshold)
+    }
+
+    /// Runs one 180-frame liveness-probe window, forcing both fighters'
+    /// health up every frame (removes the KO/hitstun confound) and, when
+    /// `inject_port` is `Some`, holding the alternating left/right burst on
+    /// that controller port. `inject_port: None` is the CONTROL pass (no
+    /// input on either port) — same burst/direction bookkeeping as a probe
+    /// pass so the two line up 1:1 for [`judge_burst_motion_differential`].
+    /// Samples `block`'s `x` every frame, live-resolving through
+    /// `GameProfile::object_ptr_field` when `is_obj` (docs/frames.md §5).
+    fn run_liveness_window(
+        &mut self,
+        profile: &crate::profile::GameProfile,
+        block: u8,
+        is_obj: bool,
+        fixed: Option<(u32, u8)>,
+        little: bool,
+        burst_frames: u32,
+        inject_port: Option<u8>,
+    ) -> Vec<(bool, Option<i64>)> {
+        const TOTAL_FRAMES: u32 = 180; // ~3s emulated at 60fps
         let health_max = profile.port.enforcement.health_max;
         let h1 = profile.field_addr(1, "health");
         let h2 = profile.field_addr(2, "health");
         let right = crate::profile::retro_button_bit("right");
         let left = crate::profile::retro_button_bit("left");
 
-        let mut samples: Vec<u32> = Vec::new();
+        let mut samples: Vec<(bool, Option<i64>)> = Vec::with_capacity(TOTAL_FRAMES as usize);
         for frame in 0..TOTAL_FRAMES {
             if let Ok(mut ds) = self.debug_state.lock() {
                 if let Some((a, s)) = h1 {
@@ -590,32 +676,30 @@ impl Frontend {
                     ds.write_addr(a as usize, s as usize, health_max as u32);
                 }
             }
-            let going_right = (frame / BURST_FRAMES) % 2 == 0;
-            let mut bits = [false; 12];
-            if let Some(bit) = if going_right { right } else { left } {
-                bits[bit as usize] = true;
-            }
-            if port == 0 {
-                self.set_input(bits);
-            } else {
-                self.set_input2(bits);
-            }
-            let _ = self.run_frame();
-            if frame % SAMPLE_EVERY == 0 {
-                if let Ok(ds) = self.debug_state.lock() {
-                    if let Some(v) = ds.read_addr(addr as usize, size as usize) {
-                        samples.push(v);
-                    }
+            let going_right = (frame / burst_frames) % 2 == 0;
+            if let Some(port) = inject_port {
+                let mut bits = [false; 12];
+                if let Some(bit) = if going_right { right } else { left } {
+                    bits[bit as usize] = true;
+                }
+                if port == 0 {
+                    self.set_input(bits);
+                } else {
+                    self.set_input2(bits);
                 }
             }
-        }
+            let _ = self.run_frame();
 
-        if samples.len() < 2 {
-            return false;
+            let sample: Option<i64> = match self.debug_state.lock() {
+                Ok(ds) if is_obj => profile.object_ptr_field(block, "x", |addr, size| {
+                    endian_fix(ds.read_addr(addr as usize, size as usize).unwrap_or(0), size, little)
+                }),
+                Ok(ds) => fixed.and_then(|(a, s)| ds.read_addr(a as usize, s as usize)).map(|v| v as i64),
+                Err(_) => None,
+            };
+            samples.push((going_right, sample));
         }
-        let min = *samples.iter().min().unwrap();
-        let max = *samples.iter().max().unwrap();
-        (max as i64 - min as i64) >= threshold
+        samples
     }
 
     /// Drain a queued save/load-state request (hotkeys / --load-state / MCP).
@@ -1937,20 +2021,139 @@ fn is_arena_path(path: &Path) -> bool {
 
 /// The three honest-degradation reasons from mission task 2, factored out as
 /// a pure function so they're testable without a live core: a recording in
-/// progress, a closed gate, or a profile that maps no `x` field for either
-/// block. Returns `Some(InputsLive::default())` (both `None`) when the probe
-/// must be skipped, or `None` when it's safe to proceed — the caller then
-/// probes whichever of `x1`/`x2` individually resolved.
+/// progress, a closed gate, or a profile that can't resolve `x` for EITHER
+/// block, by any means (see [`x_is_readable`] — task B-fix extended this
+/// from "has a fixed address" to "fixed OR pointer-resolved"). Returns
+/// `Some(InputsLive::default())` (both `None`) when the probe must be
+/// skipped, or `None` when it's safe to proceed — the caller then probes
+/// whichever of `x1_mapped`/`x2_mapped` individually resolved.
 fn liveness_precheck(
     recording_active: bool,
     gate_open: bool,
-    x1: Option<(u32, u8)>,
-    x2: Option<(u32, u8)>,
+    x1_mapped: bool,
+    x2_mapped: bool,
 ) -> Option<InputsLive> {
-    if recording_active || !gate_open || (x1.is_none() && x2.is_none()) {
+    if recording_active || !gate_open || (!x1_mapped && !x2_mapped) {
         return Some(InputsLive::default());
     }
     None
+}
+
+/// Whether fighter field `x` is resolvable for `block` (1 or 2) under the
+/// loaded profile — statically addressed (`field_addr`) OR pointer-resolved
+/// (`via: "object_ptr"`, docs/frames.md §5). Task B-fix: before this, the
+/// arena probe asked `field_addr` alone, which correctly returns `None` for
+/// an object-pointer field (there IS no fixed address) but made the whole
+/// probe look permanently unmapped on MK2 arcade — `liveness_precheck` then
+/// always skipped to `{p0:null,p1:null}`, honest but useless. A pointer-
+/// resolved field can still fail to resolve on any GIVEN frame (that's
+/// [`judge_burst_motion_differential`]'s job to tell apart from "no
+/// motion"), but it is readable in the sense this precheck cares about.
+fn x_is_readable(profile: &crate::profile::GameProfile, block: u8) -> bool {
+    profile.field_is_object_ptr("x") || profile.field_addr(block, "x").is_some()
+}
+
+/// Endian-correct a raw multi-byte read of `size` bytes (1/2/4) for the
+/// `via: "object_ptr"` live-read path (docs/frames.md §5) — the pointer word
+/// is 4 bytes, the resolved field 1 or 2. Mirrors `training.rs`'s and
+/// `record.rs`'s private `endian_fix` (duplicated rather than shared, same
+/// rationale as those files' existing `rd8`/`rd16` duplication).
+fn endian_fix(v: u32, size: u8, little: bool) -> u32 {
+    if little {
+        return v;
+    }
+    match size {
+        2 => (v as u16).swap_bytes() as u32,
+        4 => v.swap_bytes(),
+        _ => v,
+    }
+}
+
+/// Per-burst-direction, DIFFERENTIAL motion judgement (docs/frames.md §4.2's
+/// mandatory differential form, applied to the arena probe): `probe` and
+/// `control` are each one `(going_right, x)` per emulated frame, in the SAME
+/// order and burst cadence `run_liveness_window` drove from an IDENTICAL
+/// starting snapshot — `control` with no input on either port, `probe` with
+/// the alternating hold. Direction alternates every `burst_frames` samples.
+///
+/// Within EACH run, a burst's running delta is `latest − its own first
+/// resolved sample`, sign-flipped for a leftward burst, so a positive value
+/// always means "moved the way it was told to" — this is what makes MK2's
+/// measured ASYMMETRIC walk speeds (+12px/6f forward vs +5px/6f backward) a
+/// non-issue; a "hold, undo, expect to return to start" design would wash
+/// out the slower direction, but judging each burst's own start→latest delta
+/// never does.
+///
+/// A burst counts as LIVE only when the probe run's delta exceeds the
+/// control run's delta AT THE SAME instant by `threshold` — never the
+/// probe's raw delta alone. This is what tells a genuinely human-driven port
+/// apart from a CPU-driven one: a CPU-controlled block can move on its own
+/// initiative during the window (live-verified against
+/// `shadow/arenas/mk2/reptile-vs-reptile.state`, a documented 1P-vs-CPU rig
+/// — its CPU-driven port satisfied a raw/absolute delta test regardless of
+/// injected input), and since a deterministic core replays that same
+/// autonomous path identically whether or not the OTHER run holds a
+/// direction, the control run cancels it out exactly the way a differential
+/// probe cancels pushback and hitstop (docs/frames.md §1.2/§4.2).
+///
+/// Returns `None` — honestly unknown, never a guessed `false` — when not a
+/// single sample resolved in the PROBE run (e.g. an object-pointer port
+/// whose pointer never validated during the whole window). A control run
+/// that never resolves a given burst is treated as "no observed autonomous
+/// motion" (delta 0) for that burst — the probe's own delta then decides it,
+/// same as the non-differential case.
+fn judge_burst_motion_differential(
+    probe: &[(bool, Option<i64>)],
+    control: &[(bool, Option<i64>)],
+    burst_frames: usize,
+    threshold: i64,
+) -> Option<bool> {
+    let burst_frames = burst_frames.max(1);
+    let mut any_probe_sample = false;
+    let mut any_live = false;
+    let mut cur_burst: Option<usize> = None;
+    let mut probe_base: Option<i64> = None;
+    let mut control_base: Option<i64> = None;
+    let n = probe.len().min(control.len());
+    for i in 0..n {
+        let (going_right, px) = probe[i];
+        let (_, cx) = control[i];
+        let burst = i / burst_frames;
+        if Some(burst) != cur_burst {
+            cur_burst = Some(burst);
+            probe_base = None;
+            control_base = None;
+        }
+        let probe_delta = match px {
+            None => None,
+            Some(v) => {
+                any_probe_sample = true;
+                match probe_base {
+                    None => {
+                        probe_base = Some(v);
+                        None
+                    }
+                    Some(base) => Some(if going_right { v - base } else { base - v }),
+                }
+            }
+        };
+        let control_delta = match cx {
+            None => None,
+            Some(v) => match control_base {
+                None => {
+                    control_base = Some(v);
+                    None
+                }
+                Some(base) => Some(if going_right { v - base } else { base - v }),
+            },
+        };
+        if let Some(pd) = probe_delta {
+            if pd - control_delta.unwrap_or(0) >= threshold {
+                any_live = true;
+            }
+        }
+    }
+    any_probe_sample.then_some(any_live)
 }
 
 /// Read `<state>.meta.json` for a saved arena, if one exists. Returns `None`
@@ -2101,7 +2304,10 @@ mod sha1_tests {
 
 #[cfg(test)]
 mod arena_sidecar_tests {
-    use super::{is_arena_path, liveness_precheck, load_arena_meta, ArenaMeta, InputsLive};
+    use super::{
+        is_arena_path, judge_burst_motion_differential, liveness_precheck, load_arena_meta, x_is_readable,
+        ArenaMeta, InputsLive,
+    };
     use std::path::Path;
 
     #[test]
@@ -2173,30 +2379,144 @@ mod arena_sidecar_tests {
     /// skip the probe and report BOTH ports unknown — never a guess.
     #[test]
     fn liveness_precheck_degrades_to_null_when_recording_active() {
-        assert_eq!(
-            liveness_precheck(true, true, Some((0x1000, 2)), Some((0x2000, 2))),
-            Some(InputsLive::default())
-        );
+        assert_eq!(liveness_precheck(true, true, true, true), Some(InputsLive::default()));
     }
 
     #[test]
     fn liveness_precheck_degrades_to_null_when_gate_closed() {
-        assert_eq!(
-            liveness_precheck(false, false, Some((0x1000, 2)), Some((0x2000, 2))),
-            Some(InputsLive::default())
-        );
+        assert_eq!(liveness_precheck(false, false, true, true), Some(InputsLive::default()));
     }
 
     #[test]
     fn liveness_precheck_degrades_to_null_when_no_x_mapped_for_either_block() {
-        assert_eq!(liveness_precheck(false, true, None, None), Some(InputsLive::default()));
+        assert_eq!(liveness_precheck(false, true, false, false), Some(InputsLive::default()));
     }
 
     #[test]
     fn liveness_precheck_proceeds_when_open_recorder_idle_and_one_block_maps_x() {
         // Only block1 maps `x` (e.g. a port that hasn't mapped block2 yet) —
         // the precheck still says "proceed"; the per-port `None` for the
-        // unmapped block happens downstream (`x2.map(...)` on `None`).
-        assert_eq!(liveness_precheck(false, true, Some((0x1000, 2)), None), None);
+        // unmapped block happens downstream.
+        assert_eq!(liveness_precheck(false, true, true, false), None);
+    }
+
+    /// Task B-fix (docs/frames.md §5): `x` mapped via `via: "object_ptr"`
+    /// (no fixed address at all) must still count as "readable" for the
+    /// precheck — this is the actual fix for MK2 arcade's arena probe
+    /// having gone from wrong (`false`/`false`) to useless (`null`/`null`)
+    /// when `x` moved to the pointer-resolved schema.
+    #[test]
+    fn x_is_readable_true_for_object_ptr_field_with_no_fixed_address() {
+        let p = crate::profile::GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        assert!(p.field_is_object_ptr("x"), "mk2 arcade's x is via: object_ptr");
+        assert_eq!(p.field_addr(1, "x"), None, "…and therefore has no fixed address");
+        assert!(x_is_readable(&p, 1), "must still count as readable");
+        assert!(x_is_readable(&p, 2));
+    }
+
+    #[test]
+    fn x_is_readable_true_for_a_plain_off_field() {
+        let p = crate::profile::init_for_tests(); // asurabld: x is a plain `off` field
+        assert!(x_is_readable(&p, 1));
+        assert!(x_is_readable(&p, 2));
+    }
+
+    #[test]
+    fn x_is_readable_false_when_the_profile_maps_no_x_at_all() {
+        let p = crate::profile::GameProfile::load(Path::new("library/sf2ce")).expect("sf2ce profile loads");
+        assert!(!x_is_readable(&p, 1));
+        assert!(!x_is_readable(&p, 2));
+    }
+
+    /// A frozen control (no autonomous motion) means the probe's OWN raw
+    /// delta decides it — this is the differential judge degenerating to the
+    /// simple case, and it must detect BOTH directions independently even
+    /// though MK2's measured walk speeds are asymmetric (+12px/6f forward vs
+    /// +5px/6f backward): a design shaped as "hold, undo, expect to return
+    /// to start" would wash the slower direction out; judging each burst's
+    /// own start→latest delta never does.
+    #[test]
+    fn judge_burst_motion_differential_detects_both_asymmetric_directions_over_a_still_control() {
+        // Burst 0 (right, 6 frames): +10 over the burst (measured forward rate).
+        let mut probe: Vec<(bool, Option<i64>)> = (0..6).map(|i| (true, Some(100 + i * 2))).collect();
+        // Burst 1 (left, 6 frames): +5 over the burst (measured backward rate) —
+        // position DECREASES in world terms, x values fall.
+        probe.extend((0..6).map(|i| (false, Some(110 - i))));
+        let control: Vec<(bool, Option<i64>)> = probe.iter().map(|(r, _)| (*r, Some(0))).collect();
+        assert_eq!(judge_burst_motion_differential(&probe, &control, 6, 4), Some(true));
+    }
+
+    #[test]
+    fn judge_burst_motion_differential_asymmetric_backward_alone_is_not_washed_out() {
+        // Only the SLOWER (backward) direction moves; forward is frozen.
+        // A "return to start" style check would see net-zero across the
+        // pair and call it dead; the per-burst differential judge must not.
+        let mut probe: Vec<(bool, Option<i64>)> = (0..6).map(|_| (true, Some(200))).collect(); // frozen
+        probe.extend((0..6).map(|i| (false, Some(200 - i)))); // −5 over the burst
+        let control: Vec<(bool, Option<i64>)> = probe.iter().map(|(r, _)| (*r, Some(0))).collect();
+        assert_eq!(judge_burst_motion_differential(&probe, &control, 6, 4), Some(true));
+    }
+
+    #[test]
+    fn judge_burst_motion_differential_false_when_frozen_every_burst() {
+        let mut probe: Vec<(bool, Option<i64>)> = (0..6).map(|_| (true, Some(50))).collect();
+        probe.extend((0..6).map(|_| (false, Some(50))));
+        let control: Vec<(bool, Option<i64>)> = probe.iter().map(|(r, _)| (*r, Some(0))).collect();
+        assert_eq!(judge_burst_motion_differential(&probe, &control, 6, 4), Some(false));
+    }
+
+    /// The headline fix, live-verified against `shadow/arenas/mk2/
+    /// reptile-vs-reptile.state` (a documented 1P-vs-CPU rig): a CPU-driven
+    /// block moves on its OWN initiative regardless of injected input — the
+    /// control run (no input on either port) reproduces that SAME
+    /// autonomous path, so the excess over control is ~0 and the port must
+    /// NOT be reported live, even though its raw/absolute delta alone would
+    /// clear the threshold (exactly what the old absolute design got wrong).
+    #[test]
+    fn judge_burst_motion_differential_rejects_autonomous_cpu_motion_matched_in_control() {
+        let mut probe: Vec<(bool, Option<i64>)> = (0..6).map(|i| (true, Some(300 + i * 2))).collect();
+        probe.extend((0..6).map(|i| (false, Some(310 - i))));
+        // The CPU walks the SAME path whether or not a human holds a
+        // direction on its port — deterministic replay from an identical
+        // snapshot reproduces it exactly.
+        let control = probe.clone();
+        assert_eq!(
+            judge_burst_motion_differential(&probe, &control, 6, 4),
+            Some(false),
+            "CPU's own motion must not be mistaken for injected-input liveness"
+        );
+    }
+
+    #[test]
+    fn judge_burst_motion_differential_none_when_no_probe_sample_resolves() {
+        let probe: Vec<(bool, Option<i64>)> = (0..12).map(|i| (i < 6, None)).collect();
+        let control: Vec<(bool, Option<i64>)> = (0..12).map(|i| (i < 6, Some(0))).collect();
+        assert_eq!(
+            judge_burst_motion_differential(&probe, &control, 6, 4),
+            None,
+            "honestly unknown, never a guessed false"
+        );
+    }
+
+    #[test]
+    fn judge_burst_motion_differential_tolerates_sparse_object_ptr_gaps_within_a_burst() {
+        // A `via: "object_ptr"` port whose pointer only resolves on SOME
+        // frames of the burst must still detect the motion that did land,
+        // in BOTH the probe and (if sparse there too) the control run.
+        let probe: Vec<(bool, Option<i64>)> =
+            vec![(true, Some(100)), (true, None), (true, None), (true, Some(112)), (true, None), (true, Some(116))];
+        let control: Vec<(bool, Option<i64>)> = (0..6).map(|_| (true, Some(0))).collect();
+        assert_eq!(judge_burst_motion_differential(&probe, &control, 6, 4), Some(true));
+    }
+
+    #[test]
+    fn judge_burst_motion_differential_missing_control_burst_falls_back_to_probes_own_delta() {
+        // The control run's pointer never resolves this burst at all — no
+        // observed autonomous motion to subtract, so the probe's own delta
+        // decides it (never treated as "unknown" just because control was
+        // sparse — only the PROBE run's absence is honored that way).
+        let probe: Vec<(bool, Option<i64>)> = (0..6).map(|i| (true, Some(100 + i * 2))).collect();
+        let control: Vec<(bool, Option<i64>)> = (0..6).map(|_| (true, None)).collect();
+        assert_eq!(judge_burst_motion_differential(&probe, &control, 6, 4), Some(true));
     }
 }

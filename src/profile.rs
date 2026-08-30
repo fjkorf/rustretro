@@ -177,16 +177,38 @@ pub struct ContactSignal {
     pub global: Option<String>,
 }
 
-/// One macro step (MACRO_ACTIONS §2): held SEMANTIC directions, attack
+/// One macro step (MACRO_ACTIONS §2/§10): held SEMANTIC directions, attack
 /// CLASSES pressed together, and the executor's hold length in frames.
+///
+/// §10.1 extends this with three more fields, all attack-CLASS lists like
+/// `press`: `hold` (this step's chord must stay down for `min_frames`
+/// continuous frames before the step is satisfied — a release before that
+/// FAILS the whole macro, not just this step), `release` (satisfied on the
+/// FALLING edge of this chord), and `while_held` (a chord that must ALSO be
+/// down for this step to satisfy — the step-scoped stand-in for nesting,
+/// e.g. Reptile's Invisibility holding Block across `U U D`). `press`,
+/// `hold`, and `release` are mutually exclusive within one step (load-
+/// validated) — they name the step's KIND; `while_held` and `dirs` compose
+/// with any of them.
 #[derive(Deserialize, Debug, Clone)]
 pub struct StepSpec {
     #[serde(default)]
     pub dirs: Vec<String>,
     #[serde(default)]
     pub press: Vec<String>,
+    #[serde(default)]
+    pub hold: Vec<String>,
+    #[serde(default)]
+    pub release: Vec<String>,
+    #[serde(default)]
+    pub while_held: Vec<String>,
     #[serde(default = "d_step_frames")]
     pub frames: u8,
+    /// Only meaningful (and required) when `hold` is non-empty: the minimum
+    /// number of continuous frames the `hold` chord must stay down before
+    /// this step is satisfied.
+    #[serde(default)]
+    pub min_frames: Option<u32>,
 }
 fn d_step_frames() -> u8 {
     3
@@ -256,22 +278,94 @@ pub struct Blocks {
     pub block1: HexAddr,
     pub block2: HexAddr,
     pub stride: HexAddr,
+    /// The per-block pointer to a dynamic object-pool entry (docs/frames.md
+    /// §5, docs/game-profiles.md "Pointer-resolved fields"): applied
+    /// relative to EACH block's own base (block1's pointer word sits at
+    /// `block1 + off`, block2's at `block2 + off`) — MK2 arcade's world
+    /// X/Y live behind this indirection, not at a block-relative offset.
+    /// Absent for games without it.
+    #[serde(default)]
+    pub object_ptr: Option<ObjectPtr>,
+}
+
+/// Per-block pointer declaration (docs/frames.md §5). Reading a field behind
+/// it is inherently a LIVE, multi-step operation (dereference, cross-check,
+/// then read) — there is no fixed absolute address to cache, which is why
+/// this is a decode DESCRIPTION rather than an address like `Blocks`'
+/// siblings. See [`GameProfile::object_ptr_field`].
+#[derive(Deserialize, Debug, Clone)]
+pub struct ObjectPtr {
+    /// Signed offset from the fighter block to the raw pointer word (MK2
+    /// arcade: `-0xC` — the pointer sits BEFORE the block).
+    pub off: SignedHex,
+    /// Byte width of the raw pointer word (MK2 arcade: 4, a `u32`).
+    pub size: u8,
+    /// Closed vocabulary naming the decode from the raw pointer word to an
+    /// absolute object-pool address. Currently just `"tms34010_bitaddr"`:
+    /// `(word - 0x01000000) >> 3` (docs/frames.md §5). An unrecognized name
+    /// decodes to nothing (never a wrong address) — see [`ObjectPtr::decode`].
+    pub encoding: String,
+    /// `[lo, hi)` validity range for the RAW pointer word. Outside it the
+    /// pointer is not live this frame — every field behind it is ABSENT,
+    /// never a synthesized 0 (RECORDER_V3 law, docs/frames.md §2.5).
+    pub valid_range: [HexAddr; 2],
+    /// Staleness cross-check: the byte at `obj + cid_check_off` must equal
+    /// the byte at the fighter block's own `char_id` field (offset 0) or the
+    /// pointer has gone stale — the pool slot was reused by a different
+    /// object — and the read is ABSENT, not a garbage value.
+    pub cid_check_off: HexAddr,
+}
+
+impl ObjectPtr {
+    /// Decode a raw pointer word into an absolute object-pool address.
+    /// `None` when it falls outside `valid_range` (not live this frame) or
+    /// `encoding` names a decode this build doesn't know — either way,
+    /// ABSENT rather than a wrong address.
+    pub fn decode(&self, raw: u32) -> Option<u32> {
+        if raw < self.valid_range[0].0 || raw >= self.valid_range[1].0 {
+            return None;
+        }
+        match self.encoding.as_str() {
+            // TMS34010 bit-address -> byte address (docs/frames.md §5),
+            // verified live across cold boots and a mid-session pool move.
+            "tms34010_bitaddr" => Some(raw.wrapping_sub(0x0100_0000) >> 3),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct FieldSpec {
     pub name: String,
-    /// Offset from the fighter block base — the common case. Exactly one of
-    /// `off` / `globals` must be present (validated at load).
+    /// Offset — meaning depends on `via`. Plain form: offset from the
+    /// fighter block base. `via: "object_ptr"` form: offset from the
+    /// DECODED OBJECT address instead. Exactly one of `off` (with no `via`)
+    /// / `globals` / (`via` + `off`) must be present (validated at load).
     #[serde(default)]
     pub off: Option<HexAddr>,
     /// Global-sourced variant: a per-block pair of named globals, for values
-    /// that live OUTSIDE the fighter structs (MK2 arcade's world X sits in a
-    /// separate object array — `p1_x`/`p2_x` globals). Consumers see a normal
-    /// named field either way.
+    /// that live OUTSIDE the fighter structs. Superseded for MK2 arcade's
+    /// world X by the `via: "object_ptr"` form below (the globals it named,
+    /// `p1_x`/`p2_x`, were DISPROVEN — see `library/mk2/mk2.profile.json`
+    /// `_STATUS`) but kept as a schema form other ports may still use.
     #[serde(default)]
     pub globals: Option<BlockGlobals>,
-    /// 1 or 2 bytes (guest order per `endianness`).
+    /// Pointer-resolved variant (docs/frames.md §5, docs/game-profiles.md):
+    /// `"object_ptr"` means `off` is relative to `memory.blocks.object_ptr`'s
+    /// DECODED address rather than the fighter block, and every read is a
+    /// live multi-step operation (dereference, char-id cross-check, then
+    /// read) — see [`GameProfile::object_ptr_field`]. `field_off`/
+    /// `field_addr` return `None` for these fields; there is no fixed
+    /// address to hand back.
+    #[serde(default)]
+    pub via: Option<String>,
+    /// Sign-extend the read value at its own width (1 or 2 bytes) instead of
+    /// zero-extending. Default false. MK2 arcade's `y` (`obj+0x16`) is
+    /// signed; smaller = higher, and negative values occur mid-jump.
+    #[serde(default)]
+    pub signed: bool,
+    /// 1 or 2 bytes (guest order per `endianness`) for the field's own
+    /// value; unrelated to `object_ptr.size` (the pointer word's width).
     pub size: u8,
 }
 
@@ -359,6 +453,36 @@ impl<'de> Deserialize<'de> for HexAddr {
     }
 }
 
+/// Signed hex offset (`"-0xC"` or `"0x12"`, or a bare negative/positive
+/// integer). Object-pointer declarations need negative offsets — the
+/// pointer word sits BEFORE the fighter block (MK2 arcade: `block - 0xC`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignedHex(pub i32);
+
+impl<'de> Deserialize<'de> for SignedHex {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            S(String),
+            N(i32),
+        }
+        match Raw::deserialize(d)? {
+            Raw::N(n) => Ok(SignedHex(n)),
+            Raw::S(s) => {
+                let t = s.trim();
+                let (neg, t) = match t.strip_prefix('-') {
+                    Some(rest) => (true, rest),
+                    None => (false, t),
+                };
+                let t = t.trim_start_matches("0x").trim_start_matches("0X");
+                let v = u32::from_str_radix(t, 16).map_err(serde::de::Error::custom)?;
+                Ok(SignedHex(if neg { -(v as i64) as i32 } else { v as i32 }))
+            }
+        }
+    }
+}
+
 // ── the resolved profile ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -427,32 +551,64 @@ impl GameProfile {
             }
         }
 
-        // Validate fighter fields: exactly one source, and globals resolve.
+        // Validate fighter fields: exactly one source, and globals/object_ptr
+        // resolve.
         for f in &port.memory.fighter_fields {
-            match (&f.off, &f.globals) {
-                (Some(_), Some(_)) => {
-                    return Err(format!(
-                        "fighter field '{}' has both off and globals — pick one",
-                        f.name
-                    ));
-                }
-                (None, None) => {
-                    return Err(format!(
-                        "fighter field '{}' needs off or globals",
-                        f.name
-                    ));
-                }
-                (None, Some(g)) => {
-                    for gname in [&g.block1, &g.block2] {
-                        if !port.memory.globals.contains_key(gname) {
-                            return Err(format!(
-                                "fighter field '{}' names unknown global '{gname}'",
-                                f.name
-                            ));
-                        }
+            match f.via.as_deref() {
+                Some("object_ptr") => {
+                    if f.globals.is_some() {
+                        return Err(format!(
+                            "fighter field '{}' has both via=object_ptr and globals — pick one",
+                            f.name
+                        ));
+                    }
+                    if f.off.is_none() {
+                        return Err(format!(
+                            "fighter field '{}' has via=object_ptr but no off \
+                             (offset from the decoded object)",
+                            f.name
+                        ));
+                    }
+                    if port.memory.blocks.object_ptr.is_none() {
+                        return Err(format!(
+                            "fighter field '{}' uses via=object_ptr but \
+                             memory.blocks.object_ptr is not declared",
+                            f.name
+                        ));
                     }
                 }
-                (Some(_), None) => {}
+                Some(other) => {
+                    return Err(format!(
+                        "fighter field '{}' names unknown via '{other}' \
+                         (only 'object_ptr' is supported)",
+                        f.name
+                    ));
+                }
+                None => match (&f.off, &f.globals) {
+                    (Some(_), Some(_)) => {
+                        return Err(format!(
+                            "fighter field '{}' has both off and globals — pick one",
+                            f.name
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(format!(
+                            "fighter field '{}' needs off or globals",
+                            f.name
+                        ));
+                    }
+                    (None, Some(g)) => {
+                        for gname in [&g.block1, &g.block2] {
+                            if !port.memory.globals.contains_key(gname) {
+                                return Err(format!(
+                                    "fighter field '{}' names unknown global '{gname}'",
+                                    f.name
+                                ));
+                            }
+                        }
+                    }
+                    (Some(_), None) => {}
+                },
             }
         }
 
@@ -507,18 +663,44 @@ impl GameProfile {
                     return Err(format!("special_inputs '{chr}.{mv}' has no steps"));
                 }
                 for st in steps {
-                    if st.dirs.is_empty() && st.press.is_empty() {
+                    if st.dirs.is_empty()
+                        && st.press.is_empty()
+                        && st.hold.is_empty()
+                        && st.release.is_empty()
+                    {
                         return Err(format!("special_inputs '{chr}.{mv}' has an empty step"));
+                    }
+                    // §10.1: press/hold/release are mutually exclusive — they
+                    // name the step's KIND (Normal/Hold/Release).
+                    let kinds = [!st.press.is_empty(), !st.hold.is_empty(), !st.release.is_empty()];
+                    if kinds.iter().filter(|k| **k).count() > 1 {
+                        return Err(format!(
+                            "special_inputs '{chr}.{mv}' step mixes press/hold/release — pick one"
+                        ));
+                    }
+                    if !st.hold.is_empty() {
+                        match st.min_frames {
+                            Some(mf) if mf > 0 => {}
+                            _ => {
+                                return Err(format!(
+                                    "special_inputs '{chr}.{mv}' hold step needs a positive min_frames"
+                                ));
+                            }
+                        }
+                    } else if st.min_frames.is_some() {
+                        return Err(format!(
+                            "special_inputs '{chr}.{mv}' min_frames set without a hold step"
+                        ));
                     }
                     for d in &st.dirs {
                         if !DIRS.contains(&d.as_str()) {
                             return Err(format!("special_inputs '{chr}.{mv}' names unknown dir '{d}'"));
                         }
                     }
-                    for class in &st.press {
+                    for class in st.press.iter().chain(&st.hold).chain(&st.release).chain(&st.while_held) {
                         if !port.attack_chords.contains_key(class) {
                             return Err(format!(
-                                "special_inputs '{chr}.{mv}' presses unknown class '{class}'"
+                                "special_inputs '{chr}.{mv}' names unknown class '{class}'"
                             ));
                         }
                     }
@@ -754,20 +936,28 @@ impl GameProfile {
     /// Offset + size for an OFFSET-based fighter field. Returns None for
     /// global-sourced fields (callers that need those use [`field_addr`],
     /// or fall back to the per-player globals themselves — training's
-    /// x_pair pattern).
+    /// x_pair pattern) and for `via: "object_ptr"` fields (no fixed address
+    /// at all — see [`object_ptr_field`](Self::object_ptr_field)).
     pub fn field_off(&self, name: &str) -> Option<(u32, u8)> {
         self.port
             .memory
             .fighter_fields
             .iter()
             .find(|f| f.name == name)
+            .filter(|f| f.via.is_none())
             .and_then(|f| f.off.as_ref().map(|o| (o.0, f.size)))
     }
 
     /// ABSOLUTE address + size of a fighter field for one block (1 or 2),
-    /// resolving both variants: block base + offset, or the per-block global.
+    /// resolving both STATIC variants: block base + offset, or the per-block
+    /// global. Returns `None` for `via: "object_ptr"` fields — those have no
+    /// fixed address (the object pool slot moves every frame); read them
+    /// live with [`object_ptr_field`](Self::object_ptr_field) instead.
     pub fn field_addr(&self, block: u8, name: &str) -> Option<(u32, u8)> {
         let f = self.port.memory.fighter_fields.iter().find(|f| f.name == name)?;
+        if f.via.is_some() {
+            return None;
+        }
         let base = if block == 1 { self.block1() } else { self.block2() };
         if let Some(off) = &f.off {
             return Some((base.wrapping_add(off.0), f.size));
@@ -775,6 +965,57 @@ impl GameProfile {
         let g = f.globals.as_ref()?;
         let gname = if block == 1 { &g.block1 } else { &g.block2 };
         Some((self.global(gname)?, f.size))
+    }
+
+    /// Whether fighter field `name` is pointer-resolved (`via: "object_ptr"`).
+    pub fn field_is_object_ptr(&self, name: &str) -> bool {
+        self.port
+            .memory
+            .fighter_fields
+            .iter()
+            .any(|f| f.name == name && f.via.as_deref() == Some("object_ptr"))
+    }
+
+    /// Live-read a `via: "object_ptr"` fighter field for one block (1 or 2)
+    /// through a caller-supplied reader: `read(addr, size_bytes) -> natural
+    /// value` — endianness already resolved by the caller (training mode's
+    /// `rd8`/`rd16`-shaped helpers are exactly this shape; profile.rs stays
+    /// endianness-agnostic here).
+    ///
+    /// Returns `None` — ABSENT, never a synthesized 0 (RECORDER_V3 law,
+    /// docs/frames.md §2.5) — when: `name` isn't a `via: "object_ptr"`
+    /// field, no `object_ptr` is declared for this port, the raw pointer
+    /// word falls outside its `valid_range` (not live this frame), or the
+    /// char-id cross-check at `obj + cid_check_off` disagrees with the
+    /// fighter block's own char_id (the pointer went stale — the pool slot
+    /// was reused by a different object, docs/frames.md §5).
+    pub fn object_ptr_field(
+        &self,
+        block: u8,
+        name: &str,
+        mut read: impl FnMut(u32, u8) -> u32,
+    ) -> Option<i64> {
+        let f = self.port.memory.fighter_fields.iter().find(|f| f.name == name)?;
+        if f.via.as_deref() != Some("object_ptr") {
+            return None;
+        }
+        let obj_ptr = self.port.memory.blocks.object_ptr.as_ref()?;
+        let field_off = f.off.as_ref()?.0;
+        let base = if block == 1 { self.block1() } else { self.block2() };
+
+        let ptr_addr = base.wrapping_add_signed(obj_ptr.off.0);
+        let raw_ptr = read(ptr_addr, obj_ptr.size);
+        let obj = obj_ptr.decode(raw_ptr)?;
+
+        // Staleness cross-check: obj+cid_check_off MUST equal block+0.
+        let cid_at_obj = read(obj.wrapping_add(obj_ptr.cid_check_off.0), 1);
+        let cid_at_block = read(base, 1);
+        if cid_at_obj != cid_at_block {
+            return None;
+        }
+
+        let raw = read(obj.wrapping_add(field_off), f.size);
+        Some(if f.signed { sign_extend(raw, f.size) } else { raw as i64 })
     }
 
     pub fn char_name(&self, id: u8) -> String {
@@ -861,6 +1102,18 @@ impl GameProfile {
             .as_ref()
             .and_then(|m| m.get(&raw.to_string()).copied())
             .unwrap_or(raw)
+    }
+}
+
+/// Sign-extend a raw, already-natural-order value of `size` bytes (1 or 2)
+/// to `i64`, per a fighter field's `signed: true` declaration. Widths other
+/// than 1/2 pass through unsigned (the schema only uses this for 8/16-bit
+/// fighter fields).
+fn sign_extend(raw: u32, size: u8) -> i64 {
+    match size {
+        1 => raw as u8 as i8 as i64,
+        2 => raw as u16 as i16 as i64,
+        _ => raw as i64,
     }
 }
 
@@ -1273,9 +1526,11 @@ mod tests {
     #[test]
     fn mk2_ships_the_reptile_special_intersection() {
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
-        // Family order (moves list), only what the port encodes.
+        // Family order (moves list), only what the port encodes. §10 adds a
+        // 4th reptile move (invisibility) — the original three's names AND
+        // encodings below are asserted byte-identically, unmodified.
         let names: Vec<&str> = p.specials_for(9).iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, vec!["slide", "acid_spit", "force_ball"]);
+        assert_eq!(names, vec!["slide", "acid_spit", "force_ball", "invisibility"]);
         // slide: single chord step, back+LK+LP+Block (the §2 two-button
         // chord was live-DISPROVEN — the game performs a normal without
         // Block; slide pose + hit verified with Block in the chord).
@@ -1284,10 +1539,24 @@ mod tests {
         assert_eq!(slide[0].dirs, vec!["back"]);
         assert_eq!(slide[0].press, vec!["LK", "LP", "Block"]);
         assert_eq!(slide[0].frames, 8);
+        // §10.1: invisibility ([BLK] U U D, release, HP) — Block held across
+        // the U/U/D steps via while_held, released, then HP pressed.
+        let (_, invis) = p.specials_for(9)[3];
+        assert_eq!(invis.len(), 5);
+        assert_eq!(invis[0].while_held, vec!["Block"]);
+        assert_eq!(invis[3].release, vec!["Block"]);
+        assert_eq!(invis[4].press, vec!["HP"]);
         // Characters without encodings offer nothing.
         assert!(p.specials_for(1).is_empty(), "liukang has no specials this phase");
         assert!(p.specials_for(99).is_empty());
-        assert_eq!(p.all_specials().len(), 3);
+        // Mileena (§10): sai_throw (hold+release), teleport_kick, roll.
+        let mileena: Vec<&str> = p.specials_for(5).iter().map(|(n, _)| *n).collect();
+        assert_eq!(mileena, vec!["sai_throw", "teleport_kick", "roll"]);
+        let (_, sai_throw) = p.specials_for(5)[0];
+        assert_eq!(sai_throw[0].hold, vec!["HP"]);
+        assert_eq!(sai_throw[0].min_frames, Some(180));
+        assert_eq!(sai_throw[1].release, vec!["HP"]);
+        assert_eq!(p.all_specials().len(), 7);
         // The arcade contact signal is the per-fighter `action_counter`
         // FIELD (quiet while guarding, fires on blocked contact even at zero
         // chip — live-verified). hitstun_sources stays as the health-delta
@@ -1386,5 +1655,231 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("id_map maps to unknown roster id"));
+    }
+
+    // ── object_ptr (docs/frames.md §5) ──────────────────────────────────
+
+    #[test]
+    fn object_ptr_decode_tms34010_bitaddr() {
+        let ptr = ObjectPtr {
+            off: SignedHex(-0xC),
+            size: 4,
+            encoding: "tms34010_bitaddr".to_string(),
+            valid_range: [HexAddr(0x0100_0000), HexAddr(0x0140_0000)],
+            cid_check_off: HexAddr(0x3E),
+        };
+        // (0x01010000 - 0x01000000) >> 3 = 0x10000 >> 3 = 0x2000.
+        assert_eq!(ptr.decode(0x0101_0000), Some(0x2000));
+        // Exactly at the low bound decodes to 0.
+        assert_eq!(ptr.decode(0x0100_0000), Some(0));
+        // Outside [lo, hi) — the pointer is not live this frame.
+        assert_eq!(ptr.decode(0x00FF_FFFF), None);
+        assert_eq!(ptr.decode(0x0140_0000), None); // hi is exclusive
+        // Unknown encoding never guesses an address.
+        let unknown = ObjectPtr { encoding: "future_thing".to_string(), ..ptr };
+        assert_eq!(unknown.decode(0x0101_0000), None);
+    }
+
+    /// Build a family+port pair whose fighter fields exercise all three field
+    /// forms at once (`off`, `via: "object_ptr"` unsigned, `via:
+    /// "object_ptr"` signed) — the composition the task requires.
+    fn load_with_object_ptr(tag: &str) -> GameProfile {
+        let tmpbase = make_test_dir(tag);
+        let dir = tmpbase.join("g");
+        fs::create_dir(&dir).unwrap();
+        let family_json = r#"{"family":"g","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(dir.join("family.json"), family_json).unwrap();
+        let port_json = r#"{
+            "family":"g","port":"test",
+            "core":{"library_name":"","provenance_game":"g","provenance_core":"g"},
+            "memory":{
+                "cpu":"tms34010","endianness":"little",
+                "blocks":{
+                    "block1":"0x100","block2":"0x200","stride":"0x100",
+                    "object_ptr":{
+                        "off":"-0xC","size":4,"encoding":"tms34010_bitaddr",
+                        "valid_range":["0x01000000","0x01400000"],"cid_check_off":"0x3E"
+                    }
+                },
+                "fighter_fields":[
+                    {"name":"char_id","off":"0x0","size":1},
+                    {"name":"x","via":"object_ptr","off":"0x12","size":2},
+                    {"name":"y","via":"object_ptr","off":"0x16","size":2,"signed":true}
+                ],
+                "globals":{}
+            },
+            "gate":[],
+            "enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},
+            "calibration":{},"attack_chords":{}
+        }"#;
+        fs::write(dir.join("g.profile.json"), port_json).unwrap();
+        GameProfile::load(&dir).expect("object_ptr profile parses")
+    }
+
+    /// A byte-addressable little-endian synthetic RAM image, and the
+    /// `read(addr, size) -> value` closure shape `object_ptr_field` expects.
+    fn synth_reader(mem: BTreeMap<u32, u8>) -> impl FnMut(u32, u8) -> u32 {
+        move |addr, size| {
+            let mut v = 0u32;
+            for i in 0..size as u32 {
+                v |= (*mem.get(&(addr + i)).unwrap_or(&0) as u32) << (8 * i);
+            }
+            v
+        }
+    }
+
+    #[test]
+    fn object_ptr_field_composes_with_off_and_reads_x_and_signed_y() {
+        let p = load_with_object_ptr("object_ptr_field_ok");
+        // The plain `off` form still works unchanged.
+        assert_eq!(p.field_off("char_id"), Some((0x0, 1)));
+        // `via: "object_ptr"` fields have no fixed address.
+        assert_eq!(p.field_off("x"), None);
+        assert_eq!(p.field_addr(1, "x"), None);
+        assert!(p.field_is_object_ptr("x"));
+        assert!(p.field_is_object_ptr("y"));
+        assert!(!p.field_is_object_ptr("char_id"));
+
+        let mut mem = BTreeMap::new();
+        // block1 = 0x100; pointer word at block1 - 0xC = 0xF4.
+        // obj = (0x01010000 - 0x01000000) >> 3 = 0x2000.
+        let raw_ptr: u32 = 0x0101_0000;
+        for (i, b) in raw_ptr.to_le_bytes().iter().enumerate() {
+            mem.insert(0xF4 + i as u32, *b);
+        }
+        mem.insert(0x100, 7); // block1's char_id
+        mem.insert(0x2000 + 0x3E, 7); // obj's cross-check byte — matches
+        // x = 300 at obj+0x12.
+        for (i, b) in 300u16.to_le_bytes().iter().enumerate() {
+            mem.insert(0x2000 + 0x12 + i as u32, *b);
+        }
+        // y = -5 at obj+0x16, signed.
+        for (i, b) in (-5i16).to_le_bytes().iter().enumerate() {
+            mem.insert(0x2000 + 0x16 + i as u32, *b);
+        }
+
+        assert_eq!(p.object_ptr_field(1, "x", synth_reader(mem.clone())), Some(300));
+        assert_eq!(p.object_ptr_field(1, "y", synth_reader(mem.clone())), Some(-5));
+        // Never a synthesized 0 — it round-trips the real negative value.
+        assert_ne!(p.object_ptr_field(1, "y", synth_reader(mem.clone())), Some(0));
+    }
+
+    #[test]
+    fn object_ptr_field_invalid_pointer_is_absent_not_zero() {
+        let p = load_with_object_ptr("object_ptr_field_invalid_ptr");
+        let mut mem = BTreeMap::new();
+        // A pointer word OUTSIDE the valid range.
+        let raw_ptr: u32 = 0x00FF_FFFF;
+        for (i, b) in raw_ptr.to_le_bytes().iter().enumerate() {
+            mem.insert(0xF4 + i as u32, *b);
+        }
+        mem.insert(0x100, 7);
+        let v = p.object_ptr_field(1, "x", synth_reader(mem));
+        assert_eq!(v, None, "an invalid pointer must yield ABSENT, never 0");
+    }
+
+    #[test]
+    fn object_ptr_field_char_id_mismatch_is_absent_not_zero() {
+        let p = load_with_object_ptr("object_ptr_field_stale");
+        let mut mem = BTreeMap::new();
+        let raw_ptr: u32 = 0x0101_0000; // decodes to obj = 0x2000, in range.
+        for (i, b) in raw_ptr.to_le_bytes().iter().enumerate() {
+            mem.insert(0xF4 + i as u32, *b);
+        }
+        mem.insert(0x100, 7); // block1's char_id
+        mem.insert(0x2000 + 0x3E, 9); // obj's cross-check DISAGREES (stale slot)
+        for (i, b) in 300u16.to_le_bytes().iter().enumerate() {
+            mem.insert(0x2000 + 0x12 + i as u32, *b);
+        }
+        let v = p.object_ptr_field(1, "x", synth_reader(mem));
+        assert_eq!(v, None, "a char_id mismatch must yield ABSENT, never a stale value");
+    }
+
+    #[test]
+    fn object_ptr_via_rejects_bad_shapes() {
+        // via names an unsupported encoding string at the field level.
+        let tmpbase = make_test_dir("object_ptr_bad_via");
+        let dir = tmpbase.join("g");
+        fs::create_dir(&dir).unwrap();
+        fs::write(
+            dir.join("family.json"),
+            r#"{"family":"g","roster":[],"move_classes":[],"attack_classes":[]}"#,
+        )
+        .unwrap();
+        let base = |fighter_fields: &str, blocks_extra: &str| {
+            format!(
+                r#"{{"family":"g","port":"test",
+                "core":{{"library_name":"","provenance_game":"g","provenance_core":"g"}},
+                "memory":{{"blocks":{{"block1":"0x100","block2":"0x200","stride":"0x100"{blocks_extra}}},
+                    "fighter_fields":[{fighter_fields}],"globals":{{}}}},
+                "gate":[],
+                "enforcement":{{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0}},
+                "calibration":{{}},"attack_chords":{{}}}}"#
+            )
+        };
+        // via="object_ptr" with no object_ptr declared on blocks.
+        let json = base(r#"{"name":"x","via":"object_ptr","off":"0x12","size":2}"#, "");
+        fs::write(dir.join("g.profile.json"), json).unwrap();
+        let err = GameProfile::load(&dir).unwrap_err();
+        assert!(err.contains("object_ptr is not declared"), "{err}");
+
+        // via="object_ptr" with no off.
+        let obj_ptr_json = r#","object_ptr":{"off":"-0xC","size":4,"encoding":"tms34010_bitaddr","valid_range":["0x01000000","0x01400000"],"cid_check_off":"0x3E"}"#;
+        let json = base(r#"{"name":"x","via":"object_ptr","size":2}"#, obj_ptr_json);
+        fs::write(dir.join("g.profile.json"), json).unwrap();
+        let err = GameProfile::load(&dir).unwrap_err();
+        assert!(err.contains("no off"), "{err}");
+
+        // via="object_ptr" AND globals — pick one.
+        let json = base(
+            r#"{"name":"x","via":"object_ptr","off":"0x12","size":2,"globals":{"block1":"a","block2":"b"}}"#,
+            obj_ptr_json,
+        );
+        fs::write(dir.join("g.profile.json"), json).unwrap();
+        let err = GameProfile::load(&dir).unwrap_err();
+        assert!(err.contains("pick one"), "{err}");
+
+        // Unknown via name.
+        let json = base(r#"{"name":"x","via":"vram_scan","off":"0x12","size":2}"#, obj_ptr_json);
+        fs::write(dir.join("g.profile.json"), json).unwrap();
+        let err = GameProfile::load(&dir).unwrap_err();
+        assert!(err.contains("unknown via"), "{err}");
+
+        // Valid via=object_ptr composes fine alongside a plain-off field.
+        let json = base(
+            r#"{"name":"char_id","off":"0x0","size":1},{"name":"x","via":"object_ptr","off":"0x12","size":2}"#,
+            obj_ptr_json,
+        );
+        fs::write(dir.join("g.profile.json"), json).unwrap();
+        assert!(GameProfile::load(&dir).is_ok());
+    }
+
+    #[test]
+    fn signed_hex_parses_negative_and_positive() {
+        let neg: SignedHex = serde_json::from_str("\"-0xC\"").unwrap();
+        assert_eq!(neg.0, -12);
+        let pos: SignedHex = serde_json::from_str("\"0x12\"").unwrap();
+        assert_eq!(pos.0, 0x12);
+        let num: SignedHex = serde_json::from_str("-12").unwrap();
+        assert_eq!(num.0, -12);
+    }
+
+    /// mk2's shipped profile: `x` is pointer-resolved, `y` too (signed), and
+    /// `p1_x`/`p2_x` are disproven-but-retained globals no field references.
+    #[test]
+    fn mk2_ships_x_and_y_as_object_ptr_fields() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        assert!(p.field_is_object_ptr("x"));
+        assert!(p.field_is_object_ptr("y"));
+        assert_eq!(p.field_addr(1, "x"), None, "no fixed address for a pointer-resolved field");
+        assert_eq!(p.field_off("y"), None);
+        // The disproven raw globals are still declared (evidence / other
+        // tools) but no fighter field references them anymore.
+        assert!(p.global("p1_x").is_some());
+        assert!(p.global("p2_x").is_some());
+        assert!(p.port.memory.blocks.object_ptr.is_some());
+        let obj_ptr = p.port.memory.blocks.object_ptr.as_ref().unwrap();
+        assert_eq!(obj_ptr.off.0, -0xC);
+        assert_eq!(obj_ptr.encoding, "tms34010_bitaddr");
     }
 }

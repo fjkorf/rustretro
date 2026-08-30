@@ -83,6 +83,11 @@ def main() -> None:
     policy.temperature = args.temperature
     meta = json.loads((model_dir / META_FILE).read_text())
 
+    pointer_fields = rt.pointer_fields_from_meta(meta)
+    if pointer_fields:
+        print(f"[play] model declares pointer-resolved field(s) {sorted(pointer_fields)} — "
+              "will hold the last action on any tick they don't resolve.")
+
     drift = rt.check_calibration_drift(meta)
     if drift:
         print("[drift-guard] WARNING: model meta.json disagrees with the "
@@ -115,7 +120,7 @@ def main() -> None:
     period_s = 1.0 / args.hz
     rng = np.random.default_rng(args.seed)
 
-    buffers = rt.RoundBuffers()
+    buffers = rt.RoundBuffers(pointer_fields=pointer_fields)
     was_live = False
     tick_i = 0
     latencies: list[float] = []
@@ -133,7 +138,16 @@ def main() -> None:
             live = rt.is_controllable(snap)
 
             if live and not was_live:
-                x1, x2 = snap.block1["x"], snap.block2["x"]
+                x1, x2 = snap.block1.get("x"), snap.block2.get("x")
+                if x1 is None or x2 is None:
+                    # A pointer-resolved `x` (docs/frames.md §2.5) hasn't
+                    # dereferenced on this tick yet -- wait for one where it
+                    # has, same as the native runner's round-start anchor
+                    # probe (src/shadow_runner.rs). `was_live` is left False
+                    # so the next controllable tick retries this same edge.
+                    latencies.append(time.monotonic() - t0)
+                    _sleep_to_period(t0, period_s)
+                    continue
                 me_block = override or rt.resolve_me_block(x1, x2)
                 buffers.reset(me_block=me_block)
                 print(f"[round] start -- me_block={me_block} "
@@ -148,7 +162,7 @@ def main() -> None:
                 continue
 
             me_block = buffers.me_block or override or rt.resolve_me_block(
-                snap.block1["x"], snap.block2["x"]
+                snap.block1.get("x", 0), snap.block2.get("x", 0)
             )
             opp_block = rt.other_block(me_block)
             me_now = getattr(snap, me_block)
@@ -168,32 +182,50 @@ def main() -> None:
             me_hitstun = buffers.me_hitstun.update(buffers.tick, me_combo_now)
             opp_hitstun = buffers.opp_hitstun.update(buffers.tick, opp_combo_lagged)
 
-            scal = rt.build_scalars(
+            # buffers.compute_scalars (not the bare rt.build_scalars) is the
+            # guard the pointer-resolved-field contract was built for: it
+            # returns None -- never raises, never fabricates a coordinate --
+            # on a tick where a declared field (`pointer_fields`, e.g. MK2
+            # arcade's x/y) hasn't dereferenced, and fires exactly one loud
+            # warning if that run gets sustained (see runtime.PointerStaleness).
+            # For a model with no pointer-resolved fields (every model today)
+            # this is byte-identical to calling build_scalars directly.
+            scal = buffers.compute_scalars(
                 me_now, opp_lagged, s, fwd_hold, back_hold, me_hitstun, opp_hitstun
             )
-            buffers.stacker.push(scal)
 
-            move, attack, dist_x = None, None, scal["dist_x"]
-            if buffers.stacker.ready():
-                x = buffers.stacker.vector()
-                move, attack = policy.predict(x, rng=rng)
-                mask = rt.intent_to_mask(move, attack, s)
-                buttons = rt.mask_to_button_names(mask)
-                if not args.dry_run and buttons:
-                    mcp.press(buttons, frames=period_frames, port=1)
-                buffers.last_emitted_mask = mask if buttons else 0
+            move, attack, dist_x = None, None, None
+            if scal is None:
+                # Hold: skip stacking/predicting/re-emitting this tick, and
+                # don't advance prev_opp/tick on a snapshot that may itself
+                # be missing the same field -- keep the last KNOWN-GOOD
+                # opponent reading so the next resolving tick isn't held
+                # unnecessarily too.
+                pass
+            else:
+                dist_x = scal["dist_x"]
+                buffers.stacker.push(scal)
+                if buffers.stacker.ready():
+                    x = buffers.stacker.vector()
+                    move, attack = policy.predict(x, rng=rng)
+                    mask = rt.intent_to_mask(move, attack, s)
+                    buttons = rt.mask_to_button_names(mask)
+                    if not args.dry_run and buttons:
+                        mcp.press(buttons, frames=period_frames, port=1)
+                    buffers.last_emitted_mask = mask if buttons else 0
+                buffers.prev_opp = opp_now
+                buffers.prev_opp_combo = opp_combo_now
+                buffers.tick += 1
 
-            buffers.prev_opp = opp_now
-            buffers.prev_opp_combo = opp_combo_now
-            buffers.tick += 1
             tick_i += 1
 
             if trace_budget > 0:
                 trace_budget -= 1
                 mv = rt.dataset.MOVE_CLASSES[move] if move is not None else "-"
                 at = rt.dataset.ATTACK_CLASSES[attack] if attack is not None else "-"
+                dx_str = f"{dist_x:+.3f}" if dist_x is not None else "   held"
                 print(f"[trace] tick={tick_i:4d} live={live} me={me_block} "
-                      f"dist_x={dist_x:+.3f} s={s:+d} move={mv:<12} attack={at}")
+                      f"dist_x={dx_str} s={s:+d} move={mv:<12} attack={at}")
 
             latencies.append(time.monotonic() - t0)
             _sleep_to_period(t0, period_s)

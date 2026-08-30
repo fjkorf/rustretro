@@ -46,3 +46,6 @@ scratchpad/
 .DS_Store
 .claude/settings.local.json
 .claude/worktrees/
+
+# Frame lab authoring store (derived; the committed artifact is library/<family>/<port>.frames.json)
+shadow/framelab/

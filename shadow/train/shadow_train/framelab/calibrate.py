@@ -72,9 +72,17 @@ Preconditions from §3, and which of them this module enforces:
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence, Union
+
+from .session import (
+    _STEP_TIMEOUT_S,
+    call_ok,
+    confirm_step,
+    hold_buttons,
+    release_all,
+)
+from .session import set_training_enforcement as _session_set_training_enforcement
 
 __all__ = [
     "CalibrationError",
@@ -86,12 +94,6 @@ __all__ = [
 # §4.3: "MAX_SEARCH is ~60 frames; the cost is bounded and the result is
 # unconditionally correct" (linear sweep, the default method).
 DEFAULT_MAX_SEARCH = 60
-
-# Bounds for confirming a `step` call actually landed (see `_step`) — a
-# fire-and-forget MCP call needs SOME real-time bound on "did it land yet",
-# but this is a landing-confirmation poll, not a guessed fixed delay.
-_STEP_POLL_INTERVAL_S = 0.01
-_STEP_TIMEOUT_S = 2.0
 
 ObservableFn = Callable[[Any], Any]
 LivenessFn = Callable[[Any], bool]
@@ -122,22 +124,16 @@ class CalibrationResult:
 
 
 def _call_ok(client: Any, tool: str, **kwargs: Any) -> dict:
-    r = client.call(tool, **kwargs)
-    # Most tools fail as {"ok": false, "error": ...}; the write-gate check
-    # specifically (`load_state` before `enable_writes`) short-circuits to
-    # the bare {"error": ...} shape with no "ok" key at all — treat both as
-    # failure rather than trusting an absent "ok" to mean success.
-    failed = isinstance(r, dict) and (
-        r.get("ok") is False or ("error" in r and "ok" not in r)
-    )
-    if failed:
-        raise CalibrationError(f"{tool} failed: {r.get('error', r)}")
-    return r
+    """`session.call_ok` with this module's error type. The shared
+    implementation is in `session` so there is exactly ONE definition of
+    "did this MCP tool succeed" (and exactly one `press_buttons` ban) across
+    the lab; the `error_cls` indirection is what lets this module keep
+    raising `CalibrationError` for its own callers and tests."""
+    return call_ok(client, tool, error_cls=CalibrationError, **kwargs)
 
 
 def _set_training_enforcement(client: Any, enabled: bool) -> None:
-    flag = "true" if enabled else "false"
-    _call_ok(client, "run_lua", script=f"training.set_enabled({flag})")
+    _session_set_training_enforcement(client, enabled, error_cls=CalibrationError)
 
 
 def _arm_writes(client: Any) -> None:
@@ -179,35 +175,22 @@ def _load_state(client: Any, spec: Union[str, int], liveness_fn: LivenessFn) -> 
 
 
 def _hold(client: Any, buttons: Sequence[str], port: int) -> None:
-    _call_ok(client, "hold_buttons", buttons=list(buttons), port=port)
+    hold_buttons(client, buttons, port, error_cls=CalibrationError)
 
 
 def _release(client: Any, port: int) -> None:
     # Empty `buttons` releases the whole port's held set (server.rs:
     # "hold_buttons(0, []) releases everything").
-    _call_ok(client, "release_buttons", buttons=[], port=port)
+    release_all(client, port, error_cls=CalibrationError)
 
 
 def _step(client: Any) -> None:
     """Advance exactly one core frame and CONFIRM it landed before
     returning, by polling `get_state`'s `frame_count` (see the module
     docstring's precondition-3 note for why this confirmation is
-    necessary — `step` itself is fire-and-forget)."""
-    before = _call_ok(client, "get_state").get("frame_count")
-    _call_ok(client, "step")
-    if before is None:
-        return  # client's get_state doesn't report frame_count; best effort
-    deadline = time.monotonic() + _STEP_TIMEOUT_S
-    while time.monotonic() < deadline:
-        after = _call_ok(client, "get_state").get("frame_count")
-        if after != before:
-            return
-        time.sleep(_STEP_POLL_INTERVAL_S)
-    raise CalibrationError(
-        f"step() did not advance frame_count within {_STEP_TIMEOUT_S}s -- "
-        "the session may be unresponsive, or the emulator isn't actually "
-        "paused (a held pause is what makes `step` mean one frame)."
-    )
+    necessary — `step` itself is fire-and-forget). Shared implementation:
+    `session.confirm_step`."""
+    confirm_step(client, error_cls=CalibrationError, timeout_s=_STEP_TIMEOUT_S)
 
 
 # ── the differential trace ──────────────────────────────────────────────

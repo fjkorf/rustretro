@@ -8,8 +8,11 @@ Rust, Python (`shadow_train.profile`), and Lua (`game.*` bindings, API v3)
 all read the same JSON — never hardcode a game address in code again.
 MK2 note: runs on the from-source FBNeo core (../FBNeo) with readable RAM +
 save states; `memory.cpu: "tms34010"` in its profile gates the Sek capture.
-The active project is **shadow**: a training mode + a behavioral-cloning
-opponent for Asura Blade (`shadow/PLAN.md`, `shadow/SPEC.md`). The literate
+The active project is the **frame lab**: measured frame data (safe vs unsafe,
+on hit and on block) for MK2 arcade — `docs/frames.md` is its contract, and
+the section below is the short version. It sits on top of **shadow**: a
+training mode + a behavioral-cloning opponent, originally for Asura Blade
+(`shadow/PLAN.md`, `shadow/SPEC.md`). The literate
 ROM map `library/asurabld/asurabld.md` is the EVIDENCE doc (how each value
 was verified); the machine-readable extract is the profile JSON, which every
 side reads — address changes go to the profile (+ the .md's evidence), never
@@ -63,7 +66,7 @@ frame while loaded — MK2 Genesis uses it to hold the 6-button-mode flags.
 | F12, Space | debugger, pause |
 
 The F12 debugger groups panels into regions: Canvas (Frame/Disasm/Hex/Tiles,
-center), Live (Watch/CPU/Input, top right), Control (💾 State / 🎯 Training /
+center), Live (Watch/CPU/Input/**Input Log**, top right), Control (💾 State / 🎯 Training /
 Audio, bottom right), Tools (bottom strip). The ☰ toolbar menu saves/resets
 the layout and reopens closed panels; the sidecar is `rustretro_layout_v2.json`
 (cwd, gitignored). Hotkey docs live in ONE place: `KEYBINDINGS` in
@@ -146,8 +149,62 @@ in `shadow/train/shadow_train/dataset.py`).
 - WRAM snapshot via bus window costs ~10 ms; snapshot-diff + pause/step is
   the effective RE discovery method (see asurabld.md for the session log).
 
+## The frame lab — measured frame data
+
+`docs/frames.md` is the NORMATIVE contract for measured frame data (startup /
+active / recovery / advantage on hit and on block). Read it before touching
+anything that measures. The authoring store is SQLite under
+`shadow/framelab/` (gitignored, Python-owned, stdlib `sqlite3` — Rust never
+opens it); the COMMITTED artifact is `library/<family>/<port>.frames.json`.
+Harness: `shadow_train.framelab` (`session` owns the preconditions, `probe`
+the act-again measurement, `arenas` the spacing ladder, `kit` the runner).
+
+Spacing is data: `shadow/arenas/mk2/gap-K.state` + `.gap.json` is a ladder in
+walk-frames AND pixels (K=0 is the FARTHEST rung; walking cannot reach gap 0,
+MK2 has a ~62 px collision floor). MK2 has proximity normals, so the same
+button is a different MOVE by distance — gap is part of every row's key.
+
+The 🎯 Training panel gained reversal timing (Fast/Delay/Late/explicit,
+replacing a fitted `PUNISH_DELAY`) and record/playback input slots
+(`shadow/inputs/<family>/`, MCP `record_inputs`/`play_inputs`); training
+settings now persist to `rustretro_training_v1.json` (cwd, gitignored).
+
+### Measurement laws (each one cost us a wrong number)
+
+- **No ABSOLUTE observation of motion means anything.** On a game where
+  things move on their own, run the identical scenario with and without the
+  input and believe only the DIFFERENCE. This killed three separate designs:
+  the first probe draft, the arena liveness probe (which reported a
+  CPU-driven port as a live human port), and the `action_counter` contact
+  claim.
+- **Never anchor on a DRAWN value.** MK2's HUD health bar animates toward
+  its target at 1 unit/frame, smearing one hit into 11 edges. Anchor on what
+  the game computes (struct health `block+0x0E`), not what it displays.
+- **Cross-method agreement buys precision, not truth.** Two observables
+  agreeing to the frame on every sweep still published a number 9 frames
+  wrong, because both shared one flawed subtraction. Only an INDEPENDENT RIG
+  found it.
+- **Absent is not zero.** One schema change from "synthesized 0" to "absent"
+  exposed five consumers that had all been reporting success on frozen data.
+
 ## Gotchas
 
+- **`step` is FIRE-AND-FORGET**: 30 rapid MCP `step` calls were measured
+  landing **1** frame. Poll `get_state`'s `frame_count` until it advances
+  before the next step — and then let the frame FINISH (~8 ms) before
+  changing input, or ~1 run in 50 lands a hold a frame early.
+- **`load_state` does NOT drain while paused.** Resume → load → verify
+  against a known field → pause. Skipping the verify silently measures the
+  PREVIOUS state.
+- **`press_buttons` decays on GUI frames** (including while paused) — it is
+  BANNED in the frame lab; use `hold_buttons`/`release_buttons`.
+- MK2 arcade positions live behind a POINTER (`block-0x0C`, TMS34010
+  bit-address) because the object-pool slot moves at runtime; the profile's
+  `via: "object_ptr"` field form resolves it per frame and yields ABSENT,
+  never 0, when the pointer is stale. The old `p1_x`/`p2_x` globals are
+  DISPROVEN — never use them for position or liveness.
+- MK2 walk speeds are ASYMMETRIC (+12 px/6f forward vs +5 px/6f backward), so
+  any check shaped "hold a direction, undo it, expect to return" is wrong.
 - The app rewrites `library/asurabld/asurabld.busmap.json` (pretty-printed)
   on sidecar saves — don't commit that churn.
 - Block `+0x54/+0x56` positions are recomputed outputs: writes hold only

@@ -14,6 +14,17 @@ Pipeline per file:
   6. segment rounds longer than SEGMENT_DECISIONS decisions into pseudo-round
      split units (file, round_id, seg_k) -- see _segment()
 
+A mapped fighter field can still be POINTER-RESOLVED (docs/frames.md §2.5 --
+MK2 arcade's world `x`): the recorder dereferences a pointer each frame and
+simply OMITS the field from that one row when the dereference fails, never
+zero-fills it. The `.meta.json` sidecar's flat `pointer_resolved_fields` list
+names which fields may do this; step 5 above drops (and counts) any decision
+whose `me`/`opp` dict is missing one of them on the frames it reads, rather
+than crashing on the first bad row or fabricating a value -- see the
+`pointer_resolved_fields`/`ptr_fields` handling in `_RecordingView` and
+`_decisions_for_round`. Empty for every recording that names no such fields
+(all of them today), which is the zero-cost fast path.
+
 Raw fields stay raw on disk; everything here is train-time (§5).
 
 Calibration constants and the move/attack class lists below are loaded from
@@ -203,6 +214,17 @@ class _RecordingView:
     hitstun_map: dict | None      # block name -> global name, or None (unavailable)
     port: str
     family: str | None = None     # v3 sidecar's family; None = trust the profile
+    # Named fighter fields that are MAPPED (declared, so field_names contains
+    # them) but may still be OMITTED from any given row because the recorder
+    # dereferences a pointer to resolve them and that pointer can be invalid
+    # or stale on a per-frame basis (docs/frames.md §2.5, the MK2-arcade
+    # world-X case). Every other mapped field is guaranteed present on every
+    # row -- this is the ONLY set of fields _decisions_for_round must treat
+    # as possibly-per-row-absent. Empty for v2 (no such concept existed) and
+    # for any v3 sidecar that declares none -- both are the fast path with
+    # zero added per-row cost (see the `ptr_fields and (...)` short-circuit
+    # below).
+    pointer_resolved_fields: frozenset = field(default_factory=frozenset)
 
 
 def _detect_version(path: Path) -> str:
@@ -316,6 +338,7 @@ def _view_for(path: Path, version: str, prof) -> _RecordingView:
         hitstun_map=hitstun_map,
         port=meta.get("port", prof.port),
         family=meta.get("family"),
+        pointer_resolved_fields=frozenset(meta.get("pointer_resolved_fields", [])),
     )
 
 
@@ -556,11 +579,19 @@ def _macro_override_events(rows: list[dict], p1b: str, oppb: str,
 
 def _decisions_for_round(round_key: tuple, rows: list[dict],
                           view: _RecordingView | None = None,
-                          feats: list[str] | None = None):
+                          feats: list[str] | None = None,
+                          drop_stats: dict | None = None):
     """`view`/`feats` default to "everything available" (asurabld's full v2
     shape) when omitted -- this keeps the 2-arg call signature test_runtime.py
     depends on (its streaming-vs-batch parity test) working unchanged; real
-    callers (`build`/`load_decisions`) always pass both, resolved per file."""
+    callers (`build`/`load_decisions`) always pass both, resolved per file.
+
+    `drop_stats`, if given, is a mutable `{"attempted": int, "dropped": int}`
+    counter that every decision candidate increments (see the pointer-
+    resolved-field check below) -- the caller's tool for reporting how many
+    decisions a sparse recording actually cost it (docs/frames.md §2.5 /
+    RECORDER_V3.md §1.2 rule 1: a pointer-resolved field is OMITTED from a
+    row, never zero-filled, when its pointer doesn't resolve that frame)."""
     if view is None:
         view = _RecordingView(
             version="v2", field_names=_V2_FIGHTER_FIELDS,
@@ -571,6 +602,7 @@ def _decisions_for_round(round_key: tuple, rows: list[dict],
         feats = scalar_features_for(view)
     fs = set(feats)
     prof = _profile.get()
+    ptr_fields = view.pointer_resolved_fields
 
     p1b = "block1" if rows[0]["p1_block"] == 1 else "block2"
     oppb = "block2" if p1b == "block1" else "block1"
@@ -605,6 +637,28 @@ def _decisions_for_round(round_key: tuple, rows: list[dict],
         row = rows[i]
         me = fields(row, p1b)
         opp = fields(rows[max(0, i - STALE)], oppb)  # stale opponent (§4)
+        if drop_stats is not None:
+            drop_stats["attempted"] = drop_stats.get("attempted", 0) + 1
+        # A pointer-resolved field is mapped (declared, so it's in feats/
+        # field_names) but this SPECIFIC row's dereference may have failed --
+        # RECORDER_V3.md §1.2 rule 1 / docs/frames.md §2.5: it is then simply
+        # OMITTED from `me`/`opp`, never zero-filled. `ptr_fields` is empty
+        # for every recording that declares none (v2 always; v3 with no
+        # sidecar or a sidecar naming no pointer-resolved fields), so this
+        # `and` short-circuits before either generator runs -- zero added
+        # cost on the fast path. A decision that hits this is not a training
+        # example (its spatial features cannot be computed) -- it is a hole,
+        # so the whole DECISION is dropped and counted, never the round or
+        # the file, and never silently: the caller either warns (some
+        # dropped) or aborts loudly (every candidate dropped -- a broken
+        # recording, not a hole; see _decisions_from_file).
+        if ptr_fields and (
+            any(f not in me for f in ptr_fields)
+            or any(f not in opp for f in ptr_fields)
+        ):
+            if drop_stats is not None:
+                drop_stats["dropped"] = drop_stats.get("dropped", 0) + 1
+            continue
         if has_facing:
             s = 1 if me["facing"] == 1 else -1
         else:
@@ -703,16 +757,25 @@ def _segment(round_decisions: list[Decision]) -> list[Decision]:
 
 def _decisions_from_file(
     path: Path, restrict: frozenset | None = None
-) -> tuple[list[Decision], list[str], str]:
-    """One file's (decisions, its resolved feature-name list, its port) --
-    the per-file unit both load_decisions() and build() are built from.
+) -> tuple[list[Decision], list[str], str, int]:
+    """One file's (decisions, its resolved feature-name list, its port, its
+    pointer-resolution drop count) -- the per-file unit both load_decisions()
+    and build() are built from.
 
     `restrict` (§4.3 cross-port fits): keep only these feature names --
     canonical order preserved -- and ABORT if any requested feature is
     unavailable in this recording. Restricting every input to the ports'
     shared feature subset is what makes a mixed-port (or cross-port-
     deployable) fit pass the feature-parity check honestly instead of
-    zero-filling the missing signals."""
+    zero-filling the missing signals.
+
+    The 4th element is how many decision candidates this file dropped
+    because a pointer-resolved field (docs/frames.md §2.5) failed to resolve
+    on that specific row -- always 0 when the recording declares none. If
+    EVERY candidate in the file was dropped, that is not a sparse-but-usable
+    recording, it is a broken one, and this aborts loudly instead of quietly
+    returning zero decisions (mirrors the existing "no usable decisions"
+    convention, but names the actual cause)."""
     version = _detect_version(path)
     prof = _profile.get()
     view = _view_for(path, version, prof)
@@ -735,9 +798,26 @@ def _decisions_from_file(
             )
         feats = [f for f in feats if f in restrict]
     decisions: list[Decision] = []
+    stats = {"attempted": 0, "dropped": 0}
     for round_key, rows in _rounds(path):
-        decisions.extend(_segment(_decisions_for_round(round_key, rows, view, feats)))
-    return decisions, feats, view.port
+        decisions.extend(
+            _segment(_decisions_for_round(round_key, rows, view, feats, stats))
+        )
+    if stats["attempted"] and not decisions:
+        raise SystemExit(
+            f"{path.name}: every decision candidate ({stats['attempted']}) was "
+            f"dropped -- pointer-resolved field(s) {sorted(view.pointer_resolved_fields)} "
+            "never resolved on any row. That is a broken recording, not a hole "
+            "in an otherwise-usable one; re-record or fix the pointer chain "
+            "before fitting."
+        )
+    if stats["dropped"]:
+        warnings.warn(
+            f"{path.name}: dropped {stats['dropped']} of {stats['attempted']} "
+            f"decisions -- pointer-resolved field(s) "
+            f"{sorted(view.pointer_resolved_fields)} did not resolve on those rows"
+        )
+    return decisions, feats, view.port, stats["dropped"]
 
 
 def _load_decisions_with_meta(paths: list[Path], restrict: frozenset | None = None):
@@ -755,12 +835,14 @@ def _load_decisions_with_meta(paths: list[Path], restrict: frozenset | None = No
     decisions: list[Decision] = []
     feature_sets: dict = {}
     ports: list[str] = []
+    dropped_total = 0
     for p in paths:
-        decs, feats, port = _decisions_from_file(p, restrict)
+        decs, feats, port, dropped = _decisions_from_file(p, restrict)
         feature_sets[p] = feats
         ports.append(port)
         decisions.extend(decs)
-    return decisions, feature_sets, ports
+        dropped_total += dropped
+    return decisions, feature_sets, ports, dropped_total
 
 
 def _check_feature_parity(feature_sets: dict) -> None:
@@ -793,7 +875,7 @@ def load_decisions(paths: list[Path], char_filter: int | None = None,
     Shared by build() and the coverage command so both count identically.
     (No cross-file feature-parity check here -- coverage only ever reads
     d.me_char/d.opp_char, so per-file feature-vector length doesn't matter.)"""
-    decisions, _feature_sets, _ports = _load_decisions_with_meta(paths)
+    decisions, _feature_sets, _ports, _dropped = _load_decisions_with_meta(paths)
     if char_filter is not None:
         decisions = [d for d in decisions if d.me_char == char_filter]
     if opp_filter is not None:
@@ -807,10 +889,19 @@ def build(paths: list[Path], char_filter: int | None = None,
 
     Returns dict with X (N, K*len(feature_names)), y_move, y_attack, buckets,
     round keys, the per-decision categorical columns, the actually-resolved
-    `feature_names` (§4.2 -- SCALAR_FEATURES filtered per-recording), and the
-    unique `ports` seen (§4.3 -- "mixed" meta when more than one).
+    `feature_names` (§4.2 -- SCALAR_FEATURES filtered per-recording), the
+    unique `ports` seen (§4.3 -- "mixed" meta when more than one), and
+    `dropped_decisions` -- the total count of decision candidates dropped
+    across every input file because a pointer-resolved field (docs/frames.md
+    §2.5) failed to resolve on that row (0 for any fit with no pointer-
+    resolved fields declared -- today's every fit). A per-file breakdown
+    already reached the user as a warning at load time (_decisions_from_file);
+    this total is here for any programmatic consumer (report/coverage) that
+    wants to surface it without re-deriving it.
     """
-    decisions, feature_sets, ports = _load_decisions_with_meta(paths, restrict)
+    decisions, feature_sets, ports, dropped_decisions = _load_decisions_with_meta(
+        paths, restrict
+    )
     _check_feature_parity(feature_sets)
     feature_names = next(iter(feature_sets.values()))
     if char_filter is not None:
@@ -840,6 +931,7 @@ def build(paths: list[Path], char_filter: int | None = None,
         "rounds": keys,
         "feature_names": feature_names,
         "ports": sorted(set(ports)),
+        "dropped_decisions": dropped_decisions,
     }
 
 
