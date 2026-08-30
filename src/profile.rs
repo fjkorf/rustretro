@@ -177,16 +177,38 @@ pub struct ContactSignal {
     pub global: Option<String>,
 }
 
-/// One macro step (MACRO_ACTIONS §2): held SEMANTIC directions, attack
+/// One macro step (MACRO_ACTIONS §2/§10): held SEMANTIC directions, attack
 /// CLASSES pressed together, and the executor's hold length in frames.
+///
+/// §10.1 extends this with three more fields, all attack-CLASS lists like
+/// `press`: `hold` (this step's chord must stay down for `min_frames`
+/// continuous frames before the step is satisfied — a release before that
+/// FAILS the whole macro, not just this step), `release` (satisfied on the
+/// FALLING edge of this chord), and `while_held` (a chord that must ALSO be
+/// down for this step to satisfy — the step-scoped stand-in for nesting,
+/// e.g. Reptile's Invisibility holding Block across `U U D`). `press`,
+/// `hold`, and `release` are mutually exclusive within one step (load-
+/// validated) — they name the step's KIND; `while_held` and `dirs` compose
+/// with any of them.
 #[derive(Deserialize, Debug, Clone)]
 pub struct StepSpec {
     #[serde(default)]
     pub dirs: Vec<String>,
     #[serde(default)]
     pub press: Vec<String>,
+    #[serde(default)]
+    pub hold: Vec<String>,
+    #[serde(default)]
+    pub release: Vec<String>,
+    #[serde(default)]
+    pub while_held: Vec<String>,
     #[serde(default = "d_step_frames")]
     pub frames: u8,
+    /// Only meaningful (and required) when `hold` is non-empty: the minimum
+    /// number of continuous frames the `hold` chord must stay down before
+    /// this step is satisfied.
+    #[serde(default)]
+    pub min_frames: Option<u32>,
 }
 fn d_step_frames() -> u8 {
     3
@@ -641,18 +663,44 @@ impl GameProfile {
                     return Err(format!("special_inputs '{chr}.{mv}' has no steps"));
                 }
                 for st in steps {
-                    if st.dirs.is_empty() && st.press.is_empty() {
+                    if st.dirs.is_empty()
+                        && st.press.is_empty()
+                        && st.hold.is_empty()
+                        && st.release.is_empty()
+                    {
                         return Err(format!("special_inputs '{chr}.{mv}' has an empty step"));
+                    }
+                    // §10.1: press/hold/release are mutually exclusive — they
+                    // name the step's KIND (Normal/Hold/Release).
+                    let kinds = [!st.press.is_empty(), !st.hold.is_empty(), !st.release.is_empty()];
+                    if kinds.iter().filter(|k| **k).count() > 1 {
+                        return Err(format!(
+                            "special_inputs '{chr}.{mv}' step mixes press/hold/release — pick one"
+                        ));
+                    }
+                    if !st.hold.is_empty() {
+                        match st.min_frames {
+                            Some(mf) if mf > 0 => {}
+                            _ => {
+                                return Err(format!(
+                                    "special_inputs '{chr}.{mv}' hold step needs a positive min_frames"
+                                ));
+                            }
+                        }
+                    } else if st.min_frames.is_some() {
+                        return Err(format!(
+                            "special_inputs '{chr}.{mv}' min_frames set without a hold step"
+                        ));
                     }
                     for d in &st.dirs {
                         if !DIRS.contains(&d.as_str()) {
                             return Err(format!("special_inputs '{chr}.{mv}' names unknown dir '{d}'"));
                         }
                     }
-                    for class in &st.press {
+                    for class in st.press.iter().chain(&st.hold).chain(&st.release).chain(&st.while_held) {
                         if !port.attack_chords.contains_key(class) {
                             return Err(format!(
-                                "special_inputs '{chr}.{mv}' presses unknown class '{class}'"
+                                "special_inputs '{chr}.{mv}' names unknown class '{class}'"
                             ));
                         }
                     }
@@ -1478,9 +1526,11 @@ mod tests {
     #[test]
     fn mk2_ships_the_reptile_special_intersection() {
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
-        // Family order (moves list), only what the port encodes.
+        // Family order (moves list), only what the port encodes. §10 adds a
+        // 4th reptile move (invisibility) — the original three's names AND
+        // encodings below are asserted byte-identically, unmodified.
         let names: Vec<&str> = p.specials_for(9).iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, vec!["slide", "acid_spit", "force_ball"]);
+        assert_eq!(names, vec!["slide", "acid_spit", "force_ball", "invisibility"]);
         // slide: single chord step, back+LK+LP+Block (the §2 two-button
         // chord was live-DISPROVEN — the game performs a normal without
         // Block; slide pose + hit verified with Block in the chord).
@@ -1489,10 +1539,24 @@ mod tests {
         assert_eq!(slide[0].dirs, vec!["back"]);
         assert_eq!(slide[0].press, vec!["LK", "LP", "Block"]);
         assert_eq!(slide[0].frames, 8);
+        // §10.1: invisibility ([BLK] U U D, release, HP) — Block held across
+        // the U/U/D steps via while_held, released, then HP pressed.
+        let (_, invis) = p.specials_for(9)[3];
+        assert_eq!(invis.len(), 5);
+        assert_eq!(invis[0].while_held, vec!["Block"]);
+        assert_eq!(invis[3].release, vec!["Block"]);
+        assert_eq!(invis[4].press, vec!["HP"]);
         // Characters without encodings offer nothing.
         assert!(p.specials_for(1).is_empty(), "liukang has no specials this phase");
         assert!(p.specials_for(99).is_empty());
-        assert_eq!(p.all_specials().len(), 3);
+        // Mileena (§10): sai_throw (hold+release), teleport_kick, roll.
+        let mileena: Vec<&str> = p.specials_for(5).iter().map(|(n, _)| *n).collect();
+        assert_eq!(mileena, vec!["sai_throw", "teleport_kick", "roll"]);
+        let (_, sai_throw) = p.specials_for(5)[0];
+        assert_eq!(sai_throw[0].hold, vec!["HP"]);
+        assert_eq!(sai_throw[0].min_frames, Some(180));
+        assert_eq!(sai_throw[1].release, vec!["HP"]);
+        assert_eq!(p.all_specials().len(), 7);
         // The arcade contact signal is the per-fighter `action_counter`
         // FIELD (quiet while guarding, fires on blocked contact even at zero
         // chip — live-verified). hitstun_sources stays as the health-delta

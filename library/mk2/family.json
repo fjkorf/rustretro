@@ -24,9 +24,10 @@
   "block": { "style": "button", "class": "Block" },
   "moves": {
     "reptile": [
-      { "name": "slide",      "tags": ["special", "low"] },
-      { "name": "acid_spit",  "tags": ["special", "projectile"] },
-      { "name": "force_ball", "tags": ["special", "projectile"] }
+      { "name": "slide",        "tags": ["special", "low"] },
+      { "name": "acid_spit",    "tags": ["special", "projectile"] },
+      { "name": "force_ball",   "tags": ["special", "projectile"] },
+      { "name": "invisibility", "tags": ["special", "stance"] }
     ],
     "mileena": [
       { "name": "sai_throw",     "tags": ["special", "projectile", "charge"] },

@@ -217,6 +217,104 @@
      ],
      "frames": 3
     }
+   ],
+   "invisibility": [
+    {
+     "dirs": [
+      "up"
+     ],
+     "while_held": [
+      "Block"
+     ],
+     "frames": 3
+    },
+    {
+     "dirs": [
+      "up"
+     ],
+     "while_held": [
+      "Block"
+     ],
+     "frames": 3
+    },
+    {
+     "dirs": [
+      "down"
+     ],
+     "while_held": [
+      "Block"
+     ],
+     "frames": 3
+    },
+    {
+     "release": [
+      "Block"
+     ]
+    },
+    {
+     "press": [
+      "HP"
+     ],
+     "frames": 3
+    }
+   ]
+  },
+  "mileena": {
+   "sai_throw": [
+    {
+     "hold": [
+      "HP"
+     ],
+     "min_frames": 180
+    },
+    {
+     "release": [
+      "HP"
+     ]
+    }
+   ],
+   "teleport_kick": [
+    {
+     "dirs": [
+      "forward"
+     ],
+     "frames": 3
+    },
+    {
+     "dirs": [
+      "forward"
+     ],
+     "frames": 3
+    },
+    {
+     "press": [
+      "LK"
+     ],
+     "frames": 3
+    }
+   ],
+   "roll": [
+    {
+     "dirs": [
+      "back"
+     ],
+     "frames": 3
+    },
+    {
+     "dirs": [
+      "back"
+     ],
+     "frames": 3
+    },
+    {
+     "dirs": [
+      "down"
+     ],
+     "press": [
+      "HK"
+     ],
+     "frames": 3
+    }
    ]
   }
  }

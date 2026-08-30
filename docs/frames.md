@@ -204,6 +204,11 @@ Measured MK2 latencies, 5/5 constant trials each:
 alongside the data, per observable AND per probe shape. An uncalibrated run
 is not a run.
 
+**Calibrate at TWO probe points and require agreement.** A single point taken
+too close to contact measures residual stun as latency: far HK's defender
+calibrates to 6/7 at anchor+40 but 1/2 at +70 and +100. The near value would
+have inflated `on_hit` by 5 frames, silently and plausibly.
+
 ## 4. The act-again probe — the measurement protocol
 
 The key property: **no hit-state byte is required.** "Can this fighter act"
@@ -336,6 +341,32 @@ Advantage is then two probes from one anchor:
 advantage = actionable(defender, contact) − actionable(attacker, contact)
 ```
 
+**Two rules learned by publishing a number that was wrong by 9 frames:**
+
+1. **State the convention.** This lab measures "the earliest frame this
+   fighter can START A WALK". That is not "can attack" — measured on MK2,
+   earliest-attack = walk-manifest − 2. Any published number must name its
+   convention, because a reader comparing against a community table is
+   comparing against a different one.
+2. **Never subtract per-side calibration when the two sides have DIFFERENT
+   probe shapes.** Latency cancels out of a difference only when the shapes
+   match. On block they do not (attacker 1, guarded defender 10), and the
+   defender's 10 is measured while FREE — during blockstun the block-stance
+   drop runs concurrently, so subtracting it made every move look 9 frames
+   more punishable. Difference the raw MANIFEST frames.
+
+**Knockdown must gate the on-hit measurement.** The probe will happily
+return an `on_hit` for a launcher, and it is meaningless (§1.1: a knockdown
+has a wakeup clock, not an advantage). Detect it from the victim's own
+resting `y` — §10 forbids a scalar GROUND_Y here — and record `on_hit` as
+NULL with `knockdown` set.
+
+**A move must be identified by its measured SIGNATURE, not by the buttons
+pressed.** `down+button` on a single frame enters something that connects at
+no gap; concluding "crouching normals never reach" from that is clean,
+plausible and false. Validate that the intended move actually came out
+(damage, contact frame, reach) before recording a row against its name.
+
 `on_hit` and `on_block` are two runs of the identical protocol differing
 only in whether the defender's guard is held. They are separate columns and
 MUST NOT be derived from each other.
@@ -378,7 +409,9 @@ walk-frames from a fixed reset is reproducible without any position read and
 remains the fallback if a pointer resolves invalid.
 
 1. Reset to a known position.
-2. Walk K frames; save `shadow/arenas/<family>/gap-K.state`.
+2. Walk K frames; save `shadow/arenas/<family>/gap-K.state`. **Note the
+   orientation: for a ladder that walks TOWARD the opponent, K=0 is the
+   FARTHEST rung, not point-blank.**
 3. Sidecar records: K, the achieved pixel gap if trustworthy, both char ids,
    facing, and `inputs_live` for BOTH ports.
 
@@ -472,8 +505,16 @@ the same protocol reproduces the same systematic error perfectly.
 
 1. **Re-measurement is exact.** An independent re-run of a random sample of
    ≥5 rows reproduces them to the frame, from a cold start.
-2. **Internal consistency holds** or is explained: `on_hit ≥ on_block` for
-   the same move/gap, `first_active_frame ≥ 1`, `total ≥ FAF + active`.
+2. **Internal consistency holds** or is explained: `first_active_frame ≥ 1`,
+   `total ≥ FAF + active`.
+   **`on_hit ≥ on_block` is NOT one of these.** The first draft asserted it;
+   MK2 arcade violates it legitimately and repeatedly. Blockstun there takes
+   only two values across Reptile's whole kit (+19 close, +23 everything
+   else) while hitstun varies per move, so far punches come out +4 on hit
+   and +13 on block — confirmed independently by a punish rig (defender
+   counters at contact+12 on hit, contact+21 on block). `on_hit ≥ on_block`
+   encodes a modern-game convention, not a law. A checker may FLAG the
+   inversion; it must not reject the row.
 3. **A punish the table predicts actually lands.** Take the most unsafe move
    in the table, block it, punish it with the fastest normal the table says
    reaches: it must connect. Take one the table calls safe by ≥3 frames:
@@ -542,3 +583,14 @@ the same protocol reproduces the same systematic error perfectly.
 - **`first_active_frame` is NULL in every row measured so far.** §4.4 defines
   it, nothing has measured it yet.
 - **Hitstop is unmeasured**, though §1.2 reserves a column for it.
+
+## 12. Schema gaps found by the first kit run (open)
+
+- **No arena / evidence column.** A row does not record which arena it was
+  measured on, so a reader cannot reproduce it without reading the prose.
+- **The export carries two rows per cell** (one per observable) with no
+  guidance on which a consumer should pick. Either collapse agreeing
+  observables into one row carrying both, or state the selection rule.
+- **`hitstop`, `active`, `recovery`, `total`, `wakeup_window` and
+  `guard_height` are NULL in every row measured so far.** The columns exist;
+  nothing measures them yet.

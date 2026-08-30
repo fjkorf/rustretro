@@ -26,6 +26,25 @@
 //! at most [`MAX_GAP`] frames may elapse (unchanged). `frames` is the
 //! executor's hold length; the matcher matches human taps of any length
 //! (≥1 frame) instead of enforcing it.
+//!
+//! §10 extends this with two amendments (Mileena/Reptile MK2 audit):
+//!
+//! - **Release-triggered and charged steps.** A step's KIND is Normal
+//!   (`dirs`/`press`, the original shape), Hold (`hold` + `min_frames`: the
+//!   chord must stay down `min_frames` CONTINUOUS frames before the step is
+//!   satisfied; a release before that FAILS the whole macro, not just the
+//!   step), or Release (`release`: satisfied on the FALLING edge of that
+//!   chord). "Completion fires on the edge the FINAL step names" — a macro
+//!   ending in a Release step completes on a release, not a press. A
+//!   `while_held` chord on any step is an extra AND-condition (like `press`)
+//!   that must also be down for that step to satisfy — the step-scoped
+//!   stand-in for nesting a hold across other steps (Reptile's Invisibility:
+//!   Block held across `U U D`).
+//! - **Side-swapping moves.** `back`/`forward` resolve against the facing
+//!   LIVE at the moment a macro's first step satisfies, PINNED for the rest
+//!   of that attempt (matcher and executor both) — a mid-macro crossup
+//!   (Mileena's Teleport Kick) must not silently reinterpret earlier or
+//!   later steps against a different side.
 
 use crate::profile::{GameProfile, StepSpec};
 
@@ -72,24 +91,34 @@ impl Dir {
             Dir::Back => if opponent_right { BIT_LEFT } else { BIT_RIGHT },
         }
     }
-
-    /// Index into the matcher's semantic-space tracking arrays.
-    fn idx(self) -> usize {
-        match self {
-            Dir::Back => 0,
-            Dir::Forward => 1,
-            Dir::Up => 2,
-            Dir::Down => 3,
-        }
-    }
 }
 
-/// One compiled step: semantic dirs + one physical chord mask per press
-/// CLASS (a class counts as "down" only when its whole chord is down).
+/// A step's KIND (§10.1) — mutually exclusive, decides which edge the step
+/// fires on and which compiled chord list `held_now` reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StepKind {
+    /// `dirs`/`press` down now (the original §2 shape).
+    Normal,
+    /// `hold` down continuously for `min_frames` frames.
+    Hold,
+    /// `release` chord down last frame, not down now (falling edge).
+    Release,
+}
+
+/// One compiled step: semantic dirs + one physical chord mask per press/
+/// hold/release CLASS (a class counts as "down" only when its whole chord
+/// is down). `while_held` is an extra chord ANDed into satisfaction
+/// regardless of kind — the step-scoped stand-in for a hold spanning other
+/// steps (§10.1).
 #[derive(Clone, Debug)]
 struct Step {
     dirs: Vec<Dir>,
     press: Vec<u16>,
+    hold: Vec<u16>,
+    release: Vec<u16>,
+    while_held: Vec<u16>,
+    kind: StepKind,
+    min_frames: u64,
     frames: u8,
 }
 
@@ -108,6 +137,26 @@ pub fn compile(name: &str, steps: &[StepSpec], p: &GameProfile) -> Result<Compil
     if steps.is_empty() {
         return Err(format!("macro '{name}' has no steps"));
     }
+    let compile_classes = |classes: &[String]| -> Result<Vec<u16>, String> {
+        classes
+            .iter()
+            .map(|class| {
+                let chord = p
+                    .port
+                    .attack_chords
+                    .get(class)
+                    .filter(|c| !c.is_empty())
+                    .ok_or_else(|| format!("macro '{name}': class '{class}' has no chord"))?;
+                let mut mask = 0u16;
+                for b in chord {
+                    mask |= 1
+                        << crate::profile::retro_button_bit(b)
+                            .ok_or_else(|| format!("macro '{name}': unknown button '{b}'"))?;
+                }
+                Ok(mask)
+            })
+            .collect::<Result<Vec<u16>, String>>()
+    };
     let compiled = steps
         .iter()
         .map(|s| {
@@ -116,30 +165,34 @@ pub fn compile(name: &str, steps: &[StepSpec], p: &GameProfile) -> Result<Compil
                 .iter()
                 .map(|d| Dir::parse(d).ok_or_else(|| format!("macro '{name}': unknown dir '{d}'")))
                 .collect::<Result<Vec<_>, _>>()?;
-            let press = s
-                .press
-                .iter()
-                .map(|class| {
-                    let chord = p
-                        .port
-                        .attack_chords
-                        .get(class)
-                        .filter(|c| !c.is_empty())
-                        .ok_or_else(|| format!("macro '{name}': class '{class}' has no chord"))?;
-                    let mut mask = 0u16;
-                    for b in chord {
-                        mask |= 1
-                            << crate::profile::retro_button_bit(b).ok_or_else(|| {
-                                format!("macro '{name}': unknown button '{b}'")
-                            })?;
-                    }
-                    Ok(mask)
-                })
-                .collect::<Result<Vec<u16>, String>>()?;
-            if dirs.is_empty() && press.is_empty() {
+            let press = compile_classes(&s.press)?;
+            let hold = compile_classes(&s.hold)?;
+            let release = compile_classes(&s.release)?;
+            let while_held = compile_classes(&s.while_held)?;
+            if dirs.is_empty() && press.is_empty() && hold.is_empty() && release.is_empty() {
                 return Err(format!("macro '{name}': empty step"));
             }
-            Ok(Step { dirs, press, frames: s.frames.max(1) })
+            let kind_count =
+                [!press.is_empty(), !hold.is_empty(), !release.is_empty()].iter().filter(|k| **k).count();
+            if kind_count > 1 {
+                return Err(format!("macro '{name}': step mixes press/hold/release — pick one"));
+            }
+            let kind = if !hold.is_empty() {
+                StepKind::Hold
+            } else if !release.is_empty() {
+                StepKind::Release
+            } else {
+                StepKind::Normal
+            };
+            let min_frames = if kind == StepKind::Hold {
+                let mf = s.min_frames.filter(|mf| *mf > 0).ok_or_else(|| {
+                    format!("macro '{name}': hold step needs a positive min_frames")
+                })?;
+                mf as u64
+            } else {
+                0
+            };
+            Ok(Step { dirs, press, hold, release, while_held, kind, min_frames, frames: s.frames.max(1) })
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(CompiledMacro { name: name.to_string(), steps: compiled })
@@ -155,6 +208,21 @@ struct MState {
     /// Completion frame of the previous step (or the last reset) — onsets
     /// must land strictly after it, so a continuous hold can't re-fire.
     activation: u64,
+    /// Onset of the CURRENT continuous hold while `step` points at a Hold
+    /// step (§10.1); 0 means "not currently holding". Cleared on advance,
+    /// reset, or a release-before-`min_frames` failure.
+    hold_onset: u64,
+    /// Facing pinned at the frame this attempt's first step satisfied
+    /// (§10.2) — `None` while still on step 0 (nothing to pin yet), which
+    /// is when `back`/`forward` fall back to the LIVE facing passed to
+    /// `feed` this frame.
+    pinned_facing: Option<bool>,
+}
+
+impl MState {
+    fn fresh(now: u64) -> MState {
+        MState { step: 0, activation: now, hold_onset: 0, pinned_facing: None }
+    }
 }
 
 /// Streaming recognizer for ONE player's input stream. Feed the 12-bit mask
@@ -166,27 +234,18 @@ pub struct Matcher {
     /// 1-based so "onset 0" can mean "never" under strict comparisons.
     frame: u64,
     prev_mask: u16,
-    /// Last up→down edge per physical button.
+    /// Last up→down edge per PHYSICAL button (RETRO bit index). Facing is
+    /// resolved to a physical bit at query time (live for an unpinned step
+    /// 0, pinned per-macro otherwise, §10.2) rather than baked into a
+    /// semantic-space onset table, so the same onset data serves whichever
+    /// facing a given macro's attempt is currently pinned to.
     bit_onset: [u64; 12],
-    /// Held/onset tracking in SEMANTIC space (Back/Forward/Up/Down) — a
-    /// facing flip mid-hold reads as a release+press of the semantic dir,
-    /// which is exactly the physical truth of the input.
-    prev_dir: [bool; 4],
-    dir_onset: [u64; 4],
 }
 
 impl Matcher {
     pub fn new(macros: Vec<CompiledMacro>) -> Self {
-        let states = macros.iter().map(|_| MState { step: 0, activation: 0 }).collect();
-        Matcher {
-            macros,
-            states,
-            frame: 0,
-            prev_mask: 0,
-            bit_onset: [0; 12],
-            prev_dir: [false; 4],
-            dir_onset: [0; 4],
-        }
+        let states = macros.iter().map(|_| MState::fresh(0)).collect();
+        Matcher { macros, states, frame: 0, prev_mask: 0, bit_onset: [0; 12] }
     }
 
     /// Advance one frame. Returns the names completed THIS frame (deduped —
@@ -194,29 +253,43 @@ impl Matcher {
     pub fn feed(&mut self, mask: u16, opponent_right: bool) -> Vec<&str> {
         self.frame += 1;
         let now = self.frame;
+        // Captured BEFORE this frame's bit_onset/prev_mask update — a
+        // Release step's falling edge (§10.1) is "chord fully down in
+        // old_mask, not fully down in mask".
+        let old_mask = self.prev_mask;
         for i in 0..12 {
-            if mask & (1 << i) != 0 && self.prev_mask & (1 << i) == 0 {
+            if mask & (1 << i) != 0 && old_mask & (1 << i) == 0 {
                 self.bit_onset[i] = now;
             }
-        }
-        for d in [Dir::Back, Dir::Forward, Dir::Up, Dir::Down] {
-            let held = mask & (1 << d.bit(opponent_right)) != 0;
-            let i = d.idx();
-            if held && !self.prev_dir[i] {
-                self.dir_onset[i] = now;
-            }
-            self.prev_dir[i] = held;
         }
         self.prev_mask = mask;
 
         let mut done: Vec<&str> = Vec::new();
         for (m, st) in self.macros.iter().zip(self.states.iter_mut()) {
-            // Raw §2 satisfaction: dirs held now, every press class's full
-            // chord down now — one frame, no memory. This is also the
-            // release test the cooldown branch below uses.
-            let held_now = |step: &Step| -> bool {
-                step.dirs.iter().all(|d| self.prev_dir[d.idx()])
-                    && step.press.iter().all(|chord| mask & chord == *chord)
+            // facing to resolve THIS step's dirs with: pinned once this
+            // attempt has one (§10.2), else the live facing passed in.
+            let facing_for = |pin: Option<bool>| -> bool { pin.unwrap_or(opponent_right) };
+            let dirs_held = |dirs: &[Dir], facing: bool| -> bool {
+                dirs.iter().all(|d| mask & (1 << d.bit(facing)) != 0)
+            };
+            let chord_down = |chords: &[u16], m: u16| -> bool {
+                chords.iter().all(|c| m & c == *c)
+            };
+            // Raw §2/§10.1 satisfaction, dispatched by step KIND — one
+            // frame, no memory (Release aside, which needs exactly one
+            // frame of look-back to see its own falling edge). This is
+            // also the release test the cooldown branch below uses.
+            let held_now = |step: &Step, facing: bool| -> bool {
+                if !dirs_held(&step.dirs, facing) || !chord_down(&step.while_held, mask) {
+                    return false;
+                }
+                match step.kind {
+                    StepKind::Normal => chord_down(&step.press, mask),
+                    StepKind::Hold => chord_down(&step.hold, mask),
+                    StepKind::Release => {
+                        chord_down(&step.release, old_mask) && !chord_down(&step.release, mask)
+                    }
+                }
             };
             // Step-advance satisfaction: `held_now` PLUS the freshness/gap
             // bookkeeping that keeps multi-step motions distinct from a
@@ -226,15 +299,16 @@ impl Matcher {
             // that is what lets "hold back, slide, keep holding back, slide
             // again" re-fire on the chord alone. Press itself carries no
             // onset/tolerance bookkeeping any more (§2: simultaneity, not a
-            // trailing window) — see `held_now`.
-            let sat = |step: &Step, activation: u64, first: bool| -> bool {
-                if !held_now(step) {
+            // trailing window) — see `held_now`. (Hold-kind steps never
+            // reach this function — see the dedicated branch below.)
+            let sat = |step: &Step, activation: u64, first: bool, facing: bool| -> bool {
+                if !held_now(step, facing) {
                     return false;
                 }
                 if step.press.is_empty() || !first {
                     let mut onset_max = 0u64;
                     for d in &step.dirs {
-                        let o = self.dir_onset[d.idx()];
+                        let o = self.bit_onset[d.bit(facing)];
                         if o <= activation {
                             return false; // stale hold, not a fresh tap
                         }
@@ -249,13 +323,48 @@ impl Matcher {
                 // Cooldown: this macro just completed. Re-arm only once its
                 // final step releases — holding the chord is ONE input, so
                 // it must not multiply-count completions (contract §2).
-                if !held_now(&m.steps[m.steps.len() - 1]) {
-                    *st = MState { step: 0, activation: now };
+                let facing = facing_for(st.pinned_facing);
+                if !held_now(&m.steps[m.steps.len() - 1], facing) {
+                    *st = MState::fresh(now);
                 }
                 continue;
             }
 
-            if sat(&m.steps[st.step], st.activation, st.step == 0) {
+            let cur = &m.steps[st.step];
+
+            if cur.kind == StepKind::Hold {
+                // §10.1: satisfied only once held `min_frames` CONTINUOUS
+                // frames; a release before that FAILS the whole macro (not
+                // a soft reset-and-maybe-restart like the generic path
+                // below — parking short of the threshold is not progress).
+                let facing = facing_for(st.pinned_facing);
+                if held_now(cur, facing) {
+                    if st.hold_onset == 0 {
+                        st.hold_onset = now;
+                    }
+                    if now - st.hold_onset + 1 >= cur.min_frames {
+                        if st.step == 0 {
+                            st.pinned_facing = Some(facing);
+                        }
+                        st.activation = now;
+                        st.step += 1;
+                        st.hold_onset = 0;
+                        if st.step == m.steps.len() && !done.contains(&m.name.as_str()) {
+                            done.push(&m.name);
+                        }
+                    }
+                } else if st.hold_onset != 0 {
+                    *st = MState::fresh(now);
+                }
+                continue;
+            }
+
+            let first = st.step == 0;
+            let facing = facing_for(st.pinned_facing);
+            if sat(cur, st.activation, first, facing) {
+                if first {
+                    st.pinned_facing = Some(facing);
+                }
                 st.activation = now;
                 st.step += 1;
                 if st.step == m.steps.len() {
@@ -268,12 +377,22 @@ impl Matcher {
                 }
             } else if st.step > 0 {
                 // A fresh step-0 satisfaction mid-macro restarts the window
-                // (B … stray … B+HP still reads as B, B+HP); otherwise a
-                // blown gap resets to neutral.
-                if sat(&m.steps[0], now - 1, true) {
-                    *st = MState { step: 1, activation: now };
+                // (B … stray … B+HP still reads as B, B+HP), re-pinning
+                // facing to THIS restart's live side (§10.2 — a restart is a
+                // new attempt). Skipped when step 0 is Hold-kind: its
+                // `held_now` is a continuous "still down" condition, not a
+                // discrete tap, so re-checking it here would spuriously
+                // "restart" every single frame the chord stays down.
+                // Otherwise a blown gap resets to neutral.
+                if m.steps[0].kind != StepKind::Hold && sat(&m.steps[0], now - 1, true, opponent_right) {
+                    *st = MState {
+                        step: 1,
+                        activation: now,
+                        hold_onset: 0,
+                        pinned_facing: Some(opponent_right),
+                    };
                 } else if now > st.activation + MAX_GAP {
-                    *st = MState { step: 0, activation: now };
+                    *st = MState::fresh(now);
                 }
             }
         }
@@ -283,28 +402,43 @@ impl Matcher {
 
 // ── the executor ────────────────────────────────────────────────────────────
 
-/// Plays a compiled macro back one frame at a time: each step's dirs+presses
-/// held for its `frames`, [`STEP_GAP`] neutral frames between steps (so
-/// double-taps register), dirs re-resolved against live facing EVERY frame —
-/// a mid-macro side switch keeps "back" meaning away (contract §5).
+/// Plays a compiled macro back one frame at a time: each step's dirs+
+/// presses (or +hold / +while_held, by KIND — §10.1) held for its frames
+/// ([`Step::min_frames`] for a Hold step, `frames` otherwise), [`STEP_GAP`]
+/// neutral frames between steps (so double-taps register). Facing is PINNED
+/// on the first `next()` call and reused for the macro's whole duration
+/// (§10.2) — a mid-macro side switch (Mileena's Teleport Kick) must not
+/// silently flip what "back"/"forward" mean partway through playback.
 pub struct MacroExec {
     m: CompiledMacro,
     step: usize,
-    hold_left: u8,
+    hold_left: u32,
     gap_left: u8,
+    pinned_facing: Option<bool>,
 }
 
 impl MacroExec {
     pub fn new(m: CompiledMacro) -> Self {
-        let hold = m.steps[0].frames;
-        MacroExec { m, step: 0, hold_left: hold, gap_left: 0 }
+        let hold = Self::hold_len(&m.steps[0]);
+        MacroExec { m, step: 0, hold_left: hold, gap_left: 0, pinned_facing: None }
+    }
+
+    fn hold_len(step: &Step) -> u32 {
+        if step.kind == StepKind::Hold {
+            step.min_frames as u32
+        } else {
+            step.frames as u32
+        }
     }
 
     /// The next frame's held-button set; `None` once the macro has finished.
+    /// Facing is captured from THIS call the first time it's invoked, then
+    /// pinned (§10.2) — later calls' `opponent_right` is ignored.
     pub fn next(&mut self, opponent_right: bool) -> Option<[bool; 12]> {
         if self.step >= self.m.steps.len() {
             return None;
         }
+        let facing = *self.pinned_facing.get_or_insert(opponent_right);
         if self.gap_left > 0 {
             self.gap_left -= 1;
             return Some([false; 12]);
@@ -312,9 +446,18 @@ impl MacroExec {
         let st = &self.m.steps[self.step];
         let mut bits = [false; 12];
         for d in &st.dirs {
-            bits[d.bit(opponent_right)] = true;
+            bits[d.bit(facing)] = true;
         }
-        for chord in &st.press {
+        // Release-kind steps press nothing (they exist to let go of
+        // `release`'s chord — that's achieved simply by NOT setting its
+        // bits here, since `bits` is rebuilt from scratch every frame);
+        // Hold-kind steps hold `hold`'s chord instead of `press`'s.
+        let press_like: &[u16] = match st.kind {
+            StepKind::Normal => &st.press,
+            StepKind::Hold => &st.hold,
+            StepKind::Release => &[],
+        };
+        for chord in press_like.iter().chain(&st.while_held) {
             for i in 0..12 {
                 if chord & (1 << i) != 0 {
                     bits[i] = true;
@@ -326,10 +469,20 @@ impl MacroExec {
             self.step += 1;
             if self.step < self.m.steps.len() {
                 self.gap_left = STEP_GAP;
-                self.hold_left = self.m.steps[self.step].frames;
+                self.hold_left = Self::hold_len(&self.m.steps[self.step]);
             }
         }
         Some(bits)
+    }
+
+    /// Cancel this macro early. Returns the all-neutral mask the caller
+    /// MUST inject on abort (§10.1 consequence): parking on a held chord
+    /// (e.g. mid-Sai-Throw HP, or Invisibility's held Block) silently arms
+    /// a charge move, so an aborted executor cannot simply stop being
+    /// polled — it must actively hand back a release.
+    pub fn abort(&mut self) -> [bool; 12] {
+        self.step = self.m.steps.len();
+        [false; 12]
     }
 }
 
@@ -530,7 +683,11 @@ mod tests {
     }
 
     #[test]
-    fn facing_flip_mid_macro_tracks_semantic_dirs() {
+    fn facing_flip_mid_macro_pins_the_starting_side_10_2() {
+        // §10.2 supersedes the old "live facing every frame" rule: a macro
+        // pins facing at the frame its first step satisfies and keeps that
+        // pin for the rest of the attempt (a crossup must not silently
+        // reinterpret "forward" partway through a motion).
         let p = arcade();
         let ff = compile(
             "ff",
@@ -539,16 +696,21 @@ mod tests {
         )
         .unwrap();
         let mut m = Matcher::new(vec![ff]);
-        // First forward tap with the opponent on the RIGHT (physical Right).
+        // First forward tap with the opponent on the RIGHT — pins forward =
+        // physical Right for this attempt.
         assert!(m.feed(B_RIGHT, true).is_empty());
         assert!(m.feed(0, true).is_empty());
-        // Side switch: opponent now LEFT — forward is physical Left. The
-        // player taps Left and the motion still completes.
-        assert_eq!(m.feed(B_LEFT, false), vec!["ff"]);
+        // Side switch reported at the SAME frame the player presses physical
+        // Right again: under the OLD live rule this would be "back" (since
+        // live-forward is now Left) and would not complete; PINNED, it is
+        // still forward (the pin, not the live report, decides) — completes.
+        assert_eq!(m.feed(B_RIGHT, false), vec!["ff"]);
 
-        // Counter-case: holding Left through a flip becomes a fresh semantic
-        // BACK press — a back-charge matcher would see an onset. For the
-        // forward pair it contributes nothing:
+        // Counter-case: after the same flip, pressing what is now LIVE
+        // forward (physical Left) must NOT satisfy the PINNED macro's
+        // second step — that is exactly the bug §10.2 closes (a stale
+        // semantic label must not let a different physical button sneak in
+        // as if it were the same motion).
         let ff2 = compile(
             "ff",
             &spec(r#"[{"dirs":["forward"],"frames":3},{"dirs":["forward"],"frames":3}]"#),
@@ -556,9 +718,13 @@ mod tests {
         )
         .unwrap();
         let mut m = Matcher::new(vec![ff2]);
-        assert!(m.feed(B_RIGHT, true).is_empty()); // forward (opp right)
-        assert!(m.feed(B_RIGHT, false).is_empty()); // flip: same button is now BACK
-        assert!(m.feed(B_RIGHT, false).is_empty()); // still held: no fresh forward
+        assert!(m.feed(B_RIGHT, true).is_empty()); // forward (opp right) -> pin=right
+        assert!(m.feed(0, false).is_empty()); // release, side now reported left
+        // Pressing physical Left here does NOT satisfy the pinned attempt's
+        // second step (pin says forward=Right); it can only be read as a
+        // fresh, independent start (§2's existing "stray tap restarts the
+        // window" rule) — either way, this single frame does not complete.
+        assert!(m.feed(B_LEFT, false).is_empty());
     }
 
     #[test]
@@ -587,7 +753,11 @@ mod tests {
     }
 
     #[test]
-    fn executor_resolves_facing_per_frame_and_gaps_between_steps() {
+    fn executor_pins_facing_from_the_first_call_10_2() {
+        // §10.2 supersedes "dirs re-resolved every frame": the executor
+        // pins facing on its first `next()` call and reuses it for the
+        // whole macro, so a mid-macro side switch does NOT flip later
+        // steps' physical buttons.
         let p = arcade();
         let acid = compile(
             "acid_spit",
@@ -598,13 +768,75 @@ mod tests {
         let mut ex = MacroExec::new(acid);
         let mut masks = Vec::new();
         let mut i = 0;
-        // Flip the opponent's side mid-macro: frames 0-3 right, rest left.
+        // Report the opponent flipping to the left mid-macro (frames 0-3
+        // right, rest left) — the pin from frame 0 must win throughout.
         while let Some(bits) = ex.next(i < 4) {
             masks.push(crate::record::pack_mask(&bits));
             i += 1;
         }
-        // 3×F(right), 2×neutral gap — flip lands inside the gap — 3×F(left)+HP.
-        assert_eq!(masks, vec![0x80, 0x80, 0x80, 0, 0, 0x42, 0x42, 0x42]);
+        // 3×F(right), 2×neutral gap, 3×F(right)+HP — the LATER "left" report
+        // is ignored; forward stays physical Right for this whole macro.
+        assert_eq!(masks, vec![0x80, 0x80, 0x80, 0, 0, 0x82, 0x82, 0x82]);
+    }
+
+    #[test]
+    fn executor_plays_back_hold_for_min_frames_then_releases_10_1() {
+        let p = arcade();
+        let sai_throw = compile(
+            "sai_throw",
+            &spec(r#"[{"hold":["HP"],"min_frames":5},{"release":["HP"]}]"#),
+            &p,
+        )
+        .unwrap();
+        let mut ex = MacroExec::new(sai_throw);
+        let mut masks = Vec::new();
+        while let Some(bits) = ex.next(true) {
+            masks.push(crate::record::pack_mask(&bits));
+        }
+        // 5 frames holding HP (0x2), STEP_GAP=2 neutral frames, then the
+        // release step's own `frames` (default 3) neutral frames — the
+        // release step presses nothing, which IS the release.
+        assert_eq!(masks, vec![0x2, 0x2, 0x2, 0x2, 0x2, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn executor_round_trips_a_hold_release_macro_through_the_matcher_10_1() {
+        let p = arcade();
+        let make = || {
+            compile("sai_throw", &spec(r#"[{"hold":["HP"],"min_frames":5},{"release":["HP"]}]"#), &p)
+                .unwrap()
+        };
+        let mut ex = MacroExec::new(make());
+        let mut m = Matcher::new(vec![make()]);
+        let mut seen = Vec::new();
+        while let Some(bits) = ex.next(true) {
+            for n in m.feed(crate::record::pack_mask(&bits), true) {
+                seen.push(n.to_string());
+            }
+        }
+        assert_eq!(seen, vec!["sai_throw"], "the executor's own release must satisfy its own matcher");
+    }
+
+    #[test]
+    fn executor_abort_returns_neutral_and_stops_holding_10_1() {
+        // §10.1 consequence: aborting mid-Hold must release the chord, not
+        // park on it (a parked chord silently arms a charge move).
+        let p = arcade();
+        let sai_throw = compile(
+            "sai_throw",
+            &spec(r#"[{"hold":["HP"],"min_frames":150},{"release":["HP"]}]"#),
+            &p,
+        )
+        .unwrap();
+        let mut ex = MacroExec::new(sai_throw);
+        // A few frames into the hold, HP is genuinely being held.
+        for _ in 0..5 {
+            let bits = ex.next(true).expect("still mid-hold");
+            assert!(bits[1], "HP bit should be held during the hold step"); // HP=y=bit1
+        }
+        let abort_bits = ex.abort();
+        assert_eq!(abort_bits, [false; 12], "abort must hand back an all-neutral release");
+        assert!(ex.next(true).is_none(), "an aborted executor is done, not paused");
     }
 
     #[test]
@@ -629,6 +861,30 @@ mod tests {
             .contains("no chord"));
         assert!(compile("x", &spec(r#"[{}]"#), &p).unwrap_err().contains("empty step"));
         assert!(compile("x", &[], &p).unwrap_err().contains("no steps"));
+    }
+
+    #[test]
+    fn compile_rejects_bad_hold_release_shapes_10_1() {
+        let p = arcade();
+        // hold without min_frames.
+        assert!(compile("x", &spec(r#"[{"hold":["HP"]}]"#), &p)
+            .unwrap_err()
+            .contains("min_frames"));
+        // press + hold in the same step (kind ambiguity).
+        assert!(compile("x", &spec(r#"[{"press":["HP"],"hold":["LP"],"min_frames":5}]"#), &p)
+            .unwrap_err()
+            .contains("mixes"));
+        // press + release in the same step.
+        assert!(compile("x", &spec(r#"[{"press":["HP"],"release":["LP"]}]"#), &p)
+            .unwrap_err()
+            .contains("mixes"));
+        // bare while_held with no dirs/press/hold/release is still an
+        // empty step (it names no discrete action of its own).
+        assert!(compile("x", &spec(r#"[{"while_held":["Block"]}]"#), &p)
+            .unwrap_err()
+            .contains("empty step"));
+        // a well-formed hold step compiles fine.
+        assert!(compile("x", &spec(r#"[{"hold":["HP"],"min_frames":150}]"#), &p).is_ok());
     }
 
     #[test]
@@ -765,5 +1021,78 @@ mod tests {
             exercised >= 9,
             "golden fixture parity only exercised {exercised} cases — fixture shrank?"
         );
+    }
+
+    /// The §10 twin of `golden_fixture_parity`: same shared-fixture design
+    /// (`shadow/train/tests/fixtures/macro_ext_golden.json`, also run by
+    /// Python's `tests/test_macro_ext_parity.py`), covering the NEW step
+    /// kinds (hold/release/while_held, §10.1) and pinned-facing resolution
+    /// across a side swap (§10.2). Each case names its own `move_name`
+    /// explicitly (no inference needed, unlike the §2 fixture).
+    #[test]
+    fn golden_ext_fixture_parity() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let fixture_path = manifest_dir.join("shadow/train/tests/fixtures/macro_ext_golden.json");
+        let fixture_json =
+            std::fs::read_to_string(&fixture_path).expect("§10 golden fixture file exists");
+
+        #[derive(serde::Deserialize, Debug)]
+        struct ExtCase {
+            name: String,
+            move_name: String,
+            #[serde(rename = "macro")]
+            macro_steps: Vec<serde_json::Value>,
+            facing: serde_json::Value,
+            frames: Vec<String>,
+            expected: Vec<ExtExpectation>,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        struct ExtExpectation {
+            frame: usize,
+            #[serde(rename = "move")]
+            move_name: String,
+        }
+
+        let cases: Vec<ExtCase> =
+            serde_json::from_str(&fixture_json).expect("§10 golden fixture parses as JSON");
+        assert!(cases.len() >= 6, "§10 golden fixture must contain its cases to be a gate at all");
+
+        let profile = arcade();
+        for case in cases {
+            let masks: Vec<u16> = case
+                .frames
+                .iter()
+                .map(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).expect("frame is valid hex"))
+                .collect();
+            let sides: Vec<bool> = match &case.facing {
+                serde_json::Value::String(s) => vec![s == "right"; masks.len()],
+                serde_json::Value::Array(arr) => {
+                    arr.iter().map(|v| v.as_str().expect("facing is string") == "right").collect()
+                }
+                _ => panic!("facing must be string or array"),
+            };
+
+            let steps: Vec<crate::profile::StepSpec> =
+                serde_json::from_str(&serde_json::to_string(&case.macro_steps).unwrap())
+                    .expect("§10 macro steps parse");
+            let compiled = compile(&case.move_name, &steps, &profile)
+                .unwrap_or_else(|e| panic!("§10 case '{}': macro compiles: {e}", case.name));
+
+            let mut matcher = Matcher::new(vec![compiled]);
+            let mut actual: Vec<(usize, String)> = Vec::new();
+            for (i, (mask, side)) in masks.iter().zip(sides.iter()).enumerate() {
+                for name in matcher.feed(*mask, *side) {
+                    actual.push((i, name.to_string()));
+                }
+            }
+            let expected: Vec<(usize, String)> =
+                case.expected.iter().map(|e| (e.frame, e.move_name.clone())).collect();
+
+            assert_eq!(
+                actual, expected,
+                "§10 golden case '{}' diverged: expected {:?}, got {:?}",
+                case.name, expected, actual,
+            );
+        }
     }
 }

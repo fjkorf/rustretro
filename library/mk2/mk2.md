@@ -1120,8 +1120,26 @@ HP at a ~82 px gap (MK2 has proximity normals — this is not the close HP).
 
 | outcome | attacker free | defender free | **advantage** |
 |---|---|---|---|
-| on block (P2 holds Block) | N*=9 | N*=13 | **+4** |
+| on block (P2 holds Block) | N*=9 | N*=13 | ~~+4~~ → **+13** |
 | on hit (P2 holds nothing) | N*=9 | N*=13 | **+4** |
+
+> **CORRECTED 2026-08-30 (same day), on_block only: +4 was WRONG BY 9
+> FRAMES; the value is +13.** The probe differenced each side's OWN
+> calibrated latency, which cancels only when both sides share a probe
+> shape. On block they do not (attacker 1, guarded defender 10), and that 10
+> was measured while the fighter was FREE — during blockstun the
+> block-stance drop runs concurrently, so subtracting it made every move
+> look 9 frames more punishable than it is. Settled by a THIRD rig that uses
+> no probe at all (sweep the defender's counter-attack frame, read the
+> attacker's damage register): "earliest frame the defender can attack" =
+> walk manifest − 2, in 4/4 configurations across both probe shapes. Stored
+> advantage is now the manifest difference. `on_hit` was never affected.
+>
+> Note what did NOT catch this: two observables agreeing to the frame on all
+> four sweeps, monotone predicates, and reproduction from a fresh process.
+> Both observables shared the same flawed subtraction, so the cross-method
+> check (§8.4) confirmed precision perfectly while the number was wrong.
+> Only an independent RIG — different readout, no probe — found it.
 
 Anchor `contact_frame=55, hits=1` from struct health `block+0x0E`
 (161→150 on hit, 161→158 on block — so both rigs genuinely connected, and
@@ -1136,6 +1154,11 @@ a third re-measurement from a FRESH EMULATOR PROCESS reproduced the
 defender's 13 exactly. This satisfies `docs/frames.md` §8.4, the criterion
 that tests accuracy rather than precision.
 
+**ANSWERED by the full-kit run (see below): the equality was an artifact of
+the calibration bug, not a property of the game.** With the correction,
+far HP is +4 on hit and +13 on block. Advantage varies by move in BOTH
+directions. Original question preserved below for the reasoning.
+
 **Open question for the full-kit run: `on_hit == on_block` here.** That is a
 legitimate measurement (the health deltas prove the two rigs differed), and
 old engines do often give hitstun and blockstun the same length — but it is
@@ -1148,3 +1171,253 @@ not: the on-block defender's absolute (23/24) includes the ~9-frame
 block-stance drop, which cancels out of the difference. The advantage is the
 trustworthy number; the absolutes are not directly comparable across
 different probe shapes.
+
+## Reptile's normals across the spacing ladder (2026-08-30, task B3)
+
+Ten measured (move, gap) cells — every standing normal that connects, at
+every rung of the ladder where it connects, on hit AND on block — plus the
+crouching uppercut. It supersedes the single-move section above on one
+point, flagged in bold below: **the on-block numbers there were 9 frames too
+generous to the defender**, and this section shows the experiment that
+settles it.
+
+### Rig
+
+Ladder arenas `shadow/arenas/mk2/gap-{60,45,30}.state` (62 / 72 / 110 px, the
+`.gap.json` sidecars), 2-human Reptile mirror, P1 on the left. Two headless
+FBNeo instances on MCP ports 4047 and 4048 (never 4025). Contact anchored on
+the fighter-struct health `block+0x0E` per `docs/frames.md` §4.1, one anchor
+per rig — the blocked run gets its own, so "hit and block connect on the same
+frame" is a result (it does, in all ten cells) rather than an assumption.
+
+No walk-in: the arena encodes the gap, so the move's input is frame 0 of the
+replay. That removes ~45 frames from every one of the ~220 replays a cell
+costs and removes a decelerating fighter as a confound.
+
+Both observables were sampled from the same runs and **agreed to the frame on
+all 62 sweeps of both runs, without a single exception** — the walk-velocity word `block+0x0B..0x0D` and the
+pointer-resolved `x` (`obj+0x12`), which live in different data structures
+(§8.4).
+
+Probe latencies, calibrated per shape on this rig and confirmed HOLD-LIMITED
+(see "the calibration must be hold-limited" below):
+
+| probe shape | `struct_velocity` | `pointer_x` |
+|---|---|---|
+| attacker (either rig) | 1 | 2 |
+| defender, on hit | 1 | 2 |
+| defender, on block (drops Block, walks) | 10 | 11 |
+
+### The connect map — where the proximity variants actually are
+
+One anchor replay per cell, before any sweep. `—` = the contact signal never
+fired: a whiff, which is an OUTCOME (§1.1), not a missing measurement.
+
+| gap | HP | LP | HK | LK | cHP | cLK |
+|---|---|---|---|---|---|---|
+| 180 px (K=0) | — | — | — | — | — | — |
+| 147 px (K=15) | — | — | — | — | — | — |
+| 110 px (K=30) | — | — | 32 | 26 | — | — |
+| 72 px (K=45) | 11 | 8 | 32 | 26 | 40 | 6 |
+| 62 px (K=60) | **24** | *throw* | **16** | **16** | 40 | 6 |
+
+Damage alone locates every variant boundary, and it is between 62 and 72 px
+for **every button**: HP 11 → 24, HK 32 → 16, LK 26 → 16, LP → a throw. The
+same boundary for four different buttons is itself evidence that MK2 resolves
+proximity once, per input, at one distance threshold — and it is why 62 px
+rows are stored as `variant: close` and 72/110 px rows as `variant: far`,
+never averaged (§5).
+
+Kicks reach 110 px and whiff at 147; punches reach 72 px and whiff at 110;
+the crouching normals reach 72 px and whiff at 110. `connect_range` in the
+store is that largest CONNECTING rung — a bracket (`110 < range ≤ 147`), not
+a measured edge.
+
+### The table
+
+Frames are relative to the contact frame. "att free" / "def free" are the
+frames at which that fighter's walk manifests; the advantage is their
+difference (see the convention note below). `n` = independent full
+measurements; `n=2` means a second, cold-started emulator process reproduced
+the cell exactly.
+
+| move | variant | gap | damage | chip | contact f | att free | def free (hit) | def free (blk) | **on hit** | **on block** | n |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| HP | close | 62 px | 24 | 6 | 8 | +18 | +26 | +19 | **+8** | **+1** | 1 |
+| HP | far | 72 px | 11 | 3 | 11 | +10 | +14 | +23 | **+4** | **+13** | 1 |
+| LP | far | 72 px | 8 | 2 | 11 | +10 | +14 | +23 | **+4** | **+13** | 2 |
+| HK | close | 62 px | 16 | 4 | 11 | +33 | +26 | +19 | **−7** | **−14** | 2 |
+| HK | far | 72 px | 32 | 8 | 8 | +39 | +46 | +23 | **+7** | **−16** | 2 |
+| HK | far | 110 px | 32 | 8 | 8 | +39 | +46 | +23 | **+7** | **−16** | 2 |
+| LK | close | 62 px | 16 | 4 | 11 | +33 | +26 | +19 | **−7** | **−14** | 2 |
+| LK | far | 72 px | 26 | 6 | 8 | +39 | +18 | +23 | **−21** | **−16** | 1 |
+| LK | far | 110 px | 26 | 6 | 8 | +39 | +18 | +23 | **−21** | **−16** | 2 |
+| cHP | close | 62 px | 40 | 10 | 14¹ | +28 | NULL² | +23 | **NULL²** | **−5** | 1 |
+
+¹ replay-relative; the move's own input is at frame 6 (the crouch lead-in), so
+`first_active_frame` is **8**. ² the uppercut LAUNCHES: the victim's `obj+0x16`
+y leaves its resting 85 and does not return until frame 78, and §1.1 gives a
+knockdown no on-hit advantage number — the wakeup window is the measurement,
+and it is a different column (unmeasured, NULL).
+
+`first_active_frame` is stored ONLY for the 62 px rows (§4.4 — at larger gaps
+it is contaminated by travel): close HP **8**, close HK/LK **11**, cHP **8**.
+Those are the first frames the contact signal fires; the ±1 question of
+whether the damage register is written on the overlap frame or the frame after
+is not resolved here.
+
+Two more things fall out of the table. Close HK and close LK are the **same
+move**: identical damage (16), identical contact frame (11), identical
+advantage on both rigs, measured twice each. And far HK and far LK are
+gap-INVARIANT — 72 px and 110 px give byte-identical numbers, measured on two
+different emulator processes, which is the strongest evidence in this section
+that the protocol is measuring the move and not the arena.
+
+### **Correction: the block-stance drop is NOT probe overhead**
+
+The section above (Reptile HP, earlier the same day) says the on-block
+defender's ~9-frame block-stance drop "cancels out of the difference". **It
+does not**, and the same paragraph is wrong here in the same way if left
+uncorrected.
+
+The cancellation argument (`probe.py`'s module docstring) requires both sides
+to share a probe shape. They do not in the on-block rig: the attacker's shape
+calibrates to `l = 1`, the guarded defender's to `l = 10`. Subtracting each
+side's own calibration removes 9 frames from the defender that were never
+removed from the attacker, so every `on_block` number comes out 9 frames too
+favourable to the defender. The 10-frame figure is measured with the fighter
+ALREADY FREE; during blockstun the stance drop runs CONCURRENTLY with the stun
+instead of after it, so it is not additional delay at all.
+
+Settled by a third measurement that does not use the act-again probe. A
+**punish rig**: P1 throws the move, P2 blocks it, P2's counter-attack frame is
+swept, and P1's damage register says what happened (full damage = clean
+punish, chip = P1's guard was up first, nothing = no contact). "Earliest frame
+the defender can attack" came out at exactly `walk manifest − 2` every time:
+
+| rig | move | walk manifest | earliest counter-attack |
+|---|---|---|---|
+| on block | close HP @62 px | contact+19 | **contact+17** |
+| on block | far HP @72 px | contact+23 | **contact+21** |
+| on block | far HK @110 px | contact+23 | **contact+21** |
+| on hit | far HP @72 px | contact+14 | **contact+12** |
+
+The −2 is the same on both probe shapes, so it cancels out of a difference of
+MANIFEST frames — which is therefore what this table stores, and what
+`framelab.kit.manifest_advantage` computes. `on_hit` is unaffected (one shape
+on both sides, so the two formulas agree exactly); `on_block` changes by
+exactly `W_def − W_att` = **+9**. **The far-HP `on_block = +4` published in
+the section above is +13.**
+
+One assumption is left standing and named: the attacker's own "can attack
+again" frame was NOT measured. A second attack from the same fighter never
+reaches at these spacings (verified at every re-press frame out to +60), and
+`+0xC0` is not a trustworthy attack signal (it moves on guard release and on
+inputs that produce no attack), so the attacker side rests on its probe shape
+being identical to the defender's on-hit shape, which was verified.
+
+### The punish the table predicts, thrown
+
+`docs/frames.md` §8.3, on the most unsafe cell and a safe one:
+
+- **far HK @110 px, −16 on block.** Blocked, then countered with HK (the
+  fastest normal that reaches at that gap, contact frame 8). Pressed at
+  contact+21 and +22 it lands **clean, 32 damage**, contacting on frame 37
+  against a P1 whose guard does not come up until frame 47. Pressed at +19 or
+  +20 — one and two frames before the table says the defender is free —
+  **nothing comes out at all.** The predicted window opens on the predicted
+  frame.
+- **far HP @72 px, +13 on block.** Same protocol, every counter frame from
+  +21 to +24: **chip only (3)**. It cannot be punished, as the table says.
+- Unexplained, and recorded rather than smoothed over: the far-HK punish also
+  stops connecting from contact+25 onward. It is not the attacker's guard
+  (frame 47) and the gap is static at 131 px from frame 21, so the obvious
+  range explanation does not fit either. Whatever closes that window is
+  unmeasured.
+
+### on_hit vs on_block: the open question is answered
+
+The earlier section flagged `on_hit == on_block` for far HP as possibly a rig
+bug. **It was real, and it was a coincidence of that one move.** Across the
+kit the two columns are independent and differ in BOTH directions:
+
+- close HP: hit +8, block +1 — hitstun longer than blockstun.
+- close HK/LK: hit −7, block −14.
+- far HP/LP: hit +4, block **+13** — blockstun LONGER than hitstun.
+- far LK: hit −21, block −16.
+
+The physical story the numbers tell: **blockstun takes only two values
+across the whole kit** — the defender's walk manifests at contact+19 after the
+three close standing normals and at contact+23 after everything else (the four
+far normals AND the uppercut), regardless of which button or how much chip —
+while **hitstun varies per move** (8 dmg → +14, 11 → +14, 16 → +26, 24 → +26,
+26 → +18, 32 → +46). It broadly tracks damage, but not monotonically: far LK
+(26) frees the victim at +18 while close HK (16) holds it to +26, so damage is
+a correlate, not the rule.
+
+That breaks `docs/frames.md` §8.2's `on_hit ≥ on_block` for the far punches,
+and the violation is not a measurement artifact: the punish rig independently
+puts the far-HP defender's counter-attack at contact+12 on hit and contact+21
+on block. §8.2 encodes a modern-fighting-game convention, not a law; MK2's
+block recovery is simply longer than its light-hit reaction.
+
+### What was NOT measured, and why
+
+- **LP at 62 px is a THROW, not a normal.** 34 damage, contact at frame 48,
+  and the damage is IDENTICAL with the defender holding Block — unblockable,
+  which is the proof. §1.1 gives a throw/knockdown no advantage number. (This
+  is the proximity override already noted under "Macro-action encodings".)
+- **cLK @62 px: refused, twice.** Both attempts produced a NON-MONOTONE
+  attacker predicate (`F…F T F…F T…T`, the isolated TRUE at N=13 on one
+  process and N=16 on the other, real boundary at 20). That is either the
+  known one-frame-early-hold transport flake or a genuine T…F…T predicate;
+  either way §4.3 says a first_true read off it is not a boundary. No row.
+- **Jumping normals: not attempted.** The act-again probe's observable is a
+  WALK, and an airborne MK2 fighter cannot walk, so the probe cannot answer
+  "is this fighter actionable" mid-jump. Measuring jump-ins needs a different
+  observable (§1.1 also gives airborne hits no advantage number).
+- **Reptile's specials**: out of this task's scope (Invisibility needs a DSL
+  extension).
+- **`hitstop`, `active`, `recovery`, `total`, `wakeup_window`,
+  `guard_height`**: NULL in every row. None of them is a by-product of this
+  protocol; `guard_height` in particular needs a CROUCHING defender rig, which
+  was not built.
+- **Gaps 147 px and 180 px**: every button whiffs, so they carry no rows —
+  they are the whiff half of the connect map above.
+- **One character, one matchup.** Reptile mirror only.
+
+### The calibration must be hold-limited (a gap in `docs/frames.md` §3.1)
+
+§3.1 says the calibration point must be "far enough past the anchor that the
+fighter is certainly free" and gives no way to check. It matters: far HK's
+defender calibrates to **6/7** at anchor+40 and to **1/2** at anchor+70 and
+anchor+100. The 40-frame number is not a latency at all — it is residual
+hitstun (that victim is stuck for 46 frames) — and taking it would have
+inflated that move's `on_hit` by 5 frames, silently, in the safe direction.
+
+The check is cheap and now enforced in `framelab.kit.calibrate_shapes`:
+measure every shape at TWO `at_n` values and require them to agree. A latency
+that shrinks as the probe moves later is stun, not latency.
+
+### The input shape must be validated, not assumed
+
+Asserting `down + button` on the same frame from a standing start makes the
+game enter *something* (the attacker's `+0xC0` moves 160→192) that contacts
+NOTHING at any rung of the ladder. The first pass through this kit therefore
+reported "crouching normals never reach", which is clean, plausible, and
+false. Holding `down` alone for 6 frames first produces the real crouching
+normal: uppercut, 40 damage, launch. **A move must be identified by its
+measured signature (damage, contact frame, connect behaviour), never by the
+buttons the harness believes it pressed.**
+
+### Cost and provenance
+
+Three headless processes (two measuring cells in parallel, ~5,400 s each, one
+for the punish rigs): **287k confirmed steps, 5.9k verified loads** over the
+whole task (both measurement runs, the connect map, the
+calibration checks, the knockdown scan and the punish rigs). Rows live in
+`shadow/framelab/frames.db` (`framelab.store`) and export to
+`library/mk2/arcade.frames.json` — 20 rows, one per observable per cell,
+each carrying `observable`, `method`, `input_latency_frames`, `core_id`
+(`fbneo_libretro.dylib:sha256:972e8fb8c8394979`) and `rom_id`
+(`mk2.zip:sha256:e8d3f2f8cefe1aab`).

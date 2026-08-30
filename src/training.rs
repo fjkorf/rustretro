@@ -1008,7 +1008,11 @@ fn block_punish(
                 let spec = crate::profile::StepSpec {
                     dirs: Vec::new(),
                     press: vec![class.clone()],
+                    hold: Vec::new(),
+                    release: Vec::new(),
+                    while_held: Vec::new(),
                     frames: 3,
+                    min_frames: None,
                 };
                 if let Ok(m) = crate::macros::compile(&class, &[spec], p) {
                     start(m, ds);

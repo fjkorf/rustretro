@@ -176,5 +176,61 @@ class MultiStepMotionTest(unittest.TestCase):
         )
 
 
+class MacroExtCompileValidationTest(unittest.TestCase):
+    """§10.1 shape checks on `compile_macros` -- mirrors `src/macros.rs`'s
+    `compile_rejects_bad_hold_release_shapes_10_1` so a malformed step dict
+    fails the same way in both languages (see test_macro_ext_parity.py for
+    the shared BEHAVIORAL fixture; this file covers the compile-time shape
+    checks that fixture doesn't need to exercise)."""
+
+    def test_hold_without_min_frames_rejected(self):
+        with self.assertRaisesRegex(ValueError, "min_frames"):
+            compile_macros({"sai_throw": [{"hold": ["HP"]}]})
+
+    def test_press_and_hold_in_one_step_rejected(self):
+        with self.assertRaisesRegex(ValueError, "mixes"):
+            compile_macros({"x": [{"press": ["HP"], "hold": ["LP"], "min_frames": 5}]})
+
+    def test_press_and_release_in_one_step_rejected(self):
+        with self.assertRaisesRegex(ValueError, "mixes"):
+            compile_macros({"x": [{"press": ["HP"], "release": ["LP"]}]})
+
+    def test_bare_while_held_is_an_empty_step(self):
+        with self.assertRaisesRegex(ValueError, "empty step"):
+            compile_macros({"x": [{"while_held": ["Block"]}]})
+
+    def test_well_formed_hold_step_compiles(self):
+        macros = compile_macros({"sai_throw": [{"hold": ["HP"], "min_frames": 150}]})
+        self.assertEqual(macros[0].steps[0].kind, "hold")
+        self.assertEqual(macros[0].steps[0].min_frames, 150)
+
+
+class HoldReleaseDirectTest(unittest.TestCase):
+    """A direct (non-fixture) exercise of the hold/release state machine,
+    complementing test_macro_ext_parity.py's shared fixture."""
+
+    def test_hold_completes_on_release_not_on_reaching_min_frames(self):
+        macros = compile_macros({"sai_throw": [
+            {"hold": ["HP"], "min_frames": 3},
+            {"release": ["HP"]},
+        ]})
+        Y = 0x2  # HP
+        masks = [Y, Y, Y, Y, 0]  # held 4 frames (>=3), released at index 4
+        sides = [1] * len(masks)
+        self.assertEqual(
+            find_macro_completions(macros[0], masks, sides, ARCADE_CHORDS), [4]
+        )
+
+    def test_hold_released_before_min_frames_never_completes(self):
+        macros = compile_macros({"sai_throw": [
+            {"hold": ["HP"], "min_frames": 5},
+            {"release": ["HP"]},
+        ]})
+        Y = 0x2
+        masks = [Y, Y, Y, 0]  # only 3 held frames, min_frames=5
+        sides = [1] * len(masks)
+        self.assertEqual(find_macro_completions(macros[0], masks, sides, ARCADE_CHORDS), [])
+
+
 if __name__ == "__main__":
     unittest.main()

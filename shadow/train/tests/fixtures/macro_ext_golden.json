@@ -1,0 +1,91 @@
+[
+  {
+    "name": "hold_completes_release_step_on_falling_edge",
+    "description": "hold-kind step (HP, min_frames=5) held for exactly 5 continuous frames, then held 1 more frame, then released. Completion fires on the RELEASE (the final step's edge), not when min_frames is first reached.",
+    "note": "Pins §10.1's core rule: 'completion fires on the edge the FINAL step names' -- this macro's final step is a release, so the hold reaching min_frames is only an internal step-advance, not a completion.",
+    "move_name": "sai_throw",
+    "macro": [
+      { "hold": ["HP"], "min_frames": 5 },
+      { "release": ["HP"] }
+    ],
+    "facing": "right",
+    "frames": ["0x2", "0x2", "0x2", "0x2", "0x2", "0x2", "0x0"],
+    "expected": [
+      { "frame": 6, "move": "sai_throw" }
+    ]
+  },
+  {
+    "name": "hold_released_one_frame_short_of_min_frames_fails",
+    "description": "Same macro, but HP is released after only 4 continuous frames (min_frames=5) -- one frame short. §10.1: 'a release before that fails the macro', so this never completes, even though the button was held for a long time relative to the chord's own definition.",
+    "move_name": "sai_throw",
+    "macro": [
+      { "hold": ["HP"], "min_frames": 5 },
+      { "release": ["HP"] }
+    ],
+    "facing": "right",
+    "frames": ["0x2", "0x2", "0x2", "0x2", "0x0"],
+    "expected": []
+  },
+  {
+    "name": "hold_fails_then_a_second_attempt_completes",
+    "description": "First attempt: HP held 3 frames then released early -- fails per §10.1. Second attempt, later in the same stream: HP held the full 5 continuous frames then released -- completes. Demonstrates a Hold-step failure is a full reset, not a stuck state -- the macro re-arms for a fresh, independent attempt.",
+    "move_name": "sai_throw",
+    "macro": [
+      { "hold": ["HP"], "min_frames": 5 },
+      { "release": ["HP"] }
+    ],
+    "facing": "right",
+    "frames": ["0x2", "0x2", "0x2", "0x0", "0x2", "0x2", "0x2", "0x2", "0x2", "0x2", "0x0"],
+    "expected": [
+      { "frame": 10, "move": "sai_throw" }
+    ]
+  },
+  {
+    "name": "while_held_sequence_completes_invisibility_shaped",
+    "description": "Reptile Invisibility's shape ([BLK] U U D, release, HP): Block held across two fresh Up taps and a Down tap (via each intervening step's while_held), released, then HP pressed. Completes on the HP press (the final step's own rising edge).",
+    "move_name": "invisibility",
+    "macro": [
+      { "dirs": ["up"], "while_held": ["Block"] },
+      { "dirs": ["up"], "while_held": ["Block"] },
+      { "dirs": ["down"], "while_held": ["Block"] },
+      { "release": ["Block"] },
+      { "press": ["HP"] }
+    ],
+    "facing": "right",
+    "frames": ["0x410", "0x400", "0x410", "0x400", "0x420", "0x400", "0x0", "0x2"],
+    "expected": [
+      { "frame": 7, "move": "invisibility" }
+    ]
+  },
+  {
+    "name": "while_held_broken_mid_sequence_no_match",
+    "description": "Same shape, but Block is released before the second Up tap (frame 2 presses Up WITHOUT Block). The while_held condition fails for that step and is never re-established, so the motion never advances past step 1 and the macro never completes.",
+    "move_name": "invisibility",
+    "macro": [
+      { "dirs": ["up"], "while_held": ["Block"] },
+      { "dirs": ["up"], "while_held": ["Block"] },
+      { "dirs": ["down"], "while_held": ["Block"] },
+      { "release": ["Block"] },
+      { "press": ["HP"] }
+    ],
+    "facing": "right",
+    "frames": ["0x410", "0x0", "0x10", "0x0", "0x0", "0x0"],
+    "expected": []
+  },
+  {
+    "name": "side_swap_pin_holds_starting_facing_for_later_steps",
+    "description": "Teleport Kick shaped (F, F, LK): the opponent's reported facing flips from right to left between the two forward taps, but the SAME physical Right button is pressed again for the second tap. Facing is pinned at the frame the macro started (right), so the second tap still resolves as 'forward' despite the live facing report -- and the motion completes.",
+    "note": "Pins §10.2: back/forward resolve against the facing LIVE when the macro's first step satisfied, not the live facing at each later step. A pre-pin (buggy) matcher would resolve the second tap's 'forward' as physical Left (since live facing is now reported left) and would NOT see physical Right as satisfying it -- so this case's completion is exactly what the fix is for.",
+    "move_name": "teleport_kick",
+    "macro": [
+      { "dirs": ["forward"] },
+      { "dirs": ["forward"] },
+      { "press": ["LK"] }
+    ],
+    "facing": ["right", "left", "left", "left"],
+    "frames": ["0x80", "0x0", "0x80", "0x100"],
+    "expected": [
+      { "frame": 3, "move": "teleport_kick" }
+    ]
+  }
+]
