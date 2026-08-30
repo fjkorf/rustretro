@@ -45,24 +45,21 @@ Preconditions from §3, and which of them this module enforces:
      site.
 
      A live smoke test surfaced why `_step` needs that confirmation: `step`
-     is fire-and-forget server-side (it sets a flag and returns immediately
-     — the same shape as `press()`'s documented "schedules ... does NOT
-     block" gotcha in `shadow_train.re`'s module docstring), so firing many
-     `step` calls back-to-back with no wait between them can have several
-     collapse into a single real frame advance before the host's own
-     Update loop ever consumes the flag. Measured live: 10 bare `step()`
-     calls back-to-back moved `frame_count` by 0; the same 10 calls spaced
-     50ms apart moved it by exactly 10. `_step` below polls `get_state`'s
-     `frame_count` until it actually increments (bounded, `_STEP_TIMEOUT`)
-     instead of guessing a sleep duration — this is, in the letter, a
+     USED TO BE fire-and-forget server-side (it set a flag and returned
+     immediately — the same shape as `press()`'s documented "schedules ...
+     does NOT block" gotcha in `shadow_train.re`'s module docstring), so
+     firing many `step` calls back-to-back with no wait between them could
+     have several collapse into a single real frame advance before the host's
+     own Update loop ever consumed the flag. Measured live then: 10 bare
+     `step()` calls back-to-back moved `frame_count` by 0; the same 10 calls
+     spaced 50 ms apart moved it by exactly 10. The workaround was to poll
+     `get_state`'s `frame_count` until it incremented — in the letter a
      "sleep" that §2.4 ("Wall-clock is never a unit... Everything steps")
-     reads as banned; in practice it's unavoidable AS LONG AS `step` stays
-     fire-and-forget, and polling a real oracle for step-landing is a much
-     smaller wall-clock dependency than a guessed fixed delay would be. See
-     this task's final report for the fuller writeup — flagged there as a
-     genuine tension in the contract worth resolving upstream (either make
-     `step` synchronous, or §2.4 should carve out an explicit exception for
-     confirming step-landing).
+     reads as banned, flagged at the time as a tension to resolve upstream
+     ("either make `step` synchronous, or §2.4 should carve out an explicit
+     exception"). **It was resolved the first way.** `step` now blocks until
+     the emulated frame is entirely finished and reports `landed` itself, so
+     the confirmation is exact and no wall-clock appears in this path at all.
   4. Arena liveness re-verified after EVERY `load_state` — ENFORCED: every
      `_load_state` call in this module is immediately followed by a
      `liveness_fn` check that raises on failure.
@@ -76,8 +73,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence, Union
 
 from .session import (
-    _STEP_TIMEOUT_S,
     call_ok,
+    confirm_fold,
     confirm_step,
     hold_buttons,
     release_all,
@@ -175,22 +172,31 @@ def _load_state(client: Any, spec: Union[str, int], liveness_fn: LivenessFn) -> 
 
 
 def _hold(client: Any, buttons: Sequence[str], port: int) -> None:
+    # Confirmed to have reached the core's input FOLD, not merely written:
+    # the host loop folds input before it checks the frame gate, so a frame
+    # armed in that window runs on the previous input and the measured
+    # latency comes out one frame long. See `session.confirm_fold`.
     hold_buttons(client, buttons, port, error_cls=CalibrationError)
+    confirm_fold(client, port, error_cls=CalibrationError)
 
 
 def _release(client: Any, port: int) -> None:
     # Empty `buttons` releases the whole port's held set (server.rs:
     # "hold_buttons(0, []) releases everything").
     release_all(client, port, error_cls=CalibrationError)
+    confirm_fold(client, port, error_cls=CalibrationError)
 
 
 def _step(client: Any) -> None:
-    """Advance exactly one core frame and CONFIRM it landed before
-    returning, by polling `get_state`'s `frame_count` (see the module
-    docstring's precondition-3 note for why this confirmation is
-    necessary — `step` itself is fire-and-forget). Shared implementation:
-    `session.confirm_step`."""
-    confirm_step(client, error_cls=CalibrationError, timeout_s=_STEP_TIMEOUT_S)
+    """Advance exactly one core frame and CONFIRM it landed before returning.
+
+    The confirmation is no longer a `get_state` poll: `step` is synchronous
+    and reports `landed` itself (see `session.confirm_step`). The module
+    docstring's precondition-3 note below flagged that polling as a genuine
+    tension with §2.4 and named the fix — "either make `step` synchronous, or
+    §2.4 should carve out an explicit exception". It was made synchronous.
+    Shared implementation: `session.confirm_step`."""
+    confirm_step(client, error_cls=CalibrationError)
 
 
 # ── the differential trace ──────────────────────────────────────────────

@@ -1421,3 +1421,164 @@ calibration checks, the knockdown scan and the punish rigs). Rows live in
 each carrying `observable`, `method`, `input_latency_frames`, `core_id`
 (`fbneo_libretro.dylib:sha256:972e8fb8c8394979`) and `rom_id`
 (`mk2.zip:sha256:e8d3f2f8cefe1aab`).
+
+## Re-measurement of Reptile's kit on the fast transport (2026-08-30, task F3)
+
+The whole kit above, measured again from scratch on the synchronous
+`step` / `run_frames` transport and the profile-driven `framelab` block, and
+compared to `library/mk2/arcade.frames.json` **row by row**.
+
+**All 20 stored rows reproduced to the frame.** Same `on_hit`, `on_block`,
+`damage`, `hits`, `knockdown`, `first_active_frame`, `connect_range`,
+`gap_px`, `gap_walk_frames`, `input_latency_frames`, `method`, `core_id`,
+`rom_id`. Nothing was rewritten to make it agree, and no cell was re-run to
+get a better answer — the comparator (`framelab.ladder.compare_rows`) reports
+disagreement and refuses; it never resolves it. This satisfies
+`docs/frames.md` §8.1 for the whole table rather than for the required random
+sample of five.
+
+The connect map reproduced identically too, including every whiff:
+
+| gap | HP | LP | HK | LK | cHP | cLK |
+|---|---|---|---|---|---|---|
+| 180 px | — | — | — | — | — | — |
+| 147 px | — | — | — | — | — | — |
+| 110 px | — | — | 32@f8 | 26@f8 | — | — |
+| 72 px | 11@f11 | 8@f11 | 32@f8 | 26@f8 | 40@f14 (KD) | 6@f18 |
+| 62 px | 24@f8 | *throw* | 16@f11 | 16@f11 | 40@f14 (KD) | 6@f18 |
+
+…as did all four probe-shape calibrations (attacker 1/2 on both rigs,
+defender-on-hit 1/2, guarded defender 10/11), each confirmed hold-limited at
+two probe points.
+
+### The one-frame flake is NOT the `hold_buttons`-after-`step` race, and the 8 ms settle never fixed it
+
+`docs/frames.md` §3 precondition 6 attributes the ~1-in-50 spurious TRUE to a
+`hold_buttons` issued immediately after a step confirmation being read by the
+frame that was supposed to be over, and prescribes "settle, or make `step`
+synchronous". `step` is synchronous now, and the flake did not go away — so
+it was measured properly. **Both halves of that precondition turn out to be
+wrong**, and the real cause is a different, sharper thing.
+
+Rig: far HP on `gap-45.state`, defender probe at N=0 (the contact frame — the
+victim is certainly still stunned, so the answer is certainly FALSE), 200
+identical probe/control pairs per configuration.
+
+| how the probe's hold was asserted | spurious TRUE at N=0 |
+|---|---|
+| `run_frames(port1=[…])` per-port mask | **13 / 200** |
+| `hold_buttons`, then `run_frames` | 0 / 200 |
+| `hold_buttons`, then one confirmed `step` per frame | 0 / 200 |
+| `hold_buttons` + fold confirmation, then `run_frames` | **0 / 400** |
+
+And, separately, on the pre-`run_frames` protocol the 8 ms settle made it
+**worse, not better**: 16/100 spurious with the settle against 7/100 without,
+on the same rig in the same session. The A/B behind §3.6 was 14 pairs per
+arm — far too few to see a ~7% effect, and the two arms differed by less than
+the noise. The settle was never the mechanism.
+
+**What the mechanism actually is.** `src/main.rs`'s host loop folds the
+injected/held input into the core's input state at step (a0), and only then
+calls `Frontend::run_frame`, which checks the pause/step/batch gate. Those are
+separate lock acquisitions. `run_frames` sets the per-port held mask **and**
+arms `step_batch_remaining` in ONE acquisition, so there is no window for a
+fold in between: if the batch is armed while the loop is already past its
+fold, the batch's FIRST frame runs on the PREVIOUS input. `hold_buttons` is a
+separate MCP call, and a round trip is far longer than a loop iteration, so it
+almost always folds in time — which is why the old protocol looked clean.
+
+The symptom was not the probe's hold landing early at all. In every captured
+flake it was the **attacker's move coming out one frame late**: the victim's
+`block+0x0E` still read 161 on the frame it normally already reads 150, so
+contact happened at f12 instead of f11, which leaves the defender genuinely
+free on the frame the probe holds at — and it genuinely walks one frame
+(`block+0x0B..0x0D` = `00 02 00`, `obj+0x12` +2 px) before hitstun takes over.
+Both observables agree, the predicate looks plausible, and the number is
+wrong by however far that shifts the boundary. §8.4's cross-method check
+cannot see it, because both observables are watching the same real walk.
+
+**The fix is client-side and it is an oracle, not a wait.** `get_input`
+reports `folded` (what the last fold gave the core) next to `asserted` (what
+the next one will), so every input change now ends by polling until the two
+agree (`framelab.session.confirm_fold`), and `run_frames`' per-port masks are
+never used to CHANGE input. 0 spurious in 400 at the config that was 13/200.
+
+The general rule, which is the same shape as the "never anchor on a DRAWN
+value" rule: **an input is not asserted until the thing that consumes it says
+it has it.** A write to the held-input mask is a request; the fold is the
+event.
+
+### What that fixed, beyond the flake rate
+
+`cLK @62 px` was **refused twice** by the earlier run, both times on a
+non-monotone attacker predicate with an isolated TRUE at N=13 / N=16 against
+a real boundary at 20 — the exact signature of one late attack. With the fold
+confirmed it measures cleanly, first attempt, both observables agreeing, at
+both rungs it reaches, with every actionable(N) evaluated twice:
+
+| move | variant | gap | damage | contact f | att free | def free (hit) | def free (blk) | **on hit** | **on block** |
+|---|---|---|---|---|---|---|---|---|---|
+| cLK | — | 62 px | 6 | 18¹ | +23 | +10 | +19 | **−13** | **−4** |
+| cLK | — | 72 px | 6 | 18¹ | +23 | +10 | +19 | **−13** | **−4** |
+| cHP | close | 72 px | 40 | 14¹ | +28 | NULL² | +23 | **NULL²** | **−5** |
+
+¹ replay-relative; both crouching moves have a 6-frame stance lead-in, so
+cLK's `first_active_frame` is **12** and cHP's is **8** (stored only at the
+62 px rung, §4.4). ² the uppercut launches — §1.1 gives a knockdown no
+on-hit number, at 72 px exactly as at 62 px.
+
+`variant` is NULL for cLK on purpose: its damage and contact frame are
+identical at 62 and 72 px, so there is no proximity boundary to name and
+labelling one rung "close" would invent a variant the signature does not
+support (§5). Every OTHER button has its boundary between 62 and 72 px; the
+crouching ones do not have one at all in this ladder's range.
+
+cLK is negative on hit (−13) and nearly neutral on block (−4), and its
+hitstun of +10 is the **shortest in the kit** — consistent with its 6 damage
+being the smallest (8 → +14, 11 → +14, 16 → +26, 24 → +26, 26 → +18,
+32 → +46, and now 6 → +10).
+
+**This revises the blockstun rule stated above.** That section reads the two
+blockstun values as a distance rule — "+19 after the three close standing
+normals and +23 after everything else (the four far normals AND the
+uppercut)". cLK breaks that: it frees the defender at **+19 at BOTH 62 and
+72 px**, while cHP gives +23 at both. So blockstun is a property of the MOVE,
+not of the gap; the earlier phrasing held only because every move measured
+then happened to have its variant boundary at the same distance. Reptile's
+blockstun still takes exactly two values (+19, +23) across everything
+measured — that part survives.
+
+`cHP @72 px` matches `cHP @62 px` exactly on every column, which is the same
+gap-invariance far HK and far LK show — more evidence that the protocol is
+measuring the move rather than the arena.
+
+**Jumping normals are still out**, for the unchanged reason: the act-again
+observable is a WALK and an airborne MK2 fighter cannot walk, so the probe
+cannot answer "is this fighter actionable" mid-jump. Nothing about the speed
+work changes that; it needs a different observable.
+
+### Cost
+
+One headless FBNeo process, `--pace 0`, MCP port 4055. The full re-measure
+(connect map + all four probe-shape calibrations + all 10 cells + the two
+far-HK cells at a wider `max_search`) ran **230,336 frames and 5,301 verified
+loads in 335 s** — and it did it at `repeats=2`, i.e. every actionable(N)
+evaluated twice and required to agree, which is roughly double the work the
+original run did.
+
+The original task measured 287k confirmed steps at 41.1 ms and 5.9k loads at
+12.3 ms: **~3.3 hours**. The same 230k frames on that transport would have
+been ~2.6 hours. Measured now: 5.6 minutes, a ~28× speedup, from a
+synchronous `step` at 0.74 ms and `run_frames` at 0.71 ms/frame with the
+replay's unobserved prefix batched into one call per segment (132,718 of
+167,564 frames in the main run were batched, at 8,217 calls instead of
+132,718).
+
+Flake evidence from the real protocol, no settle anywhere: **52 exhaustive
+sweeps, 2,626 repeat-checked actionable(N) evaluations, 0 repeat-check
+failures and 0 non-monotone refusals.** The two refusals the run did produce
+were the cap guard doing its job — far HK's defender frees at `first_true`
+43 against a default `max_search` of 45, inside `_CAP_MARGIN`, so the row was
+refused rather than reported; re-run at `max_search=58` it reproduces the
+stored numbers exactly. That is worth keeping in mind for the next kit: 45 is
+too tight for a 32-damage roundhouse's victim.

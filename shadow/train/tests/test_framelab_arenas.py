@@ -169,6 +169,13 @@ class FakeClient:
         self._held[port] = None
         return {"ok": True}
 
+    def _tool_get_input(self, port=0) -> dict:
+        # No host loop here, so the fold is instantaneous and `confirm_fold`
+        # returns on its first poll.
+        mask = self._held[port] or ""
+        return {"ok": True, "port": port,
+                "asserted_mask": mask, "folded_mask": mask}
+
     def _tool_step(self) -> dict:
         self.frame_count += 1
         self._steps_total += 1
@@ -184,7 +191,32 @@ class FakeClient:
             and self._steps_total == self.corrupt_block1_cid_at_step
         ):
             self._write(OBJ1 + 0x3E, bytes([self.char_id1 ^ 0xFF]))
-        return {"ok": True}
+        return {
+            "ok": True,
+            "stepped": True,
+            "landed": True,
+            "frame_count": self.frame_count,
+        }
+
+    def _tool_run_frames(self, count, port0=None, port1=None) -> dict:
+        """`step` batched, with per-port held masks applied first (replace,
+        not OR) — the whole walk of a ladder rung is now one call."""
+        if port0 is not None:
+            self._held[0] = port0[0] if port0 else None
+        if port1 is not None:
+            self._held[1] = port1[0] if port1 else None
+        start = self.frame_count
+        for _ in range(count):
+            self._tool_step()
+        return {
+            "ok": True,
+            "start_frame": start,
+            "end_frame": self.frame_count,
+            "requested": count,
+            "landed": count,
+            "all_landed": True,
+            "error": None,
+        }
 
     def _tool_read_memory(self, addr: int, len: int) -> dict:  # noqa: A002
         return {"hex": self._read(addr, len).hex()}

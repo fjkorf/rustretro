@@ -1,6 +1,7 @@
-"""docs/frames.md §4.2 — the observables, built from a `GameProfile` rather
-than from constants in code (CLAUDE.md: "never hardcode a game address in
-code again").
+"""docs/frames.md §4.2 — the observables, built from a `GameProfile`'s
+`framelab` block (`shadow_train.framelab.spec.FramelabSpec`) rather than from
+constants in code (CLAUDE.md: "never hardcode a game address in code
+again").
 
 §4.2's preference order, per port:
 
@@ -62,10 +63,13 @@ The object pointer and its `x`/`y`/`cid` offsets are read from the profile
 `ObjectPointer.from_profile`; the constants on `ObjectPointer` are only a
 fallback for a profile that predates that schema.
 
-`STRUCT_VELOCITY_RANGE` is the one address in this module that is NOT in any
-profile: it was found by this task and has no schema slot yet. It is flagged
-at its definition and should move into `mk2.profile.json` as a fighter field
-(alongside its evidence in `library/mk2/mk2.md`) rather than stay here.
+Every OTHER observable's addressing (MK2's walk-velocity word included) and
+every probe-shape calibration now come from the profile's `framelab` block
+(`shadow_train.framelab.spec.FramelabSpec`) via `make_sampler`/
+`make_contact_read_from_spec`. There is no MK2-shaped fallback anywhere in
+this module: a port with no `framelab` block gets `FramelabNotConfigured`,
+not a silently-reused MK2 default (CLAUDE.md: "never hardcode a game address
+in code again" — a byte range is exactly that kind of fact).
 """
 
 from __future__ import annotations
@@ -73,11 +77,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Hashable, Mapping, Optional, Tuple
 
+from .spec import Addressing, FramelabNotConfigured, FramelabSpec
+
 __all__ = [
     "OBJECT_PTR",
     "STRUCT_DIVERGENCE",
     "STRUCT_VELOCITY",
-    "STRUCT_VELOCITY_RANGE",
     "ACTION_COUNTER",
     "POINTER_X",
     "CONTACT_STRUCT_HEALTH",
@@ -85,21 +90,20 @@ __all__ = [
     "FighterAddrs",
     "resolve_fighter",
     "make_sampler",
+    "make_pointer_field_read",
     "make_contact_read",
+    "make_contact_read_from_spec",
     "make_arena_verifier",
 ]
 
+# Canonical observable NAMES. These are just string labels now (matched
+# against the profile's `framelab.observables[].name`) -- the addressing that
+# used to be hardcoded per name (MK2's walk-velocity byte range included) is
+# profile data, read through `Addressing`/`FramelabSpec`.
 STRUCT_DIVERGENCE = "struct_divergence"
 STRUCT_VELOCITY = "struct_velocity"
 ACTION_COUNTER = "action_counter"
 POINTER_X = "pointer_x"
-
-# MK2 arcade, live-measured (see this module's docstring): the fighter's own
-# walk velocity, a 3-byte little-endian-ish run at `block + 0x0B`. Reads
-# 00 00 00 standing, 00 fe ff walking left, and a mirrored pattern walking
-# right. Like OBJECT_PTR this belongs in the profile once the schema grows a
-# place for it; it is NOT in `mk2.profile.json` today.
-STRUCT_VELOCITY_RANGE = (0x0B, 0x0E)
 
 
 def _as_int(v: Any, default: int) -> int:
@@ -178,12 +182,25 @@ class FighterAddrs:
     health_off: Optional[int]
     hitstun_source: Optional[int]   # this fighter's per-victim contact global
     ptr: "ObjectPointer" = OBJECT_PTR
+    # Every OFF-based (non `via: "object_ptr"`) entry in this port's
+    # `memory.fighter_fields`, name -> (off, size). This is what lets
+    # `make_sampler`/`make_contact_read_from_spec` resolve an ARBITRARY
+    # `framelab` addressing of kind "fighter_field" (e.g. the contact
+    # anchor's `health`, or a future port's own field) without a new
+    # hardcoded accessor per field name -- `action_counter_off`/`health_off`
+    # above are kept as the two names other code already reads directly.
+    field_offsets: Dict[str, "Tuple[int, int]"] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.field_offsets is None:
+            object.__setattr__(self, "field_offsets", {})
 
 
 def resolve_fighter(profile: Any, block: str, port: int) -> FighterAddrs:
     """Everything the observables need about one fighter, straight from the
-    profile: block base, stride, the `action_counter` and `health` field
-    offsets, the `hitstun_sources` global for this fighter (§4.1), and the
+    profile: block base, stride, every plain fighter-field offset (§4.1's
+    anchor and any `framelab` "fighter_field" addressing resolve through
+    this), the `hitstun_sources` global for this fighter (§4.1), and the
     object-pointer declaration (§5)."""
     base = profile.block1() if block == "block1" else profile.block2()
     ac = profile.field_off("action_counter")
@@ -193,6 +210,15 @@ def resolve_fighter(profile: Any, block: str, port: int) -> FighterAddrs:
         gname = profile.hitstun_sources.get(block)
         if gname:
             hs = profile.global_addr(gname)
+    field_offsets: Dict[str, Tuple[int, int]] = {}
+    mem = (getattr(profile, "port_raw", None) or {}).get("memory", {}) or {}
+    for f in mem.get("fighter_fields", []):
+        if f.get("via"):
+            continue  # pointer-resolved (e.g. x/y) -- not a fixed block offset
+        off = f.get("off")
+        if off is None:
+            continue
+        field_offsets[f["name"]] = (_as_int(off, 0), int(f.get("size", 1)))
     return FighterAddrs(
         name=block,
         base=base,
@@ -202,6 +228,7 @@ def resolve_fighter(profile: Any, block: str, port: int) -> FighterAddrs:
         health_off=hp[0] if hp else None,
         hitstun_source=hs,
         ptr=ObjectPointer.from_profile(profile),
+        field_offsets=field_offsets,
     )
 
 
@@ -219,67 +246,146 @@ def _resolve_obj(struct_lead: bytes, ptr: ObjectPointer) -> Optional[int]:
     return (raw - ptr.bias) >> ptr.shift
 
 
+def _read_pointer_field(
+    *,
+    field: str,
+    ptr: ObjectPointer,
+    buf: bytes,
+    lead: int,
+    struct: bytes,
+    session: Any,
+) -> Optional[int]:
+    """`x`/`y` — the only two pointer-resolved fields `ObjectPointer` knows
+    (`x_off`/`y_off`, both populated from the profile's own `via:
+    "object_ptr"` fighter fields by `ObjectPointer.from_profile`). `None` on
+    an out-of-range pointer OR a staleness mismatch (§4.2/§5) — never a
+    stale or synthesized value."""
+    obj = _resolve_obj(buf[:lead], ptr)
+    if obj is None:
+        return None
+    ent = session.read_memory(obj, ptr.span)
+    if ent[ptr.char_off] != struct[0]:
+        return None  # stale pointer -> discard, never record
+    off = ptr.x_off if field == "x" else ptr.y_off
+    return int.from_bytes(ent[off : off + 2], "little")
+
+
 def make_sampler(
     fighter: FighterAddrs,
+    spec: FramelabSpec,
     *,
     ptr: Optional[ObjectPointer] = None,
-    include: Tuple[str, ...] = (
-        STRUCT_DIVERGENCE,
-        STRUCT_VELOCITY,
-        ACTION_COUNTER,
-        POINTER_X,
-    ),
-    velocity_range: Tuple[int, int] = STRUCT_VELOCITY_RANGE,
 ) -> Callable[[Any], Mapping[str, Hashable]]:
-    """One composite read per frame -> `{observable_name: hashable value}`.
+    """One composite read per frame -> `{observable_name: hashable value}`,
+    for every ACTIVE observable `spec` declares (docs/frames.md §4.2's
+    preference order — declared order in the profile).
 
-    Two `read_memory` calls per frame (each ~0.4 ms live, versus ~18 ms for a
-    confirmed step), so sampling every frame is free relative to stepping:
+    Two `read_memory` calls per frame at most (each ~0.4 ms live, versus
+    ~18 ms for a confirmed step), so sampling every frame is free relative to
+    stepping:
 
       1. `[block-0x0C, block+stride)` — the object pointer AND the whole
          fighter struct in one read.
-      2. `[obj, obj+0x42)` — the fighter's object-pool entry, for x/y and the
-         `obj+0x3E` staleness cross-check.
+      2. `[obj, obj+0x42)` — the fighter's object-pool entry, only if some
+         active observable addresses a pointer-resolved field (`x`/`y`).
 
-    `pointer_x` is `None` when the pointer is out of range OR when
-    `obj+0x3E != block+0x0` — §4.2: "a mismatch means the pointer went stale
-    and the row must be discarded, not recorded". A `None` here propagates
-    into the differential as a value like any other; the caller sees it in
-    the trace and can refuse the row.
+    Every addressing `spec.active_observables()` can carry is handled
+    generically here — no observable name is special-cased except the two
+    pointer-resolved field names `ObjectPointer` itself knows (`x`, `y`):
+
+      * `"whole_struct"` — the entire fighter struct.
+      * `"byte_range"` — raw bytes `[off, end)` relative to the block base
+        (MK2's walk-velocity word lives here now, as profile data).
+      * `"fighter_field"` — the profile's own named field. `x`/`y` resolve
+        through the object pointer exactly as before (`None` when the
+        pointer is out of range or the `obj+cid_check_off` staleness check
+        fails — §4.2: "a mismatch means the pointer went stale and the row
+        must be discarded, not recorded"); any other name resolves directly
+        against `fighter.field_offsets`, raising `FramelabNotConfigured` if
+        `spec` names a field this port's `memory.fighter_fields` does not
+        have (a profile inconsistency, not a per-frame absence).
+
+    A `None` value propagates into the differential trace like any other —
+    the caller sees it and can refuse the row.
     """
     ptr = ptr or fighter.ptr
     lead = -ptr.off  # bytes read before `base`
+    actives = spec.active_observables()
 
     def sample(session: Any) -> Mapping[str, Hashable]:
         buf = session.read_memory(fighter.base + ptr.off, lead + fighter.stride)
         struct = buf[lead:]
         out: Dict[str, Hashable] = {}
-        if STRUCT_DIVERGENCE in include:
-            out[STRUCT_DIVERGENCE] = bytes(struct)
-        if STRUCT_VELOCITY in include:
-            out[STRUCT_VELOCITY] = bytes(struct[velocity_range[0] : velocity_range[1]])
-        if ACTION_COUNTER in include:
-            out[ACTION_COUNTER] = (
-                struct[fighter.action_counter_off]
-                if fighter.action_counter_off is not None
-                else None
-            )
-        if POINTER_X in include:
-            obj = _resolve_obj(buf[:lead], ptr)
-            if obj is None:
-                out[POINTER_X] = None
-            else:
-                ent = session.read_memory(obj, ptr.span)
-                cid = ent[ptr.char_off]
-                if cid != struct[0]:
-                    out[POINTER_X] = None  # stale pointer -> discard, never record
-                else:
-                    out[POINTER_X] = int.from_bytes(
-                        ent[ptr.x_off : ptr.x_off + 2], "little"
+        for o in actives:
+            addr: Addressing = o.addressing
+            if addr.kind == "whole_struct":
+                out[o.name] = bytes(struct)
+            elif addr.kind == "byte_range":
+                out[o.name] = bytes(struct[addr.off : addr.end])
+            elif addr.kind == "fighter_field":
+                if addr.field in ("x", "y"):
+                    out[o.name] = _read_pointer_field(
+                        field=addr.field, ptr=ptr, buf=buf, lead=lead,
+                        struct=struct, session=session,
                     )
+                else:
+                    off_size = fighter.field_offsets.get(addr.field)
+                    if off_size is None:
+                        raise FramelabNotConfigured(
+                            f"observable {o.name!r} addresses fighter field "
+                            f"{addr.field!r}, which is not in "
+                            f"{fighter.name}'s `memory.fighter_fields` for "
+                            "this port."
+                        )
+                    off, size = off_size
+                    out[o.name] = int.from_bytes(
+                        struct[off : off + size], "little"
+                    )
+            else:  # pragma: no cover - Addressing.from_json already validates
+                raise FramelabNotConfigured(
+                    f"observable {o.name!r} has unknown addressing kind "
+                    f"{addr.kind!r}"
+                )
         return out
 
     return sample
+
+
+def make_pointer_field_read(
+    fighter: FighterAddrs, field: str, *, ptr: Optional[ObjectPointer] = None
+) -> Callable[[Any], Optional[int]]:
+    """Read ONE pointer-resolved field (`x` or `y`) for this fighter, per
+    frame — the standalone form of what `make_sampler` does inline.
+
+    It exists for docs/frames.md §1.1's knockdown gate, which needs the
+    VICTIM's own `y` and is not an act-again observable at all: a knockdown
+    means the on-hit advantage number must not be reported, so this read has
+    to be available without declaring `y` in the profile's `framelab`
+    observable list.
+
+    Returns `None` — never a stale or synthesized value — on an out-of-range
+    pointer or a `obj+cid_check_off` staleness mismatch (§4.2/§5: "a mismatch
+    means the pointer went stale and the row must be discarded"). §10's rule
+    applies to the CALLER: resting y is character- and stage-dependent, so
+    "airborne" is this fighter's y differing from its OWN pre-contact resting
+    value, never a comparison against a scalar GROUND_Y.
+    """
+    if field not in ("x", "y"):
+        raise FramelabNotConfigured(
+            f"make_pointer_field_read only resolves the object-pool fields "
+            f"'x'/'y' the object pointer knows, not {field!r}"
+        )
+    p = ptr or fighter.ptr
+    lead = -p.off
+
+    def read(session: Any) -> Optional[int]:
+        buf = session.read_memory(fighter.base + p.off, lead + fighter.stride)
+        return _read_pointer_field(
+            field=field, ptr=p, buf=buf, lead=lead,
+            struct=buf[lead:], session=session,
+        )
+
+    return read
 
 
 CONTACT_STRUCT_HEALTH = "struct_health"
@@ -287,7 +393,7 @@ CONTACT_HUD_HEALTH = "hud_health"
 
 
 def make_contact_read(
-    fighter: FighterAddrs, *, source: str = CONTACT_STRUCT_HEALTH
+    fighter: FighterAddrs, *, source: str
 ) -> Callable[[Any], Hashable]:
     """§4.1's contact anchor, read for THIS fighter (the victim).
 
@@ -308,11 +414,16 @@ def make_contact_read(
         not — §4.1's rule would anchor 10 frames late on a single hit and
         would count a one-hit move as 11 hits.
 
-    So the default here is `struct_health`, and `hud_health` is kept for the
-    cross-check that established the difference. `hit_counter 0xD3FE` is
-    offered by neither: live 2-human testing found it does not move for hits
+    `source` has NO default: this module used to default to `struct_health`,
+    which is exactly right for MK2 arcade and exactly the kind of silent
+    per-game assumption CLAUDE.md forbids on a port where nobody has measured
+    which reading is safe to anchor on. `hit_counter 0xD3FE` is offered by
+    neither source: live 2-human testing found it does not move for hits
     landed on P2 (mk2.md, "Contact-signal correction"), and it is not in the
     shipped profile.
+
+    Prefer `make_contact_read_from_spec`, which picks `source` FROM the
+    profile's `framelab.anchor` instead of asking the caller to know it.
     """
     if source == CONTACT_STRUCT_HEALTH:
         if fighter.health_off is None:
@@ -329,6 +440,46 @@ def make_contact_read(
         addr = fighter.hitstun_source
     else:
         raise ValueError(f"unknown contact source {source!r}")
+
+    def read(session: Any) -> Hashable:
+        return session.read_memory(addr, 1)[0]
+
+    return read
+
+
+def make_contact_read_from_spec(
+    fighter: FighterAddrs, spec: FramelabSpec
+) -> Callable[[Any], Hashable]:
+    """`make_contact_read`, choosing `source` from `spec.anchor` (the
+    profile's `framelab.anchor`) instead of a caller-supplied/default
+    constant. This is the one true "which contact signal does this port
+    anchor on" decision: MK2 arcade's profile declares `field: "health"`
+    (the struct register, §4.1's corrected anchor), never the HUD pair.
+
+    Declines with `FramelabNotConfigured` — never falls back to
+    `CONTACT_STRUCT_HEALTH` — when the anchor names a field/hitstun_sources
+    entry this fighter's profile does not actually have.
+    """
+    anchor = spec.anchor
+    if anchor.source == "field":
+        off_size = fighter.field_offsets.get(anchor.field)
+        if off_size is None:
+            raise FramelabNotConfigured(
+                f"{fighter.name}: framelab.anchor names field {anchor.field!r}, "
+                "which is not in this port's `memory.fighter_fields`."
+            )
+        addr = fighter.base + off_size[0]
+    elif anchor.source == "hitstun_sources":
+        if fighter.hitstun_source is None:
+            raise FramelabNotConfigured(
+                f"{fighter.name}: framelab.anchor uses 'hitstun_sources', but "
+                "this fighter has no hitstun_sources entry in the profile. "
+                "docs/frames.md §4.1: that is a legitimate 'unmeasurable' "
+                "result, not a reason to substitute a proxy."
+            )
+        addr = fighter.hitstun_source
+    else:  # pragma: no cover - AnchorSpec.from_json already validates
+        raise FramelabNotConfigured(f"unknown anchor source {anchor.source!r}")
 
     def read(session: Any) -> Hashable:
         return session.read_memory(addr, 1)[0]

@@ -3,7 +3,7 @@ pub mod window;
 pub mod dock;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 pub type SharedDebugState = Arc<Mutex<DebugState>>;
 
@@ -948,6 +948,43 @@ pub struct DebugState {
     pub debug_open: bool,
     pub paused: bool,
     pub step_one: bool,
+    /// `run_frames`' N-deep counterpart to `step_one`: while > 0, `Frontend::
+    /// run_frame` bypasses `paused` for exactly one frame (same as `step_one`)
+    /// and decrements this instead of clearing a bool, so a whole batch runs
+    /// through the identical one-frame-at-a-time pause bypass `step` already
+    /// used — just driven by the emulation thread across many of its own
+    /// iterations instead of by N separate MCP round trips.
+    pub step_batch_remaining: u32,
+    /// Incremented by `Frontend::run_frame` exactly once per frame that ran
+    /// all the way to completion (full post-processing done, right before
+    /// `run_frame` returns) — never on the early-return-because-paused path.
+    /// `step`/`run_frames` wait on `frame_cv` for this to advance rather than
+    /// polling `frame_count`: waking here means a specific frame's core.run
+    /// *and* everything `run_frame` does after it (bus-window refresh, state
+    /// ops, training/shadow ticks, recording) already happened, which is the
+    /// honest definition of "the frame finished" (docs/frames.md §3 precondition 6 ("let the frame finish")).
+    pub step_generation: u64,
+    /// Condvar paired with the outer `Mutex<DebugState>` (there is only ever
+    /// one such mutex per session) and signaled alongside `step_generation`
+    /// AND [`fold_generation`](Self::fold_generation) — one condvar, two
+    /// independent counters, each waiter re-checks its own predicate on wake.
+    /// `Arc`-wrapped so a waiter can clone it out of the very guard it is
+    /// about to move into `wait_timeout` — cloning first avoids borrowing
+    /// `guard.frame_cv` and moving `guard` in the same expression.
+    pub frame_cv: Arc<Condvar>,
+    /// Incremented by the host loop's input-fold site — `main.rs`'s headless
+    /// loop step (a0) and the windowed `read_input` Bevy system — exactly
+    /// once per fold, i.e. once per call to `take_injected_input`/
+    /// `take_injected_input2` for that tick, and notified on `frame_cv`
+    /// alongside the bump. This is a DIFFERENT event than `step_generation`:
+    /// the fold runs on EVERY host-loop tick regardless of `paused`, while
+    /// `step_generation` only advances for a frame that actually ran
+    /// `core.run()`. `run_frames` waits on this to confirm a fold has
+    /// observed newly-set `held_input`/`held_input2` BEFORE arming
+    /// `step_batch_remaining` — see `RetroMcpServer::run_frames`'s doc for
+    /// the race this closes (two lock acquisitions where one ordering
+    /// guarantee was needed).
+    pub fold_generation: u64,
     /// MCP-injected controller input for port 0: per-button countdown of frames
     /// still to hold (index = RETRO_DEVICE_ID_JOYPAD: 0=B 1=Y 2=Select 3=Start
     /// 4=Up 5=Down 6=Left 7=Right 8=A 9=X 10=L 11=R). The emulation loop calls
@@ -973,6 +1010,21 @@ pub struct DebugState {
     pub held_input: [bool; 12],
     /// Port-1 (P2) counterpart of [`held_input`](Self::held_input).
     pub held_input2: [bool; 12],
+    /// What `Frontend::run_frame` fed the core on the LAST frame that
+    /// actually ran `core.run()` — set atomically, inside the SAME lock
+    /// acquisition that decides a frame will run (not a later one), from
+    /// `callback_context.input_state`. Unlike [`input_state`](Self::input_state)
+    /// (overwritten every host-loop TICK, executed or not — see its own
+    /// doc), this is sticky: it changes only when a real frame ran, so it
+    /// cannot be raced back to "correct" by a later non-executing tick's
+    /// re-fold before an observer reads it. Exists so `get_input`/tests can
+    /// observe exactly what an executed frame saw, closing the observability
+    /// gap that made task F4's `run_frames` mask race hard to catch from
+    /// outside (two independent observables — contact frame, `input_state`
+    /// polling — both agreed with each other on the wrong answer).
+    pub last_executed_input: [bool; 12],
+    /// Port-1 (P2) counterpart of [`last_executed_input`](Self::last_executed_input).
+    pub last_executed_input2: [bool; 12],
     /// Training-mode controls (shadow PLAN Wave 2b) — flipped by `--training`
     /// and hotkeys in the GUI, consumed by `training::tick` each frame.
     pub training: TrainingConfig,
@@ -1176,10 +1228,16 @@ impl DebugState {
             debug_open: false,
             paused: false,
             step_one: false,
+            step_batch_remaining: 0,
+            step_generation: 0,
+            frame_cv: Arc::new(Condvar::new()),
+            fold_generation: 0,
             injected_input: [0; 12],
             injected_input2: [0; 12],
             held_input: [false; 12],
             held_input2: [false; 12],
+            last_executed_input: [false; 12],
+            last_executed_input2: [false; 12],
             // Deliberately `default()`, not `merge_persisted()`: this
             // constructor is also every test's "give me a blank DebugState",
             // and a real settings sidecar sitting in the test process's cwd

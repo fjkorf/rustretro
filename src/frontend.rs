@@ -1346,12 +1346,25 @@ impl Frontend {
                 }
             }
 
-            if ds.step_one {
+            let will_bail = if ds.step_one {
                 ds.step_one = false;
+                false
+            } else if ds.step_batch_remaining > 0 {
+                ds.step_batch_remaining -= 1;
                 false
             } else {
                 ds.paused
+            };
+            // Sticky record of what THIS frame fed the core, captured only
+            // when we've just decided (in this same lock acquisition) that
+            // the frame will actually run — see `last_executed_input`'s doc
+            // for why this has to be atomic with the decision, not a
+            // separate later write.
+            if !will_bail {
+                ds.last_executed_input = self.callback_context.input_state;
+                ds.last_executed_input2 = self.callback_context.input_state2;
             }
+            will_bail
         };
 
         if paused {
@@ -1470,6 +1483,20 @@ impl Frontend {
             let mut ds = self.debug_state.lock().unwrap();
             ds.video_frames = ctx.video_frames;
             ds.video_real = ctx.video_real;
+        }
+
+        // --- Signal frame completion (MCP `step`/`run_frames` synchrony) ---
+        // Bumped exactly here, after every bit of this frame's work above —
+        // bus-window refresh, state/shadow/record drains, pins, training and
+        // shadow ticks, bookmarks, sidecar saves — has already happened. This
+        // is the ONLY point that counts as "the frame finished"; a waiter
+        // that wakes up here is safe to change input or read state next
+        // (docs/frames.md §3 precondition 6 ("let the frame finish") — this replaces the old poll-frame_count-then-
+        // sleep-8ms settle with an actual completion signal).
+        {
+            let mut ds = self.debug_state.lock().unwrap();
+            ds.step_generation = ds.step_generation.wrapping_add(1);
+            ds.frame_cv.notify_all();
         }
 
         Ok(self.callback_context.video_real > 0)

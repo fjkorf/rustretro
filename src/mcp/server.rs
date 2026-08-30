@@ -87,6 +87,27 @@ const MAX_SCAN_LEN: usize = 8 * 1024 * 1024;
 const MAX_INPUT_HOLD_FRAMES: u32 = 600;
 /// Human-facing list of valid `press_buttons` names (for error messages).
 const JOYPAD_BUTTON_LIST: &str = "a, b, x, y, l, r, start, select, up, down, left, right";
+/// Bounded wait for a synchronous `step` to land. Generous relative to a
+/// single frame's real cost (≈16.7ms even capped at 60fps, sub-millisecond
+/// uncapped) but finite — a wedged emulation thread must produce a clear
+/// timeout error, never an indefinitely hung MCP call.
+const STEP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// `run_frames` cap — mirrors `MAX_INPUT_HOLD_FRAMES`'s ~10s-at-60fps budget
+/// so one call can't make the server unresponsive for an unbounded time.
+const MAX_RUN_FRAMES: u32 = 600;
+/// Per-frame slice of `run_frames`' overall wait budget, plus a fixed floor
+/// for small counts — same "generous but finite" shape as `STEP_WAIT_TIMEOUT`,
+/// scaled up because a batch is many frames' worth of waiting.
+const RUN_FRAMES_PER_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
+const RUN_FRAMES_TIMEOUT_FLOOR: Duration = Duration::from_secs(2);
+/// Bounded wait for the host loop's NEXT input fold after `run_frames` sets
+/// `port0`/`port1` masks — same "generous but finite" shape as
+/// `STEP_WAIT_TIMEOUT`. The fold runs every host-loop tick regardless of
+/// `paused` (see `main.rs`'s headless step (a0) / windowed `read_input`), so
+/// under normal operation this resolves in well under a millisecond; a
+/// timeout here means the host loop itself is wedged, same failure mode
+/// `STEP_WAIT_TIMEOUT` names for `step`.
+const FOLD_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Sentinel error prefix emitted by [`RetroMcpServer::clone_region_bytes`] when a
 /// region is declared but backed by no readable host memory (a virtual/garbage
 /// descriptor). Format: `"<prefix>:<region_name>"`.
@@ -1058,13 +1079,19 @@ impl RetroMcpServer {
         json!({ "ok": true, "released": set, "port": port })
     }
 
-    /// `get_input`: report `port`'s input state two ways — `asserted` is what
-    /// the NEXT fold will feed the core (held ORed with any live `press_buttons`
-    /// countdown, via `DebugState::peek_injected_input`, non-consuming), and
-    /// `folded` is what the game actually received on the LAST fold
-    /// (`input_state`/`input_state2`, which also includes keyboard/pad input in
-    /// windowed mode). The two can legitimately differ (e.g. paused: `asserted`
-    /// still shows a hold, `folded` is stale until the next `step`).
+    /// `get_input`: report `port`'s input state three ways — `asserted` is
+    /// what the NEXT fold will feed the core (held ORed with any live
+    /// `press_buttons` countdown, via `DebugState::peek_injected_input`,
+    /// non-consuming); `folded` is the LAST TICK's fold
+    /// (`input_state`/`input_state2`) — this is refreshed every host-loop
+    /// tick regardless of whether that tick's frame actually ran, so while
+    /// paused it can race back to matching the held set even when the last
+    /// EXECUTED frame briefly saw something else; `executed` is the fix for
+    /// that — `DebugState::last_executed_input(2)`, updated ONLY on frames
+    /// that actually ran `core.run()`, atomically with the decision to run,
+    /// so it can't be overwritten by a later non-executing tick's re-fold.
+    /// Use `executed` when you need to know what a SPECIFIC landed frame
+    /// (e.g. from `run_frames`) actually saw.
     fn get_input(&self, port: usize) -> Value {
         if port > 1 {
             return json!({ "ok": false, "error": "`port` must be 0 (P1) or 1 (P2)" });
@@ -1076,6 +1103,7 @@ impl RetroMcpServer {
         let asserted = ds.peek_injected_input(port);
         let folded = if port == 1 { ds.input_state2 } else { ds.input_state };
         let held = if port == 1 { ds.held_input2 } else { ds.held_input };
+        let executed = if port == 1 { ds.last_executed_input2 } else { ds.last_executed_input };
         drop(ds);
         json!({
             "ok": true,
@@ -1085,9 +1113,14 @@ impl RetroMcpServer {
             "held_buttons": button_names(&held),
             "folded_mask": format!("0x{:03X}", mask_from_bits(&folded)),
             "folded_buttons": button_names(&folded),
+            "executed_mask": format!("0x{:03X}", mask_from_bits(&executed)),
+            "executed_buttons": button_names(&executed),
             "note": "asserted = what the NEXT fold will feed the core (held + any press_buttons \
-                     countdown remaining); folded = what the game ACTUALLY received on the LAST \
-                     fold (input_state/input_state2 — also includes keyboard/pad in windowed mode)",
+                     countdown remaining); folded = the LAST TICK's fold (input_state/input_state2 \
+                     — refreshed every host-loop tick whether or not that tick's frame ran, also \
+                     includes keyboard/pad in windowed mode); executed = what the LAST FRAME THAT \
+                     ACTUALLY RAN core.run() saw (sticky — only changes on a real frame, so it is \
+                     safe to read after a `step`/`run_frames` call without racing a later tick)",
         })
     }
 
@@ -1277,14 +1310,330 @@ impl RetroMcpServer {
         json!({ "ok": true, "message": crate::hunt::reset(), "status": crate::hunt::status() })
     }
 
-    /// Request a single-frame step: clear pause-edge by arming `step_one`.
-    fn step(&self) -> Value {
-        if let Ok(mut ds) = self.debug.lock() {
-            ds.step_one = true;
-            json!({ "ok": true, "stepped": true })
-        } else {
-            json!({ "ok": false, "error": "lock poisoned" })
+    /// Block until `DebugState::step_generation` advances past `start_gen`,
+    /// waking on the SAME `notify_all` `Frontend::run_frame` fires once a
+    /// frame's post-processing is entirely done — not a moved `frame_count`
+    /// observed via polling, which is what made the old fire-and-forget
+    /// `step` need an 8ms settle (docs/frames.md §3 precondition 6 ("let the frame finish")). Bounded by `timeout`;
+    /// returns `Ok(None)` on timeout instead of blocking forever, so a
+    /// wedged emulation thread surfaces as a clear error, not a hang.
+    fn wait_for_next_frame(&self, start_gen: u64, timeout: Duration) -> Result<Option<u64>, &'static str> {
+        let mut ds = self.debug.lock().map_err(|_| "lock poisoned")?;
+        if ds.step_generation != start_gen {
+            return Ok(Some(ds.frame_count));
         }
+        let cv = ds.frame_cv.clone(); // clone out of the guard before moving it into wait_timeout
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let (guard, _) = cv.wait_timeout(ds, deadline - now).map_err(|_| "lock poisoned")?;
+            ds = guard;
+            if ds.step_generation != start_gen {
+                return Ok(Some(ds.frame_count));
+            }
+        }
+    }
+
+    /// Block until `DebugState::fold_generation` advances past `start_gen`, or
+    /// `timeout` expires. This is `run_frames`' guarantee that the port masks
+    /// it just set have been folded into `Frontend::callback_context.input_state`
+    /// (`main.rs`'s headless step (a0) / windowed `read_input`) at least once
+    /// BEFORE it arms `step_batch_remaining` — closing the race documented on
+    /// `run_frames` itself: setting held masks and arming the batch used to
+    /// happen in a single lock acquisition, with no guarantee the host loop's
+    /// separate fold-then-gate-check pair had picked up the new masks before
+    /// the gate opened. Since the fold runs unconditionally every host-loop
+    /// tick (not gated on `paused`), the FIRST fold observed after this call's
+    /// caller mutates `held_input`/`held_input2` is guaranteed — by mutex
+    /// total order alone, no timing assumption — to have read the new values:
+    /// the mutation happens-before this function's lock is released, and any
+    /// fold's lock acquisition that observes a bumped generation happened
+    /// strictly after that release.
+    fn wait_for_fold(&self, start_gen: u64, timeout: Duration) -> Result<Option<u64>, &'static str> {
+        let mut ds = self.debug.lock().map_err(|_| "lock poisoned")?;
+        if ds.fold_generation != start_gen {
+            return Ok(Some(ds.fold_generation));
+        }
+        let cv = ds.frame_cv.clone();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let (guard, _) = cv.wait_timeout(ds, deadline - now).map_err(|_| "lock poisoned")?;
+            ds = guard;
+            if ds.fold_generation != start_gen {
+                return Ok(Some(ds.fold_generation));
+            }
+        }
+    }
+
+    /// `run_frames`' counterpart to [`wait_for_next_frame`](Self::wait_for_next_frame):
+    /// blocks until `count` frames' worth of `step_generation` have landed, or
+    /// `timeout` expires. Returns `(frames_landed, end_frame, timed_out)`; on
+    /// timeout it also clears `step_batch_remaining` so a wedged wait doesn't
+    /// leave a dangling auto-step budget for later frames to silently burn
+    /// through unsupervised.
+    ///
+    /// Deliberately does NOT also exit early on `step_batch_remaining == 0` —
+    /// that field is decremented at the START of `Frontend::run_frame` (before
+    /// `core.run()`), while `step_generation` is only bumped at the very END
+    /// (after all post-processing). A waiter that also treated
+    /// `step_batch_remaining == 0` as "done" could observe the LAST frame's
+    /// decrement (start of its `run_frame` call) before that same frame's
+    /// generation bump (end of the same call) and return one frame short —
+    /// measured live as `run_frames(60)` reporting `landed: 59`. Generation is
+    /// the only completion signal; the two counters' independent lock windows
+    /// must not be cross-checked against each other.
+    fn wait_for_batch(&self, start_gen: u64, count: u32, timeout: Duration) -> Result<(u64, u64, bool), &'static str> {
+        let mut ds = self.debug.lock().map_err(|_| "lock poisoned")?;
+        let cv = ds.frame_cv.clone();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let landed = ds.step_generation.wrapping_sub(start_gen).min(count as u64);
+            if landed >= count as u64 {
+                return Ok((landed, ds.frame_count, false));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                ds.step_batch_remaining = 0;
+                let landed = ds.step_generation.wrapping_sub(start_gen).min(count as u64);
+                return Ok((landed, ds.frame_count, true));
+            }
+            let (guard, _) = cv.wait_timeout(ds, deadline - now).map_err(|_| "lock poisoned")?;
+            ds = guard;
+        }
+    }
+
+    /// Advance emulation by exactly one frame, SYNCHRONOUSLY: unlike the old
+    /// fire-and-forget `step_one` flag-set, this only returns once that frame
+    /// has completely finished (`Frontend::run_frame`'s full post-processing
+    /// done, per docs/frames.md §3 precondition 6 ("let the frame finish")) — not when a counter merely moved. An
+    /// immediately-following `hold_buttons`/read is safe once this returns.
+    /// Backward compatible: existing callers that poll `get_state` afterwards
+    /// still work, they just observe it already landed.
+    fn step(&self) -> Value {
+        let start_gen = match self.debug.lock() {
+            Ok(mut ds) => {
+                let g = ds.step_generation;
+                ds.step_one = true;
+                g
+            }
+            Err(_) => return json!({ "ok": false, "error": "lock poisoned" }),
+        };
+        match self.wait_for_next_frame(start_gen, STEP_WAIT_TIMEOUT) {
+            Ok(Some(frame_count)) => json!({
+                "ok": true,
+                "stepped": true,
+                "landed": true,
+                "frame_count": frame_count,
+            }),
+            Ok(None) => json!({
+                "ok": false,
+                "stepped": true,
+                "landed": false,
+                "error": format!(
+                    "timed out after {:?} waiting for the emulation thread to finish the frame \
+                     (it may be wedged) — step_one is still armed and will consume the next \
+                     frame that does run",
+                    STEP_WAIT_TIMEOUT,
+                ),
+            }),
+            Err(e) => json!({ "ok": false, "error": e }),
+        }
+    }
+
+    /// `run_frames`: advance `count` frames SYNCHRONOUSLY in ONE call — the
+    /// batch counterpart to `step`, collapsing a replay segment from N round
+    /// trips into one (the frame lab measured a confirmed, settled `step` at
+    /// ~41ms; this exists so a whole segment doesn't pay that per frame).
+    ///
+    /// Requires the emulator to already be PAUSED — same precondition as the
+    /// documented pause→step frame-exact workflow (CLAUDE.md's MCP/agent-
+    /// workflow section). Refuses otherwise rather than silently pausing/
+    /// resuming around the caller, which would be a surprising side effect
+    /// for a "just advance frames" tool.
+    ///
+    /// `port0`/`port1`, when given, REPLACE that port's held set for the
+    /// whole run — identical semantics to `hold_buttons` (not additive), and
+    /// they stay held after the call returns (`release_buttons` to clear).
+    /// Ports not mentioned keep whatever was already held.
+    ///
+    /// ORDERING GUARANTEE (closes a measured race — 13/200 spurious results on
+    /// a live rig before this fix): setting the masks and arming
+    /// `step_batch_remaining` are DELIBERATELY two separate lock acquisitions
+    /// with a [`wait_for_fold`](Self::wait_for_fold) in between, not one. The
+    /// host loop folds input (`main.rs`'s headless step (a0) / windowed
+    /// `read_input`) and checks the pause/batch gate (`Frontend::run_frame`)
+    /// in two SEPARATE lock acquisitions of its own, once per tick. Setting
+    /// the masks and arming the batch together in a single critical section
+    /// left a window: the host loop could fold the OLD masks and then, in the
+    /// very same tick, see the batch just got armed and run frame 1 on that
+    /// stale fold — the attacker's move landing one frame late, silently.
+    /// Waiting for a CONFIRMED fold (fold_generation advancing past a value
+    /// snapshotted before the masks were mutated) before arming the batch
+    /// guarantees the batch's first counted frame sees the new masks: the
+    /// mutation happens-before the wait's lock release, so the first fold
+    /// observed afterward is provably a fold of the new values, and every
+    /// fold from then on reads the same (unchanged) held set. Only paid when
+    /// `port0`/`port1` is actually given — the no-mask path (already measured
+    /// at 0/200) is untouched. Residual hazard: this is still "single agent
+    /// per MCP session" like the rest of this server — a concurrent
+    /// `hold_buttons`/`run_frames` from another session between the fold
+    /// confirmation and the batch arming could overwrite the just-confirmed
+    /// masks; not defended against, same as the pre-existing
+    /// `step_batch_remaining` sharing noted below. If the emulator is resumed
+    /// or re-paused between the two lock acquisitions, the second one re-
+    /// checks `paused` and refuses rather than silently arming a batch against
+    /// a state that changed underneath it.
+    ///
+    /// A `load_state` landing mid-run is NOT special-cased: `Frontend::
+    /// frame_count` is a host-side counter that is never part of the
+    /// save-state blob (retro_(un)serialize never touches it), so it stays
+    /// monotonic straight through a load — only the CONTENT of frames run
+    /// after the load reflects the restored machine state. `end_frame` is
+    /// therefore always `start_frame + landed`, even across a mid-batch load.
+    ///
+    /// Not mutually exclusive with a concurrent `step`/`run_frames` from
+    /// another session: both share the same `step_batch_remaining` counter,
+    /// same as `hold_buttons`/`press_buttons` already race on shared input
+    /// state today. The frame lab's protocol is single-agent-per-session by
+    /// convention, same as the rest of this server.
+    fn run_frames(&self, count: u32, port0: Option<&[&str]>, port1: Option<&[&str]>) -> Value {
+        if count == 0 {
+            return json!({ "ok": false, "error": "`count` must be >= 1" });
+        }
+        if count > MAX_RUN_FRAMES {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "`count` must be <= {MAX_RUN_FRAMES} (~10s at 60fps, keeps a single call \
+                     from making the server unresponsive) — issue multiple calls for a longer \
+                     segment",
+                ),
+            });
+        }
+
+        let mut unknown: Vec<String> = Vec::new();
+        let resolve = |names: &[&str], unknown: &mut Vec<String>| -> [bool; 12] {
+            let mut bits = [false; 12];
+            for n in names {
+                match joypad_button_index(n) {
+                    Some(i) => bits[i] = true,
+                    None => unknown.push(n.to_string()),
+                }
+            }
+            bits
+        };
+        let bits0 = port0.map(|n| resolve(n, &mut unknown));
+        let bits1 = port1.map(|n| resolve(n, &mut unknown));
+        if !unknown.is_empty() {
+            return json!({
+                "ok": false,
+                "error": format!("unknown button(s): {}. Valid: {}", unknown.join(", "), JOYPAD_BUTTON_LIST),
+            });
+        }
+
+        // Phase 1: validate paused, then (if masks were given) mutate held
+        // input and snapshot fold_generation from BEFORE that mutation. Do
+        // NOT arm step_batch_remaining here — see the ordering-guarantee doc
+        // above for why that has to wait for a confirmed fold.
+        let (fold_start, masks_given) = match self.debug.lock() {
+            Ok(mut ds) => {
+                if !ds.paused {
+                    return json!({
+                        "ok": false,
+                        "error": "run_frames requires the emulator to be paused first (pause, \
+                                  then run_frames) — same precondition as the pause→step \
+                                  frame-exact workflow",
+                    });
+                }
+                let fold_start = ds.fold_generation;
+                let mut masks_given = false;
+                if let Some(bits) = bits0 {
+                    ds.set_held_input(0, bits);
+                    masks_given = true;
+                }
+                if let Some(bits) = bits1 {
+                    ds.set_held_input(1, bits);
+                    masks_given = true;
+                }
+                (fold_start, masks_given)
+            }
+            Err(_) => return json!({ "ok": false, "error": "lock poisoned" }),
+        };
+
+        // Phase 1.5: only when masks were actually set, block until the host
+        // loop's next fold has observed them — the fix for the race. The
+        // no-mask path (measured clean at 0/200) skips this entirely.
+        if masks_given {
+            match self.wait_for_fold(fold_start, FOLD_WAIT_TIMEOUT) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return json!({
+                        "ok": false,
+                        "error": format!(
+                            "timed out after {:?} waiting for the host loop to fold the new \
+                             port0/port1 masks — the masks ARE set (held) but no batch was \
+                             armed, so nothing ran on a possibly-stale fold; the host loop may \
+                             be wedged",
+                            FOLD_WAIT_TIMEOUT,
+                        ),
+                    });
+                }
+                Err(e) => return json!({ "ok": false, "error": e }),
+            }
+        }
+
+        // Phase 2: arm the batch — a SEPARATE lock acquisition from phase 1,
+        // now that (for the masked path) a fold of the new masks is
+        // confirmed. Re-checks `paused` since it may have changed while we
+        // waited.
+        let (start_gen, start_frame) = match self.debug.lock() {
+            Ok(mut ds) => {
+                if !ds.paused {
+                    return json!({
+                        "ok": false,
+                        "error": "run_frames requires the emulator to be paused first — it was \
+                                  paused when the masks were set but was resumed before the \
+                                  batch could be armed; the masks are still held, retry",
+                    });
+                }
+                let start_gen = ds.step_generation;
+                let start_frame = ds.frame_count;
+                ds.step_batch_remaining = count;
+                (start_gen, start_frame)
+            }
+            Err(_) => return json!({ "ok": false, "error": "lock poisoned" }),
+        };
+
+        let timeout = RUN_FRAMES_TIMEOUT_FLOOR + RUN_FRAMES_PER_FRAME_TIMEOUT * count;
+        let (landed, end_frame, timed_out) = match self.wait_for_batch(start_gen, count, timeout) {
+            Ok(v) => v,
+            Err(e) => return json!({ "ok": false, "error": e }),
+        };
+
+        json!({
+            "ok": !timed_out,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "requested": count,
+            "landed": landed,
+            "all_landed": landed == count as u64,
+            "error": if timed_out {
+                json!(format!(
+                    "timed out after {:?} waiting for {} of {} requested frames — the \
+                     remaining auto-step budget was cleared",
+                    timeout, count as u64 - landed, count,
+                ))
+            } else {
+                Value::Null
+            },
+        })
     }
 
     /// Submit a Lua script to the main thread and poll for its result.
@@ -1906,6 +2255,19 @@ impl RetroMcpServer {
             });
             Arc::new(schema.as_object().unwrap().clone())
         };
+        // Schema for { count, port0?:[string], port1?:[string] } (run_frames).
+        let run_frames_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "count": { "type": "integer", "description": "Frames to advance synchronously (1-600 ≈ 10s at 60fps)" },
+                    "port0": { "type": "array", "items": { "type": "string" }, "description": "Buttons to HOLD on P1 for the whole run (REPLACES P1's held set, same semantics as hold_buttons); omit to leave P1's current held set unchanged. When given, run_frames blocks until the host loop has confirmed folding this mask before counting frame 1 — the first counted frame is guaranteed to see it, not a stale prior fold." },
+                    "port1": { "type": "array", "items": { "type": "string" }, "description": "Same as port0 but for P2." }
+                },
+                "required": ["count"]
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
         // Schema for { buttons?:[string], port? } (release_buttons).
         let release_buttons_schema = || -> Arc<Map<String, Value>> {
             let schema = json!({
@@ -2167,8 +2529,36 @@ impl RetroMcpServer {
             Tool::new("resume", "Resume emulation (safe control flag).", no_params()),
             Tool::new(
                 "step",
-                "Advance emulation by one frame while paused (safe control flag).",
+                "Advance emulation by exactly one frame while paused — SYNCHRONOUS: returns \
+                 only once that frame has FULLY finished (all of run_frame's post-processing \
+                 done), not merely queued or a counter that moved. An immediately-following \
+                 hold_buttons/read is safe once this returns. Bounded wait (2s); a timeout \
+                 means the emulation thread may be wedged. Backward compatible with callers \
+                 that still poll get_state afterwards — they just observe it already landed.",
                 no_params(),
+            ),
+            Tool::new(
+                "run_frames",
+                "Advance emulation by `count` frames SYNCHRONOUSLY in ONE call — the batch \
+                 counterpart to `step`, for replay segments where N round trips would dominate \
+                 the cost. Requires the emulator to already be PAUSED (same precondition as \
+                 pause→step); refuses otherwise rather than silently pausing/resuming around \
+                 you. `port0`/`port1`, if given, REPLACE that port's held set for the whole run \
+                 (hold_buttons semantics) and stay held after the call returns; when given, this \
+                 call blocks until the host loop confirms it has folded the NEW mask before \
+                 counting frame 1, so the batch's first frame is guaranteed to run on the mask \
+                 you just supplied, never a stale one from before the call (this closes a fixed \
+                 race — do not work around it by adding your own settle/sleep). Returns \
+                 {start_frame, end_frame, requested, landed, all_landed}. A load_state landing \
+                 mid-run is not special-cased: frame_count is a host-side counter untouched by \
+                 (un)serialization, so it just keeps counting through the load — only the \
+                 CONTENT of frames after the load reflects the restored state. Capped at 600 \
+                 frames per call (~10s at 60fps). Safe — input-only, no memory writes (no write \
+                 gate). Residual hazard: like hold_buttons/press_buttons, input state is shared \
+                 per session, not per-caller — a concurrent run_frames/hold_buttons from another \
+                 MCP session between the mask being folded and this batch being armed can \
+                 overwrite the mask before it's used. Single-agent-per-session by convention.",
+                run_frames_schema(),
             ),
             Tool::new(
                 "press_buttons",
@@ -2767,6 +3157,20 @@ impl ServerHandler for RetroMcpServer {
                 )?])),
                 "step" => {
                     Ok(CallToolResult::success(vec![Self::json_content(&this.step())?]))
+                }
+                "run_frames" => {
+                    let count = get_u("count").unwrap_or(0) as u32;
+                    let port0_names: Option<Vec<String>> = args.get("port0").and_then(|v| v.as_array()).map(|a| {
+                        a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                    });
+                    let port1_names: Option<Vec<String>> = args.get("port1").and_then(|v| v.as_array()).map(|a| {
+                        a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                    });
+                    let port0_refs: Option<Vec<&str>> = port0_names.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+                    let port1_refs: Option<Vec<&str>> = port1_names.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+                    Ok(CallToolResult::success(vec![Self::json_content(
+                        &this.run_frames(count, port0_refs.as_deref(), port1_refs.as_deref()),
+                    )?]))
                 }
                 "press_buttons" => {
                     let buttons: Vec<String> = args
@@ -3586,6 +3990,345 @@ mod tests {
         assert_eq!(srv.release_buttons(&["a"], 2)["ok"], false);
     }
 
+    // ── step / run_frames synchrony (task F1) ───────────────────────────────
+
+    #[test]
+    fn wait_for_next_frame_times_out_when_nothing_bumps_generation() {
+        // No emulation thread exists in a unit test, so a wait that isn't
+        // satisfied by an external notify MUST return Ok(None) — never hang —
+        // within (well under) the requested bound. This is the bounded-wait
+        // error path `step` surfaces as its timeout error.
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let start_gen = srv.debug.lock().unwrap().step_generation;
+        let began = std::time::Instant::now();
+        let got = srv.wait_for_next_frame(start_gen, std::time::Duration::from_millis(20));
+        assert_eq!(got, Ok(None), "no notifier exists — must time out, not hang");
+        assert!(began.elapsed() < std::time::Duration::from_millis(500), "must not block far past its timeout");
+    }
+
+    #[test]
+    fn wait_for_next_frame_wakes_immediately_on_notify() {
+        // Sanity-check the OTHER side of the same bound: when something DOES
+        // bump `step_generation` and notify, the wait resolves promptly
+        // instead of only ever resolving via timeout.
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let start_gen = srv.debug.lock().unwrap().step_generation;
+        let debug = srv.debug.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let mut ds = debug.lock().unwrap();
+            ds.frame_count += 1;
+            ds.step_generation = ds.step_generation.wrapping_add(1);
+            ds.frame_cv.notify_all();
+        });
+        let began = std::time::Instant::now();
+        let got = srv.wait_for_next_frame(start_gen, std::time::Duration::from_secs(2));
+        assert_eq!(got, Ok(Some(1)), "should observe the bumped frame_count");
+        assert!(began.elapsed() < std::time::Duration::from_secs(1), "should wake on notify, not timeout");
+    }
+
+    // ── run_frames mask/fold ordering (task F4 — closes the two-lock-
+    //    acquisition race between setting held masks and arming the batch) ──
+
+    #[test]
+    fn wait_for_fold_times_out_when_nothing_bumps_generation() {
+        // Mirrors wait_for_next_frame's timeout test but for fold_generation:
+        // no host loop exists in a unit test, so an unsatisfied wait must
+        // return Ok(None), never hang.
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let start_gen = srv.debug.lock().unwrap().fold_generation;
+        let began = std::time::Instant::now();
+        let got = srv.wait_for_fold(start_gen, std::time::Duration::from_millis(20));
+        assert_eq!(got, Ok(None), "no fold notifier exists — must time out, not hang");
+        assert!(began.elapsed() < std::time::Duration::from_millis(500), "must not block far past its timeout");
+    }
+
+    #[test]
+    fn wait_for_fold_wakes_immediately_on_notify() {
+        // The other side of the same bound: when something DOES bump
+        // fold_generation and notify frame_cv, the wait resolves promptly.
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let start_gen = srv.debug.lock().unwrap().fold_generation;
+        let debug = srv.debug.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let mut ds = debug.lock().unwrap();
+            ds.fold_generation = ds.fold_generation.wrapping_add(1);
+            ds.frame_cv.notify_all();
+        });
+        let began = std::time::Instant::now();
+        let got = srv.wait_for_fold(start_gen, std::time::Duration::from_secs(2));
+        assert_eq!(got, Ok(Some(1)));
+        assert!(began.elapsed() < std::time::Duration::from_secs(1), "should wake on notify, not timeout");
+    }
+
+    #[test]
+    fn run_frames_with_masks_times_out_distinctly_when_the_fold_never_lands() {
+        // If nothing ever folds the new masks (host loop wedged / test has no
+        // stand-in thread at all), run_frames must report a fold-specific
+        // timeout and MUST NOT have armed a batch — the whole point is that a
+        // batch is never armed on an unconfirmed fold. Uses a temporarily
+        // shortened fold timeout via direct field access is not exposed, so
+        // this exercises the real FOLD_WAIT_TIMEOUT-bounded path; kept as a
+        // single small case (not looped) to bound total suite time.
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        srv.debug.lock().unwrap().paused = true;
+        let v = srv.run_frames(1, Some(&["right"]), None);
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("fold"), "{v}");
+        let ds = srv.debug.lock().unwrap();
+        assert_eq!(ds.step_batch_remaining, 0, "must not arm a batch on an unconfirmed fold");
+        assert!(ds.held_input[7], "the mask itself is still set — release_buttons can clear it");
+    }
+
+    #[test]
+    fn run_frames_without_masks_does_not_wait_for_a_fold() {
+        // The no-mask path is the one measured clean at 0/200 on the live
+        // rig — it must stay a single lock acquisition with no fold wait, so
+        // it keeps landing instantly with no dependency on the host loop
+        // ever folding anything.
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        srv.debug.lock().unwrap().paused = true;
+        let debug = srv.debug.clone();
+        std::thread::spawn(move || {
+            loop {
+                {
+                    let ds = debug.lock().unwrap();
+                    if ds.step_batch_remaining > 0 {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut ds = debug.lock().unwrap();
+            ds.step_batch_remaining = 0;
+            ds.frame_count += 1;
+            ds.step_generation = ds.step_generation.wrapping_add(1);
+            ds.frame_cv.notify_all();
+        });
+        let began = std::time::Instant::now();
+        let v = srv.run_frames(1, None, None);
+        assert_eq!(v["ok"], true, "{v}");
+        assert!(began.elapsed() < std::time::Duration::from_secs(1), "no fold wait means no multi-second latency");
+    }
+
+    #[test]
+    fn run_frames_never_arms_the_batch_before_a_fold_confirms_the_new_masks() {
+        // The direct regression test for the race: a watcher thread polls
+        // for the specific bad interleaving (step_batch_remaining armed while
+        // fold_generation is still at its pre-call value) that the OLD
+        // single-lock-acquisition run_frames could produce. It must never be
+        // observed with the fixed two-phase run_frames.
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        srv.debug.lock().unwrap().paused = true;
+        let debug = srv.debug.clone();
+
+        let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (raced_w, stop_w) = (raced.clone(), stop.clone());
+        let debug_w = debug.clone();
+        let watcher = std::thread::spawn(move || {
+            while !stop_w.load(std::sync::atomic::Ordering::SeqCst) {
+                let ds = debug_w.lock().unwrap();
+                if ds.step_batch_remaining > 0 && ds.fold_generation == 0 {
+                    raced_w.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                drop(ds);
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+        });
+
+        std::thread::spawn(move || {
+            // Stand in for the host loop: fold (bump fold_generation) only
+            // after observing the new mask, then complete the batch.
+            loop {
+                {
+                    let ds = debug.lock().unwrap();
+                    if ds.held_input[7] {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            {
+                let mut ds = debug.lock().unwrap();
+                ds.fold_generation = ds.fold_generation.wrapping_add(1);
+                ds.frame_cv.notify_all();
+            }
+            loop {
+                {
+                    let ds = debug.lock().unwrap();
+                    if ds.step_batch_remaining > 0 {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut ds = debug.lock().unwrap();
+            ds.step_batch_remaining = 0;
+            ds.frame_count += 1;
+            ds.step_generation = ds.step_generation.wrapping_add(1);
+            ds.frame_cv.notify_all();
+        });
+
+        let v = srv.run_frames(1, Some(&["right"]), None);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        watcher.join().unwrap();
+
+        assert_eq!(v["ok"], true, "{v}");
+        assert!(
+            !raced.load(std::sync::atomic::Ordering::SeqCst),
+            "step_batch_remaining was armed while fold_generation was still at its pre-call \
+             value — the batch's first frame could have run on a stale fold"
+        );
+    }
+
+    #[test]
+    fn step_is_synchronous_and_reports_the_landed_frame() {
+        // Simulates the emulation thread: after `step` arms `step_one`, a
+        // background thread stands in for `Frontend::run_frame` finishing the
+        // frame and bumps+notifies `step_generation` exactly like the real
+        // completion signal in frontend.rs. `step()` must not return before
+        // that happens.
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let debug = srv.debug.clone();
+        std::thread::spawn(move || {
+            // Wait for step_one to be armed, mimicking the main loop noticing it.
+            loop {
+                {
+                    let ds = debug.lock().unwrap();
+                    if ds.step_one {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut ds = debug.lock().unwrap();
+            ds.step_one = false;
+            ds.frame_count += 1;
+            ds.step_generation = ds.step_generation.wrapping_add(1);
+            ds.frame_cv.notify_all();
+        });
+        let v = srv.step();
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["landed"], true, "{v}");
+        assert_eq!(v["frame_count"], 1, "{v}");
+    }
+
+    #[test]
+    fn run_frames_rejects_zero_and_over_cap_count() {
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let v = srv.run_frames(0, None, None);
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v["error"].as_str().unwrap().contains(">= 1"), "{v}");
+
+        let v = srv.run_frames(super::MAX_RUN_FRAMES + 1, None, None);
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("600"), "{v}");
+    }
+
+    #[test]
+    fn run_frames_requires_paused() {
+        // A fresh DebugState starts unpaused; run_frames must refuse rather
+        // than silently pausing/resuming around the caller.
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        assert!(!srv.debug.lock().unwrap().paused);
+        let v = srv.run_frames(5, None, None);
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("paused"), "{v}");
+        // And it must not have armed a batch it's about to refuse to run.
+        assert_eq!(srv.debug.lock().unwrap().step_batch_remaining, 0);
+    }
+
+    #[test]
+    fn run_frames_rejects_unknown_buttons_without_arming_a_batch() {
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        srv.debug.lock().unwrap().paused = true;
+        let v = srv.run_frames(5, Some(&["not_a_button"]), None);
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("unknown"), "{v}");
+        assert_eq!(srv.debug.lock().unwrap().step_batch_remaining, 0, "must refuse before arming");
+    }
+
+    #[test]
+    fn run_frames_times_out_and_reports_partial_progress() {
+        // Nothing plays the role of the emulation thread here, so the batch
+        // never completes — the bounded wait must still return (not hang)
+        // and must clear step_batch_remaining rather than leave it dangling.
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let start_gen = {
+            let mut ds = srv.debug.lock().unwrap();
+            ds.paused = true;
+            // Mirror what run_frames itself does right before it waits: arm
+            // the batch so `step_batch_remaining == 0` doesn't look like an
+            // (already-drained) batch that never started.
+            ds.step_batch_remaining = 3;
+            ds.step_generation
+        };
+        let (landed, end_frame, timed_out) = srv
+            .wait_for_batch(start_gen, 3, std::time::Duration::from_millis(20))
+            .unwrap();
+        assert!(timed_out);
+        assert_eq!(landed, 0);
+        assert_eq!(end_frame, 0);
+        assert_eq!(srv.debug.lock().unwrap().step_batch_remaining, 0, "timeout must clear the batch");
+    }
+
+    #[test]
+    fn run_frames_applies_port_masks_and_reports_success_when_the_batch_lands() {
+        // port0/port1 REPLACE the held set (same contract as hold_buttons),
+        // applied before the batch is armed. A background thread stands in
+        // for BOTH the host loop's fold (bumping fold_generation once the
+        // new masks have landed — the ordering guarantee under test) and the
+        // emulation thread completing the 1-frame batch, so this also
+        // exercises run_frames' success (non-timeout) path end to end.
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        srv.debug.lock().unwrap().paused = true;
+        let debug = srv.debug.clone();
+        std::thread::spawn(move || {
+            // Stand in for the host loop's input fold (main.rs step (a0) /
+            // read_input): wait for the masks run_frames just set, THEN bump
+            // fold_generation — mirroring exactly what run_frames' internal
+            // wait_for_fold blocks on before it will arm the batch.
+            loop {
+                {
+                    let ds = debug.lock().unwrap();
+                    if ds.held_input[7] && ds.held_input2[6] {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            {
+                let mut ds = debug.lock().unwrap();
+                ds.fold_generation = ds.fold_generation.wrapping_add(1);
+                ds.frame_cv.notify_all();
+            }
+            // Stand in for the emulation thread completing the 1-frame batch.
+            loop {
+                {
+                    let ds = debug.lock().unwrap();
+                    if ds.step_batch_remaining > 0 {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut ds = debug.lock().unwrap();
+            ds.step_batch_remaining = 0;
+            ds.frame_count += 1;
+            ds.step_generation = ds.step_generation.wrapping_add(1);
+            ds.frame_cv.notify_all();
+        });
+        let v = srv.run_frames(1, Some(&["right"]), Some(&["left"]));
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["landed"], 1, "{v}");
+        assert_eq!(v["all_landed"], true, "{v}");
+        let ds = srv.debug.lock().unwrap();
+        assert!(ds.held_input[7], "port0 right should be held"); // right = index 7
+        assert!(ds.held_input2[6], "port1 left should be held"); // left = index 6
+    }
+
     #[test]
     fn get_input_reports_asserted_and_folded_separately() {
         let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
@@ -3619,6 +4362,51 @@ mod tests {
         assert!(folded.contains(&"right".to_string()));
         assert!(folded.contains(&"b".to_string()));
         assert_eq!(srv.get_input(2)["ok"], false);
+    }
+
+    #[test]
+    fn get_input_executed_is_sticky_across_non_executing_folds() {
+        // task F4: `executed_*` (DebugState::last_executed_input) exists
+        // because `folded_*` (input_state) is refreshed by `Frontend::
+        // run_frame` on EVERY host-loop tick — including ticks whose frame
+        // never actually ran — so a caller reading `folded` after a landed
+        // `run_frames` batch can observe a value that has already drifted
+        // away from what that specific executed frame saw. `executed` must
+        // NOT drift: it changes only when something (standing in here for
+        // `Frontend::run_frame`'s executed branch) explicitly sets it.
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        {
+            let mut ds = srv.debug.lock().unwrap();
+            // Simulate frame 1 executing with "right" held: this is the
+            // atomic capture `run_frame` does only on the branch that will
+            // actually call core.run().
+            ds.set_held_input(0, {
+                let mut b = [false; 12];
+                b[7] = true; // right
+                b
+            });
+            ds.input_state = ds.take_injected_input();
+            ds.last_executed_input = ds.input_state;
+        }
+        {
+            // Simulate a LATER non-executing tick's re-fold with a DIFFERENT
+            // mask — this is exactly the overwrite that made `folded` racy
+            // as a post-hoc probe: it moves even though no frame ran.
+            let mut ds = srv.debug.lock().unwrap();
+            ds.set_held_input(0, {
+                let mut b = [false; 12];
+                b[6] = true; // left
+                b
+            });
+            ds.input_state = ds.take_injected_input();
+        }
+        let v = srv.get_input(0);
+        let folded: Vec<String> = v["folded_buttons"].as_array().unwrap()
+            .iter().map(|s| s.as_str().unwrap().to_string()).collect();
+        let executed: Vec<String> = v["executed_buttons"].as_array().unwrap()
+            .iter().map(|s| s.as_str().unwrap().to_string()).collect();
+        assert_eq!(folded, vec!["left".to_string()], "folded drifted to the later non-executing tick — expected");
+        assert_eq!(executed, vec!["right".to_string()], "executed must stay pinned to what frame 1 actually saw");
     }
 
     #[test]

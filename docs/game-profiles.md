@@ -140,6 +140,114 @@ matchup grid) is engine code. Game-specific *behavior* beyond the schema
 (overlays, scripted drills) goes in the per-game Lua script via API v3
 bindings — reading the profile, never restating it.
 
+## The `framelab` block
+
+`docs/frames.md`'s frame lab (`shadow_train.framelab`) measures "when can
+this fighter act again" per port, and that protocol has its own per-port
+constants — a contact anchor, an ordered observable candidate list with its
+own addressing, and per-probe-shape calibration numbers — that used to be
+hardcoded in `framelab/observables.py` and `framelab/kit.py` as MK2's own
+answers. They are DATA now, same as everything else in this doc: an
+OPTIONAL top-level `framelab` key on the port profile, read by
+`shadow_train.framelab.spec.FramelabSpec` (Python-only; Rust does not parse
+this key, and tolerates it as an unrecognized field the same way it already
+tolerates `_STATUS` — see `src/profile.rs`'s `PortProfile`, which has no
+`framelab` field and no `#[serde(deny_unknown_fields)]`).
+
+**A port with no `framelab` key has not been calibrated for the frame lab.**
+That is the correct state for every port except `library/mk2` arcade today
+(asurabld, mk2 Genesis included) — `FramelabSpec.from_profile` raises
+`FramelabNotConfigured` naming the port, rather than the lab silently
+reusing MK2's numbers on a game nobody has measured. The same exception
+names the SPECIFIC missing piece (anchor / observables / an active
+observable's calibration) when the block exists but is incomplete — absence
+is a distinct, expressible state at every level of this schema, never a
+default.
+
+```json
+"framelab": {
+  "anchor": { "field": "health" },
+  "quiet_frames": 20,
+  "observables": [
+    {
+      "name": "struct_velocity",
+      "status": "active",
+      "addressing": { "kind": "byte_range", "off": "0xB", "end": "0xE" },
+      "calibration": {
+        "attacker/hit": 1, "defender/hit": 1,
+        "attacker/block": 1, "defender/block": 10
+      }
+    },
+    {
+      "name": "pointer_x",
+      "status": "active",
+      "addressing": { "kind": "fighter_field", "field": "x" },
+      "calibration": {
+        "attacker/hit": 2, "defender/hit": 2,
+        "attacker/block": 2, "defender/block": 11
+      }
+    },
+    {
+      "name": "struct_divergence",
+      "status": "disqualified",
+      "reason": "contaminated by an input echo while the fighter is stunned (docs/frames.md §4.2)."
+    }
+  ],
+  "rig": {
+    "attacker_port": 0, "defender_port": 1,
+    "walk_directions_by_port": { "0": ["left", "right"], "1": ["right", "left"] }
+  },
+  "spacing": { "collision_floor_px": 62, "collision_floor_evidence": "..." }
+}
+```
+
+- **`anchor`** (docs/frames.md §4.1) — the port's contact signal. Exactly
+  one of `field` (a `memory.fighter_fields` name, PREFERRED — it steps by
+  the true value in one frame) or `hitstun_sources` (use the profile's
+  existing per-block `hitstun_sources` map instead). MK2 arcade anchors on
+  the fighter-struct health field, explicitly NOT the HUD health pair
+  `hitstun_sources` names — the HUD is a DRAWN bar that animates toward the
+  true value at 1 unit/frame and smears one hit into ~11 edges.
+- **`quiet_frames`** — the multi-hit clustering window (§4.1): consecutive
+  contacts closer together than this belong to one move.
+- **`observables`** (§4.2) — the ORDERED act-again candidate list; declared
+  order is preference order. Each entry is `"status": "active"` (carries
+  `addressing` + `calibration`, both required) or `"status":
+  "disqualified"` (carries a `reason`, required — a disqualified candidate
+  is itself a measured result, and omitting it would look like an
+  oversight rather than a finding). `addressing.kind` is one of:
+  - `"fighter_field"` — read the profile's own named `memory.fighter_fields`
+    entry (`field`). This is how `pointer_x` reuses the existing
+    `via: "object_ptr"` field `x` instead of repeating its offsets.
+  - `"byte_range"` — raw bytes `[off, end)` relative to the fighter block
+    base, compared for equality rather than decoded as a number (MK2's
+    3-byte walk-velocity word has no numeric meaning worth extracting; only
+    "did it change" matters).
+  - `"whole_struct"` — the entire fighter struct (`block .. block+stride`).
+    Offered for schema completeness; MK2 disqualifies it (§4.2: contaminated
+    by an input echo in several fields while the fighter is stunned).
+
+  `calibration` maps probe SHAPE (`"attacker/hit"`, `"defender/hit"`,
+  `"attacker/block"`, `"defender/block"`) to that shape's measured
+  `input_latency_frames` (§3.1). The four shapes are not redundant: MK2's
+  guarded-defender shape measures 10-11 frames where every other shape
+  measures 1-2, because releasing a held Block and walking on the same
+  frame does not drop MK2's block stance on the frame the button does.
+  Sizing that sweep's window from the neutral number instead of measuring
+  the guarded shape directly reported "never actionable" across every
+  candidate — the reason this is per-shape data, not one number per
+  observable.
+- **`rig`** / **`spacing`** (optional) — per-port rig conventions (which
+  walk direction each port should try FIRST, away from the opponent) and
+  spacing-ladder evidence (the measured collision floor below which no
+  amount of extra walking closes the gap further, docs/frames.md §5).
+  Documentary today; nothing computes with `spacing` yet.
+
+MK2 arcade's `library/mk2/mk2.profile.json` is the worked example above (in
+full). `library/asurabld` and `library/mk2/genesis.profile.json` carry no
+`framelab` key — neither port has been calibrated, and the lab is expected
+to decline for both.
+
 ## Controls contract (the Controls phase)
 
 Controls are a four-layer pipeline; only layer 1→2 is stored, everything
