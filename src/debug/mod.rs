@@ -570,10 +570,24 @@ pub struct TrainingConfig {
     pub punish_wait: u64,
     /// Human-readable BlockPunish phase, refreshed every frame the mode
     /// runs: "guarding — armed" / "cooling (Nf)" / "punishing: slide" /
-    /// "unavailable …". The ONE place this is computed (panel, Lua
-    /// `training.punish_state()`, and any overlay all read it) so a silent
-    /// dummy explains itself instead of looking broken.
+    /// "aborted — <reason>" / "unavailable …". The ONE place this is
+    /// computed (panel, Lua `training.punish_state()`, and any overlay all
+    /// read it) so a silent dummy explains itself instead of looking broken
+    /// — an abort is exactly the case that USED to freeze on a stale
+    /// "punishing: slide" while the gate was closed (misdiagnosed live);
+    /// this field must say "aborted" instead (MACRO_ACTIONS §10.1).
     pub punish_phase: String,
+    /// `ds.training.dummy` as observed on the PREVIOUS tick — lets
+    /// `training::abort_disrupted_punish` detect a mode switch AWAY FROM
+    /// `BlockPunish` (panel dropdown, Lua `training.set_dummy`, or the F1
+    /// hotkey — any mutation site) without those sites having to know about
+    /// macro abort themselves. Runtime bookkeeping, not a setting.
+    pub dummy_prev: DummyMode,
+    /// `ds.state_note` as last observed by `training::abort_disrupted_punish`
+    /// — a change to a `"loaded …"` note means a save state just landed
+    /// under an in-flight punish macro's feet (the RAM it was playing into
+    /// no longer means what it did a frame ago). Runtime bookkeeping.
+    pub last_seen_state_note: Option<String>,
     /// WHEN the guarding dummy guards (§9.4). Applies to both guard styles.
     pub guard_mode: GuardMode,
     /// `GuardMode::Random`'s probability, in percent.

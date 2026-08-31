@@ -293,6 +293,17 @@ twin, or the two halves diverge:
 
 ### 10.2 Side-swapping moves
 
+> **CORRECTED 2026-08-30 by live audit: Teleport Kick does NOT swap sides.**
+> Measured 4/4 (at 192 px and after 30/50/65-frame walk-ins), Mileena ends
+> on the same side — she teleports **vertically**, `y` swinging from +200
+> (underground) to −131 (above the screen) with `x` discontinuous
+> (945→1013 in one frame). This section was built around the wrong move.
+> The confirmed side-swapper is the **ROLL** (3/3): it travels through the
+> opponent, 915→1192 while pushing him 1119→1002. The facing-pin rule below
+> is correct and still wanted — it is simply the roll that needs it. The
+> `side_swap` tag stays on teleport_kick because the pin is conservative,
+> flagged as unconfirmed rather than removed.
+
 Mileena's Teleport Kick crosses the opponent mid-move. §2 resolves
 `back`/`forward` against live facing, which is correct frame by frame and
 therefore WRONG across a swap: the same macro's later steps resolve against
@@ -305,3 +316,26 @@ the flipped side.
 - **Downstream**: gap-keyed data (frames.md §5) is discontinuous across a
   swap. A side change between anchor and probe invalidates that measurement;
   the harness must detect the facing flip and discard, not record.
+
+
+## 11. The direction/press timing rule (live-audited 2026-08-30)
+
+**A direction chorded with its trigger button ON THE SAME FRAME does not
+register on MK2 arcade.** The direction must be down at least one frame
+BEFORE the press, and need not still be held at the press.
+
+Measured: `F · F+HP` produced 0 damage in **all 16** frames×gap
+configurations; `F · F · HP` produced 15 damage in every config at an
+inter-step gap ≥ 2. This invalidates the chorded shape for every motion
+special on this port.
+
+Two measured exemptions, recorded rather than explained away:
+- **single-frame chords are exempt** — Reptile's slide (`B + LP + LK + BLK`)
+  works as one simultaneous press;
+- **`force_ball`'s two-button chord fires anyway.** The mechanism was not
+  isolated. It is an exception with no theory, which is worth more written
+  down than tidied away.
+
+**Executor constraint**: the inter-step gap must be ≥ 2 frames — every
+motion special fails at gap 1, and `STEP_GAP = 2` sits exactly on that
+boundary. Anything that shortens it breaks every motion special at once.
