@@ -361,6 +361,16 @@ def main() -> None:  # pragma: no cover - the live-rig path
                     help="JSON {shape: {observable: frames}} to use INSTEAD of "
                          "measuring them (only for a run that is explicitly "
                          "reusing a calibration)")
+    ap.add_argument("--faf-at-px", type=int, default=None,
+                    help="the gap at which first_active_frame is stored "
+                         "(§4.4's minimum reproducible gap). Defaults to the "
+                         "profile's framelab.spacing.collision_floor_px — but "
+                         "that floor is a property of the MATCHUP (measure it "
+                         "with `python -m shadow_train.framelab.spacing`), and "
+                         "the profile carries the Reptile mirror's 62 px. "
+                         "Mileena-vs-Reptile floors at 61, so a run that let "
+                         "the default stand would store FAF nowhere and say "
+                         "nothing about why.")
     ap.add_argument("--max-search", type=int, default=DEFAULT_MAX_SEARCH)
     ap.add_argument("--repeats", type=int, default=1,
                     help="evaluations per actionable(N); >1 requires them to "
@@ -370,6 +380,12 @@ def main() -> None:  # pragma: no cover - the live-rig path
     ap.add_argument("--compare", default=None,
                     help="a previous <port>.frames.json to compare against")
     ap.add_argument("--out", default=None, help="write this run's rows here")
+    ap.add_argument("--db", default=None,
+                    help="insert this run's rows into the authoring store "
+                         "(`framelab.store`, §6) as well as printing them. "
+                         "Omitted, the run measures and reports without "
+                         "storing — which is what a RE-measurement wants "
+                         "(--compare) and what a first measurement does not.")
     args = ap.parse_args()
 
     if ":4025" in args.url:
@@ -391,6 +407,8 @@ def main() -> None:  # pragma: no cover - the live-rig path
     wdbp = flspec.rig.walk_directions_by_port if flspec.rig else None
     quiet = flspec.quiet_frames
     floor_px = flspec.spacing.collision_floor_px if flspec.spacing else None
+    if args.faf_at_px is not None:
+        floor_px = args.faf_at_px
 
     session = LabSession(
         McpClient(args.url), verify_fn=obs.make_arena_verifier(prof, expect={})
@@ -486,6 +504,15 @@ def main() -> None:  # pragma: no cover - the live-rig path
     print(f"steps={session.steps_taken} loads={session.loads_done} "
           f"step_calls={session.step_calls} batch_calls={session.batch_calls} "
           f"frames_batched={session.frames_batched} elapsed={elapsed:.1f}s")
+
+    if args.db and rows:
+        from .store import FrameStore
+
+        Path(args.db).parent.mkdir(parents=True, exist_ok=True)
+        with FrameStore(args.db) as store:
+            for row in rows:
+                store.insert(row)
+        print(f"wrote {len(rows)} rows to {args.db}")
 
     if args.out:
         Path(args.out).write_text(json.dumps(

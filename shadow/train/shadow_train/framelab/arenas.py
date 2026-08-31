@@ -396,6 +396,8 @@ def build_gap_ladder_arena(
     probe_frames: int = _DEFAULT_PROBE_FRAMES,
     family: str = "mk2",
     port_name: str = "arcade",
+    settle_frames: int = 0,
+    reload_after_liveness: bool = False,
 ) -> LadderArenaResult:
     """Build and save one rung of the spacing ladder (docs/frames.md §5):
 
@@ -412,6 +414,27 @@ def build_gap_ladder_arena(
         6. Write the JSON sidecar (`<out_dir>/gap-<k>.gap.json`, or
            `<name>.gap.json`) with `walk_frames`, `gap_px` (nullable),
            both char ids, `facing`, and `inputs_live` for both ports.
+
+    `reload_after_liveness` re-loads `base_arena` between step 2 and step 3.
+    The liveness probe WALKS both ports (6 frames out, 6 back, per port), and
+    MK2's forward and backward walk speeds are not symmetric, so it leaves the
+    fighters somewhere other than where the base state put them: measured on
+    `r-v-r.state` (a 192 px base) the probe alone closes the gap to **180 px**,
+    which is exactly why the shipped Reptile ladder's "K=0" rung reads 180 and
+    not 192. With this set, liveness is still verified on this exact state
+    after this exact load (§3 precondition 4 — liveness is a property of the
+    RIG, not of a position), and the walk then starts from the base geometry,
+    so a rung's achieved gap matches the K → px curve `spacing.walk_curve`
+    measures. Default False only to keep every existing rung reproducible.
+
+    `settle_frames` runs that many NEUTRAL frames after the walk, before the
+    save. Without it the state is saved on a frame where the direction was
+    still held one frame earlier: the fighter is mid-walk-animation and, once
+    the two bodies touch, the measured gap OSCILLATES frame to frame (60–66 px
+    on Mileena-vs-Reptile) because the anti-overlap resolution and the walk
+    animation are fighting each other. Settling makes the saved gap the gap
+    the fight actually starts from, and it makes the rung's own `gap_px` a
+    stable number rather than one sample of an oscillation.
 
     NOTE on the sidecar's filename: this deliberately does NOT reuse the
     `.meta.json` extension the app itself auto-writes for any `save_state`
@@ -469,7 +492,16 @@ def build_gap_ladder_arena(
         )
 
     # ── the real walk ───────────────────────────────────────────────────
+    if reload_after_liveness:
+        # The liveness probe just walked both ports; reload so the walk below
+        # starts from the base state's own geometry (see the docstring).
+        _load_state_raw(client, base_arena)
+        _release(client, 0)
+        _release(client, 1)
     _hold_step_release(client, walk_direction, walk_port, k)
+    if settle_frames > 0:
+        _release(client, walk_port)
+        _run_frames(client, settle_frames, error_cls=ArenaGenerationError)
 
     gap_pre = measure_gap_px(client, block1_addr, block2_addr, char_id_off)
     cid1_pre = read_char_id(client, block1_addr, char_id_off)
@@ -512,6 +544,8 @@ def build_gap_ladder_arena(
         "walk_frames": k,
         "walk_port": walk_port,
         "walk_direction": walk_direction,
+        "settle_frames": settle_frames,
+        "reload_after_liveness": reload_after_liveness,
         "gap_px": gap_post,
         "char_id_block1": cid1_post,
         "char_id_block2": cid2_post,
@@ -557,12 +591,22 @@ def build_gap_ladder(
     probe_frames: int = _DEFAULT_PROBE_FRAMES,
     family: str = "mk2",
     port_name: str = "arcade",
+    settle_frames: int = 0,
+    reload_after_liveness: bool = False,
+    name_prefix: str = "gap-",
 ) -> list[LadderArenaResult]:
     """Build every rung named in `ks` (ascending order, so the point-blank
     K=0 rung -- if present -- establishes the base gap first). A rung that
     raises (`ArenaLivenessError`/`ArenaReproductionError`) stops the whole
     ladder rather than silently skipping it -- §7's "no silent caps": the
-    caller sees exactly which rung failed and why."""
+    caller sees exactly which rung failed and why.
+
+    `name_prefix` keys the ladder to its MATCHUP. The gap a K walk-frames
+    reaches, and the floor it stops at, are properties of the two characters
+    involved (`spacing.py`), so one `shadow/arenas/<family>/` directory holds
+    several ladders and `gap-45.state` must not mean two different things --
+    Mileena-vs-Reptile ships as `m-gap-45.state` rather than overwriting the
+    Reptile mirror's rung of the same K."""
     results = []
     for k in sorted(ks):
         results.append(
@@ -579,6 +623,9 @@ def build_gap_ladder(
                 probe_frames=probe_frames,
                 family=family,
                 port_name=port_name,
+                settle_frames=settle_frames,
+                reload_after_liveness=reload_after_liveness,
+                name=f"{name_prefix}{k}",
             )
         )
     return results
@@ -593,30 +640,46 @@ def main() -> None:
     touched) to generate the spacing ladder into `shadow/arenas/mk2/`.
     Not exercised by the unit tests (those pass a fake `client`); this is
     the operator path CLAUDE.md's per-task README would point at."""
-    import sys
+    import argparse
 
     from shadow_train import profile as game_profile
     from shadow_train.mcpclient import McpClient
 
-    url = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:4042/mcp"
-    base_arena = sys.argv[2] if len(sys.argv) > 2 else "shadow/arenas/mk2/r-v-r.state"
-    ks = [int(x) for x in sys.argv[3:]] if len(sys.argv) > 3 else [0, 15, 40, 80]
+    ap = argparse.ArgumentParser(description="generate a gap ladder")
+    ap.add_argument("--url", default="http://127.0.0.1:4042/mcp")
+    ap.add_argument("--game", default="library/mk2")
+    ap.add_argument("--base", default="shadow/arenas/mk2/r-v-r.state")
+    ap.add_argument("--out-dir", default="shadow/arenas/mk2")
+    ap.add_argument("--prefix", default="gap-",
+                    help="rung filename prefix — key it to the MATCHUP")
+    ap.add_argument("--walk-port", type=int, default=0)
+    ap.add_argument("--walk-direction", default="right")
+    ap.add_argument("--settle-frames", type=int, default=0)
+    ap.add_argument("--reload-after-liveness", action="store_true")
+    ap.add_argument("ks", nargs="*", type=int, default=[0, 15, 40, 80])
+    args = ap.parse_args()
 
-    prof = game_profile.load("library/mk2")
+    if ":4025" in args.url:
+        raise SystemExit("refusing port 4025 — that is the user's live session.")
+
+    prof = game_profile.load(args.game)
     char_id_off, _size = prof.field_off("char_id")
-    client = McpClient(url)
+    client = McpClient(args.url)
     results = build_gap_ladder(
         client,
-        base_arena=base_arena,
-        out_dir="shadow/arenas/mk2",
-        ks=ks,
-        walk_port=0,
-        walk_direction="right",
+        base_arena=args.base,
+        out_dir=args.out_dir,
+        ks=args.ks,
+        walk_port=args.walk_port,
+        walk_direction=args.walk_direction,
         block1_addr=prof.block1(),
         block2_addr=prof.block2(),
         char_id_off=char_id_off or 0x0,
         family=prof.family,
         port_name=prof.port,
+        settle_frames=args.settle_frames,
+        reload_after_liveness=args.reload_after_liveness,
+        name_prefix=args.prefix,
     )
     for r in results:
         print(f"K={r.k:>4}  gap_px={r.gap_px!r:>6}  "

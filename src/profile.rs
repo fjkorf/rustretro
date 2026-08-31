@@ -497,11 +497,42 @@ impl<'de> Deserialize<'de> for SignedHex {
 // `struct_velocity` and `pointer_x`. The two have agreed on every sweep
 // across two independent full runs (52 sweeps in the second alone), so the
 // chosen rule is: COLLAPSE agreeing observables into one row. A field where
-// the observables DISAGREE is the exceptional case (never yet observed) and
-// is surfaced rather than silently resolved — the collapsed value for that
-// field is left `None` and the field's name is recorded in
-// `FrameCell::disagreements`, while each observable's own raw value survives
-// unedited in `FrameCell::observations` for audit.
+// the observables DISAGREE is the exceptional case (surfaced rather than
+// silently resolved — the collapsed value for that field is left `None` and
+// the field's name is recorded in `FrameCell::disagreements`, while each
+// observable's own raw value survives unedited in `FrameCell::observations`
+// for audit) — EXCEPT that "agree" means something different depending on
+// what kind of quantity the field is (`docs/frames.md` §8.4, corrected):
+//
+// - **Difference quantities** (`on_hit`, `on_block` — a manifest frame minus
+//   another manifest frame, both from the SAME observable) have their
+//   observable's own margin cancel out of the subtraction. Two observables
+//   must therefore agree EXACTLY. `first_active_frame` and the still-NULL
+//   duration fields (`active`/`recovery`/`total`/`hitstop`) are anchor-based
+//   (§4.4), not probe manifests at all, so they carry no per-observable
+//   margin either and are held to the same exact-agreement rule.
+// - **One-sided quantities** (currently just `wakeup_window`) are a raw
+//   single-sided probe manifest and carry the measuring observable's own
+//   manifestation margin `m` directly: `value = A_rel + m`, and — because
+//   §3.1 calibrates the OBSERVABLE, not the move — the very same `m` is
+//   baked into that observable's `input_latency_frames = l + m` (`l` the
+//   shared injection latency). So `value − input_latency_frames = A_rel − l`
+//   is invariant across observables measuring the same truth, independent of
+//   each one's own `m`. Two sound observables' raw values will therefore
+//   differ by exactly the difference in their `input_latency_frames` — NOT
+//   by zero. Mileena's roll: `wakeup_window` 77 (`struct_velocity`,
+//   latency 1) vs 78 (`pointer_x`, latency 2) is this agreement, not a
+//   disagreement (77 − 1 == 78 − 2 == 76). A one-sided field that does NOT
+//   satisfy this invariant is a REAL disagreement and is still flagged.
+//
+// A one-sided field's collapsed value is the raw reading of whichever
+// observable in the cell has the SMALLEST `input_latency_frames` — by the
+// probe's own construction (`shadow_train.framelab.probe`) that observable's
+// margin `m` is zero, so its raw number already equals `A_rel` with nothing
+// to correct. `FrameCell::one_sided_reference` records, per such field, which
+// observable's frame of reference the collapsed number is in — a bare "77"
+// means different things in different rows, and that ambiguity is exactly
+// what this map exists to close off.
 
 /// One raw row exactly as `shadow_train.framelab.export` writes it. Field
 /// names/nullability mirror the Python schema (`docs/frames.md` §6) —
@@ -636,16 +667,39 @@ impl FrameMeasurement {
     }
 }
 
+/// One observable's contribution as `collapse_measurements` needs it: its
+/// name (so a one-sided field's chosen reference can be recorded), its
+/// calibrated `input_latency_frames`, and the measurement it produced.
+struct CollapseInput<'a> {
+    observable: &'a str,
+    input_latency_frames: Option<i64>,
+    raw: &'a FrameMeasurement,
+}
+
 /// Collapse a cell's per-observable measurements into one, field by field.
 /// A field collapses to `Some`/`None` only when every observation agrees on
-/// it; a disagreement leaves that field `None` in the result AND records the
-/// field's name — never picks a winner silently (docs/frames.md §7, §12).
-fn collapse_measurements(raws: &[FrameMeasurement]) -> (FrameMeasurement, Vec<&'static str>) {
+/// it — where "agrees" is field-kind-dependent (see the module-level comment
+/// above: difference/anchor quantities need exact equality, one-sided
+/// quantities need equality after subtracting each observation's own
+/// `input_latency_frames`). A disagreement leaves that field `None` in the
+/// result AND records the field's name — never picks a winner silently
+/// (docs/frames.md §7, §12). Returns the collapsed measurement, the
+/// disagreeing field names, and — for one-sided fields that DID collapse —
+/// which observable's frame of reference the collapsed number is in.
+fn collapse_measurements(
+    items: &[CollapseInput],
+) -> (FrameMeasurement, Vec<&'static str>, BTreeMap<&'static str, String>) {
     let mut out = FrameMeasurement::default();
     let mut disagreements = Vec::new();
-    macro_rules! field {
+    let mut one_sided_reference = BTreeMap::new();
+
+    // Difference quantities (on_hit/on_block) and anchor-based absolutes
+    // (first_active_frame, and the still-unmeasured active/recovery/total/
+    // hitstop) carry no per-observable margin, so two observations must
+    // agree to the frame.
+    macro_rules! exact_field {
         ($name:ident) => {{
-            let mut it = raws.iter().map(|m| &m.$name);
+            let mut it = items.iter().map(|o| &o.raw.$name);
             let first = it.next().expect("cell has at least one observation");
             if it.all(|v| v == first) {
                 out.$name = first.clone();
@@ -654,22 +708,69 @@ fn collapse_measurements(raws: &[FrameMeasurement]) -> (FrameMeasurement, Vec<&'
             }
         }};
     }
-    field!(gap_px);
-    field!(first_active_frame);
-    field!(active);
-    field!(recovery);
-    field!(total);
-    field!(hits);
-    field!(hitstop);
-    field!(on_hit);
-    field!(on_block);
-    field!(wakeup_window);
-    field!(knockdown);
-    field!(juggle);
-    field!(guard_height);
-    field!(connect_range);
-    field!(damage);
-    (out, disagreements)
+
+    // One-sided quantities (currently just wakeup_window) carry the
+    // measuring observable's own manifestation margin directly, so raw
+    // values legitimately differ by the observables' latency delta. The
+    // module comment above derives `value − input_latency_frames` as the
+    // margin-independent invariant; two observations agree exactly when it
+    // matches for both. Falls back to plain exact-agreement when latency
+    // data is absent (older/uncalibrated exports), rather than treating
+    // every such row as an automatic disagreement.
+    macro_rules! one_sided_field {
+        ($name:ident) => {{
+            let correctable: Vec<(i64, i64, &str)> = items
+                .iter()
+                .filter_map(|o| match (o.raw.$name, o.input_latency_frames) {
+                    (Some(v), Some(l)) => Some((v - l, l, o.observable)),
+                    _ => None,
+                })
+                .collect();
+            if correctable.len() < items.len() {
+                // Not every observation carries both a value and a latency
+                // for this field — fall back to the old, unconditional
+                // exact-match rule rather than guessing.
+                exact_field!($name);
+            } else {
+                let reference_corrected = correctable[0].0;
+                if correctable.iter().all(|(c, _, _)| *c == reference_corrected) {
+                    // The observable with the SMALLEST latency has zero
+                    // manifestation margin by the probe's construction, so
+                    // its own raw reading already equals the corrected
+                    // (margin-free) value — no arithmetic needed to produce
+                    // the collapsed number, just picking which row to read
+                    // it off of.
+                    let (_, _, reference_obs) =
+                        correctable.iter().min_by_key(|(_, l, _)| *l).unwrap();
+                    let reference_row = items
+                        .iter()
+                        .find(|o| o.observable == *reference_obs)
+                        .expect("reference observable is one of `items`");
+                    out.$name = reference_row.raw.$name;
+                    one_sided_reference.insert(stringify!($name), reference_obs.to_string());
+                } else {
+                    disagreements.push(stringify!($name));
+                }
+            }
+        }};
+    }
+
+    exact_field!(gap_px);
+    exact_field!(first_active_frame);
+    exact_field!(active);
+    exact_field!(recovery);
+    exact_field!(total);
+    exact_field!(hits);
+    exact_field!(hitstop);
+    exact_field!(on_hit);
+    exact_field!(on_block);
+    one_sided_field!(wakeup_window);
+    exact_field!(knockdown);
+    exact_field!(juggle);
+    exact_field!(guard_height);
+    exact_field!(connect_range);
+    exact_field!(damage);
+    (out, disagreements, one_sided_reference)
 }
 
 /// One observable's contribution to a cell — the provenance §12 asks for:
@@ -709,6 +810,16 @@ pub struct FrameCell {
     /// `FrameMeasurement` field names where this cell's observations
     /// disagreed. Empty on every shipped MK2 arcade cell so far (§12).
     pub disagreements: Vec<&'static str>,
+    /// For each ONE-SIDED field (docs/frames.md §4.2/§8.4, e.g.
+    /// `wakeup_window`) that collapsed successfully, the observable whose
+    /// frame of reference `measurement`'s value is in — the one with the
+    /// smallest `input_latency_frames` among this cell's observations,
+    /// whose manifestation margin is zero by the probe's own construction.
+    /// A bare number is ambiguous once two observables can legitimately
+    /// disagree by their own latency delta; this is what removes the
+    /// ambiguity. Empty for a cell with no one-sided fields, or where one
+    /// disagreed (it's in `disagreements` instead, not here).
+    pub one_sided_reference: BTreeMap<&'static str, String>,
     pub observations: Vec<FrameObservation>,
 }
 
@@ -768,8 +879,16 @@ impl FrameTable {
                     raw: FrameMeasurement::from_raw(r),
                 })
                 .collect();
-            let raws: Vec<FrameMeasurement> = observations.iter().map(|o| o.raw.clone()).collect();
-            let (measurement, disagreements) = collapse_measurements(&raws);
+            let collapse_inputs: Vec<CollapseInput> = observations
+                .iter()
+                .map(|o| CollapseInput {
+                    observable: &o.observable,
+                    input_latency_frames: o.input_latency_frames,
+                    raw: &o.raw,
+                })
+                .collect();
+            let (measurement, disagreements, one_sided_reference) =
+                collapse_measurements(&collapse_inputs);
             cells.push(FrameCell {
                 char,
                 move_name,
@@ -777,6 +896,7 @@ impl FrameTable {
                 gap_walk_frames,
                 measurement,
                 disagreements,
+                one_sided_reference,
                 observations,
             });
         }
@@ -2327,15 +2447,31 @@ mod tests {
 
     // ── frame lab loader (docs/frames.md) ───────────────────────────────
 
-    /// The shipped `library/mk2/arcade.frames.json` (20 raw rows, 2 per
-    /// cell) parses and collapses to 10 cells, all agreeing.
+    /// The shipped `library/mk2/arcade.frames.json` parses and collapses,
+    /// every cell agreeing across its two observables — where "agrees" is
+    /// now the CORRECTED rule (docs/frames.md §8.4): DIFFERENCE quantities
+    /// (`on_hit`/`on_block`) and anchor-based absolutes
+    /// (`first_active_frame`) must match to the frame, but ONE-SIDED
+    /// quantities (`wakeup_window`) may legitimately differ by the two
+    /// observables' `input_latency_frames` delta — that delta IS the
+    /// observable's own manifestation margin, not noise. Before this fix the
+    /// loader applied the exact-match rule to `wakeup_window` too and
+    /// flagged Mileena's roll (77 vs 78, latencies 1 vs 2) as a
+    /// disagreement it was not.
+    ///
+    /// Asserts the INVARIANT, not a snapshot of the row count. An earlier
+    /// version pinned `cells.len() == 10` and `chars() == ["reptile"]`, and
+    /// broke the moment a second character was measured — a test that fails
+    /// because the lab did its job is a test that trains people to edit
+    /// numbers until it passes. What must hold is: every cell carries one
+    /// observation per observable and they agree.
     #[test]
     fn mk2_frames_json_parses_and_collapses_agreeing_observables() {
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
         let table = p.frames.as_ref().expect("mk2 arcade ships a frames.json");
         assert_eq!(table.family, "mk2");
         assert_eq!(table.port, "arcade");
-        assert_eq!(table.cells.len(), 10, "20 raw rows / 2 observables per cell");
+        assert!(!table.cells.is_empty(), "the shipped export has rows");
         for cell in &table.cells {
             assert!(
                 cell.agrees(),
@@ -2356,10 +2492,29 @@ mod tests {
         assert_eq!(hk_close.measurement.first_active_frame, Some(11));
         assert_eq!(hk_close.variant.as_deref(), Some("close"));
 
-        // The moves/gaps/chars accessors.
-        assert_eq!(table.chars(), vec!["reptile"]);
+        // Mileena's roll: the ONLY cross-observable raw difference anywhere
+        // in the shipped file, and it's agreement, not disagreement.
+        // struct_velocity read wakeup_window=77 at latency 1, pointer_x read
+        // 78 at latency 2 -- 77-1 == 78-2 -- so it collapses instead of
+        // flagging, and the collapsed 77 is in struct_velocity's frame of
+        // reference (the smaller latency -> zero manifestation margin).
+        let roll = table.cell("mileena", "roll", Some(0)).expect("mileena roll cell present");
+        assert!(roll.agrees(), "the roll's wakeup_window is agreement, not disagreement: {:?}", roll.disagreements);
+        assert_eq!(roll.measurement.wakeup_window, Some(77));
+        assert_eq!(
+            roll.one_sided_reference.get("wakeup_window").map(String::as_str),
+            Some("struct_velocity"),
+            "collapsed value is in the fastest (zero-margin) observable's frame of reference"
+        );
+
+        // The moves/gaps/chars accessors. Membership, not equality — the
+        // roster of MEASURED characters grows as the lab runs.
+        assert!(table.chars().contains(&"reptile"));
+        assert!(table.chars().contains(&"mileena"));
         assert!(table.moves_for_char("reptile").contains(&"cHP"));
-        assert_eq!(table.gaps_for_char("reptile"), vec![30, 45, 60]);
+        for g in [30, 45, 60] {
+            assert!(table.gaps_for_char("reptile").contains(&g), "gap {g} present");
+        }
     }
 
     /// A knockdown move's `on_hit` is absent (NULL) because a knockdown has
@@ -2395,9 +2550,21 @@ mod tests {
         assert!(p.frames.is_none());
     }
 
+    /// Builds a `CollapseInput` for the tests below — every one of them only
+    /// needs an observable name, a latency, and a measurement.
+    fn ci<'a>(
+        observable: &'a str,
+        input_latency_frames: Option<i64>,
+        raw: &'a FrameMeasurement,
+    ) -> CollapseInput<'a> {
+        CollapseInput { observable, input_latency_frames, raw }
+    }
+
     /// The collapse rule, tested directly: agreeing observations collapse
     /// field-by-field; a disagreeing field is left `None` and named, rather
-    /// than one observable's value winning silently (§7, §12).
+    /// than one observable's value winning silently (§7, §12). `on_hit` is a
+    /// DIFFERENCE quantity, so it still requires exact agreement even though
+    /// the two observations here carry different latencies.
     #[test]
     fn collapse_measurements_flags_disagreement_without_picking_a_winner() {
         let mut a = FrameMeasurement::default();
@@ -2408,11 +2575,15 @@ mod tests {
         let mut b = a.clone();
         b.on_block = Some(-9); // the two observables disagree here
 
-        let (collapsed, disagreements) = collapse_measurements(&[a, b]);
+        let (collapsed, disagreements, one_sided) = collapse_measurements(&[
+            ci("struct_velocity", Some(1), &a),
+            ci("pointer_x", Some(2), &b),
+        ]);
         assert_eq!(collapsed.on_hit, Some(7), "agreeing field still collapses");
         assert_eq!(collapsed.damage, Some(32));
         assert_eq!(collapsed.on_block, None, "disagreeing field is NOT silently resolved");
         assert_eq!(disagreements, vec!["on_block"]);
+        assert!(one_sided.is_empty(), "on_block is a difference quantity, not one-sided");
     }
 
     /// The agreement path, tested directly (not just via the shipped file):
@@ -2425,9 +2596,96 @@ mod tests {
         a.knockdown = Some(false);
         let b = a.clone();
 
-        let (collapsed, disagreements) = collapse_measurements(&[a.clone(), b]);
+        let (collapsed, disagreements, one_sided) =
+            collapse_measurements(&[ci("struct_velocity", Some(1), &a), ci("pointer_x", Some(2), &b)]);
         assert!(disagreements.is_empty());
+        assert!(one_sided.is_empty(), "no one-sided field was measured here");
         assert_eq!(collapsed, a);
+    }
+
+    /// A ONE-SIDED quantity (`wakeup_window`) carries the measuring
+    /// observable's own manifestation margin directly (docs/frames.md
+    /// §4.2/§8.4): two sound observables legitimately differ by exactly
+    /// their `input_latency_frames` delta. This isolates the Mileena-roll
+    /// shape (77 vs 78, latencies 1 vs 2) from the shipped file.
+    #[test]
+    fn collapse_measurements_one_sided_field_agrees_within_latency_delta() {
+        let mut a = FrameMeasurement::default();
+        a.wakeup_window = Some(77);
+        let mut b = FrameMeasurement::default();
+        b.wakeup_window = Some(78);
+
+        let (collapsed, disagreements, one_sided) = collapse_measurements(&[
+            ci("struct_velocity", Some(1), &a),
+            ci("pointer_x", Some(2), &b),
+        ]);
+        assert!(
+            disagreements.is_empty(),
+            "77 vs 78 at latencies 1 vs 2 is agreement, not disagreement: {disagreements:?}"
+        );
+        assert_eq!(collapsed.wakeup_window, Some(77));
+        assert_eq!(
+            one_sided.get("wakeup_window").map(String::as_str),
+            Some("struct_velocity"),
+            "collapsed value is in the smaller-latency (zero-margin) observable's frame"
+        );
+    }
+
+    /// A one-sided field differing by anything OTHER than the latency delta
+    /// is still a real disagreement — the corrected rule narrows what counts
+    /// as agreement, it does not delete the check.
+    #[test]
+    fn collapse_measurements_one_sided_field_disagreeing_by_more_than_latency_is_flagged() {
+        let mut a = FrameMeasurement::default();
+        a.wakeup_window = Some(77);
+        let mut b = FrameMeasurement::default();
+        b.wakeup_window = Some(80); // off by 3, not the latency delta of 1
+
+        let (collapsed, disagreements, one_sided) = collapse_measurements(&[
+            ci("struct_velocity", Some(1), &a),
+            ci("pointer_x", Some(2), &b),
+        ]);
+        assert_eq!(disagreements, vec!["wakeup_window"]);
+        assert_eq!(collapsed.wakeup_window, None, "not silently resolved to either value");
+        assert!(one_sided.is_empty());
+    }
+
+    /// A DIFFERENCE quantity does NOT get the one-sided leniency: its
+    /// observable's margin already cancelled out of the subtraction (§4.3),
+    /// so a raw difference — even one that happens to equal the observables'
+    /// latency delta — is still a real disagreement.
+    #[test]
+    fn collapse_measurements_difference_quantity_ignores_latency_and_still_flags() {
+        let mut a = FrameMeasurement::default();
+        a.on_hit = Some(7);
+        let mut b = FrameMeasurement::default();
+        b.on_hit = Some(8); // == latency delta below, but on_hit isn't one-sided
+
+        let (collapsed, disagreements, _) = collapse_measurements(&[
+            ci("struct_velocity", Some(1), &a),
+            ci("pointer_x", Some(2), &b),
+        ]);
+        assert_eq!(disagreements, vec!["on_hit"]);
+        assert_eq!(collapsed.on_hit, None);
+    }
+
+    /// Missing latency data on a one-sided field falls back to the
+    /// unconditional exact-match rule rather than guessing at an offset.
+    #[test]
+    fn collapse_measurements_one_sided_field_without_latency_falls_back_to_exact_match() {
+        let mut a = FrameMeasurement::default();
+        a.wakeup_window = Some(77);
+        let mut b = FrameMeasurement::default();
+        b.wakeup_window = Some(78);
+
+        let (_, disagreements, one_sided) =
+            collapse_measurements(&[ci("struct_velocity", None, &a), ci("pointer_x", Some(2), &b)]);
+        assert_eq!(
+            disagreements,
+            vec!["wakeup_window"],
+            "no latency to correct with on one side -- exact match applies"
+        );
+        assert!(one_sided.is_empty());
     }
 
     /// A malformed (but present) frames.json is a loud error, not a silent

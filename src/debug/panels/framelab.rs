@@ -394,6 +394,17 @@ impl FramelabPanel {
                         format!("⚠ observables disagreed on: {}", cell.disagreements.join(", ")),
                     );
                 }
+                for (field, reference_obs) in &cell.one_sided_reference {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{field} is one-sided: collapsed value is in {reference_obs}'s frame \
+                             of reference (docs/frames.md §4.2) — the other observable's raw \
+                             reading legitimately differs by its own input_latency_frames.",
+                        ))
+                        .small()
+                        .color(egui::Color32::DARK_GRAY),
+                    );
+                }
             }
             None => {
                 ui.label(format!("{mv} @ {} is not measured.", gap_label(gap)));
@@ -492,6 +503,18 @@ fn cell_hover_text(cell: Option<&FrameCell>) -> String {
                 format!("hits: {}", opt_i64(c.measurement.hits)),
                 format!("min sample_n: {}", opt_i64(c.min_sample_n())),
             ];
+            if let Some(w) = c.measurement.wakeup_window {
+                // wakeup_window is ONE-SIDED (docs/frames.md §4.2/§8.4): the
+                // number means "frames until actionable" only relative to
+                // the observable that produced it, so name that observable
+                // rather than printing a bare, ambiguous frame count.
+                let frame = c
+                    .one_sided_reference
+                    .get("wakeup_window")
+                    .map(|o| format!(" ({o}'s frame of reference)"))
+                    .unwrap_or_default();
+                lines.push(format!("wakeup_window: {w}{frame}"));
+            }
             if !c.agrees() {
                 lines.push(format!("⚠ disagreement: {}", c.disagreements.join(", ")));
             }
@@ -545,6 +568,7 @@ mod tests {
             gap_walk_frames: Some(60),
             measurement: agree_raw.clone(),
             disagreements: vec![],
+            one_sided_reference: BTreeMap::new(),
             observations: vec![
                 obs("struct_velocity", "held+none", 1, 2, agree_raw.clone()),
                 obs("pointer_x", "held+none", 2, 2, agree_raw),
@@ -563,6 +587,7 @@ mod tests {
             gap_walk_frames: Some(45),
             measurement: collapsed,
             disagreements: vec!["on_block"],
+            one_sided_reference: BTreeMap::new(),
             observations: vec![
                 obs("struct_velocity", "held+none", 1, 1, a),
                 obs("pointer_x", "held+none", 2, 1, b),
@@ -577,7 +602,34 @@ mod tests {
             gap_walk_frames: Some(60),
             measurement: kd_raw.clone(),
             disagreements: vec![],
+            one_sided_reference: BTreeMap::new(),
             observations: vec![obs("struct_velocity", "held", 1, 1, kd_raw)],
+        };
+
+        // Mileena's roll: a ONE-SIDED field (`wakeup_window`) that agrees
+        // within the observables' latency delta (77 @ latency 1, 78 @
+        // latency 2) rather than to the exact frame — docs/frames.md
+        // §4.2/§8.4. This is the case the collapse rule was fixed for.
+        let mut struct_raw = FrameMeasurement { wakeup_window: Some(77), ..Default::default() };
+        let mut pointer_raw = FrameMeasurement { wakeup_window: Some(78), ..Default::default() };
+        struct_raw.knockdown = Some(true);
+        pointer_raw.knockdown = Some(true);
+        let mut roll_measurement = struct_raw.clone();
+        roll_measurement.wakeup_window = Some(77); // collapsed: struct_velocity's frame
+        let mut one_sided_reference = BTreeMap::new();
+        one_sided_reference.insert("wakeup_window", "struct_velocity".to_string());
+        let roll = FrameCell {
+            char: "mileena".to_string(),
+            move_name: "roll".to_string(),
+            variant: None,
+            gap_walk_frames: Some(0),
+            measurement: roll_measurement,
+            disagreements: vec![],
+            one_sided_reference,
+            observations: vec![
+                obs("struct_velocity", "held", 1, 1, struct_raw),
+                obs("pointer_x", "held", 2, 1, pointer_raw),
+            ],
         };
 
         FrameTable {
@@ -586,7 +638,7 @@ mod tests {
             generated_at: Some("2026-08-30T00:00:00Z".to_string()),
             schema_version: Some(1),
             // `HK` at gap 45 is intentionally absent — the missing-cell path.
-            cells: vec![agree, disagree, knockdown],
+            cells: vec![agree, disagree, knockdown, roll],
         }
     }
 
@@ -609,6 +661,19 @@ mod tests {
         let (text, color) = cell_style(Some(disagreed));
         assert!(text.contains('⚠'), "{text}");
         assert_eq!(color, egui::Color32::from_rgb(220, 90, 90));
+    }
+
+    /// A one-sided field's collapsed value must never render as a bare,
+    /// ambiguous number — the hover text names the observable whose frame of
+    /// reference it's in (docs/frames.md §4.2/§8.4).
+    #[test]
+    fn cell_hover_text_names_one_sided_reference_observable() {
+        let table = synthetic_table();
+        let roll = table.cell("mileena", "roll", Some(0)).unwrap();
+        assert!(roll.agrees(), "77/78 at latencies 1/2 is agreement");
+        let hover = cell_hover_text(Some(roll));
+        assert!(hover.contains("wakeup_window: 77"), "{hover}");
+        assert!(hover.contains("struct_velocity"), "{hover}");
     }
 
     /// Render the panel's real entry point headlessly against the process
