@@ -372,11 +372,24 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
                 raise ProfileError(f"moves[{char_name!r}] has an entry with no 'name'")
     moves = {k: [dict(mv) for mv in v] for k, v in moves_raw.items()}
 
-    # MACRO_ACTIONS.md §2: port profile `special_inputs` -- char name -> move
-    # name -> ordered step list. Load-validated: character key must exist in
-    # the family `moves` table, move name must be one of that character's
-    # moves, dirs must be the semantic vocabulary, and `press` class names
-    # must exist in `attack_chords` (all per §2's "load-validated" bullet).
+    # MACRO_ACTIONS.md §2/§10.1: port profile `special_inputs` -- char name ->
+    # move name -> ordered step list. Load-validated: character key must
+    # exist in the family `moves` table, move name must be one of that
+    # character's moves, dirs must be the semantic vocabulary, and every
+    # `press`/`hold`/`release`/`while_held` class name must exist in
+    # `attack_chords` (mirrors `src/profile.rs`'s `GameProfile::load`
+    # validation block verbatim, including the exact rejection messages'
+    # shape, so a bad profile fails the same way in either loader).
+    #
+    # §10.1 added three step kinds on top of §2's `dirs`/`press`/`frames`:
+    # `hold` (chord classes; satisfied only once held `min_frames` continuous
+    # frames), `release` (chord classes; satisfied on the falling edge), and
+    # `while_held` (a chord ANDed into any step's satisfaction regardless of
+    # its kind). These MUST survive compilation byte-for-byte -- dropping
+    # them here (the bug this block fixes) makes every hold/release move
+    # compile down to a step that presses nothing, silently erasing it from
+    # anything downstream (the recorder's annotations, the train-side
+    # matcher, the label space) without ever raising.
     _VALID_MACRO_DIRS = {"back", "forward", "up", "down"}
     special_inputs_raw = port_raw.get("special_inputs") or {}
     special_inputs: dict = {}
@@ -394,6 +407,10 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
                     f"special_inputs[{char_name!r}] names move {move_name!r} "
                     f"not in family moves[{char_name!r}]"
                 )
+            if not steps:
+                raise ProfileError(
+                    f"special_inputs[{char_name!r}][{move_name!r}] has no steps"
+                )
             compiled_steps = []
             for step in steps:
                 dirs = list(step.get("dirs", []))
@@ -405,7 +422,35 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
                             f"{sorted(_VALID_MACRO_DIRS)})"
                         )
                 press = list(step.get("press", []))
-                for cls in press:
+                hold = list(step.get("hold", []))
+                release = list(step.get("release", []))
+                while_held = list(step.get("while_held", []))
+                min_frames = step.get("min_frames")
+
+                if not (dirs or press or hold or release):
+                    raise ProfileError(
+                        f"special_inputs[{char_name!r}][{move_name!r}] has "
+                        "an empty step"
+                    )
+                kinds_present = sum(1 for k in (press, hold, release) if k)
+                if kinds_present > 1:
+                    raise ProfileError(
+                        f"special_inputs[{char_name!r}][{move_name!r}] step "
+                        "mixes press/hold/release -- pick one"
+                    )
+                if hold:
+                    if not min_frames or min_frames <= 0:
+                        raise ProfileError(
+                            f"special_inputs[{char_name!r}][{move_name!r}] "
+                            "hold step needs a positive min_frames"
+                        )
+                elif min_frames is not None:
+                    raise ProfileError(
+                        f"special_inputs[{char_name!r}][{move_name!r}] "
+                        "min_frames set without a hold step"
+                    )
+
+                for cls in press + hold + release + while_held:
                     if cls not in attack_chords:
                         raise ProfileError(
                             f"special_inputs[{char_name!r}][{move_name!r}] "
@@ -414,6 +459,9 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
                 compiled_steps.append({
                     "dirs": dirs, "press": press,
                     "frames": int(step.get("frames", 3)),
+                    "hold": hold, "release": release,
+                    "while_held": while_held,
+                    "min_frames": int(min_frames) if min_frames else 0,
                 })
             compiled_moves[move_name] = compiled_steps
         special_inputs[char_name] = compiled_moves

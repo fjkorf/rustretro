@@ -483,7 +483,10 @@ class MacroActionsSchemaTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             prof = self._write(Path(d), moves=moves, special_inputs=special_inputs)
             steps = prof.macro_steps_for("reptile", "slide")
-            self.assertEqual(steps, [{"dirs": ["back"], "press": ["LK", "LP"], "frames": 4}])
+            self.assertEqual(steps, [{
+                "dirs": ["back"], "press": ["LK", "LP"], "frames": 4,
+                "hold": [], "release": [], "while_held": [], "min_frames": 0,
+            }])
             self.assertIsNone(prof.macro_steps_for("reptile", "nonexistent"))
 
     def test_special_inputs_default_frames_is_3(self):
@@ -492,6 +495,92 @@ class MacroActionsSchemaTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             prof = self._write(Path(d), moves=moves, special_inputs=special_inputs)
             self.assertEqual(prof.macro_steps_for("reptile", "slide")[0]["frames"], 3)
+
+    def test_special_inputs_carries_hold_release_while_held(self):
+        """MACRO_ACTIONS.md §10.1: the compiled step dict must carry `hold`/
+        `min_frames`, `release`, and `while_held` through -- the bug this
+        test pins is the compiler silently dropping all three, which made
+        every hold/release move compile down to a step that presses
+        nothing (invisible to every downstream consumer, never an error)."""
+        moves = {"reptile": [
+            {"name": "sai_throw", "tags": ["special"]},
+            {"name": "invisibility", "tags": ["special"]},
+        ]}
+        special_inputs = {"reptile": {
+            "sai_throw": [
+                {"hold": ["LP"], "min_frames": 34},
+                {"release": ["LP"]},
+            ],
+            "invisibility": [
+                {"dirs": ["up"], "while_held": ["LK"]},
+                {"release": ["LK"]},
+                {"press": ["LP"]},
+            ],
+        }}
+        with tempfile.TemporaryDirectory() as d:
+            prof = self._write(Path(d), moves=moves, special_inputs=special_inputs)
+            sai = prof.macro_steps_for("reptile", "sai_throw")
+            self.assertEqual(sai[0]["hold"], ["LP"])
+            self.assertEqual(sai[0]["min_frames"], 34)
+            self.assertEqual(sai[1]["release"], ["LP"])
+            invis = prof.macro_steps_for("reptile", "invisibility")
+            self.assertEqual(invis[0]["while_held"], ["LK"])
+            self.assertEqual(invis[1]["release"], ["LK"])
+
+    def test_special_inputs_hold_needs_positive_min_frames(self):
+        moves = {"reptile": [{"name": "sai_throw", "tags": ["special"]}]}
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(Path(d), moves=moves, special_inputs={
+                    "reptile": {"sai_throw": [{"hold": ["LP"]}]},
+                })
+            self.assertIn("needs a positive min_frames", str(ctx.exception))
+
+    def test_special_inputs_min_frames_without_hold_raises(self):
+        moves = {"reptile": [{"name": "sai_throw", "tags": ["special"]}]}
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(Path(d), moves=moves, special_inputs={
+                    "reptile": {"sai_throw": [{"press": ["LP"], "min_frames": 5}]},
+                })
+            self.assertIn("min_frames set without a hold step", str(ctx.exception))
+
+    def test_special_inputs_step_mixing_press_and_hold_raises(self):
+        moves = {"reptile": [{"name": "sai_throw", "tags": ["special"]}]}
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(Path(d), moves=moves, special_inputs={
+                    "reptile": {"sai_throw": [
+                        {"press": ["LP"], "hold": ["LK"], "min_frames": 5},
+                    ]},
+                })
+            self.assertIn("mixes press/hold/release", str(ctx.exception))
+
+    def test_special_inputs_unknown_class_in_hold_or_while_held_raises(self):
+        moves = {"reptile": [{"name": "sai_throw", "tags": ["special"]}]}
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(Path(d), moves=moves, special_inputs={
+                    "reptile": {"sai_throw": [{"hold": ["HP"], "min_frames": 5}]},
+                })
+            self.assertIn("unknown attack-chord class 'HP'", str(ctx.exception))
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(Path(d), moves=moves, special_inputs={
+                    "reptile": {"sai_throw": [
+                        {"dirs": ["up"], "while_held": ["HP"]},
+                        {"press": ["LP"]},
+                    ]},
+                })
+            self.assertIn("unknown attack-chord class 'HP'", str(ctx.exception))
+
+    def test_special_inputs_empty_step_list_raises(self):
+        moves = {"reptile": [{"name": "slide", "tags": ["special"]}]}
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(Path(d), moves=moves,
+                             special_inputs={"reptile": {"slide": []}})
+            self.assertIn("has no steps", str(ctx.exception))
 
     def test_special_inputs_unknown_character_raises(self):
         with tempfile.TemporaryDirectory() as d:
@@ -524,6 +613,39 @@ class MacroActionsSchemaTest(unittest.TestCase):
                     "reptile": {"slide": [{"dirs": ["back"], "press": ["NoSuchClass"]}]},
                 })
             self.assertIn("unknown attack-chord class", str(ctx.exception))
+
+    def test_shipped_mk2_sai_throw_hold_and_release_survive_compilation(self):
+        """Regression pin for the §10.1 compiler-drop bug: Mileena's real
+        shipped `sai_throw` (`library/mk2/mk2.profile.json`) is
+        `hold HP for 34 frames, then release` -- driven live (see
+        MACRO_ACTIONS.md §10.1's docstring note: 34 frames, not the
+        transcribed ~180, was bisected against the real charge threshold).
+        Before the fix, this compiled to two steps holding/releasing
+        NOTHING; this test loads the actual on-disk profile (no hand-built
+        fixture) so a regression here is a real profile, not a synthetic
+        stand-in, failing to compile correctly."""
+        prof = profile.load(profile.REPO_ROOT / "library" / "mk2")
+        steps = prof.macro_steps_for("mileena", "sai_throw")
+        self.assertIsNotNone(steps)
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[0]["hold"], ["HP"])
+        self.assertEqual(steps[0]["min_frames"], 34)
+        self.assertEqual(steps[0]["press"], [])
+        self.assertEqual(steps[1]["release"], ["HP"])
+
+        # And the compiled view round-trips through the matcher compiler
+        # (shadow_train.macros.compile_macros) without raising and without
+        # losing the kinds -- the actual path _macro_override_events (in
+        # dataset.py) exercises for every recorded round.
+        from shadow_train import macros as _macros
+        macro_list = _macros.compile_macros({"sai_throw": steps})
+        self.assertEqual(len(macro_list), 1)
+        compiled = macro_list[0].steps
+        self.assertEqual(compiled[0].kind, "hold")
+        self.assertEqual(compiled[0].hold, ("HP",))
+        self.assertEqual(compiled[0].min_frames, 34)
+        self.assertEqual(compiled[1].kind, "release")
+        self.assertEqual(compiled[1].release, ("HP",))
 
     def test_contact_signal_valid(self):
         with tempfile.TemporaryDirectory() as d:

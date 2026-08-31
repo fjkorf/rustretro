@@ -1786,3 +1786,795 @@ example is the wrong move.
    failed roll produced exactly as it does for the roll. It cannot tell a
    special from the normal it degenerated into; only damage, travel and the
    victim's `y` can.
+
+## Mileena's ladder and her normals (2026-08-31, task M3+M4)
+
+Her own spacing ladder, generated from `shadow/arenas/mk2/m-v-r.state`, and
+every standing and crouching normal measured across it on hit AND on block.
+Reptile's ladder does not transfer and was not reused: **walk speed is a
+property of the character walking and the collision floor is a property of
+the two bodies**, and both came out different here.
+
+New in this run, beyond one more character: `guard_height` is no longer NULL
+(`docs/frames.md` §12 listed it as unmeasured in every row), the punish rig
+is a module rather than an ad-hoc script, and the per-matchup walk curve has
+its own tool.
+
+### Rig
+
+Mileena = `block1`, port 0, char_id 5, on the LEFT; Reptile = `block2`,
+port 1, char_id 9. Both ports human-live, re-verified after every load.
+Headless FBNeo, `--pace 0`, MCP port 4066 (measurement) and 4067 (guard
+height, punish rigs, the cold re-measure ran on a second 4066 process). Never
+4025. Contact anchored on the fighter-struct health `block+0x0E` (§4.1), one
+anchor per rig — the blocked run gets its own, so "hit and block connect on
+the same frame" stays a result rather than an assumption. It held in 24 of
+the 25 cells; the exception is the first row of the "what the guard changes"
+section below, and it is not a timing difference but a WHIFF.
+
+Probe-shape calibrations, measured on this matchup and confirmed hold-limited
+at anchor+70 and anchor+100:
+
+| probe shape | `struct_velocity` | `pointer_x` |
+|---|---|---|
+| attacker (hit rig and block rig) | 1 | 2 |
+| defender, on hit | 1 | 2 |
+| defender, on block (drops Block, walks) | 10 | 11 |
+
+Identical to Reptile's, which is evidence that these are properties of the
+PORT and the probe shape rather than of the character — the first independent
+character to test that.
+
+### Her walk curve: 3.125 px/frame, no startup ramp
+
+One continuous hold from the base arena, gap read after every frame
+(`framelab.spacing.walk_curve`), cross-checked at K = 0/30/60/90 against an
+independent reload-and-walk — all four agree exactly.
+
+| K (walk frames) | gap, mid-walk | K | gap |
+|---|---|---|---|
+| 0 | 192 px | 30 | 102 px |
+| 1 | 192 px | 35 | 86 px |
+| 5 | 180 px | 40 | 71 px |
+| 10 | 164 px | 42 | 64 px |
+| 15 | 149 px | **43** | **61 px** |
+| 20 | 133 px | 50 | 63 px |
+| 25 | 117 px | 90 | 63 px |
+
+The shape: **one dead frame** (K=0→1 closes nothing), then a flat 3 px/frame
+with a 4 px frame every eighth (K = 8, 16, 24, 32, 40) — a mean of
+**3.125 px/frame** held from K=1 all the way to contact. There is no
+acceleration phase at all.
+
+Against Reptile's own curve (§5: "a ~1.6 px/frame startup ramp, a ~2.5
+px/frame cruise from K≈5 to K≈45"), **Mileena walks ~25% faster and starts at
+full speed**. Reusing his numbers to place her arenas would have missed every
+target gap by a growing margin — at K=45 his curve predicts ~110 px where she
+is actually at the floor.
+
+### Her collision floor is 61 px, not 62
+
+She reaches 61 px at **K=43** and no amount of further walking closes it. What
+happens past K=43 is worth stating precisely, because a naive "minimum gap
+seen" reading gets it wrong: from K=44 the walk starts PUSHING Reptile — his
+`x` climbs with hers — and the measured gap then oscillates between 60 and 66
+px while both bodies slide right together. Released and settled, the pair
+sits at 63 px, i.e. **walking past the floor opens the gap slightly rather
+than closing it**.
+
+So `spacing.collision_floor` refuses a "floor" that the curve did not sit on
+to the end (the tail must hold the minimum for `plateau_frames`), and the
+floor reported here is the settled 61 px at K=43–45 — one pixel tighter than
+the 62 px the profile's `framelab.spacing.collision_floor_px` carries for the
+Reptile mirror. One pixel is small; the point is that it is a MEASUREMENT and
+the ladder tooling now takes it as an argument (`ladder.py --faf-at-px`)
+instead of inheriting another matchup's constant.
+
+### The ladder as shipped
+
+`shadow/arenas/mk2/m-gap-{0,15,25,30,35,39,45}.state`, each with a
+`.gap.json` sidecar (K, achieved gap, both char ids, facing, `inputs_live`
+for both ports, and now `settle_frames` / `reload_after_liveness`). Every one
+was re-loaded fresh after saving and required to reproduce its gap and both
+char ids exactly, then re-verified again in a separate pass with a fresh
+liveness probe on both ports:
+
+| arena | K | gap | arena | K | gap |
+|---|---|---|---|---|---|
+| `m-gap-0` | 0 | 192 px | `m-gap-35` | 35 | 83 px |
+| `m-gap-15` | 15 | 146 px | `m-gap-39` | 39 | 71 px |
+| `m-gap-25` | 25 | 114 px | `m-gap-45` | 45 | **61 px** |
+| `m-gap-30` | 30 | 99 px | | | |
+
+Two generator fixes were needed to make those gaps mean what they say, and
+both are worth knowing because they silently affected the shipped Reptile
+ladder:
+
+- **The liveness probe moves the fighters.** It walks each port 6 frames out
+  and 6 back, and MK2's forward/backward walk speeds are asymmetric, so it
+  leaves the pair closer than the base state did. Measured: `r-v-r.state` is
+  a **192 px** arena, and the shipped `gap-0.state` — "K=0", i.e. no walk at
+  all — is **180 px**. That 12 px is the probe. `build_gap_ladder_arena` now
+  takes `reload_after_liveness`, which re-loads the base state after the
+  check (liveness is a property of the RIG, not of a position), and with it
+  every Mileena rung's achieved gap matches the walk curve exactly.
+- **A rung must be settled.** Saving on the frame after the last held walk
+  frame captures a fighter mid-walk-animation, and near the floor the
+  measured gap oscillates. `settle_frames=8` (8 neutral frames before the
+  save) makes the saved gap the gap the fight starts from; 8 and 20 settle
+  frames agree at every K, so 8 is enough.
+
+### The connect map
+
+One anchor replay per (move, rung), `damage@contact-frame`, `—` = the contact
+signal never fired. Reproduced identically by the cold re-measure on the
+rungs it covered.
+
+| gap | HP | LP | HK | LK | cHP | cLP | cHK | cLK |
+|---|---|---|---|---|---|---|---|---|
+| 192 px | — | — | — | — | — | — | — | — |
+| 146 px | — | — | — | — | — | — | — | — |
+| 114 px | — | — | — | 26@f8 | — | — | — | — |
+| 99 px | — | — | 32@f8 | 26@f8 | — | — | 12@f20 | — |
+| 83 px | 11@f11 | 8@f11 | 32@f8 | 26@f8 | 40@f14 [KD] | — | 12@f20 | 6@f16 |
+| 71 px | 11@f11 | 8@f11 | 32@f8 | 26@f8 | 40@f14 [KD] | 6@f17 | 12@f20 | 6@f16 |
+| 61 px | **24@f8** | *throw* | **16@f11** | **16@f11** | 40@f14 [KD] | 6@f17 | 12@f20 | 6@f16 |
+
+Her proximity boundary sits between 71 and 61 px for HP, HK and LK — the same
+place Reptile's sits for the same buttons (his ladder brackets it as 62/72),
+which is more evidence that MK2 resolves proximity once per input at one
+distance. The crouching normals have no boundary anywhere in this ladder:
+identical damage and contact frame at every rung they reach, so their
+`variant` is NULL rather than an invented "close".
+
+`connect_range` (the largest CONNECTING rung, a bracket and not an edge):
+LK 114, HK 99, cHK 99, HP 83, LP 83, cHP 83, cLK 83, cLP 71.
+
+**cHK is the reach surprise.** Her crouching HK connects out to 99 px — as
+far as her standing roundhouse and further than any punch — for 12 damage at
+contact frame 20. Nothing in Reptile's kit was measured at that shape (his
+crouching normals were the uppercut and cLK, both short).
+
+**LP at 61 px is a THROW, not a normal.** 30 damage, contact at frame 24, and
+the guard rig below settles it: 30 damage with the defender standing-blocking
+AND 30 with him crouch-blocking — unblockable. §1.1 gives a throw no
+advantage number, so it has no row. (Reptile's own LP-at-62 throw does 34 at
+frame 48; hers is faster and weaker.)
+
+### The table
+
+Frames are relative to the contact frame. "att free"/"def free" are the
+frames at which that fighter's WALK manifests; advantage is their difference
+(§4.3 — raw manifests, no per-side calibration subtracted). Both observables
+(`block+0x0B..0x0D` walk velocity and the pointer-resolved `obj+0x12`) were
+sampled on every sweep and **agreed to the frame on all 94 sweeps**. `n` = how
+many independent full measurements are behind the row; `n=2` means a
+cold-started second emulator process reproduced it exactly.
+
+| move | variant | gap | dmg | chip | contact f | FAF | att free | def free (hit) | def free (blk) | **on hit** | **on block** | guard | n |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| HP | far | 71 px | 11 | 3 | 11 | — | +10 | +14 | +23 | **+4** | **+13** | mid | 1 |
+| HP | close | 61 px | 24 | 6 | 8 | 8 | +21 | +46 | +19 | **+25** | **−2** | mid | 2 |
+| LP | far | 83 px | 8 | 2 | 11 | — | +10 | +14 | +23 | **+4** | **+13** | mid | 1 |
+| LP | far | 71 px | 8 | 2 | 11 | — | +10 | +14 | +23 | **+4** | **+13** | mid | 1 |
+| HK | far | 99 px | 32 | 8 | 8 | — | +43 | +46 | +23 | **+3** | **−20** | mid | 1 |
+| HK | far | 83 px | 32 | 8 | 8 | — | +43 | +46 | +23 | **+3** | **−20** | mid | 1 |
+| HK | far | 71 px | 32 | 8 | 8 | — | +43 | +46 | +23 | **+3** | **−20** | mid | 1 |
+| HK | close | 61 px | 16 | 4 | 11 | 11 | +33 | +26 | +19 | **−7** | **−14** | mid | 1 |
+| LK | far | 114 px | 26 | 6 | 8 | — | +43 | +18 | +23 | **−25** | **−20** | mid | 2 |
+| LK | far | 99 px | 26 | 6 | 8 | — | +43 | +18 | +23 | **−25** | **−20** | mid | 1 |
+| LK | far | 83 px | 26 | 6 | 8 | — | +43 | +18 | +23 | **−25** | **−20** | mid | 1 |
+| LK | far | 71 px | 26 | 6 | 8 | — | +43 | +18 | +23 | **−25** | **−20** | mid | 1 |
+| LK | close | 61 px | 16 | 4 | 11 | 11 | +33 | +26 | +19 | **−7** | **−14** | mid | 1 |
+| cHP | — | 83 px | 40 | 10 | 14¹ | — | +28 | NULL² | +23 | **NULL²** | **−5** | mid | 1 |
+| cHP | — | 71 px | 40 | 10 | 14¹ | — | +28 | NULL² | +23 | **NULL²** | **−5** | mid | 1 |
+| cHP | — | 61 px | 40 | 10 | 14¹ | 8 | +28 | NULL² | +23 | **NULL²** | **−5** | mid | 1 |
+| cLP | — | 71 px | 6 | 2 | 17¹ | — | +16 | +23 | +19 | **+7** | **+3** | mid | 2 |
+| cLP | — | 61 px | 6 | 2 | 17¹ | 11 | +16 | +23 | +19 | **+7** | **+3** | mid | 1 |
+| cHK | — | 99 px | 12 | 3 | 20¹ | — | +39 | +14 | +19 | **−25** | **−20** | mid | 1 |
+| cHK | — | 83 px | 12 | 3 | 20¹ | — | +39 | +14 | +19 | **−25** | **−20** | mid | 1 |
+| cHK | — | 71 px | 12 | 3 | 20¹ | — | +39 | +14 | +19 | **−25** | **−20** | mid | 1 |
+| cHK | — | 61 px | 12 | 3 | 20¹ | 14 | +39 | +14 | +19 | **−25** | **−20** | mid | 2 |
+| cLK | — | 83 px | 6 | 2 | 16¹ | — | +21 | +10 | +19 | **−11** | **−2** | mid | 1 |
+| cLK | — | 71 px | 6 | 2 | 16¹ | — | +21 | +10 | +19 | **−11** | **−2** | mid | 1 |
+| cLK | — | 61 px | 6 | 2 | 16¹ | 10 | +21 | +10 | +19 | **−11** | **−2** | mid | 1 |
+
+¹ replay-relative: every crouching normal has a 6-frame stance lead-in, so
+its `first_active_frame` is the contact frame minus 6. ² the uppercut
+LAUNCHES (the victim's `obj+0x16` leaves its resting y and does not return
+until frame 78), and §1.1 gives a knockdown no on-hit advantage — the wakeup
+window is the measurement and it is a different, still-unmeasured column.
+
+`first_active_frame` is stored only at the 61 px rung (§4.4): **HP 8, HK 11,
+LK 11, cHP 8, cLP 11, cHK 14, cLK 10**.
+
+Every far variant is gap-INVARIANT: HK at 71/83/99 px and LK at 71/83/99/114
+px are byte-identical across four rungs, as are all three cHP rows and all
+four cHK rows. That is the strongest internal evidence that the protocol
+measures the move rather than the arena.
+
+### Blockstun takes exactly two values for her too — the same two
+
+Her defender's walk manifests at **+19** after close HP, close HK, close LK,
+cLP, cHK and cLK, and at **+23** after far HP, far LP, far HK, far LK and
+cHP. Nothing else. Two values, and they are the SAME two Reptile's kit
+produced (+19 and +23) with the same non-alignment to distance — cHK is +19
+at 99 px and cLK is +19 at 83 px, while far LP is +23 at 71 px.
+
+So the answer to the question this task asked: **no third value.** Blockstun
+on MK2 arcade looks like a two-state property of the MOVE, now measured
+across two characters, 13 distinct moves and 25 (move, gap) cells. What it
+keys on is not damage (6 damage gives +19 as cLK and +19 as cLP but far LP's
+8 gives +23), not the button, and not the gap.
+
+Hitstun, by contrast, takes six values across her kit (+10, +14, +18, +23,
++26, +46) and does not track damage monotonically: her 26-damage far LK frees
+the victim at +18 while her 16-damage close HK holds him to +26, and her
+6-damage cLP holds him to +23 while her 6-damage cLK frees him at +10. Two
+moves, same damage, 13 frames apart — damage is a correlate at best, and the
+per-move table is the only honest form.
+
+**`on_hit ≥ on_block` fails again, in both directions**, exactly as §8.2
+allows: far HP and far LP are +4 on hit and **+13** on block, while close HP
+is +25 on hit and −2 on block. The checker must flag, never reject.
+
+### `guard_height`: measured, and the column is no longer empty
+
+`docs/frames.md` §12: "`guard_height` … NULL in every row measured so far …
+needs a CROUCHING defender rig, which was not built." It is built
+(`framelab.guard`): three anchor replays per cell — defender open, defender
+holding Block, defender holding Block+down — classified from the damage
+signature.
+
+**Every one of Mileena's 25 row-bearing cells is `mid`**: standing Block and
+crouching Block both reduce the hit to chip, chip being exactly a quarter of
+the damage (24→6, 16→4, 40→10, 12→3, 8→2, 6→2, 11→3, 32→8, 26→6). She has no
+overhead and no low among her normals — her sweep-shaped cHK is stopped by a
+standing block like everything else. The two non-`mid` results are the
+interesting ones:
+
+- **LP at 61 px: `unblockable`** — 30 damage against an open defender, 30
+  against a standing block, 30 against a crouching block. That is the throw,
+  proven rather than assumed.
+- **HP at 83 px: `whiffs_vs_guard`** — 11 damage against an open defender,
+  chip against a CROUCH-blocking one, and **no contact at all** against a
+  standing blocking one. MK2's standing block stance leans the fighter back,
+  so at the outer edge of a move's range the connect map is guard-state
+  dependent. This is why that cell has no advantage row: the hit rig
+  connected and the block rig whiffed, and `measure_cell` correctly refused
+  to report an advantage for a move that did not connect (§1.1). A classifier
+  that read "the standing blocker took no damage" as "the standing block
+  stopped it" would have labelled that move `low` — backwards — so
+  `classify_guard` reports the whiff as its own verdict.
+
+### The punish the table predicts, thrown
+
+`framelab.punish`, a rig with no act-again probe in it: the defender's
+counter-attack frame is swept and the ATTACKER's damage register says what
+happened (full damage = clean punish, chip = her guard was up first, nothing
+= no contact).
+
+**First, a protocol correction that the doc needs.** Dropping Block and
+pressing the counter on the SAME frame produces **no attack at all**. Swept
+against her blocked cHK at 61 px: HP, HK, LK and LP all give zero contact at
+every counter frame from contact+8 to contact+30, and Reptile's
+`action_counter` never leaves its blocking value — the button never became an
+attack. Release the guard at contact+1 and the identical sweep lands. The
+first-landing frame is then INVARIANT to when the release happens (measured
+identical for release at contact+0, +1, +5 and +10), so this is not a stance
+drop that has to finish — it is the same "chorded on the trigger frame does
+not register" rule the special-move audit found, applied to Block. A punish
+rig without it reports every move in the game as unpunishable, which is
+clean, plausible and false.
+
+With that fixed, on the two extremes of the table:
+
+| rig | move | on block | def free (blk) | counter | first landing | attacker's guard up? |
+|---|---|---|---|---|---|---|
+| block | far HP @71 px | **+13** | +23 | HK | contact+**21** | chip 8 — SAFE |
+| block | cHK @61 px | **−20** | +19 | HK | contact+**24** | chip 8 |
+| block | cHK @61 px | −20 | +19 | LK | contact+**22** | — |
+| block | cHK @61 px | −20 | +19 | HP / LP | **never** | out of range |
+
+Two things fall out, and the second is a caveat on the whole table.
+
+1. **Far HP reproduces Reptile's `manifest − 2` rule exactly**: the defender's
+   walk manifests at +23 and his earliest connecting counter is +21. cHK does
+   not — its defender manifests at +19 and the earliest counter is +22 (LK) or
+   +24 (HK). The difference is that the blocked cHK PUSHES him from 61 px to
+   93 px, out of punch range entirely (HP and LP never connect at any counter
+   frame), and the remaining kicks arrive later than the −2 rule predicts.
+   Recorded rather than smoothed: the −2 rule is not universal.
+2. **The counter lands as CHIP in both cases, including on the "−20" move.**
+   Mileena holds Block from the frame she threw the move; against cHK the
+   counter contacts at +32 and she blocks it, even though her own walk
+   manifests at +39. So **her guard comes back before her walk does**, by at
+   least 7 frames, and "unsafe by the walk clock" overstates real
+   punishability. §1's `punishable` predicate needs both the pushback (which
+   it names) and a guard clock (which nobody has measured). What can be said
+   from this rig is a bound: her guard is effective by contact+32 after cHK,
+   and no counter that reaches can arrive earlier than contact+30.
+
+### Her safest and her most unsafe normal
+
+- **Safest: far HP (and far LP), +13 on block, +4 on hit.** They are the only
+  normals in her kit that are PLUS on block, and the punish rig confirms it —
+  the fastest counter that reaches cannot beat her guard, it chips. Her close
+  HP is the safest close-range option at −2 with the biggest close-range
+  reward (+25 on hit, 24 damage), and cLP is the safest crouching poke (+3 on
+  block, +7 on hit).
+- **Most unsafe: a three-way tie at −20 on block — far HK, far LK, cHK.** By
+  the on-HIT column the worst are far LK and cHK at **−25**, i.e. they are
+  negative even when they connect. cHK is the one to single out: 12 damage
+  for 25 frames of disadvantage on hit, the longest committal in the kit
+  (attacker free at +39) — and yet the punish rig cannot punish it at the
+  floor, because it shoves the blocker to 93 px. **The most unsafe number in
+  the table is not the most punishable move on the screen**, which is exactly
+  the range clause §1 warns is not a footnote.
+
+### What was NOT measured, and why
+
+- **HP at 83 px**: no row. It connects against an open defender and WHIFFS
+  against a standing-blocking one (above), so there is no on-block number and
+  §4.3 forbids deriving one from the on-hit run.
+- **LP at 61 px**: the throw. §1.1 gives it no advantage number; it is
+  measured as damage + unblockability, nothing more.
+- **`on_hit` for cHP at any rung**: the uppercut launches, and a knockdown
+  has a wakeup window rather than a hit advantage.
+- **Jumping normals**: still out, for the unchanged reason — the act-again
+  observable is a WALK and an airborne fighter cannot walk.
+- **Her specials**: another task's scope (and `mk2.md`'s special-move audit
+  already records why the roll and the teleport break any gap-keyed
+  protocol).
+- **`hitstop`, `active`, `recovery`, `total`, `wakeup_window`**: still NULL
+  in every row. None is a by-product of this protocol. `guard_height` is no
+  longer on that list.
+- **Gaps 146 px and 192 px**: every button whiffs; they are the whiff half of
+  the connect map and carry no rows.
+- **`cLP` at 83 px and above, `cLK` at 99 px and above**: they do not reach,
+  which the connect map records.
+
+### Cost and provenance
+
+| phase | steps | loads | wall clock |
+|---|---|---|---|
+| walk curve + settled-gap scan | 3,013 | 62 | ~4 s |
+| ladder generation (7 arenas, each verified on reload) | 413 | 21 | ~6 s |
+| arena re-verification pass (fresh liveness, both ports) | 168 | 14 | ~2 s |
+| connect map (8 moves × 7 rungs, with knockdown probes) | 5,388 | 83 | 9 s |
+| **the kit: 4 calibrations + 26 cells at `repeats=2`** | **756,319** | **14,777** | **1,070 s** |
+| cold-process re-measure (4 cells) | 135,757 | 2,558 | 190 s |
+| `guard_height` (27 cells × 3 stances) | 3,888 | 81 | 7 s |
+| punish rigs (7 sweeps) | ~13,000 | ~160 | ~20 s |
+
+**~920k frames and ~17.8k verified loads, ~22 minutes of measurement.** The
+kit ran 94 exhaustive sweeps with every `actionable(N)` evaluated TWICE and
+required to agree: **0 repeat-check failures, 0 non-monotone refusals, 0
+cross-method disagreements, 0 refusals of any kind.** `max_search` was 60
+(45 is too tight — her far HK's victim frees at +46).
+
+Rows live in `shadow/framelab/frames.db` and export to
+`library/mk2/arcade.frames.json`: **50 Mileena rows** (25 cells × 2
+observables) alongside the 20 Reptile rows, each carrying `observable`,
+`method`, `input_latency_frames`, `guard_height`, `sample_n`, `core_id`
+(`fbneo_libretro.dylib:sha256:972e8fb8c8394979`) and `rom_id`
+(`mk2.zip:sha256:e8d3f2f8cefe1aab`).
+
+**One consumer needs updating, and it is not this data.**
+`src/profile.rs`'s `mk2_frames_json_parses_and_collapses_agreeing_observables`
+asserts the shipped export has exactly **10** cells and that
+`table.chars() == ["reptile"]` — a snapshot of a one-character table that any
+second character was always going to break. The export now holds **35** cells
+across two characters; every one still collapses to exactly two AGREEING
+observations, which is the property that test actually exists to check, and
+the loader keys cells on `(char, move, variant, gap_walk_frames)` so nothing
+collides. The two counts want to become 35 and `["mileena", "reptile"]`. Left
+alone here deliberately: this task's file scope excludes Rust.
+
+**Re-measurement (§8.1).** Four cells — close HP @61, far LK @114, cHK @61,
+cLP @71 — were measured again from scratch on a COLD emulator process, with
+its own calibration, and reproduced every measured column to the frame
+(`on_hit`, `on_block`, `damage`, `hits`, `knockdown`, `first_active_frame`,
+`gap_px`, `gap_walk_frames`, `input_latency_frames`, `method`, `core_id`,
+`rom_id`). The comparator reported two columns differing, both
+`connect_range`, and both because the re-run was given three rungs instead of
+seven — a smaller ladder brackets the range tighter. That is a difference in
+what was ASKED, not in what was measured, and it is the one place
+`compare_rows` cannot tell those apart.
+
+### Confidence, per row
+
+- **High** for every `on_block` number and for the `on_hit` numbers of the
+  standing normals: two observables in different data structures agreeing on
+  94 sweeps, monotone predicates everywhere, every evaluation doubled, and
+  four cells reproduced from a cold process.
+- **High** for the connect map, damage and chip: single replays, but the cold
+  re-measure reproduced every cell it covered and the far variants are
+  identical across four rungs each.
+- **Medium** for `first_active_frame`: it is the contact frame at the 61 px
+  floor minus the stance lead-in, and the ±1 question of whether the damage
+  register is written on the overlap frame or the frame after is still
+  unresolved (same caveat as Reptile's).
+- **Medium** for the punish rig's cHK numbers: the first-landing frames are
+  reproducible and invariant to the guard-release lead, but the +22/+24 split
+  between LK and HK at the same 8-frame contact delay is unexplained.
+- **NULL, not low confidence**, for everything in the "not measured" list.
+
+### What this run says `docs/frames.md` still gets wrong
+
+1. **§4.4/§5 treat the collision floor as a per-PORT constant** and the
+   profile stores one (`framelab.spacing.collision_floor_px: 62`). It is
+   per-MATCHUP: 61 px here. `ladder.py` now takes `--faf-at-px`, and without
+   it this run would have stored `first_active_frame` nowhere and said
+   nothing about why.
+2. **§5's ladder recipe ("reset to a known position, walk K frames") omits
+   that the liveness check itself walks both fighters.** The shipped Reptile
+   K=0 rung is 180 px from a 192 px base for exactly that reason. Either
+   re-load after the check (what `reload_after_liveness` does) or stop
+   calling the base gap "K=0".
+3. **§5 says to record the achieved gap and does not say it can OSCILLATE.**
+   Within the collision floor the gap swings 60–66 px frame to frame while a
+   direction is held. A rung saved on an arbitrary frame is reproducible but
+   not meaningful; settle it.
+4. **§8.3's punish test cannot be run as written.** Release the guard on the
+   counter frame and no counter ever comes out; the acceptance criterion
+   would be met vacuously by declaring everything safe.
+5. **§1's `punishable` predicate is missing a clock.** It compares advantage
+   against the opponent's fastest `first_active_frame` and range, both of
+   which this lab measures — but the defender being able to GUARD is what
+   actually decides it, and guard returns before the walk this lab probes
+   (bound: ≥7 frames earlier for Mileena after cHK). Until there is a guard
+   observable, "−20 on block" is an upper bound on punishability, not a
+   verdict.
+6. **§12's second item (two rows per cell, one per observable) is still
+   open**, and this run is more evidence for collapsing them: 94 more sweeps,
+   zero disagreements, now across two characters.
+
+## Mileena's three specials — and the three assumptions each one breaks (2026-08-31, task M5)
+
+`docs/frames.md` was written for normals: one button, one frame, both
+fighters grounded, both on the sides they started on. Each of Mileena's
+specials breaks a different one of those, so this section is as much about
+what REFUSED to be measured as about what was.
+
+New code: `shadow_train/framelab/specials.py` only. The differential act-again
+protocol (`probe.py`), the §3 preconditions (`session.py`) and the profile's
+`framelab` block are unchanged and do the actual work.
+
+### Rig
+
+`shadow/arenas/mk2/m-v-r.state` — Mileena (`block1`, port 0, char_id 5) at
+`x` 927, Reptile (`block2`, port 1, char_id 9) at `x` 1119: **192 px**, past
+the whiff edge of every measured normal. Headless FBNeo, `--pace 0`, MCP
+ports 4068 (first pass) and 4069 (cold-start re-measurement). Never 4025.
+Contact anchored on the victim's fighter-struct health `block+0x0E` (§4.1),
+one anchor per rig. Both observables (`struct_velocity` `block+0x0B..0x0D`
+and pointer-resolved `x` `obj+0x12`) sampled from the same runs.
+
+Encodings come from the profile's `special_inputs` and are played back
+exactly as `src/macros.rs::MacroExec` does — each step's mask for its
+`frames`, `STEP_GAP = 2` neutral frames between. **All three moves came out on
+the first attempt with the shipped encodings**, and the M1 audit's charge
+threshold reproduced under this harness's own step convention (33 held frames
+fails 2/2, 34 fires 2/2).
+
+**A second, cold-started emulator process reproduced all six measured cells
+EXACTLY** — every `first_true`, every direction, every predicate shape, every
+advantage, and the charge experiment. `n = 2` for every row below.
+
+### What was measured
+
+Frames are relative to that side's own origin; "att free" / "def free" are
+the frames at which that fighter's walk manifests. Advantage is the
+difference of the two ABSOLUTE manifest frames (§4.3), which is what makes
+the attacker's release-relative clock and the defender's contact-relative
+clock comparable.
+
+| move | gap | dmg | chip | contact | att free | def free (hit) | def free (blk) | **on hit** | **on block** | wakeup |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `sai_throw` | 192 px | 23 | 5 | f58 | release+51 | contact+26 | contact+19 | **−1** | **−8** | — |
+| `sai_throw` | 161 px | 23 | 5 | f67 | release+51 | contact+26 | contact+19 | **−5** | **−11** | — |
+| `sai_throw` | 130 px | 23 | 5 | f75 | release+51 | contact+26 | contact+19 | **−7** | **−14** | — |
+| `sai_throw` | 89 px | 23 | 5 | f85 | release+51 | contact+26 | contact+19 | **−10** | **−17** | — |
+| `teleport_kick` | 192 px | 32 | 4 | f38 | contact+31 | contact+26 | contact+19 | **−5** | **−25** | — |
+| `roll` | 192 px | 21 | 5 | f33 | contact+23 | *knockdown* | contact+19 | **NULL** | **−34** | **77** |
+
+Twelve rows in `shadow/framelab/frames.db` (six cells × two observables).
+`first_active_frame`, `active`, `recovery`, `total`, `hitstop`,
+`guard_height` and `connect_range` are NULL in all of them — none of them is
+a by-product of this protocol (§4.4, §12).
+
+---
+
+### 1. `sai_throw` — a charge move AND a projectile
+
+**The advantage is a curve, and it decomposes into two constants plus travel
+time.** Her recovery is `release + 51` at EVERY rung and the victim's is
+`contact + 26` at every rung, so
+
+```
+on_hit(gap)   = travel(gap) − 25        on_block(gap) = travel(gap) − 32
+travel = contact − release:  24 f @192 px, 20 @161, 18 @130, 15 @89
+```
+
+which reproduces all eight measured numbers exactly. The "attacker recovers
+while the sai travels" intuition is **false on this port**: 51 frames of
+recovery outlast a 24-frame flight, so the sai is negative at every range she
+can throw it from — it is merely *less* negative the further away she is.
+
+Her recovery is byte-identical on hit and on block (`release + 51` in both),
+which is what a projectile should do — she never touches him — and is a
+falsifiable prediction the block rig confirmed rather than assumed.
+
+**The ladder is walk-in, not arenas.** §5's ladder is saved states; a charge
+cannot use them (see the pre-charge result below — walking resets the
+charge), so each rung is a `lead_in` walk of K frames plus a 3-frame settle
+inside ONE replay, replayed identically in probe and control so it cancels
+exactly like pushback does. K = 0/10/20/33 → 192/161/130/89 px, gap read at
+the frame the charge starts.
+
+**Closer than 89 px is REFUSED, not measured.** Holding HP to charge also
+throws an HP normal, and where that normal connects the health anchor sees
+two contacts:
+
+| K | gap | contacts | damage | verdict |
+|---|---|---|---|---|
+| 33 | 89 px | f85 | 23 | measured |
+| 35 | 83 px | f49, f87 | 34 = 11 + 23 | **refused** — far HP + sai |
+| 40 | 67 px | f54, f92 | 34 = 11 + 23 | **refused** |
+| 45 | 61 px | f56, f104 | 47 = 24 + 23 | would refuse — close HP + sai |
+
+The first three rows are the harness's own verdicts; the K=45 row is from the
+exploratory boundary scan (same script, same rig) and is included because it
+shows the second regime — past the proximity boundary the contaminating
+normal is the CLOSE HP (24), not the far one (11).
+
+The refusal is by SIGNATURE (`damage 34 != 23`, `2 contact(s) != 1`) and it
+is enforced in code, not in prose: `measure_special` returns with no row.
+Mileena's own HP normal connect boundary is therefore between 89 px (clean)
+and 83 px (contaminated) — measured here as a by-product, and the reason the
+sai's ladder has a floor.
+
+#### The probe CANCELS the move — a hazard normals cannot have
+
+The attacker's sweep from the release frame produced the predicate
+`T F F F …`: actionable at N=0, then locked for 45 frames. That is not a
+flake and not a recovery. A walk asserted on the exact release frame
+**produces 0 damage, in both directions** — the walk preempts the throw, and
+the "divergence" the probe saw was her walking instead of attacking. One
+frame later the full 23 lands, at every N tried (0..11, both directions).
+
+For a normal this cannot happen: the probe starts AT contact, and a walk
+cannot un-throw a move that already hit. For a charge/release move the probe
+frame lands INSIDE the move. `preemption_scan` now measures which N kill the
+move (by the same contact anchor, so no new instrument), and `sweep_side`
+refuses a boundary that lands on one of them. With the origin moved to
+`release + 1`, the scan says the move survives at every N from there to
+contact, and the sweep is monotone with `first_true = 47` at all four rungs.
+
+Re-verified through the module's own API on the cold-started process:
+`{0: False, 1: True, 2: True, 3: True}`, and `sweep_side` refuses the N=0
+boundary with the preemption message.
+
+#### The pre-charged arena question, answered — and the control that changes the answer
+
+**The charge lives in the machine state and survives `save_state`/
+`load_state` exactly.** Banked at 20 held frames: reloading and holding 13
+more does NOT fire; 14 more DOES (20 + 14 = 34, the fresh threshold). Banked
+at 33: **one** further frame fires it. Reloaded and left alone for 90 frames:
+nothing comes out, so a stale pre-charged arena does not spontaneously throw
+a sai — it silently changes the next HP press instead.
+
+**But the save state is not what made that work**, and the control is the
+whole finding. Without any save state, splitting a charge as
+`20 held | G neutral | 13 held`:
+
+| G | fires? |
+|---|---|
+| 1 | **yes** (the released frame still counts toward the 34) |
+| 2 | no |
+| 5, 20, 60 | no (and a fresh 34 always fires) |
+
+An interposed LP, or a 2-frame walk, also resets it. So MK2's charge is an
+elapsed-frames counter with a **1-frame release tolerance**, and the reload
+is free only because `load_state(pause_after=True)` executes ZERO frames with
+the button released before `hold_buttons` + `confirm_fold` re-asserts it.
+That is a property of §4.6's atomic load, not of save states in general: a
+harness that resumed around the load would lose the charge.
+
+**Cost model for every future charge move.** A pre-charged arena is viable
+and cheap — 33 of 34 charge frames banked, one frame per replay instead of 34
+— under three conditions: the load never runs a released frame; the arena is
+recorded as ARMED (loading it and pressing HP for one frame throws a sai);
+and it cannot be combined with a walk-in ladder, because the walk resets the
+charge. A pre-charged ladder therefore needs one arena per rung. For this run
+the 34 frames were simply paid: at ~0.72 ms/frame batched they cost ~25 ms
+per replay against a ~2-minute cell.
+
+---
+
+### 2. `teleport_kick` — airborne, so "actionable" means something else
+
+The flight, per frame: `y` 87 → 200 by f25 (underground), then `x` jumps
+945 → 1007 with `y` = −44 (above the screen) in ONE frame, contact at f38 on
+the way down, resting `y` regained at **f62**, `x` settling at 995.
+
+The victim's `y` never leaves 89. **This is not a knockdown**, so unlike the
+roll it has a real on-hit advantage — the airborne fighter is the ATTACKER.
+
+The act-again probe is a walk and she cannot walk underground, so the
+predicate is FALSE through the whole flight for a reason that is not stun.
+The honest reading of `first_true = 28` is therefore **"the first frame she
+can walk again after landing"**: contact + 31, which is landing + 7. It is a
+legitimate advantage number and it is not the same quantity a grounded move's
+is; the table says so.
+
+**Its calibration was measured, not inherited.** §3.1 warns that a
+wrong-shape calibration produced a confident silent "never actionable" once
+already, so the landing-recovery shape was calibrated on this move at
+contact+70 and contact+100 and required to agree: `struct_velocity` 1,
+`pointer_x` 2 — identical to the grounded attacker shape. That is a result
+(the transition really is the same once she is standing), not an assumption,
+and it cost ~20 replays to know rather than hope.
+
+Two things the exhaustive sweep bought that an early exit would not:
+
+- **Holding a direction mid-teleport does nothing observable.** Both
+  predicates are cleanly monotone — 28 F, then T for all 63 remaining N, in
+  both observables, with no divergence at any airborne N. There is no air control to contaminate the probe.
+- **She recovers 12 frames LATER when it is blocked** (contact+44 vs
+  contact+31), which is why `on_block` is −25 while `on_hit` is −5. On block
+  she also lands short (ends at `x` 966 rather than 995) and stays airborne
+  until f74 rather than f62. Both observables agree; recorded as measured, and
+  flagged as surprising.
+
+---
+
+### 3. `roll` — it swaps sides, and only when it hits
+
+Damage 21 at f33; she rolls from `x` 915 at 10 px/frame, crosses him around
+f41, and ends at 1192 with him pushed to 1002. The victim is LAUNCHED —
+`y` 89 → −6, back to resting at f73 — so §1.1's knockdown gate applies:
+**`on_hit` is NULL with `knockdown` set**, enforced in `special_row` rather
+than left to the operator. The probe will happily produce a number there and
+it is meaningless.
+
+What is meaningful instead:
+
+- **`wakeup_window` = 77** (`struct_velocity`; 78 by `pointer_x`, see the
+  convention note below) — frames from contact to the victim's first manifest
+  walk, measured by the identical differential probe, stored in its own
+  column. It is the first non-NULL `wakeup_window` in the store.
+- **She is free at contact+23**, 54 frames before he can walk. That is the
+  wakeup pressure the roll buys, and it is a different number from an
+  advantage; it is recorded here in prose rather than squeezed into `on_hit`.
+
+**The side swap is only a swap on hit.** Blocked, she is stopped dead: she
+ends at `x` 1016 — still on his LEFT, `crossed = False`, airborne (roll
+stance) until f79 instead of f49. So the same move needs OPPOSITE probe walk
+directions on the two rigs, and the harness derives them per pass from that
+pass's own end positions (`walk_directions_after`, sign of `opp.x − me.x`,
+§5's derived facing). The sweeps picked `right` for her on hit and `left` on
+block, exactly as the positions require; the pre-move order would have walked
+her into his body on the hit rig and read as "not actionable".
+
+**The signature check is load-bearing here.** `block+0xC0` reads 160 → 192
+for the roll and for the crouching normal a failed roll degenerates into
+(mk2.md, M1). The row is gated on damage 21, exactly one contact, ≥200 px of
+attacker travel, a crossing, and the victim leaving its own resting `y` — five
+conditions, all measured, and `check_signature` reports every one that fails.
+
+**The calibration point had to move, and the harness moved it by measurement.**
+§3.1 says "far enough past the anchor that the fighter is certainly free" and
+gives no way to pick that point. For a knocked-down victim contact+70 is
+still stun-limited — it calibrates to 7/8 — and contact+100 gives 1/2. Taking
+the +70 number would have inflated the wakeup window by 6 frames, silently
+and plausibly. `kit.calibrate_shapes`' two-point rule CAUGHT it (the run
+refused rather than reporting), and `measure_special` now derives the point
+from the observation's own airborne window (`victim_airborne_until + 40`)
+instead of a constant.
+
+---
+
+### Cross-checks nobody designed in
+
+1. **Blockstun is `contact + 19` for all three specials** — the sai, the
+   teleport and the roll, on a rig none of them shares with a normal. That is
+   one of the exactly two blockstun values Reptile's whole kit produced
+   (task B3: "+19 close, +23 everything else"), measured here on a different
+   character with three different moves.
+2. **Hitstun is `contact + 26` for both the sai and the teleport** — two
+   moves with completely different geometry and 9 damage between them.
+3. **The two observables agreed on `first_true` in all 24 sweeps**, across
+   both runs, with no exceptions (48 sweeps counting the cold re-measurement).
+   `struct_velocity` and `pointer_x` live in different data structures (§8.4).
+4. **The four probe-shape latencies came out identical to the profile's**
+   (1/2 attacker, 1/2 defender-on-hit, 10/11 defender-on-block) on every
+   move, including the airborne one — but they were re-measured per move
+   rather than read from the table, which is what made the knocked-down
+   victim's failure visible instead of silent.
+
+### What was NOT measured, and why
+
+- **`sai_throw` closer than 89 px** — refused: her own HP normal connects and
+  the anchor sees two contacts (above). This is a property of the move, not a
+  gap in the run: the sai has no measurable point-blank row.
+- **`teleport_kick` and `roll` at any other gap.** Both moves make `x`
+  discontinuous (the teleport jumps 68 px in one frame; the roll ends 265 px
+  away on the other side), so §5's gap key is not defined across them. One
+  rung, honestly labelled, beats a ladder of numbers keyed on a quantity that
+  does not survive the move.
+- **`on_hit` for the roll** — NULL by §1.1, with `knockdown` set and the
+  wakeup window in its own column.
+- **`first_active_frame`** — §4.4 measures it at the minimum reproducible
+  gap, which for the sai is inside the contaminated zone and for the other two
+  is not a gap that exists.
+- **Hitstop, active, recovery, total, `guard_height`.** Still NULL (§12).
+- **Reptile's specials.** Out of scope for this task; the harness is
+  character-agnostic (`--char`, `--move`) and `acid_spit`'s corrected encoding
+  is the obvious next cell.
+
+### Contract gaps in `docs/frames.md` these three moves expose
+
+1. **§4.3's advantage formula assumes ONE origin for both sides.**
+   `advantage = manifest(defender, contact) − manifest(attacker, contact)`
+   sweeps both sides from the anchor, which silently assumes the attacker
+   cannot have committed long before contact. A projectile breaks that: the
+   attacker's clock starts at the RELEASE, 24 frames earlier. The fix is
+   small and is implemented here — each side carries its own `origin` and
+   `origin_kind`, and the difference is taken between ABSOLUTE manifest
+   frames — but §4.3 should say so, and the schema has no column for it (§12).
+2. **§4.3's signature rule covers the SCRIPT but not the PROBE.** "A move must
+   be identified by its measured signature" stops a mislabelled move; nothing
+   in the contract stops the probe's own input from CANCELLING the move, which
+   is exactly what a walk on the sai's release frame does. Proposed rule: any
+   probe frame that falls inside the move's own input window must be validated
+   by the contact anchor, and a boundary landing on an invalidated N is void.
+3. **§8.4's "agree to the frame" is only true for DIFFERENCES.** An absolute
+   per-side number (`actionable_after_contact`, and now `wakeup_window`)
+   carries that observable's manifestation margin `m`, so `struct_velocity`
+   77 and `pointer_x` 78 are AGREEMENT, not a 1-frame discrepancy — the
+   comparable quantity is `first_true` (74 for both). The cross-method check
+   is implemented against `first_true` here; §8.4 should name it.
+4. **§1.1 reserves `wakeup_window` without defining it.** Proposed, and used
+   here: frames from contact to the victim's first manifest walk, same
+   observable and window as an advantage row, never stored in `on_hit`.
+5. **§3.1's calibration point is not a constant.** "Far enough past the anchor
+   that the fighter is certainly free" is 70 frames for a normal and not
+   enough for a knockdown. It should be DERIVED from the victim's own airborne
+   window, and the two-point agreement check should be mandatory rather than
+   `kit`-local — it is the only thing that caught this.
+6. **§5's ladder cannot be arenas for a charge move.** Two released frames
+   reset the charge, so a walk-in ladder must live inside one replay, and a
+   pre-charged ladder needs one arena per rung, each recorded as ARMED.
+
+### One loader gap, outside `docs/frames.md`
+
+`shadow_train.profile` compiles `special_inputs` down to
+`{dirs, press, frames}` and **drops the §10.1 kinds** (`hold`, `min_frames`,
+`release`, `while_held`). Mileena's `sai_throw` therefore reads, through
+`profile.special_inputs` / `macro_steps_for`, as two steps that hold nothing
+— a charge move silently compiled into a no-op. `specials.special_encoding`
+reads `port_raw` instead and there is a regression test for it, but any other
+Python consumer of the compiled view has the same hole.
+
+### Cost and provenance
+
+The full production run — 6 measured cells (each: 2 contact observations, 4
+calibrations × 2 points × 5 trials, 4 exhaustive sweeps, a preemption scan),
+2 refused rungs, and the charge experiment — cost **400,135 core frames over
+3,372 loads in ~12 minutes** on one headless process. `core_id`
+`fbneo_libretro.dylib:sha256:972e8fb8c8394979`, `rom_id`
+`mk2.zip:sha256:e8d3f2f8cefe1aab`.
+
+Reproduce:
+
+```sh
+python -m shadow_train.framelab.specials \
+  --url http://127.0.0.1:4069/mcp --game library/mk2 \
+  --core ../FBNeo/src/burner/libretro/fbneo_libretro.dylib \
+  --rom ~/games/roms/mk2.zip --arena shadow/arenas/mk2/m-v-r.state \
+  --char mileena --move teleport_kick --move roll --move sai_throw \
+  --rung 0 --rung 10 --rung 20 --rung 33 --rung 35 --rung 40 \
+  --charge-probe --db shadow/framelab/frames.db
+```

@@ -1,0 +1,23 @@
+{
+  "format": "gap-ladder-v1",
+  "family": "mk2",
+  "port": "arcade",
+  "walk_frames": 25,
+  "walk_port": 0,
+  "walk_direction": "right",
+  "settle_frames": 8,
+  "reload_after_liveness": true,
+  "gap_px": 114,
+  "char_id_block1": 5,
+  "char_id_block2": 9,
+  "facing": {
+    "block1_side": "left",
+    "block2_side": "right"
+  },
+  "inputs_live": {
+    "p0": true,
+    "p1": true
+  },
+  "base_arena": "shadow/arenas/mk2/m-v-r.state",
+  "saved_at": "2026-08-31T01:43:01Z"
+}

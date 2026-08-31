@@ -53,11 +53,21 @@ advantage = (frame the defender becomes actionable)
 ```
 punishable ⟺ advantage ≤ −(opponent's fastest first_active_frame)
              AND the post-contact gap is inside that move's connect range
+             AND the defender's GUARD has not already returned
 ```
 
 The range clause is not a footnote. A move that is −8 but shoves the
-defender past their own connect range is safe in practice. Connect ranges
-are part of this table (§6), not a separate concern.
+defender past their own connect range is safe in practice.
+
+**The third clause was missing from the first draft and it changes verdicts.**
+This lab measures "the earliest frame the fighter can start a WALK", but
+GUARD comes back before the walk does — measured ≥7 frames earlier for
+Mileena after cHK. So a negative advantage number is an UPPER BOUND on
+punishability, not a verdict. Worked example: Mileena's cHK is −20 on block
+and is **not punishable at the floor** — it shoves the blocker to 93 px,
+outside punch range, and her guard is back before the kicks arrive. A table
+that prints −20 and stops has told the reader something true and misleading
+at once.
 
 ### 1.1 Outcomes
 
@@ -485,6 +495,20 @@ Proximity normals mean the same input is a DIFFERENT MOVE by distance, and
 projectile advantage is a curve over gap rather than a scalar. So gap is
 part of the key, and arenas are generated, not hand-saved.
 
+**The collision floor is PER-MATCHUP, not per-port.** Reptile's mirror
+floors at 62 px, Mileena vs Reptile at 61 px, and she walks ~25 % faster
+with no startup ramp — so one character's K→px curve misses every target gap
+for another. Generate a ladder per matchup; never inherit one.
+
+**Two hazards in the ladder recipe itself**, both found only after the first
+ladder shipped:
+- **The liveness probe WALKS both fighters.** The shipped Reptile "K=0" rung
+  reads 180 px from a 192 px base — that 12 px is the probe, not the walk.
+  Probe liveness in a separate pass, or re-read the gap afterwards.
+- **The gap OSCILLATES inside the floor** while a direction is held (60–66,
+  settling at 63), and walking past the floor *opens* it again. A rung saved
+  mid-walk samples the oscillation; settle before saving.
+
 **MK2 arcade CAN now measure gap in pixels** (this reverses the first
 draft's limitation). The fighter struct carries a pointer to its object-pool
 entry at `block - 0x0C`:
@@ -609,15 +633,58 @@ the same protocol reproduces the same systematic error perfectly.
    counters at contact+12 on hit, contact+21 on block). `on_hit ≥ on_block`
    encodes a modern-game convention, not a law. A checker may FLAG the
    inversion; it must not reject the row.
-3. **A punish the table predicts actually lands.** Take the most unsafe move
+3. **A punish the table predicts actually lands.**
+   **Protocol correction — the first draft's version cannot be run.**
+   Dropping Block and pressing the counter on the SAME frame produces no
+   attack at all (all four buttons, every N from +8 to +30, `action_counter`
+   never moves), so a naive punish rig reports EVERYTHING as safe. Release
+   the guard at least one frame before the counter. This is the same
+   same-frame-chord rule that governs move inputs (MACRO_ACTIONS §11) —
+   guard release obeys it too. Take the most unsafe move
    in the table, block it, punish it with the fastest normal the table says
    reaches: it must connect. Take one the table calls safe by ≥3 frames:
    the same punish must NOT connect.
-4. **Cross-method agreement is REQUIRED.** At least one row per character
-   must be measured a second time by a DIFFERENT observable (struct
-   divergence vs `+0xC0` edge) and agree to the frame. Criterion 1 catches
-   noise; only this catches a constant offset, and a 3-frame systematic
-   error passes criteria 1–3 unnoticed.
+4. **Cross-method agreement is REQUIRED — but "agree" means something
+   different depending on what kind of quantity the row is.** At least one
+   row per character must be measured a second time by a DIFFERENT
+   observable (struct divergence vs `+0xC0` edge, or `struct_velocity` vs
+   `pointer_x`), and:
+
+   - **DIFFERENCE quantities agree to the frame, exactly.** `advantage`
+     (`on_hit`/`on_block`) is a difference of two manifest frames measured
+     with the SAME observable (§4.3's `manifest(defender) − manifest(attacker)`),
+     so that observable's own manifestation margin appears in both terms and
+     cancels out of the subtraction. `first_active_frame` and the duration
+     fields (`active`/`recovery`/`total`/`hitstop`) are anchor-based (§4.4),
+     not probe manifests at all, so they carry no observable margin either
+     and are held to the same exact-frame rule. Criterion 1 catches noise;
+     only exact cross-observable agreement on these catches a constant
+     offset, and a 3-frame systematic error passes criteria 1–3 unnoticed.
+   - **ONE-SIDED quantities carry the observable's margin directly, and
+     legitimately differ by it.** `wakeup_window` (and any future raw
+     single-sided manifest, e.g. an `actionable_after_contact` column) is
+     `value = A_rel + m`, where `m` is that observable's own manifestation
+     margin (§4.2's probe algebra) — the SAME `m` that is baked into that
+     observable's own `input_latency_frames = l + m` at calibration (§3.1).
+     Two observables measuring the same truth therefore differ, in general,
+     by exactly the DIFFERENCE in their `input_latency_frames` — treating
+     that as a disagreement is a units error in the check, not a finding.
+     A one-sided row's two raw values must satisfy
+     `value₁ − latency₁ == value₂ − latency₂`; anything else is still a real
+     disagreement and must still be flagged.
+
+   **Worked example — Mileena's roll.** `wakeup_window` reads 77 from
+   `struct_velocity` (`input_latency_frames = 1`) and 78 from `pointer_x`
+   (`input_latency_frames = 2`). `77 − 1 == 78 − 2 == 76`: this is exact
+   agreement under the one-sided rule, not the 1-frame disagreement the
+   difference-quantity rule would have reported. The collapsed value (77) is
+   stored in the frame of reference of whichever observable has the SMALLEST
+   `input_latency_frames` in the cell — by the probe's own construction that
+   observable's margin `m` is zero, so its raw reading already equals the
+   margin-free truth with nothing to correct. A reader MUST be able to tell
+   which observable's frame a stored one-sided number is in; a bare "77"
+   that means different things depending on which row it came from is
+   exactly the ambiguity §7 exists to prevent.
 5. **Sanity against an external table**, if one is obtained. Not required to
    match — required to be reconciled in writing.
 
@@ -687,10 +754,26 @@ the same protocol reproduces the same systematic error perfectly.
 - **No arena / evidence column.** A row does not record which arena it was
   measured on, so a reader cannot reproduce it without reading the prose.
 - **The export carries two rows per cell** (one per observable) with no
-  guidance on which a consumer should pick. Evidence now favours collapsing:
-  the two observables have agreed on every sweep across two independent full
-  runs (52 sweeps in the second alone). Collapse into one row carrying both,
+  guidance on which a consumer should pick. Evidence now strongly favours
+  collapsing: **zero disagreements across three full runs and two
+  characters** (52 sweeps in the second, 94 in the third). The Rust loader
+  already collapses field-by-field and names any disagreement. Collapse into one row carrying both,
   and treat a DISAGREEMENT as the exceptional case it has never yet been.
+  ~~**RESOLVED — the first real cross-observable difference arrived, and it
+  was not a measurement error.**~~ Mileena's roll produced `wakeup_window`
+  77 (`struct_velocity`) vs 78 (`pointer_x`), and the loader flagged it as
+  the first-ever disagreement. It was not one: the two observables have
+  different calibrated `input_latency_frames` (1 and 2 — §3.1), and
+  `wakeup_window` is a ONE-SIDED quantity that carries that margin directly
+  (§8.4, corrected). The bug was a **units error in the check itself** —
+  applying the exact-frame rule (correct for `on_hit`/`on_block`, which are
+  DIFFERENCES and cancel the margin) to a quantity that doesn't cancel it.
+  Fixed in `src/profile.rs`'s `collapse_measurements`: difference/anchor
+  fields still require exact agreement; one-sided fields require agreement
+  after subtracting each observation's own latency, and record which
+  observable's frame of reference the collapsed value is in
+  (`FrameCell::one_sided_reference`). Zero disagreements now holds again
+  across all 41 shipped cells.
 - **`hitstop`, `active`, `recovery`, `total`, `wakeup_window` and
   `guard_height` are NULL in every row measured so far.** The columns exist;
   nothing measures them yet.
