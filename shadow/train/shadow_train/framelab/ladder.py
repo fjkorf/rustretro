@@ -53,6 +53,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from . import observables as obs
 from .identity import compute_core_id, compute_rom_id
 from .kit import (
+    DEFAULT_ANCHOR_FRAMES,
     DEFAULT_MAX_SEARCH,
     CellMeasurement,
     ContactScan,
@@ -124,6 +125,7 @@ def connect_map(
     quiet_frames: int,
     walk_directions_by_port,
     victim_y_read=None,
+    anchor_frames: int = DEFAULT_ANCHOR_FRAMES,
 ) -> Dict[Tuple[str, str], ContactScan]:
     """One anchor replay per (move, rung): did it reach, for how much, on
     what frame. `(move.label, rung.arena) -> ContactScan`.
@@ -133,7 +135,18 @@ def connect_map(
     its resting value. That is the gate on whether an `on_hit` number may be
     reported at all, so it belongs to the map rather than to the sweep: a
     launcher's on-hit advantage is not a worse number, it is not a number.
-    """
+
+    `anchor_frames` is the length of that replay, and it is a REACHABILITY
+    limit, not a tuning knob: `find_anchor` needs the contact cluster to be
+    followed by `quiet_frames` of silence inside the trace, so a move whose
+    contact frame exceeds `anchor_frames - quiet_frames` is reported as
+    `connected=False` — indistinguishable, in the printed map, from a move
+    that does not reach. Measured: Baraka's close LP is a THROW that contacts
+    at frame 40, which the shipped default (48 − 20 = 28) reported as a whiff;
+    at `anchor_frames=90` it is 34 damage, unblockable, and it knocks down.
+    Reptile's own close-LP throw contacts at frame 48 and is past the default
+    too. Raise it whenever a map cell says "—" at the collision floor, where
+    a whiff is the least likely explanation."""
     out: Dict[Tuple[str, str], ContactScan] = {}
     for rung in rungs:
         rig = make_rig(
@@ -144,7 +157,7 @@ def connect_map(
             scan = scan_contact(
                 session, rig=rig, spec=spec, gap_px=rung.gap_px,
                 contact_read=contact_read, defender_guard=False,
-                victim_y_read=victim_y_read,
+                victim_y_read=victim_y_read, anchor_frames=anchor_frames,
             )
             out[(spec.label, rung.arena)] = scan
     return out
@@ -187,6 +200,7 @@ def measure_ladder(
     max_search: int = DEFAULT_MAX_SEARCH,
     repeats: int = 1,
     victim_y_read=None,
+    anchor_frames: int = DEFAULT_ANCHOR_FRAMES,
     on_progress=None,
 ) -> Tuple[List[CellMeasurement], List[str]]:
     """Measure every cell, returning the measurements and the REFUSALS.
@@ -215,6 +229,7 @@ def measure_ladder(
                 latencies=latencies, observables=observables,
                 max_search=max_search, variant=variant, scans=pre,
                 victim_y_read=victim_y_read, repeats=repeats,
+                anchor_frames=anchor_frames,
             )
         except ProbeError as exc:
             refusals.append(f"{spec.label}@{rung.gap_px}px [{variant}]: {exc}")
@@ -372,6 +387,13 @@ def main() -> None:  # pragma: no cover - the live-rig path
                          "the default stand would store FAF nowhere and say "
                          "nothing about why.")
     ap.add_argument("--max-search", type=int, default=DEFAULT_MAX_SEARCH)
+    ap.add_argument("--anchor-frames", type=int, default=DEFAULT_ANCHOR_FRAMES,
+                    help="frames of contact-signal watching per anchor replay. "
+                         "A move whose contact frame exceeds this minus the "
+                         "profile's quiet_frames is reported as a WHIFF — the "
+                         "shipped 48 hides every MK2 throw (Baraka's contacts "
+                         "at f40, Reptile's at f48). Raise it when a cell reads "
+                         "'—' at the collision floor.")
     ap.add_argument("--repeats", type=int, default=1,
                     help="evaluations per actionable(N); >1 requires them to "
                          "agree and raises otherwise (docs/frames.md §7)")
@@ -426,6 +448,7 @@ def main() -> None:  # pragma: no cover - the live-rig path
             session, specs=specs, rungs=rungs, guard_buttons=guard,
             contact_read=contact_read, quiet_frames=quiet,
             walk_directions_by_port=wdbp, victim_y_read=victim_y_read,
+            anchor_frames=args.anchor_frames,
         )
         for rung in rungs:
             row = [f"{rung.gap_px:>4}px"]
@@ -483,7 +506,8 @@ def main() -> None:  # pragma: no cover - the live-rig path
         observables=observable_names, quiet_frames=quiet,
         walk_directions_by_port=wdbp, ranges=ranges, scans=cmap or None,
         faf_at_px=floor_px, max_search=args.max_search, repeats=args.repeats,
-        victim_y_read=victim_y_read, on_progress=print,
+        victim_y_read=victim_y_read, anchor_frames=args.anchor_frames,
+        on_progress=print,
     )
 
     core_id, rom_id = compute_core_id(args.core), compute_rom_id(args.rom)

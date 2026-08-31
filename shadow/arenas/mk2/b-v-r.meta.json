@@ -1,0 +1,20 @@
+{
+  "format": "arena-meta-v1",
+  "family": "mk2",
+  "port": "arcade",
+  "char_id_block1": 3,
+  "char_id_block2": 9,
+  "health_block1": 161,
+  "health_block2": 161,
+  "gate_open": true,
+  "inputs_live": {
+    "p0": true,
+    "p1": true
+  },
+  "gap_px": 192,
+  "x_block1": 469,
+  "x_block2": 661,
+  "stage": "dead pool",
+  "provenance": "task A1, 2026-08-30. Built from a COLD BOOT on MCP 4072 (never 4025): CMOS screen -> 8x select (coin) -> start on port 0 -> start on port 1 -> both cursors on the CHOOSE YOUR FIGHTER grid -> P1 down,down,right to Baraka (block1+0x0 read 3 at the cursor) with P2 left on its default Reptile (9) -> HP to lock both -> 180 settle frames after the health bars filled. Liveness re-verified after saving: port 0 `right` moved block1 x 469->526 over 20 frames while block2 stayed at 661; port 1 `left` moved block2 661->613 while block1 stayed at 469; a fresh load reproduced 469/661 and both char ids exactly. obj+0x3E == block+0x0 on both fighters.",
+  "saved_at": "2026-08-30T23:01:00Z"
+}
