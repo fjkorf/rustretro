@@ -206,6 +206,12 @@ def main() -> None:  # pragma: no cover - the live-rig path
     ap.add_argument("--game", default="library/mk2")
     ap.add_argument("--cell", action="append", default=[],
                     help="MOVE[:crouch]:ARENA — repeatable")
+    ap.add_argument("--anchor-frames", type=int, default=48,
+                    help="frames watched per replay. A move contacting later "
+                         "than this minus the profile's quiet_frames reads as a "
+                         "whiff in ALL THREE stances and classifies as NULL — "
+                         "which is how Baraka's f40 throw first looked. 90 is "
+                         "enough for every MK2 throw measured so far.")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -233,7 +239,7 @@ def main() -> None:  # pragma: no cover - the live-rig path
         g = measure_guard_height(
             session, spec=spec, rung=rung, contact_read=contact_read,
             guard_buttons=guard, quiet_frames=flspec.quiet_frames,
-            walk_directions_by_port=wdbp,
+            walk_directions_by_port=wdbp, anchor_frames=args.anchor_frames,
         )
         print(f"{g.move:>4} @ {g.gap_px}px  open={g.damage_open!r} "
               f"stand={g.damage_standing!r} crouch={g.damage_crouching!r} "

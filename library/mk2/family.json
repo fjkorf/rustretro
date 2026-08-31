@@ -4,18 +4,18 @@
   "roster": [
     { "id": 0, "name": "kunglao", "select_slot": 1 },
     { "id": 1, "name": "liukang", "select_slot": 0 },
-    { "id": 2, "name": "johnnycage", "select_slot": null },
-    { "id": 3, "name": "baraka", "select_slot": null },
-    { "id": 4, "name": "kitana", "select_slot": null },
-    { "id": 5, "name": "mileena", "select_slot": null },
-    { "id": 6, "name": "shangtsung", "select_slot": null },
-    { "id": 7, "name": "raiden", "select_slot": null },
-    { "id": 8, "name": "subzero", "select_slot": null },
-    { "id": 9, "name": "reptile", "select_slot": null },
-    { "id": 10, "name": "scorpion", "select_slot": null },
-    { "id": 11, "name": "jax", "select_slot": null }
+    { "id": 2, "name": "johnnycage", "select_slot": 2 },
+    { "id": 3, "name": "baraka", "select_slot": 9 },
+    { "id": 4, "name": "kitana", "select_slot": 6 },
+    { "id": 5, "name": "mileena", "select_slot": 8 },
+    { "id": 6, "name": "shangtsung", "select_slot": 5 },
+    { "id": 7, "name": "raiden", "select_slot": 11 },
+    { "id": 8, "name": "subzero", "select_slot": 4 },
+    { "id": 9, "name": "reptile", "select_slot": 3 },
+    { "id": 10, "name": "scorpion", "select_slot": 10 },
+    { "id": 11, "name": "jax", "select_slot": 7 }
   ],
-  "_roster_provenance": "all 12 selectable ids read live from block1+0x0 at character select, 2026-08-29 (mk2.md). 0xFF = no selection. BOSSES (kintaro, shaokahn) are NOT in this list and their ids are unknown — the id space does not stop at 11; read block2+0x0 during a 1P ladder boss fight to map them.",
+  "_roster_provenance": "all 12 selectable ids read live from block1+0x0 at character select, 2026-08-29 (mk2.md). 0xFF = no selection. BOSSES (kintaro, shaokahn) are NOT in this list and their ids are unknown — the id space does not stop at 11; read block2+0x0 during a 1P ladder boss fight to map them. select_slot completed 2026-08-30 (task A1) by walking P1's cursor over the whole 4x3 CHOOSE YOUR FIGHTER grid and reading block1+0x0 at every cell; slot = row*4 + col, reading order left-to-right from the top-left. The two slots that were already filled in (liukang 0, kunglao 1) came out identical, which is the cross-check. Measured grid, by row: [liukang, kunglao, johnnycage, reptile] / [subzero, shangtsung, kitana, jax] / [mileena, baraka, scorpion, raiden].",
   "move_classes": [
     "Neutral", "Forward", "Back", "Up", "Down",
     "UpForward", "UpBack", "DownForward", "DownBack"
@@ -33,6 +33,12 @@
       { "name": "sai_throw",     "tags": ["special", "projectile", "charge"] },
       { "name": "teleport_kick", "tags": ["special", "side_swap"] },
       { "name": "roll",          "tags": ["special", "low", "knockdown", "side_swap"] }
+    ],
+    "baraka": [
+      { "name": "blade_swipe",     "tags": ["special", "chord"] },
+      { "name": "blade_spark",     "tags": ["special", "projectile"] },
+      { "name": "double_kick",     "tags": ["special", "proximity", "rate_limited"] },
+      { "name": "blade_shredder",  "tags": ["special"] }
     ]
   }
 }

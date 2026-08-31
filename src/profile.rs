@@ -2058,7 +2058,15 @@ mod tests {
         // real requirement.
         assert_eq!(sai_throw[0].min_frames, Some(34));
         assert_eq!(sai_throw[1].release, vec!["HP"]);
-        assert_eq!(p.all_specials().len(), 7);
+        // Membership, not a count. This assertion has now broken twice
+        // because the lab did its job and encoded another character's kit;
+        // a test that fails on success trains people to edit the number
+        // until it passes. What must hold is that every declared special
+        // survives compilation with a non-empty step list.
+        assert!(p.all_specials().len() >= 7, "the shipped specials are present");
+        for (name, steps) in p.all_specials() {
+            assert!(!steps.is_empty(), "{name} compiled to no steps");
+        }
         // The arcade contact signal is the per-fighter `action_counter`
         // FIELD (quiet while guarding, fires on blocked contact even at zero
         // chip — live-verified). hitstun_sources stays as the health-delta

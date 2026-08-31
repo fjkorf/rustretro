@@ -193,3 +193,48 @@ class MeasureLadderTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class ConnectMapAnchorFramesTest(unittest.TestCase):
+    """A LATE-contacting move is not a whiff, and the map used to say it was.
+
+    `find_anchor` needs `quiet_frames` of silence after the contact cluster
+    INSIDE the trace, so the reachable contact window is
+    `anchor_frames - quiet_frames` — 28 frames at the shipped defaults. Live on
+    MK2 arcade that is narrower than the game: Baraka's close LP is a throw
+    that contacts at frame 40 (34 damage, unblockable, knocks down) and the
+    connect map printed it as `—`, the same glyph a genuine whiff gets.
+    Reptile's own close-LP throw contacts at frame 48. The map is now given
+    the window as an argument so the operator can widen it, and this pins that
+    it is the window and not the move that decides.
+    """
+
+    def _map(self, anchor_frames):
+        game = FakeGame()
+        game.STARTUP = 40          # a throw-shaped move, not a jab
+        s = make_session(game)
+        rung = ladder.Rung(arena="fake.state", gap_px=62, gap_walk_frames=60)
+        return ladder.connect_map(
+            s, specs=[PUNCH], rungs=[rung],
+            guard_buttons=(FakeGame.GUARD,), contact_read=contact_read,
+            quiet_frames=20, walk_directions_by_port=DIRS,
+            anchor_frames=anchor_frames,
+        )[("HP", "fake.state")]
+
+    def test_a_late_contact_is_invisible_inside_the_default_window(self):
+        scan = self._map(ladder.DEFAULT_ANCHOR_FRAMES)
+        self.assertFalse(scan.connected)
+        self.assertIsNone(scan.damage)
+
+    def test_the_same_move_is_measured_once_the_window_is_wide_enough(self):
+        scan = self._map(90)
+        self.assertTrue(scan.connected)
+        self.assertEqual(scan.contact_frame, 41)   # the fake's STARTUP is 0-relative
+        self.assertEqual(scan.damage, 11)
+        self.assertEqual(scan.hits, 1)
+
+    def test_the_window_is_not_silently_widened_for_the_operator(self):
+        # §7: no silent caps, in both directions. The default is unchanged, so
+        # every previously-measured row stays comparable; widening is an
+        # explicit act that the run's own provenance records.
+        self.assertEqual(ladder.DEFAULT_ANCHOR_FRAMES, 48)

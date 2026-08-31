@@ -2578,3 +2578,934 @@ python -m shadow_train.framelab.specials \
   --rung 0 --rung 10 --rung 20 --rung 33 --rung 35 --rung 40 \
   --charge-probe --db shadow/framelab/frames.db
 ```
+
+## Baraka: the four moves that broke the DSL (2026-08-30, task A1)
+
+Mileena's audit found mis-transcribed inputs. Baraka's four published moves
+are all real and all now verified — but three of them need vocabulary the
+macro DSL does not have, and the fourth resolved the one rule
+`MACRO_ACTIONS` §11 recorded and could not explain. The encodings are the
+smaller half of this section; the specification in "What the DSL must gain"
+is the larger one.
+
+### Rig — built, because none existed
+
+No committed arena and no recording had Baraka in it. `shadow/arenas/mk2/
+b-v-r.state` was built from a **cold boot** on MCP port **4072** (4025 never
+touched): CMOS screen → 8 × `select` (coin) → `start` on port 0 → `start` on
+port 1 → both cursors live on CHOOSE YOUR FIGHTER → P1 `down, down, right`
+onto **Baraka** → an attack button to lock. **`start` does NOT lock a pick
+here** — two `start` presses left both cursors sitting on the grid, and
+tapping `y` (HP) locked *both* sides at once. P2 was left on its default
+Reptile. (mk2.md's earlier "a `start` press locks P1's pick, this needed 1-6
+retries" was written from a 1P flow; in a 2-human select `start` is not the
+confirm button at all, which is a simpler explanation than flaky presses.)
+
+**Baraka = char_id 3**, read at the cursor and again in the fight, with
+Reptile reading 9 in the same reads — the same corroboration standard as the
+rest of the roster. `block1` x 469, `block2` x 661, **192 px apart**, both at
+161 health, Dead Pool stage. Liveness verified after saving: port 0 `right`
+moved block1 469 → 526 over 20 frames while block2 stayed at 661, port 1
+`left` moved block2 661 → 613 while block1 stayed at 469, and a fresh load
+reproduced 469/661 and both char ids exactly. `obj+0x3E == block+0x0` on
+both fighters, every load.
+
+**Free by-product: `select_slot` is now complete for all 12 fighters.**
+Walking P1's cursor over the whole grid and reading `block1+0x0` at every
+cell gives, by row: `[liukang, kunglao, johnnycage, reptile]`,
+`[subzero, shangtsung, kitana, jax]`, `[mileena, baraka, scorpion, raiden]`
+— `slot = row*4 + col`. The two slots family.json already carried (liukang
+0, kunglao 1) came out identical; that is the cross-check.
+
+### Baraka's own spacing, measured on this rig
+
+His walk-in ladder (port 0 holding `right` for K frames from the base
+arena), and what each of his bare normals does there — this is the whiff map
+every verdict below is anchored on. Nothing of Reptile's or Mileena's
+transfers; his walk is ~3.0 px/frame and his floor against Reptile is 63 px.
+
+| K | gap | bare HP | bare HK | bare LP |
+|---|---|---|---|---|
+| 0 | 192 | — | — | — |
+| 20 | 132 | — | — | — |
+| 25 | 117 | — | — | — |
+| 30 | 102 | — | **32** | — |
+| 35 | 87 | **11** | 32 | **8** |
+| 40 | 72 | 11 | 32 | 8 |
+| 42 | 66 | 11 | 32 (far, contact f8) | 8 |
+| 43+ | 63 (floor) | 24 (close) | 16 (close, contact f11) | 34 (throw, contact f40) |
+
+### Verdicts
+
+| move | published | shipped | verdict | signature |
+|---|---|---|---|---|
+| `blade_swipe` | `B + HP` | `[{dirs:["back"], press:["HP"], frames:3}]` | **VERIFIED** | 32 dmg at **102 px**, contact 10 frames after the chord's first frame — a range at which *every* Baraka normal whiffs. Screenshot: the arm blade extends all the way across and lands on Reptile's head. |
+| `blade_spark` | `D B HP` | `D` · `B` · `HP`, 3f steps | **VERIFIED** | 24 dmg at **192 px** (only a projectile reaches), contact 24 frames after the HP onset. Screenshot: a purple energy bolt leaves the blades. |
+| `double_kick` | *(close, quickly)* `HK HK` | `HK` (9f) · `HK`, + two keys the DSL lacks | **VERIFIED** | **2 hits, 16 + 10 = 26**, at a starting gap ≤ 64 px, with the second press 11–16 frames after the first. The second kick's contact is **5** frames after its own press, against 7 for a far HK and 10 for a close one — a distinct move, not a repeat of the normal. |
+| `blade_shredder` | `B B B LP` | `B` · `B` · `B` · `LP`, 3f steps | **VERIFIED** | **40 dmg**, contact **6** frames after the LP onset. Identified by damage and startup rather than by reach (see the note below): at the same 97 px trigger gap the LP normal does 8 at +10, HK 32 at +7, LK 26 at +7, HP and Block nothing, and the close throw does 34 at +39 — no other Baraka input on this rig produces 40, and none produces contact at +6. Screenshot: a low lunging double-blade stab. |
+
+All four were then played exactly the way `src/macros.rs::MacroExec` plays a
+macro — each step's mask held for its `frames`, `STEP_GAP = 2` neutral frames
+between steps — **3/3 each**, against 5–6 negative controls per move (no
+input, bare button, wrong button, wrong direction, one tap short, held
+instead of tapped, too-early and too-late repeats). **Zero controls leaked.**
+
+### The §11 exemption, resolved: there is no such thing as a single-frame chord
+
+`MACRO_ACTIONS` §11 records that a direction chorded with its trigger on the
+same frame does not register, with two measured exemptions it explicitly
+declined to explain: "single-frame chords are exempt" (Reptile's slide) and
+"`force_ball`'s two-button chord fires anyway". **Both readings were wrong,
+and for different reasons.**
+
+**A chord special needs the direction and the button down TOGETHER for at
+least two consecutive frames.** Measured on Blade Swipe at 102 px, where
+nothing else connects:
+
+| `back+HP` held for | 1 | 2 | 3 | 4 | 5 | 8 | 12 |
+|---|---|---|---|---|---|---|---|
+| damage | 0 | 32 | 32 | 32 | 32 | 32 | 32 |
+
+and reproduced **independently on Reptile's slide** (`back+LK+LP+Block` on
+`m-v-r.state`, 192 px): 1 frame → 0, 2–12 frames → 13 damage every time. The
+slide has always shipped `frames: 8`; it was never a single-frame chord, and
+it does not work as one. §11's first exemption described a hold length nobody
+had varied.
+
+Three further results pin the mechanism, all at 102 px:
+
+- **It is the CONJUNCTION that needs two frames, not the direction.** Back
+  held for 1, 3 or 5 frames and *then* joined by HP for exactly one frame:
+  **0 damage, 3/3**. The same prefixes joined by HP for two frames: 32, 3/3.
+  Reproduced on the slide (back held 5 frames, chord 1 frame → 0; chord 2
+  frames → 13).
+- **The trigger is not the button's rising edge.** `HP` pressed one frame
+  *before* back, then `back+HP` held two frames, **fires** (32). Order of
+  arrival is irrelevant; only two frames of overlap matter.
+- **The direction must still be down at the press.** `B` · `HP` sequential,
+  at neutral gap 0 and at gap 2, produces a *normal* — 0 at 102 px, and 11
+  (the far HP) at 72 px. §11's "the direction need not still be held at the
+  press" is a statement about MOTION specials and does not carry over.
+
+**`force_ball` is not an exemption either.** Its `B . B+HP+LP` fires with the
+chord held a single frame — because that chord's `back` is the **second tap
+of a `B,B` motion**, not a held-direction chord. The controls say so: `B .
+HP+LP` = 0, `HP+LP` alone = 0, `F . HP+LP` = 0, `B . F . HP+LP` = 0, `B .
+F+HP+LP` = 0, `B . D+HP+LP` = 0, and `B+HP+LP` as a lone chord = 0 at every
+hold length 1–8. The move genuinely needs two backs and the chorded one
+genuinely counts as the second.
+
+### What is left of the exemption: chorded FINAL taps are per-move
+
+Which leaves a real, still-unexplained split — whether a motion special
+accepts its **last direction tap chorded with the trigger**. Six measured
+cases, four of them re-measured or newly measured here:
+
+| move | motion | trigger | last tap chorded |
+|---|---|---|---|
+| reptile `force_ball` | B, B | HP+LP | **fires** |
+| reptile `acid_spit` | F, F | HP | does not |
+| mileena `teleport_kick` | F, F | LK | **fires** |
+| mileena `roll` | B, B, D | HK | does not |
+| baraka `blade_spark` | D, B | HP | does not |
+| baraka `blade_shredder` | B, B, B | LP | **fires** |
+
+Neither "repeated direction" nor "back-only" survives that table (`acid_spit`
+kills the first, `blade_spark` and `teleport_kick` kill the second). The one
+predicate that fits all six is **the trigger contains a LOW attack button**:
+LP or LK accept the chorded tap, HP or HK alone do not, and `force_ball`'s
+`HP+LP` contains LP. That is a hypothesis with a 6/6 fit and **no mechanism**
+— recorded as such rather than promoted. It is falsified by any LP/LK-trigger
+move that rejects a chorded tap, or any HP/HK-trigger move that accepts one;
+whoever finds either should say so here.
+
+It could not be tested by adding LP to `blade_spark`'s trigger, because
+`HP+LP` is its own trigger class on this port: `D . B . HP+LP` = 0 and
+`B . B . B+LP+HP` = 8 (a normal). Adding a button does not weaken a trigger,
+it replaces it.
+
+### Timing, measured — and none of it is expressible today
+
+Every number below was bisected with 3 repeats at the boundary, on the rung
+named, with the confound named.
+
+**`double_kick`'s "quickly" is an ONSET-TO-ONSET window of 11–16 frames.**
+At the floor (63 px), varying the neutral gap between two 3-frame HK steps:
+
+| onset-to-onset | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 |
+|---|---|---|---|---|---|---|---|---|---|
+| hits | 1 | 1 | **2** | 2 | 2 | 2 | 2 | **2** | 1 |
+
+10 fails 3/3, 11 fires 3/3, 16 fires 3/3, 17 fails. **It is invariant under
+the first press's hold length**: holds of 1, 2, 3, 5 and 8 frames with the
+gap compensated to keep onset-to-onset at 13 all give the identical 2-hit
+result (16 + 10, contacts at f11 and f19), and the same five holds at
+onset-to-onset 9 all fail. So the controlling quantity is the interval
+between the two presses' **onsets**, not the neutral gap between steps — the
+gap is an executor artifact, the onset interval is the game's rule.
+
+**`blade_spark` is capped by TOTAL SPAN, not by a per-step gap.** From the
+first direction onset to the trigger onset, at 192 px:
+
+| span | 6 | 15 | 16 | 17 | 18 | 20 | 22 | 26 |
+|---|---|---|---|---|---|---|---|---|
+| fires | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+
+Bisected from both ends independently — stretching only `D`→`B` (span 16 ✓,
+17 ✗) and stretching only `B`→`HP` (span 16 ✓, 17 ✗) — and confirmed by two
+configurations that keep every *individual* interval well inside its own
+limit and still fail: `[9, 9]` (span 18) and `[13, 7]` / `[7, 13]` (span 20)
+are all misses, while `[13, 3]` and `[3, 13]` (span 16) both fire. **§2's
+`max_gap` of 12 frames per step would admit a 24-frame span this move
+refuses.**
+
+**`blade_shredder` needs BOTH a per-step cap and a span cap.** Its three back
+taps must be ≤ 13 frames apart onset-to-onset (14 fails), its last direction
+→ LP interval may be as long as 28 frames (29 fails), and the whole macro
+must span ≤ 34 frames:
+
+| intervals | span | result |
+|---|---|---|
+| `[3, 3, 28]` | 34 | fires |
+| `[3, 3, 29]` | 35 | miss |
+| `[13, 13, 8]` | 34 | fires |
+| `[13, 13, 9]` | 35 | miss |
+| `[14, 14, 3]` | 31 | **miss** — span is fine, the direction interval is not |
+| `[9, 9, 9]` | 27 | fires |
+
+The last row is what forces two separate rules: a span cap alone would have
+admitted `[14, 14, 3]`, and a per-step cap alone would have admitted
+`[3, 3, 29]`.
+
+**Fresh onsets are required, and 2 neutral frames is what makes one.** Back
+held continuously for 9 or 11 frames then LP → 8 damage (a normal). The three
+taps at neutral gap 0 or 1 → 8. At gap 2 (onset-to-onset 3, with 1-frame
+taps) → 40. This is the §2 matcher's "fresh direction onset per step"
+requirement, confirmed for a three-repeat motion.
+
+**`double_kick`'s "close" is the game's own proximity-normal switch.** Gaps
+built by walking BOTH ports (port 0 right, port 1 left) so the ladder is not
+quantised to Baraka's 3 px stride:
+
+| gap at the first press | 61 | 62 | 63 | 64 | 65 | 66 | 67 | 69 | 72 |
+|---|---|---|---|---|---|---|---|---|---|
+| `HK HK` | 2 hits | 2 | 2 | **2** | **1** | 1 | 1 | 1 | 1 |
+| bare `HK` | 16 @f11 | 16 | 16 | 16 | **32 @f8** | 32 | 32 | 32 | 32 |
+
+**≤ 64 px available, ≥ 65 px not** — and the boundary is *exactly* the frame
+at which the bare HK stops being the close variant (16 damage, 10-frame
+startup) and becomes the far one (32 damage, 7-frame startup). The follow-up
+links off the CLOSE kick only. At 66 px no inter-press interval works at all
+(swept 4, 6, 8, 10, 12, 14, 16, 20, 25, 30 — every one gives a single 32).
+The gap that matters is the one at the **first** press: at 63 px the first
+kick pushes Reptile out to 69 px before the second press and the link still
+fires.
+
+**"Came out and whiffed" and "did not come out" are NOT distinguishable by
+`action_counter`.** `block+0xC0` fires twice in *every* `HK HK` trial — at 63
+px and at 192 px, inside the timing window and outside it. Both presses always
+start an action; what changes is whether the second one is the linked kick or
+an ordinary roundhouse. Only the two-hit damage signature and the 5-frame
+startup separate them, which is why the DSL needs to express the precondition
+rather than hoping a counter will report it.
+
+### Hazard: never measure a special at its reach boundary
+
+Blade Swipe at 117 px is *not reproducible*, and the way it fails is worth
+knowing because it looks exactly like a real result. Holding the rig, the
+positions and the macro byte-identical and varying only the number of idle
+frames between the walk-in and the chord:
+
+| settle frames | 0 | 1–8 | 9 | 10 | 11 |
+|---|---|---|---|---|---|
+| damage | 32 | 0 | 32 | 32 | 32 |
+
+The defender's idle animation moves his hurtbox in and out of the blade's
+last pixel. Worse, the phase reference **drifts across a session**: the same
+`settle=3` trial that fired for 32 damage in eight consecutive configurations
+early in this session produced 0 damage six times in a row an hour later,
+from the same save state, with `block1` x = 544 and `block2` x = 661 in both
+— the whole batch that first "verified" the swipe at 117 px no longer
+reproduces. `load_state`
+does not restore whatever carries that phase. Every verdict above was
+therefore re-measured at a rung well inside the connect region (102 px for
+the swipe, 192 px for the spark, 97 px for the shredder, the floor for the
+double kick), where the result is phase-independent (4/4 across settle 0, 3,
+6, 9). **Sitting a special on its whiff edge buys a boundary number and costs
+the whole measurement.**
+
+### Disproven readings — do not re-derive these
+
+- **`blade_swipe` as a MOTION (`B` · `HP`) — DISPROVEN.** 0 damage at 102 px
+  and at 117 px, at neutral gap 0 and 2; at 72 px it produces exactly the far
+  HP normal (11). The back must be held *at* the press.
+- **`blade_swipe` as a one-frame chord — DISPROVEN**, 3/3, and the same for
+  Reptile's slide. See above.
+- **`blade_spark` chorded (`D` · `B+HP`) — DISPROVEN**, 0 damage; also 0 with
+  `B+HP+LP` and `B+HP+LK`, and 0 for `D+HP` · `B+HP`. The two-button chord is
+  not the mechanism that rescues `force_ball`.
+- **`blade_spark` with one direction — DISPROVEN.** `D` · `HP` = 0,
+  `B` · `HP` = 0, `D` · `F` · `HP` = 0, `D` · `B` · `LP` = 0 at 192 px.
+- **`double_kick` at `STEP_GAP = 2` — DISPROVEN**, and this one matters
+  because it is what the executor does by default: two 3-frame HK steps
+  separated by 2 neutral frames put the second press 5 frames after the
+  first, which is inside the first kick's startup, and the result is a single
+  close HK (16 damage) indistinguishable from pressing HK once. The shipped
+  encoding uses `frames: 9` on the first step purely to push the second onset
+  to +11.
+- **`blade_shredder` with two backs, or with a held back — DISPROVEN.**
+  `B` · `B` · `LP` = 8 (far LP normal); `B` held 9 or 11 frames then `LP` = 8;
+  three taps at neutral gap 0 or 1 = 8. Three *fresh* back onsets are the
+  move.
+- **`blade_shredder` with a substituted direction — DISPROVEN.**
+  `B` · `B` · `F` · `LP`, `B` · `F` · `B` · `LP` and `B` · `B` · `D` · `LP`
+  all give 8. Three *identical* backs.
+- **`MACRO_ACTIONS` §11's "every motion special fails at gap 1" — CORRECTED,
+  not disproven.** It holds for REPEATED-direction motions, where gap 0 and 1
+  merge the two taps into one hold. `blade_spark` is `down` then `back` — two
+  *different* directions, nothing to merge — and it fires at neutral gap 0
+  and 1 as well as 2 (24 damage, 192 px, contact simply arrives earlier).
+  `STEP_GAP = 2` is still the right executor constant because it is the one
+  value that works for both kinds; the claim that motion specials fail at gap
+  1 should be narrowed to repeated directions.
+
+### What the DSL must gain
+
+Three step-scoped keys, all optional, all no-ops when absent, none of which
+requires changing the shape of a macro (a macro stays a **list of steps**, so
+`Vec<StepSpec>` and the Python compiler keep deserialising). They are already
+shipped in `mk2.profile.json` under `baraka`, where both loaders currently
+ignore them.
+
+**1. `onset_after: [min, max]`** — the number of frames between the PREVIOUS
+step's first frame and THIS step's first frame, inclusive, replacing §2's
+single implicit `max_gap` for the steps that need it.
+
+```jsonc
+{ "press": ["HK"], "frames": 3, "onset_after": [11, 16] }
+```
+
+Justified by: `double_kick` fires at onset-to-onset 11–16 and at nothing
+else, 3 repeats at each of the four boundary values, invariant under the
+first press's hold length (1/2/3/5/8). **Matcher**: reject a completion whose
+step onsets fall outside the interval. **Executor**: choose the neutral gap
+so the onset lands inside it, instead of always emitting `STEP_GAP`. Note
+that today's `STEP_GAP = 2` cannot play this move at all — the encoding
+compensates with `frames: 9`, which is a workaround, not a fix.
+
+**2. `max_span_frames: N`** on the step that completes the macro — the
+maximum number of frames from the FIRST step's onset to this one's.
+
+```jsonc
+{ "press": ["HP"], "frames": 3, "max_span_frames": 16 }
+```
+
+Justified by: `blade_spark` fires at span ≤ 16 and fails at ≥ 17, bisected
+independently from both ends, with `[9,9]` and `[13,7]` and `[7,13]` failing
+despite every individual interval being legal; `blade_shredder` fires at span
+≤ 34 and fails at ≥ 35, from two different interval shapes. A per-step
+`max_gap` cannot express either, and §2's 12 frames per step is *looser* than
+both moves allow. Both `max_span_frames` and `onset_after` must be checked —
+`blade_shredder`'s `[14, 14, 3]` (span 31, legal) fails on the per-step rule
+while `[3, 3, 29]` (every interval legal) fails on the span rule.
+
+**3. `requires: { gap_px_max: N }`** on the step it gates — a precondition
+evaluated at that step's onset against the live `|opp.x − me.x|` the matcher
+and executor already resolve for facing.
+
+```jsonc
+{ "press": ["HK"], "frames": 9, "requires": { "gap_px_max": 64 } }
+```
+
+Justified by: `double_kick` at ≤ 64 px produces its two hits and at ≥ 65 px
+produces nothing but a far normal, at every inter-press interval tried. It is
+the first move whose *validity* depends on distance rather than its outcome,
+and it needs three consumers to agree:
+
+- **the matcher** must not annotate `double_kick` for a player who pressed
+  `HK HK` in rhythm at 120 px — he pressed the input, the move did not exist;
+- **the block-punish dummy** (§6) must not offer `double_kick` in its option
+  pool when the gap is outside the precondition, or its punish silently
+  becomes a whiffing normal;
+- **the label space** (§4) should keep the move as a family-level label
+  regardless — a character who *can* double-kick has the label even in rounds
+  where he was never close enough to use it.
+
+`gap_px_max` is deliberately the only comparator this needs today; a future
+`gap_px_min` (for moves that require space) should reuse the same block
+rather than inventing a second key.
+
+**What must NOT be added.** A `close`/`far` boolean. The threshold is a
+measured pixel count that coincides with this port's proximity-normal switch
+for *this* button — 64 px for Baraka's HK against Reptile — and it is a
+property of the two bodies, not a mode. `docs/frames.md` §5's gap keys are
+the right unit and the measurement already produces them.
+
+### Cost
+
+Eighteen live batches, ~250 macro trials plus the rig build, on one headless
+process at `--pace 0`; the whole audit ran in under four minutes of emulated
+time. The identification screenshots (blade extended, purple bolt, two kicks,
+lunging stab) were taken frame-exactly through the same paused-step protocol.
+
+**One Rust change this data REQUIRES and which task A1 was scoped out of
+making:** `src/profile.rs:2061` asserts
+`assert_eq!(p.all_specials().len(), 7)`. With Baraka's four encodings shipped
+the count is **11**. That single integer is the only thing standing between
+this profile and a green `cargo test --profile release-dev`; nothing else in
+the suite enumerates specials.
+## Baraka's ladder and his normals (2026-08-31, task A3)
+
+His own spacing ladder, generated from a fresh 2-human
+`shadow/arenas/mk2/b-v-r.state`, and every standing and crouching normal
+measured across it on hit AND on block. Neither existing ladder transfers and
+neither was reused: the walk curve is a property of the character walking and
+the collision floor of the two bodies, and both came out different again —
+**63 px here, against 62 for the Reptile mirror and 61 for Mileena-vs-Reptile.
+Three matchups, three floors.**
+
+This was run as the CONVERGENCE TEST: Mileena's run surfaced four corrections
+to the measurement contract, and the question this task asked was whether a
+third character surfaces none. It surfaced **two**, and one of them is a
+property of the GAME rather than of the protocol — Baraka's walk cannot be
+aborted for its first 13 frames, which breaks the shipped liveness probe and
+makes the ladder's K → px curve discontinuous. Details in "What this run says
+`docs/frames.md` still gets wrong", below.
+
+### Rig
+
+Baraka = `block1`, port 0, char_id **3**, on the LEFT; Reptile = `block2`,
+port 1, char_id 9. Both ports human-live, re-verified after every load.
+Headless FBNeo, `--pace 0`, MCP port 4073 (ladder + the kit) and 4074 (guard
+heights, punish rigs, determinism, and a cold-process re-measure). Never 4025.
+Contact anchored on the fighter-struct health `block+0x0E` (§4.1), one anchor
+per rig.
+
+**The rig had to be built from scratch — no arena or recording had Baraka.**
+Cold boot → past the CMOS screen → 4 coins on `select` → `start` on port 0 →
+`start` on port 1 (this is what makes it 2-human; a single start gives a
+1P-vs-CPU rig, the confusion §4.2 records as having wasted two earlier
+sessions) → P1's cursor `down, down, right` from the Liu Kang default. The
+select grid is 4 wide, not 6: row 0 = Liu Kang / Kung Lao / Johnny Cage /
+Reptile, row 1 = Sub-Zero / Shang Tsung / Kitana / Jax, row 2 = Mileena /
+**Baraka** / Scorpion / Raiden. Corroborated two ways before locking, exactly
+as mk2.md's roster reads are: the portrait/preview screenshot showed Baraka
+and Reptile, and `block1+0x0`/`block2+0x0` read `3`/`9` at the same instant.
+
+**Character select cannot be driven in wall-clock on `--pace 0`.** The first
+attempt pressed buttons with `press_buttons` and `sleep`s and watched the
+select screen TIME OUT between two presses — uncapped headless runs the
+select countdown out in a fraction of a second of host time. Everything from
+the CMOS screen onwards is therefore driven paused, with
+`hold_buttons` + `run_frames` + `release_buttons`, which is the same
+frame-exact discipline §3.3 already requires of the measurement itself.
+
+Probe-shape calibrations, measured fresh on this matchup and confirmed
+hold-limited at anchor+70 and anchor+100:
+
+| probe shape | `struct_velocity` | `pointer_x` |
+|---|---|---|
+| attacker (hit rig and block rig) | 1 | 2 |
+| defender, on hit | 1 | 2 |
+| defender, on block (drops Block, walks) | 10 | 11 |
+
+**Identical to Reptile's and to Mileena's, on all four shapes and both
+observables.** Two characters made that plausible; three make it the
+established reading — these are properties of the PORT and the probe shape,
+not of the character.
+
+### His walk: exactly 3.0 px/frame, and it CANNOT BE STOPPED for 13 frames
+
+One continuous hold from the base arena, gap read after every frame
+(`framelab.spacing.walk_curve`, `max_k=110`):
+
+| K | gap | K | gap | K | gap |
+|---|---|---|---|---|---|
+| 0 | 192 px | 15 | 150 px | 40 | 75 px |
+| 1 | 192 px | 20 | 135 px | 43 | 66 px |
+| 5 | 180 px | 25 | 120 px | **44** | **63 px** |
+| 10 | 165 px | 30 | 105 px | 60 | 63 px |
+| 11 | 162 px | 35 | 90 px | 110 | 63 px |
+
+One dead frame (K=0→1 closes nothing), then a **flat 3.0 px/frame with no
+ramp and no irregular frame at all** from K=1 to K=44, then the floor.
+`curve_segments` reports exactly three segments: `0/1 @ 0 px`, `1→44 @ 3.0`,
+`44→110 @ 0.0`. Against the other two: Reptile ~1.6 ramping to ~2.5, Mileena a
+flat 3.125 (3 px/frame with a 4 px frame every eighth). Baraka is the only one
+of the three whose curve is a single straight line.
+
+**And then the finding that is not about the curve at all.** Hold a direction
+for K frames, release it, and hold NOTHING: Baraka keeps walking.
+
+| release after | travel during hold | travel AFTER release | extra moving frames |
+|---|---|---|---|
+| 1 frame | +0 px | **+39 px** | **12** |
+| 3 frames | +6 px | +39 px | 12 |
+| 6 frames | +15 px | +39 px | 12 |
+| 10 frames | +27 px | +39 px | 12 |
+| **11 frames** | +30 px | **+3 px** | **0** |
+| 20 frames | +57 px | +3 px | 0 |
+
+The boundary is exactly between 10 and 11, and it is reproducible. The same
+measurement on the same rig shape for the other two characters, from their own
+base arenas:
+
+| character | after release, any hold length |
+|---|---|
+| Baraka (hold ≤ 10) | +39 px over 12 frames |
+| Mileena | +3 px, 0 frames |
+| Reptile | +2 px, 0 frames |
+
+So Baraka's walk has a **committed opening step of 13 frames** that a release
+cannot interrupt; the other two stop on the frame the button does. Two things
+follow, and both would have produced confident wrong numbers:
+
+1. **The shipped liveness probe reports him NOT LIVE.** `_probe_port_liveness`
+   walks 6 frames out and 6 back and requires ≥2 px of motion in each leg's own
+   direction. Baraka's back leg is swamped by the forward step still
+   completing, so the probe reads `p0=False` on a rig that is provably live
+   (per-frame: −2.15 px/frame holding `left`, +2.85 holding `right`, both
+   directions clean, 20/20 frames). Measured threshold: `probe_frames` 6 and 10
+   → FALSE; 14, 16, 20 → TRUE. This whole ladder used `probe_frames=20`.
+   Since §3 makes the lab REFUSE an arena whose sidecar does not assert
+   liveness, the shipped default would have refused to build a Baraka ladder at
+   all, for a reason that has nothing to do with liveness.
+2. **The settled K → gap curve is DISCONTINUOUS and non-monotone.** The gap a
+   rung actually starts a fight from is the SETTLED one (walk K, release, run
+   neutral frames), and it is not the continuous curve:
+
+   | K | settled gap | K | settled gap |
+   |---|---|---|---|
+   | 0 | 192 px | **10** | **126 px** |
+   | 1 | 153 px | **11** | **159 px** |
+   | 5 | 141 px | 20 | 132 px |
+   | | | 43 | 63 px |
+
+   Settled gap is `156 − 3K` for K ≤ 10 and `192 − 3K` for K ≥ 11. **Walking
+   one frame LONGER leaves him 33 px further away**, and no K reaches a settled
+   gap between 159 and 192 except K=0. Mileena's run added `settle_frames=8`
+   and verified 8 and 20 agree; 8 is not enough here — the tail is 12 frames —
+   and this ladder used 20.
+
+### His collision floor is 63 px
+
+Reached at K=44 (continuous) / K=43 (settled) and held flat to K=110: 67
+consecutive points on 63 px, so `spacing.collision_floor`'s plateau rule
+accepts it. **Unlike Mileena's, it does not oscillate**: hers swings 60–66 px
+frame to frame inside the floor while a direction is held, and walking past it
+opens the gap; his sits on 63 for 67 straight frames of held walk. The floor
+is the third distinct value in three matchups (62 / 61 / 63), which is the
+point — the profile's `framelab.spacing.collision_floor_px: 62` is one
+matchup's measurement and `ladder.py --faf-at-px` exists because of it.
+
+### The ladder as shipped
+
+`shadow/arenas/mk2/b-gap-{0,15,26,31,36,40,43}.state`, each with a `.gap.json`
+sidecar (K, achieved gap, both char ids, facing, `inputs_live` for both ports,
+`settle_frames`, `reload_after_liveness`). `settle_frames=20`,
+`reload_after_liveness=True`, `probe_frames=20`. Ks were chosen to land on
+Mileena's gaps where the two floors allow it, so the two tables are comparable
+rung for rung.
+
+| arena | K | gap | arena | K | gap |
+|---|---|---|---|---|---|
+| `b-gap-0` | 0 | 192 px | `b-gap-36` | 36 | 84 px |
+| `b-gap-15` | 15 | 147 px | `b-gap-40` | 40 | 72 px |
+| `b-gap-26` | 26 | 114 px | `b-gap-43` | 43 | **63 px** |
+| `b-gap-31` | 31 | 99 px | | | |
+
+Every rung reproduced its gap and both char ids on a fresh reload at build
+time, and again in a separate pass that re-probed liveness on both ports from
+the saved file. Every achieved gap matches the settled walk curve exactly.
+
+**Filename collision to be aware of when merging.** Task A1 (Baraka's
+specials, same wave) independently built a Baraka-vs-Reptile base arena at the
+SAME path, `shadow/arenas/mk2/b-v-r.state`, within the same minute, and its
+`.meta.json` on disk now carries A1's provenance rather than this run's. The
+two are geometrically identical and the collision is benign — verified on a
+fresh cold process at the end of this run, the file on disk loads as char ids
+(3, 9) at x 469 / 661, gap 192 px, which is exactly the base every rung here
+was walked from, and each rung independently reproduces its own gap from its
+own file (`b-gap-43` → 63 px, `b-gap-31` → 99 px, `b-gap-0` → 192 px). But two
+tasks writing one arena filename is luck, not design; a matchup base arena
+wants the task or the date in its name the way the ladder rungs carry their
+`b-` prefix.
+
+The app's own auto-written `b-gap-*.meta.json` sidecars were DELETED, for the
+reason §11 already records: they assert `inputs_live: {p0: false, p1: false}`
+— they read MK2's disproven `p1_x`/`p2_x` globals — while this module's
+`.gap.json` correctly says true/true. A wrong sidecar is worse than an absent
+one. (`b-v-r.meta.json` is KEPT: the base arena was saved while the emulator
+was running, and the app's probe got it right there — true/true, healths
+161/161, `gate_open: true`.)
+
+### The connect map
+
+One anchor replay per (move, rung), `damage@contact-frame`, `—` = the contact
+signal never fired. **Measured at `anchor_frames=90`, not the shipped 48** —
+see the throw, below.
+
+| gap | HP | LP | HK | LK | cHP | cLP | cHK | cLK |
+|---|---|---|---|---|---|---|---|---|
+| 192 px | — | — | — | — | — | — | — | — |
+| 147 px | — | — | — | — | — | — | — | — |
+| 114 px | — | — | — | 26@f8 | — | — | — | — |
+| 99 px | 11@f11 | 8@f11 | 32@f8 | 26@f8 | — | — | — | — |
+| 84 px | 11@f11 | 8@f11 | 32@f8 | 26@f8 | 40@f14 [KD] | 6@f14 | 12@f20 | 6@f16 |
+| 72 px | 11@f11 | 8@f11 | 32@f8 | 26@f8 | 40@f14 [KD] | 6@f14 | 12@f20 | 6@f16 |
+| 63 px | **24@f14** | ***34@f40 [KD]*** | **16@f11** | **16@f11** | 40@f14 [KD] | 6@f14 | 12@f20 | 6@f16 |
+
+`connect_range` (the largest CONNECTING rung — a bracket, not an edge):
+LK 114, HP 99, LP 99, HK 99, cHP 84, cLP 84, cHK 84, cLK 84.
+
+His proximity boundary for HP, HK and LK sits between 72 and 63 px, the same
+place Mileena's (71/61) and Reptile's (72/62) sit — a third character agreeing
+that MK2 resolves proximity once per input at one distance. His crouching
+normals have no boundary anywhere in the ladder (identical damage and contact
+frame at every rung they reach), so their `variant` is NULL rather than an
+invented "close".
+
+**Two differences from Mileena worth naming.** His crouching normals reach only
+to 84 px where hers reached to 99 (her cHK was the reach surprise; his is not).
+And his close HP contacts at **f14** where hers contacts at f8 — same 24
+damage, six frames slower.
+
+**`LP` at 63 px is a THROW, and the shipped connect map called it a whiff.**
+34 damage, contact at frame **40**, and the guard rig settles it: 34 against an
+open defender, 34 against a standing block, 34 against a crouching block —
+`unblockable`. It also knocks down. §1.1 gives a throw no advantage number, so
+it has no row. What matters beyond Baraka is HOW it was missed: `find_anchor`
+needs `quiet_frames` (20) of silence after the contact cluster inside the
+trace, so `DEFAULT_ANCHOR_FRAMES = 48` can only see a contact at frame ≤ 28.
+Mileena's throw contacts at f24 and squeaked in; Baraka's at f40 does not, and
+the map printed `—`, the identical glyph a genuine whiff gets. Reptile's own
+close-LP throw is recorded in mk2.md at frame 48 and is outside the window
+too. A full re-scan of all 56 (move, rung) cells at `anchor_frames=90` found
+exactly one cell the 48-frame map had hidden — this one — so nothing else in
+the table is affected. `framelab.ladder.connect_map` and both CLIs now take
+`--anchor-frames`; the default is unchanged, so every earlier row stays
+comparable.
+
+### The table
+
+Frames are relative to the contact frame. "att free"/"def free" are the frames
+at which that fighter's WALK manifests; advantage is their difference (§4.3 —
+raw manifests, no per-side calibration subtracted). Both observables
+(`block+0x0B..0x0D` walk velocity and the pointer-resolved `obj+0x12`) were
+sampled on every sweep and **agreed to the frame on all 90 sweeps**.
+
+| move | variant | gap | dmg | chip | contact f | FAF | att free | def free (hit) | def free (blk) | **on hit** | **on block** | guard | n |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| HP | far | 84 px | 11 | 3 | 11 | — | +10 | +14 | +23 | **+4** | **+13** | mid | 1 |
+| HP | far | 72 px | 11 | 3 | 11 | — | +10 | +14 | +23 | **+4** | **+13** | mid | 1 |
+| HP | close | 63 px | 24 | 6 | 14 | 14 | +24 | +46 | +19 | **+22** | **−5** | mid | 2 |
+| LP | far | 84 px | 8 | 2 | 11 | — | +10 | +14 | +23 | **+4** | **+13** | mid | 1 |
+| LP | far | 72 px | 8 | 2 | 11 | — | +10 | +14 | +23 | **+4** | **+13** | mid | 1 |
+| HK | far | 84 px | 32 | 8 | 8 | — | +39 | +46 | +23 | **+7** | **−16** | mid | 1 |
+| HK | far | 72 px | 32 | 8 | 8 | — | +39 | +46 | +23 | **+7** | **−16** | mid | 2 |
+| HK | close | 63 px | 16 | 4 | 11 | 11 | +20 | +26 | +19 | **+6** | **−1** | mid | 1 |
+| LK | far | 99 px | 26 | 6 | 8 | — | +39 | +18 | +23 | **−21** | **−16** | mid | 2 |
+| LK | far | 84 px | 26 | 6 | 8 | — | +39 | +18 | +23 | **−21** | **−16** | mid | 1 |
+| LK | far | 72 px | 26 | 6 | 8 | — | +39 | +18 | +23 | **−21** | **−16** | mid | 1 |
+| LK | close | 63 px | 16 | 4 | 11 | 11 | +20 | +26 | +19 | **+6** | **−1** | mid | 1 |
+| cHP | — | 84 px | 40 | 10 | 14¹ | — | +24 | NULL² | +23 | **NULL²** | **−1** | mid | 1 |
+| cHP | — | 72 px | 40 | 10 | 14¹ | — | +24 | NULL² | +23 | **NULL²** | **−1** | mid | 1 |
+| cHP | — | 63 px | 40 | 10 | 14¹ | 8 | +24 | NULL² | +23 | **NULL²** | **−1** | mid | 1 |
+| cLP | — | 84 px | 6 | 2 | 14¹ | — | +13 | +23 | +19 | **+10** | **+6** | mid | 1 |
+| cLP | — | 72 px | 6 | 2 | 14¹ | — | +13 | +23 | +19 | **+10** | **+6** | mid | 2 |
+| cLP | — | 63 px | 6 | 2 | 14¹ | 8 | +13 | +23 | +19 | **+10** | **+6** | mid | 1 |
+| cHK | — | 84 px | 12 | 3 | 20¹ | — | +39 | +14 | +19 | **−25** | **−20** | mid | 1 |
+| cHK | — | 72 px | 12 | 3 | 20¹ | — | +39 | +14 | +19 | **−25** | **−20** | mid | 1 |
+| cHK | — | 63 px | 12 | 3 | 20¹ | 14 | +39 | +14 | +19 | **−25** | **−20** | mid | 2 |
+| cLK | — | 84 px | 6 | 2 | 16¹ | — | +21 | +10 | +19 | **−11** | **−2** | mid | 2 |
+| cLK | — | 72 px | 6 | 2 | 16¹ | — | +21 | +10 | +19 | **−11** | **−2** | mid | 1 |
+| cLK | — | 63 px | 6 | 2 | 16¹ | 10 | +21 | +10 | +19 | **−11** | **−2** | mid | 1 |
+
+¹ replay-relative: every crouching normal has a 6-frame stance lead-in, so its
+`first_active_frame` is the contact frame minus 6. ² the uppercut LAUNCHES
+(the victim's `obj+0x16` leaves its resting y and does not return until frame
+78) and §1.1 gives a knockdown no on-hit advantage.
+
+`first_active_frame` is stored only at the 63 px rung (§4.4): **HP 14, HK 11,
+LK 11, cHP 8, cLP 8, cHK 14, cLK 10.**
+
+Every far variant is gap-INVARIANT: HK at 72/84 px, LK at 72/84/99 px, HP and
+LP at 72/84 px, and all three rows each of cHP/cLP/cHK/cLK are byte-identical
+across their rungs.
+
+**Where he differs from Mileena, move for move.** Same far punches to the
+frame (+4/+13). His far HK recovers 4 frames sooner (+39 vs +43) so it is
++7/−16 where hers is +3/−20; his far LK likewise −21/−16 against her −25/−20.
+His close kicks are a different move entirely in frame terms: att free +20
+against her +33, giving **+6/−1** where she has −7/−14. His close HP is slower
+to contact (f14 vs f8) and slightly worse (+22/−5 vs +25/−2). His cLK and his
+cHK reproduce her numbers EXACTLY (−11/−2 and −25/−20). His cLP is 3 frames
+better (+10/+6 vs +7/+3), his cHP 4 frames better on block (−1 vs −5).
+
+### Blockstun takes exactly two values for him too — the same two
+
+His defender's walk manifests at **+19** after close HP, close HK, close LK,
+cLP, cHK and cLK, and at **+23** after far HP, far LP, far HK, far LK and cHP.
+Nothing else.
+
+**So: no third value.** Blockstun on MK2 arcade is now measured across THREE
+characters and 59 (move, gap) cells — Reptile's 10, Mileena's 25 and Baraka's
+24 — and it has taken exactly two values — +19 and +23 — with the same non-alignment to distance,
+damage or button. Baraka's split is identical to Mileena's, move class for
+move class, including the oddity that the far normals (23) are stunnier than
+the close ones (19).
+
+Hitstun is the contrast, again: **+10, +14, +18, +23, +26, +46** — six values,
+and the SAME six Mileena's kit produced. It does not track damage (his
+6-damage cLK frees the victim at +10 while his 6-damage cLP holds him to +23;
+his 32-damage far HK holds to +46 while his 26-damage far LK frees at +18).
+
+**`on_hit ≥ on_block` fails again, in both directions**, exactly as §8.2
+allows: far HP and far LP are +4 on hit and **+13** on block, while close HP is
++22 on hit and −5 on block. Flag, never reject.
+
+### `guard_height`
+
+Three anchor replays per cell (`framelab.guard`): defender open, defender
+holding Block, defender holding Block+down.
+
+**Every one of Baraka's 24 row-bearing cells is `mid`**, and chip is exactly a
+quarter of the damage in all of them (40→10, 32→8, 26→6, 24→6, 16→4, 12→3,
+11→3, 8→2, 6→2). No overhead, no low; his sweep-shaped cHK is stopped by a
+standing block like everything else. The non-`mid` results are the interesting
+ones:
+
+- **LP at 63 px: `unblockable`** — 34 / 34 / 34. That is the throw, proven
+  rather than assumed (and only visible at `anchor_frames=90`).
+- **`whiffs_vs_guard` at the OUTER rung of every standing normal**: HP@99,
+  HK@99 and LK@114 reach an open defender and make no contact at all against a
+  standing-blocking one; LP@99 whiffs against a standing block but chips a
+  CROUCH-blocking one. Mileena's kit produced exactly one such cell (HP@83);
+  Baraka's produces four, one for each standing normal, all at that move's
+  outermost connecting rung. This is the same mechanism — MK2's standing block
+  stance leans the fighter back — and it is why those four cells have no
+  advantage rows: the hit rig connected and the block rig whiffed, and
+  `measure_cell` correctly refuses to report an advantage for a move that did
+  not connect. A classifier reading "the standing blocker took no damage" as
+  "the standing block stopped it" would have labelled all four `low`.
+
+### The punish the table predicts, thrown
+
+`framelab.punish` (no act-again probe in it): sweep the defender's
+counter-attack frame and let the ATTACKER's damage register say what happened
+— full damage = clean punish, chip = the attacker's guard was up first,
+nothing = no contact. Guard released at contact+1, one frame before the
+earliest counter, per §8.3's correction.
+
+| rig | move | on block | def free (blk) | counter | first landing | attacker took |
+|---|---|---|---|---|---|---|
+| block | cHK @63 px | **−20** | +19 | HK | contact+**24** | chip 8 |
+| block | cHK @63 px | −20 | +19 | LK | contact+**24** | chip 6 |
+| block | cHK @63 px | −20 | +19 | HP | contact+**24** | chip 3 (only +24…+31) |
+| block | cHK @63 px | −20 | +19 | LP | **never** | — |
+| block | cHK @63 px | −20 | +19 | HK, guard HELD to the counter frame | **never** | — |
+| block | far HP @72 px | **+13** | +23 | HK | contact+**21** | chip 8 |
+| block | far HP @72 px | +13 | +23 | LK | contact+**21** | chip 6 |
+| **control** | cHK @63 px, attacker does NOT guard | −20 | +19 | HK | contact+**24** | **full 32** |
+| **control** | far HP @72 px, attacker does NOT guard | +13 | +23 | HK | contact+**21** | **full 32** |
+
+Four things fall out.
+
+1. **§8.3's guard-release correction reproduces on a third character.** Hold
+   Block to the counter frame and the counter never comes out — zero contact at
+   every N from +8 to +40. Release it one frame after contact and the identical
+   sweep lands from +24. A punish rig without that rule reports Baraka's entire
+   kit as unpunishable.
+2. **Far HP reproduces the `manifest − 2` rule exactly**: defender manifests at
+   +23, earliest connecting counter +21. cHK does not — manifest +19, earliest
+   counter +24 — the same direction Mileena's cHK missed it in (+22/+24 against
+   a +19 manifest). Two characters now, same move shape, same failure of the
+   rule; it is not universal and cHK is where it breaks.
+3. **The counter LANDS, and it lands as chip, and the two controls prove which
+   clause is doing the work.** With the attacker guarding after the move, every
+   counter that connects does exactly a quarter damage. With
+   `--no-attacker-guard`, the SAME counter at the SAME first-landing frame does
+   the full 32. So the counter is in range and on time; what stops it is that
+   **Baraka's guard is back by contact+24 while his walk does not manifest
+   until +39 — a ≥15-frame gap**, against the ≥7 frames Mileena's cHK bounded.
+   This is a cleaner instance of §1's missing guard clock than Mileena's,
+   because hers was confounded with range: her blocked cHK shoved the defender
+   to 93 px where her punches could not reach at all, and the question of
+   whether the kicks were stopped by range or by guard was left open. Baraka's
+   is not confounded — the no-guard control lands full damage from the same
+   distance.
+4. **Pushback is real but not decisive here.** Measured through the object
+   pointer during the blocked replay: cHK @63 px shoves the pair to **95 px**
+   (Mileena's shoves to 93), far HP @72 px to 81 px, and close HP @63 px not at
+   all. 95 px is still inside HK's 99 px connect range, which is why his kicks
+   keep landing where hers stopped. His HP counter connects only from +24 to
+   +31 and then stops — recorded, not explained; 3 damage is chip either way.
+
+### His safest and his most unsafe normal
+
+- **Safest: far HP and far LP, +13 on block, +4 on hit.** They are the only
+  normals in his kit that are PLUS on block, and the punish rig confirms it:
+  the fastest counter that reaches arrives at +21, eleven frames after he is
+  already free at +10, and it chips. **His close kicks are the real surprise of
+  the kit**: close HK and close LK are **+6 on hit and −1 on block** for 16
+  damage at FAF 11 — a nearly-neutral, 11-frame close-range poke that Mileena
+  does not have (hers are −7/−14). And cLP is the safest crouching poke in
+  either character's table at **+6 on block, +10 on hit**.
+- **Most unsafe: cHK, −20 on block and −25 on hit**, for 12 damage and the
+  longest committal in the kit (attacker free at +39). Second are far HK and
+  far LK at −16 on block; by the on-HIT column far LK is −21, i.e. negative
+  even when it connects.
+- **Is the most unsafe one actually punishable? No — and this time it is
+  purely the guard clock.** By the walk clock cHK is −20 and the defender's
+  earliest counter (+24) beats the attacker's walk (+39) by 15 frames. The
+  counter is in range (95 px after pushback, inside HK's 99 px) and it does
+  land. It has never done more than chip damage in any sweep, because Baraka's
+  guard is effective by contact+24. The bound this rig can state: **his guard
+  is up by contact+24 after a blocked cHK, and no counter that reaches can
+  arrive earlier than contact+24.** So "−20 on block" is, for a third
+  character, an upper bound on punishability rather than a verdict — the third
+  clause §1 grew after Mileena's run, now demonstrated without the range
+  confound that motivated it.
+
+### What was NOT measured, and why
+
+- **HP@99, LP@99, HK@99, LK@114**: no rows. Each connects against an open
+  defender and WHIFFS against a standing-blocking one, so there is no on-block
+  number and §4.3 forbids deriving one from the on-hit run.
+- **LP at 63 px**: the throw. §1.1 gives it no advantage number; it is measured
+  as damage + contact frame + unblockability, nothing more.
+- **`on_hit` for cHP at any rung**: the uppercut launches, and a knockdown has
+  a wakeup window rather than a hit advantage.
+- **`wakeup_window`**: not measured for any Baraka move, including the two that
+  knock down (cHP and the LP throw). The column stays NULL.
+- **Jumping normals**: still out — the act-again observable is a WALK and an
+  airborne fighter cannot walk.
+- **His specials** (Blade Fury, Blade Swipe, Blade Spin): another task's scope.
+- **`hitstop`, `active`, `recovery`, `total`**: still NULL in every row. None
+  is a by-product of this protocol.
+- **Gaps 192 px and 147 px**: every button whiffs; they are the whiff half of
+  the connect map and carry no rows.
+- **The K ≤ 10 half of his settled walk curve**: characterised (above) but no
+  arena was built there. The rungs at 126–153 px are reachable, and would need
+  their K chosen off the `156 − 3K` branch rather than the `192 − 3K` one.
+
+### Cost and provenance
+
+| phase | steps | loads | wall clock |
+|---|---|---|---|
+| cold boot → char select → 2-human fight, verified | ~2,000 | 0 | ~40 s |
+| walk curve + settled-gap scan (K 0–60 + 5 more) | 3,675 | 67 | 4.7 s |
+| walk-commitment characterisation (3 characters) | ~3,700 | 70 | ~10 s |
+| liveness-probe threshold sweep (`probe_frames` 6→20) | ~800 | 10 | ~2 s |
+| ladder generation (7 arenas, each verified on reload) | ~1,100 | 21 | 1.4 s |
+| arena re-verification pass (fresh liveness, both ports) | ~600 | 21 | ~2 s |
+| connect map, 48-frame (8 moves × 7 rungs) | 5,488 | 84 | 9.4 s |
+| connect map, 90-frame re-scan (the throw hunt) | 7,940 | 85 | 13.7 s |
+| **the kit: 4 calibrations + 28 cells at `repeats=2`** | **726,644** | **14,167** | **1,025.9 s** |
+| `guard_height` (29 cells × 3 stances) | ~4,600 | 90 | ~8 s |
+| determinism check (2 scopes × 2 rigs) | 480 | 8 | ~1 s |
+| punish rigs (9 sweeps) + pushback replays | ~24,600 | ~310 | ~36 s |
+| cold-process re-measure (6 cells) | 202,672 | 3,849 | 278.1 s |
+
+**≈985,000 frames and ≈18,800 verified loads, ≈24 minutes of
+measurement.** The kit ran 90 exhaustive sweeps with every `actionable(N)`
+evaluated TWICE and required to agree: **0 repeat-check failures, 0
+non-monotone refusals, 0 cross-method disagreements, 0 refusals of any kind.**
+`max_search` was 60 (his far HK's victim frees at +46, so 45 is too tight —
+same reason as Mileena's).
+
+Rows live in `shadow/framelab/frames.db` and export to
+`library/mk2/arcade.frames.json`: **48 Baraka rows** (24 cells × 2 observables)
+alongside Mileena's 62 and Reptile's 20, 130 rows total, each carrying
+`observable`, `method`, `input_latency_frames`, `guard_height`, `sample_n`,
+`core_id` (`fbneo_libretro.dylib:sha256:972e8fb8c8394979`) and `rom_id`
+(`mk2.zip:sha256:e8d3f2f8cefe1aab`). The export was regenerated from the store
+at the end of the run and verified to contain all 48 — the store and the export
+silently diverged once before.
+
+**Determinism (§4.6): all clear, and at two scopes.** One scripted replay run
+twice from one state, on `b-gap-43`, hit rig and block rig, compared over (a)
+both fighters' whole 0xD0-byte structs and (b) exactly the two profile
+observables: identical in all four pairs, 60 frames each.
+
+**Re-measurement (§8.1).** Six cells — close HP @63, far HK @72, far LK @99,
+cHK @63, cLP @72 and cLK @84 — were measured again from scratch on a COLD
+emulator process (killed and relaunched), with its own fresh calibration
+(which came out identical again) and the same seven-rung connect map so that
+`connect_range` would be comparable. `compare_rows` reports **0 of 12 compared
+rows disagree**: every measured column reproduced to the frame (`on_hit`,
+`on_block`, `damage`, `hits`, `knockdown`, `first_active_frame`,
+`connect_range`, `gap_px`, `gap_walk_frames`, `input_latency_frames`,
+`method`, `core_id`, `rom_id`). The verdict line still prints NOT IDENTICAL
+because the comparison is against the WHOLE export and this run was not asked
+for Mileena's or Reptile's cells — those are listed as `MISSING`, which is
+"not produced by this run", not "disagreed". Those twelve rows carry
+`sample_n = 2`.
+
+### Confidence, per row
+
+- **High** for every `on_block` number and for the `on_hit` numbers of the
+  standing normals: two observables in different data structures agreeing on 90
+  sweeps, monotone predicates everywhere, every evaluation doubled, and six
+  cells reproduced from a cold process.
+- **High** for the connect map, damage and chip: single replays, but the far
+  variants are identical across their rungs and the cold re-measure reproduced
+  every cell it covered.
+- **High** for the walk-commitment finding: it reproduces at every hold length
+  1–26, the boundary is a single frame, and the two other characters measured
+  on the identical rig shape do not show it.
+- **Medium** for `first_active_frame`: it is the contact frame at the 63 px
+  floor minus the stance lead-in, and the ±1 question of whether the damage
+  register is written on the overlap frame or the frame after is still
+  unresolved (same caveat as Reptile's and Mileena's).
+- **Medium** for the punish rig's cHK numbers: first-landing frames are
+  reproducible and the guarded/unguarded controls bracket the verdict cleanly,
+  but HP's connecting window (+24…+31 and then nothing) is unexplained.
+- **NULL, not low confidence**, for everything in the "not measured" list.
+
+### What this run says `docs/frames.md` still gets wrong
+
+The convergence question this task asked was whether a third character
+surfaces any NEW contract gap. It surfaced **two**, and they are of different
+kinds — one is a property of the game the protocol had never met, the other is
+a silent cap in the tooling.
+
+1. **§5's ladder recipe assumes a walk STOPS when the button is released.**
+   Baraka's does not: his opening step is committed for 13 frames, so a rung
+   saved with the shipped `settle_frames=8` is captured mid-glide, and the
+   settled K → gap curve is discontinuous and NON-MONOTONE (K=10 settles 33 px
+   closer than K=11). §5 already says "settle before saving" because of
+   Mileena's oscillation; the settle it needs here is a different quantity —
+   the character's own walk-stop commitment — and 8 frames is not it. The same
+   commitment breaks `_probe_port_liveness` outright at its default
+   `probe_frames=6`: Baraka reads NOT LIVE on a provably live port, and §3
+   makes the lab refuse such an arena. A liveness probe whose leg is shorter
+   than the walk it probes is measuring the wrong thing; the leg must exceed
+   the character's commitment (14 frames is the measured threshold here, 20 was
+   used).
+2. **`DEFAULT_ANCHOR_FRAMES = 48` is a silent cap, and it hid a whole move.**
+   With `quiet_frames = 20` the reachable contact window is 28 frames, and MK2's
+   throws are outside it: Baraka's contacts at f40, Reptile's at f48. The
+   connect map printed `—` — the identical glyph a genuine whiff gets — for an
+   unblockable 34-damage knockdown. §7's "no silent caps" is about a run
+   REPORTING what it skipped; this is the shape where the run does not know it
+   skipped anything. `framelab.ladder.connect_map` and the `ladder`/`guard`
+   CLIs now take an explicit `--anchor-frames` (default unchanged, so earlier
+   rows stay comparable), and the operator rule is: a `—` at the collision
+   floor is the least likely place for a genuine whiff, so widen the window
+   before believing it.
+
+Everything else was MECHANICAL, and that is the more important half of the
+answer. The four corrections Mileena's run produced all held without
+amendment: the two-point hold-limited calibration, the raw-manifest advantage,
+the guard-release lead in the punish rig, and the "negative on block is an
+upper bound" clause (which this run demonstrated more cleanly than she did).
+The per-shape calibrations came out identical for a third character. Blockstun
+took the same two values. The cross-observable check passed on all 90 sweeps.
+No new failure mode appeared anywhere in the sweep, the store, or the export.
+
+Two items from §12 are also worth re-affirming with a third character's data:
+**two rows per cell, one per observable, is still open** and this run adds 90
+more sweeps with zero disagreements; and `guard_height` is now populated for
+three characters and has produced exactly one non-`mid` verdict per character
+kind — `unblockable` for the throw, `whiffs_vs_guard` at the geometric edge.

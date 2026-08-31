@@ -151,7 +151,15 @@ A measurement run that skips any of these is void.
    real wall-clock to elapse after the call returns). A protocol built on it
    is wall-clock-dependent, which §2.4 forbids.
 4. **Arena liveness re-verified after EVERY `load_state`**, not once at
-   capture. The sidecar's `inputs_live` is a save-time assertion; the same
+   capture — **and the probe's walk window must be long enough for the
+   CHARACTER.** Baraka's walk cannot be aborted for 13 frames: released at
+   hold ≤10 he travels a further +39 px over 12 frames with nothing held,
+   where Mileena and Reptile stop within +3 px and 0 frames. The shipped
+   6-frame probe therefore reported him NOT LIVE on a provably live port
+   (FALSE at 6 and 10, TRUE at 14/16/20) — and §3 makes the lab REFUSE such
+   an arena, so the default would have silently blocked his entire ladder.
+   A liveness default tuned on two characters is a default tuned on two
+   characters. The sidecar's `inputs_live` is a save-time assertion; the same
    object-pool instability that breaks `x` can invalidate it later.
 5. **`step` is SYNCHRONOUS** — it returns only once the emulated frame is
    fully complete, and reports `landed`. No polling, no sleeping.
@@ -533,6 +541,13 @@ remains the fallback if a pointer resolves invalid.
 3. Sidecar records: K, the achieved pixel gap if trustworthy, both char ids,
    facing, and `inputs_live` for BOTH ports.
 
+**Momentum makes the settled K→gap curve discontinuous.** Baraka's is
+non-monotone across his abort boundary — K=10 settles at 126 px, K=11 at
+159 px (`156−3K` below the break, `192−3K` above) — so a generator assuming
+monotonicity picks the wrong rung. `settle_frames=8` is not enough for a
+character with momentum; his run used 20. Third matchup, third collision
+floor: 62 / 61 / 63 px.
+
 Minimum ladder: point-blank (K=0 after a reset that leaves them touching),
 the move's connect boundary minus a margin, and one intermediate. Variants
 are stored as separate `variant` rows — never averaged into one.
@@ -601,7 +616,16 @@ three within this document's own first draft.
   a draft naming a contact signal its own `library/<family>/<port>.md` had
   already retracted. A profile or evidence doc that contradicts a plan wins.
 - **No silent caps.** If a run skips moves, gaps, or characters, the report
-  names what was skipped and why.
+  names what was skipped and why. **This rule was violated by a DEFAULT, not
+  by a decision**: `DEFAULT_ANCHOR_FRAMES = 48` minus a 20-frame quiet window
+  leaves a 28-frame contact horizon, and Baraka's close LP is a THROW
+  contacting at frame 40 — 34 damage, unblockable, knocks down. The connect
+  map printed `—`, **the same glyph a genuine whiff gets**, so an entire move
+  read as "does not reach". A 90-frame re-scan found it.
+  **Retroactive: Reptile's throw contacts at f48 and is also outside the
+  default horizon**, so his and Mileena's connect maps must be re-scanned at
+  90 frames before their tables are called complete. A cap that renders
+  identically to a measurement is the most dangerous kind.
 - **A number that fails re-measurement is DELETED, not averaged.**
   Disagreement between runs means the protocol was wrong, not that the truth
   is in the middle.

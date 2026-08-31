@@ -1,0 +1,23 @@
+{
+  "format": "gap-ladder-v1",
+  "family": "mk2",
+  "port": "arcade",
+  "walk_frames": 15,
+  "walk_port": 0,
+  "walk_direction": "right",
+  "settle_frames": 20,
+  "reload_after_liveness": true,
+  "gap_px": 147,
+  "char_id_block1": 3,
+  "char_id_block2": 9,
+  "facing": {
+    "block1_side": "left",
+    "block2_side": "right"
+  },
+  "inputs_live": {
+    "p0": true,
+    "p1": true
+  },
+  "base_arena": "/Users/frankkorf/Playspaces/rustretro/shadow/arenas/mk2/b-v-r.state",
+  "saved_at": "2026-08-31T04:06:31Z"
+}

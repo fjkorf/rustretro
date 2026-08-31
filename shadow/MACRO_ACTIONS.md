@@ -329,13 +329,60 @@ configurations; `F · F · HP` produced 15 damage in every config at an
 inter-step gap ≥ 2. This invalidates the chorded shape for every motion
 special on this port.
 
-Two measured exemptions, recorded rather than explained away:
-- **single-frame chords are exempt** — Reptile's slide (`B + LP + LK + BLK`)
-  works as one simultaneous press;
-- **`force_ball`'s two-button chord fires anyway.** The mechanism was not
-  isolated. It is an exception with no theory, which is worth more written
-  down than tidied away.
+> **BOTH "exemptions" recorded here were WRONG, and dissolving them produced
+> the real rule (Baraka audit, 2026-08-30).**
 
-**Executor constraint**: the inter-step gap must be ≥ 2 frames — every
-motion special fails at gap 1, and `STEP_GAP = 2` sits exactly on that
-boundary. Anything that shortens it breaks every motion special at once.
+**The real rule: a chorded special needs the direction and the button down
+TOGETHER for ≥2 consecutive frames.** It is the CONJUNCTION that needs two
+frames, not the direction — back held 5 frames then HP for 1 still fails —
+and the trigger is not the button's rising edge: pressing HP one frame
+*before* back and then overlapping for 2 frames fires it.
+
+- **"Single-frame chords are exempt" was false.** There is no single-frame
+  chord on this port. Baraka's Blade Swipe: 1 frame → 0 damage, 2–12 frames
+  → 32. Reproduced independently on **Reptile's slide** (1 frame → 0, 2–12
+  → 13) — it has always shipped `frames: 8`, so nobody had ever varied it
+  and the "exemption" was an artifact of never testing the boundary.
+- **`force_ball` was never an exemption either.** Its chord's `back` is the
+  second tap of a `B,B` motion, not a chorded direction: `B · HP+LP` = 0,
+  `B+HP+LP` alone = 0 at every hold length, `B · F+HP+LP` = 0.
+
+**Still open, stated as a hypothesis rather than a rule**: which motions
+accept a chorded FINAL tap. `force_ball`, `teleport_kick` and
+`blade_shredder` do; `acid_spit`, `roll` and `blade_spark` do not. The only
+predicate fitting all six is "the trigger contains LP or LK" — 6/6, no
+mechanism, and the falsifying test is a chorded final tap on a
+punch-triggered motion.
+
+**Executor constraint**: the inter-step gap must be ≥ 2 frames for
+**repeated-direction** motions, and `STEP_GAP = 2` sits exactly on that
+boundary. Corrected: this does NOT hold universally — `blade_spark`
+(`D · B · HP`, two DIFFERENT directions) fires at neutral gap 0 and 1.
+
+## 12. Timing bounds the DSL cannot express (Baraka audit, 2026-08-30)
+
+Every step interval in this DSL is currently UNBOUNDED, which is wrong in
+both directions: real moves fail if you are too slow, and a matcher with no
+upper bound will annotate a special in a recording that no human performed.
+
+Measured on MK2 arcade, each by bisection from both ends:
+
+| bound | evidence |
+|---|---|
+| **onset-to-onset window** | `double_kick`'s second press must land 11–16 frames after the first press's ONSET (10 fails 3/3, 11 fires 3/3, 16 fires, 17 fails) — and it is INVARIANT under the first press's hold length (1/2/3/5/8), so onset-to-onset is the rule and any neutral-gap framing is an executor artifact |
+| **whole-macro span cap** | `blade_spark` fires at span ≤16 and fails ≥17; `[9,9]`, `[13,7]`, `[7,13]` all fail despite every per-step gap being legal |
+| **both at once** | `blade_shredder` needs a per-step cap (dir taps ≤13 apart) AND a span cap (≤34): `[14,14,3]` (span 31) fails on the first, `[3,3,29]` (all gaps legal) fails on the second |
+| **proximity precondition** | `double_kick` is available at ≤64 px and unavailable at ≥65, and that boundary is EXACTLY the game's close/far HK variant switch (16 dmg @f11 → 32 dmg @f8). "Close" is §1's proximity-normal selection, not a separate gate — so do NOT add a close/far boolean |
+
+Note the precondition cannot be inferred at runtime: `block+0xC0` fires
+twice in every `HK HK` trial at every range, so "came out and whiffed" and
+"did not come out" are indistinguishable from the action counter. Only the
+two-hit damage signature separates them, which is why the gap precondition
+has to live in the DSL rather than be detected.
+
+**Measurement hazard — never audit a move at its reach boundary.** Blade
+Swipe at 117 px depends on the DEFENDER'S IDLE-ANIMATION PHASE (settle 0
+fires, 1–8 miss, 9–11 fire), and the phase reference DRIFTS across a
+session: a batch that verified the move there stopped reproducing an hour
+later from the same save state with byte-identical positions. Anchor every
+verdict well inside the connect region.
