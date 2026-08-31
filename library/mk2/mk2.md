@@ -531,7 +531,7 @@ dummy → chip → `p2_health_hud` change → punish macro plays.
 | move | encoding (arcade) | verdict | evidence |
 |---|---|---|---|
 | slide | `back + LK+LP+Block`, 8f | **VERIFIED** (chord corrected) | The contract's back+LK+LP produced a NORMAL (pose screenshot); adding Block: slide pose + h1 161→148 (−13), 3/3 trials from round-start range. **Point-blank caveat**: the LP-bearing chord resolves to a close normal/throw (the §1 proximity phenomenon) — a point-blank punish slide whiffs by game rule. |
-| acid_spit | `F` · `F+HP`, 3f steps | **VERIFIED** | Via the punish executor at point blank: h1 161→137 (−24), repeated across two runs; full mask trace in the session recording (`0x40`×3, 2f gap, `0x42`×4) with `p2_special:"acid_spit"` annotated. |
+| acid_spit | `F` · `F+HP`, 3f steps | ~~VERIFIED~~ **RETRACTED 2026-08-30** — see "Special-move encodings, live-audited" below. This chord produces NO special (0 damage, 16/16 configurations at a range where only a projectile can reach); the −24 measured here is Reptile's CLOSE HP NORMAL, which does exactly 24 at 62 px in `arcade.frames.json`. Shipped encoding is now `F` · `F` · `HP`. | Via the punish executor at point blank: h1 161→137 (−24), repeated across two runs; full mask trace in the session recording (`0x40`×3, 2f gap, `0x42`×4) with `p2_special:"acid_spit"` annotated. **The trace is real; the attribution was not** — a point-blank trial cannot tell a projectile from a normal. |
 | force_ball | `B` · `B+HP+LP`, 3f steps | **VERIFIED** | Same path: h1 161→145 (−16), repeated; trace `0x80`×3, gap, `0x83`×4, annotated. |
 
 Punish-timing findings (now constants in `src/training.rs`):
@@ -1607,3 +1607,182 @@ Also found in the same pass: **`Block` appears in both MK2 ports'
 `attack_chords`** (it is needed for macro chords like the slide), so any
 code that treats every entry in that table as an ATTACK will attribute
 contacts to "Block". Attribution must exclude it.
+
+## Special-move encodings, live-audited (2026-08-30, task M1)
+
+Every `special_inputs` entry in `library/mk2/mk2.profile.json` executed live
+and required to PRODUCE ITS MOVE. Four of the seven had never been
+demonstrated; two of those four were wrong, and one entry that *had* been
+"verified" (Reptile's `acid_spit`) turns out to have been verified against
+the wrong evidence and does not work at all.
+
+**Rig.** Headless FBNeo, MCP port 4064, `shadow/arenas/mk2/m-v-r.state` —
+Mileena (`block1`, port 0, char_id 5) at `x` 927 vs Reptile (`block2`,
+port 1, char_id 9) at `x` 1119, **192 px apart**. That gap is past the whiff
+edge of the entire measured normal-move connect map (§"Reptile's normals
+across the spacing ladder": nothing reaches at 180 px), so *any* damage is a
+special. Transport: `framelab.session.LabSession` — `load_state(pause_after)`,
+`hold_buttons` + `confirm_fold` for every input change, confirmed `step`.
+Playback mirrors `src/macros.rs::MacroExec` exactly: each step's mask held for
+its `frames`, `STEP_GAP = 2` neutral frames between steps. Controls run in
+every batch (no input; bare button; wrong button; wrong direction; one tap
+instead of two) and every one of them produced 0 damage.
+
+### The rule that decides three of the four questions
+
+**A direction chorded with the trigger button on the SAME FRAME does not
+register. The direction must be down at least one frame BEFORE the press —
+and it need not still be held AT the press.**
+
+This is one measurement, not an interpretation. `F . F+HP` (Reptile) gives 0
+damage in **all 16** frames×gap configurations tried; `F . F . HP` gives 15
+in every configuration with gap ≥ 2. `B . B . D+HK` (Mileena) gives 0; move
+the `down` one frame earlier — `B . B . D(1f) . D+HK`, or drop it to a bare
+`HK` — and the roll comes out. So MK2's parser keeps a buffer of directional
+taps and fires when a button edge arrives with the right taps already in it;
+a direction pressed on the trigger frame is not yet in the buffer.
+
+Two exemptions, both measured:
+
+- **Single-frame chords are exempt.** Reptile's slide is
+  `back+LK+LP+Block` on one frame and still lands (13 damage, victim
+  launched). A chord special is not a motion; it has no buffer to be late for.
+- **`force_ball` (`B . B+HP+LP`) fires chorded anyway** — 16 damage, victim
+  launched, both chorded and bare. Its two-button chord evidently needs a
+  coincidence window that delays the trigger past the direction. Mechanism
+  NOT isolated; recorded as an exception rather than explained away.
+
+### Verdicts
+
+| move | published | shipped now | verdict | evidence |
+|---|---|---|---|---|
+| mileena `sai_throw` | hold HP ~3 s, release | `hold HP` **`min_frames: 34`**, `release` | **VERIFIED, timing corrected** | 23 dmg at 192 px, projectile. HP-specific (LP/HK/LK/Block held 60 f: 0). Fires on RELEASE only — held 60 f and 120 f without releasing: 0 dmg. |
+| mileena `teleport_kick` | `F F LK` | `F` · `F` · `LK` (unchanged) | **VERIFIED, no change** | 32 dmg; `y` dives to +200 (underground) then to −131 (above the screen) and she lands kicking. |
+| mileena `roll` | `B B D+HK` | `B` · `B` · `D` · `HK` (**changed**) | **VERIFIED after correction** | 21 dmg at contact f32, victim's `y` 89 → −6 (launched) and pushed 1119 → 1002, Mileena rolls 915 → 1192 **through** him. |
+| reptile `invisibility` | `[BLK] U U D HP` | `while_held BLK` over `U U D`, `release`, `HP` (unchanged) | **VERIFIED, no change** | Framebuffer: Reptile's sprite is gone (see below). |
+| reptile `acid_spit` | `F F HP` | `F` · `F` · `HP` (**changed**) | **prior verification RETRACTED** | see below |
+| reptile `slide` | — | unchanged | re-confirmed | 13 dmg, victim launched −45. |
+| reptile `force_ball` | `B B HP+LP` | unchanged | re-confirmed | 16 dmg, victim launched −82. |
+
+`teleport_kick`'s other candidate reading, `F` · `F+LK` (the acid_spit
+shape), **also fires** — 32 damage, and its contact lands 27 frames after
+the LK onset in both readings, i.e. the same move with the same startup.
+The bare-button encoding is kept because it is the one the *matcher* can
+recognise from either human input: `src/macros.rs`'s `sat()` requires a
+non-first step's `dirs` to have a FRESH onset, so `F . F+LK` only matches a
+player who re-taps forward on the button frame, while a dirs-less final step
+matches whether or not forward is still held. Same argument applies to
+`acid_spit` and `roll`: encode the trigger as a bare button.
+
+Known cost of that choice, stated rather than discovered later: a dirs-less
+trigger step is satisfied on any frame the chord is down, so the matcher
+advances through it one frame after the direction step. A player who presses
+`D+HK` simultaneously — which the game REJECTS, per the rule above — will
+still be annotated as having rolled if HK stays down for a second frame. The
+matcher is therefore slightly more permissive than the game on exactly the
+input the game refuses. Distinguishing them needs a "this step must not be
+satisfiable on the same frame as the previous one" rule that the DSL does
+not have; until then, annotation counts for these three moves are an upper
+bound.
+
+### Disproven readings — do not re-derive these
+
+- **`acid_spit` = `F` · `F+HP` — DISPROVEN.** 0 damage, 16/16 configurations
+  (`frames` ∈ {2,3,5,8} × gap ∈ {1,2,3,5}). What comes out is a whiffing HP
+  normal. **The 2026-08-28 "VERIFIED (h1 161→137, −24)" above is retracted**:
+  that trial ran at point blank, and 24 is exactly what Reptile's *close HP
+  normal* does at 62 px in `library/mk2/arcade.frames.json`. The measurement
+  was real; the attribution was not. Verifying a projectile at a range where
+  a normal also connects cannot distinguish them — this is the same failure
+  shape as the retracted `action_counter` and the disproven `p1_x`.
+- **`roll` = `B` · `B` · `D+HK` — DISPROVEN.** 0 damage across `frames` ∈
+  {2,3,5,8} × gap ∈ {0,1,2,4} and across four step shapes. The game performs
+  a crouching normal (`block+0xC0` still goes 160 → 192, so the *button*
+  registers — only the special does not).
+- **`roll` = `B` · `B+D+HK` — DISPROVEN**, same sweep, same reason.
+- **`sai_throw` `min_frames: 180` — wrong by 5×**, see below.
+- **Any multi-step special at inter-step gap ≤ 1 — DISPROVEN.** Every motion
+  special fails at gap 1 (the taps are not seen as separate) and at gap 0
+  (they are one continuous hold). `STEP_GAP = 2` sits exactly on the
+  boundary; do not lower it, and do not "optimise" a macro by removing the
+  neutral frames.
+
+### Sai Throw's charge is 34 frames, not 180
+
+Bisected at 2-frame resolution, 3 repeats at the boundary: **33 held frames
+fails 3/3, 34 fires 3/3.** The projectile then contacts ~22 frames after the
+RELEASE, linearly in the hold length (hold 40 → contact f62, hold 180 →
+contact f202), which is what proves release is the trigger rather than the
+charge completing. 34 frames is ≈0.62 s at this core's 54.71 fps — the
+published "hold ~3 seconds" is folklore, and 180 was a transcription of it.
+
+34 is shipped rather than a padded number because `min_frames` is *also* the
+matcher's recognition threshold: padding it would make the matcher miss real
+sais. It re-fires from six different starting phases (prefix walks of
+0/7/13/21/34/55 frames), so the boundary is a property of the move, not of
+this one save state. The 55-frame-prefix trial deals 47 = 24 + 23 — she
+walked into range, the held HP came out as a close normal *and* the release
+still threw the sai. Charge and normal are not exclusive.
+
+### Invisibility has NO memory observable — the framebuffer is the only one
+
+It deals no damage, so the health anchor is useless. Searched for a flag and
+did not find one:
+
+- **Framebuffer (works).** `app://screen` at rest, 45 frames after the
+  macro: Reptile is simply **not drawn** (Mileena, both health bars, the
+  stage and the "REPTILE" nameplate all still render). Quantified as the
+  pixel count differing from a standing-control screenshot inside his sprite
+  box (`y` 77–239, `x` 225–312): 5255 changed for a successful attempt vs
+  ~0–500 against an invisible reference. Swept 64 encodings on that
+  classifier: fires at gap ≥ 2 for every `frames` value, with or without the
+  `release` step, and whether or not Block is still held with the HP.
+  Negative controls stay visible: no Block held (`U U D HP` alone), wrong
+  direction sequence (`U U U`), bare HP.
+- **Memory (honest negative).** Three invisible runs vs three visible runs,
+  240 settle frames each, intersected over `0x0000..0x30000`: 188 candidate
+  bytes and **all 188 lie in `0x3270..0x3317`**, a sprite/display list whose
+  entries visibly REORDER when a sprite leaves (adjacent 0x18-stride slots
+  swap values). Nothing in either fighter struct differs. There is no
+  invisibility flag to watch; anything that needs to know Reptile is
+  invisible must read the framebuffer or VRAM.
+
+The `release` step is not required by the game — it is kept because it costs
+nothing and it is what the published notation says. Note it does mean the
+matcher only completes on a Block *release*, so a player who holds Block
+through the HP will not be annotated even though his move came out; if that
+shows up in real recordings, drop the step rather than "fixing" the matcher.
+
+### Side-swap: it is the ROLL, not the teleport
+
+`MACRO_ACTIONS` §10.2 is written around Mileena's Teleport Kick crossing the
+opponent. **It does not cross** — 4/4 trials (starting gap 192 px and after
+30/50/65-frame walk-ins) end with Mileena still on the left. She teleports
+*vertically*: `y` 87 → 200 (into the ground) → −37 (above the screen) → down
+onto the opponent's near side, and the hit pushes HIM away (1119 → 1215)
+rather than passing through.
+
+**The `roll` crosses, 3/3**, at every range tried: Mileena ends at `x` 1192
+with Reptile at 1002. `side_swap` has been added to its `family.json` tags.
+`teleport_kick`'s `side_swap` tag is left in place — the facing pin it
+implies is conservative — but it is UNCONFIRMED, and §10.2's motivating
+example is the wrong move.
+
+### What will complicate measuring Mileena later
+
+1. **Both her damaging specials are geometry-destroying.** The roll ends
+   ~265 px from where it started and on the other side; the teleport moves
+   her ~116 px and swings `y` over a 331-unit range (−131 … +200) with
+   `x` DISCONTINUOUS (945 → 1013 in one frame). Any gap-keyed protocol
+   (docs/frames.md §5) is invalid across either, and the frame lab's
+   act-again probe is a WALK, which she cannot do while underground — same
+   exclusion that already rules out jumping normals.
+2. **The sai's charge collides with normals.** Holding HP to charge also
+   throws an HP normal; at any range where that normal connects, the health
+   anchor sees two contacts. Measure the sai only from outside normal range
+   (192 px works).
+3. **`block+0xC0` is a poor discriminator.** It reads 160 → 192 on *entering
+   an attack* and then stays 192 — it fires for the crouching normal the
+   failed roll produced exactly as it does for the roll. It cannot tell a
+   special from the normal it degenerated into; only damage, travel and the
+   victim's `y` can.

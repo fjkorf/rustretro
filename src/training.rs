@@ -619,6 +619,81 @@ fn guard_frame(
     GuardOut { bits, commit: raw, commit_edge, guarding, opp_right }
 }
 
+/// Release an in-flight punish macro's executor and inject the neutral mask
+/// it hands back (MACRO_ACTIONS §10.1) — the one place every non-completion
+/// abort path in this module funnels through, so a held chord can never
+/// survive whichever event ended the macro. Respects playback precedence
+/// (task A2 §4): if an input-slot playback owns port 1 this frame, the
+/// release is skipped exactly like every other dummy write, because
+/// playback's own countdown already governs what that port sees.
+fn release_punish_exec(ds: &mut DebugState, reason: &str, frame: u64) {
+    let Some(mut ex) = ds.training.punish_exec.take() else { return };
+    let bits = ex.abort();
+    ds.training.punish_wait = 0;
+    if !crate::playback::active_on_port(ds, 1) {
+        for (i, on) in bits.iter().enumerate() {
+            ds.injected_input2[i] = if *on { 2 } else { 0 };
+        }
+    }
+    ds.training.punish_phase = format!("aborted — {reason}");
+    ds.log(format!("🎯 punish aborted: {reason}"));
+    eprintln!("[training] punish aborted: {reason} (frame {frame})"); // headless-visible twin
+}
+
+/// The §10.1 dispatcher: decides WHETHER this frame disrupted an in-flight
+/// punish macro, and if so calls [`release_punish_exec`]. Three disjoint
+/// causes, checked in this order (the order only matters for which reason
+/// string wins when more than one is simultaneously true, e.g. the panel
+/// flips the dummy mode away on the very frame the user also hits F5):
+///
+/// 1. **Training just got disabled.** The rest of `tick_with` returns
+///    immediately once `!enabled`, so this is the ONLY chance to release a
+///    macro that was mid-flight at the moment of disabling — every later
+///    frame this function still runs (it's unconditional, like
+///    `playback::tick`) but finds `punish_exec` already `None` and no-ops.
+/// 2. **A save state just loaded.** Detected via `ds.state_note`'s sticky
+///    "loaded …"/"saved …"/"load … FAILED"/"save … FAILED" wording (the
+///    State panel's existing contract, `Frontend::drain_state_op`) — only
+///    a *successful load* ("loaded ", past tense) rewrites live RAM, so
+///    that is the only prefix that counts; a save or a failed load changes
+///    nothing underfoot and must not spuriously abort a macro mid-punish.
+/// 3. **The dummy mode just left `BlockPunish`.** Tracked via `dummy_prev`
+///    rather than hooking every mutation site (panel dropdown, Lua
+///    `training.set_dummy`, the F1 hotkey) individually — once the mode
+///    stops matching `DummyMode::BlockPunish` in the dispatch below, nothing
+///    would ever call `ex.next()` or `ex.abort()` on the orphaned executor
+///    again, so it must be caught HERE, on the transition frame.
+///
+/// Deliberately NOT a trigger: a gate closure. That path plays out fully
+/// inside `tick_with`'s gate-closed branch (a punish rides out a SHORT
+/// closure on purpose — MK2 zeroes its in-fight word at the contact frame
+/// that triggers the punish, so aborting on first closure would strand
+/// every punish two frames in); only that branch's own grace-timeout calls
+/// [`release_punish_exec`] directly, for "gate closed too long" — a real
+/// round end, not a hit-freeze blip.
+fn abort_disrupted_punish(ds: &mut DebugState, frame: u64) {
+    let mode_left_block_punish = ds.training.dummy_prev == DummyMode::BlockPunish
+        && ds.training.dummy != DummyMode::BlockPunish;
+    ds.training.dummy_prev = ds.training.dummy;
+
+    let note_changed = ds.state_note != ds.training.last_seen_state_note;
+    let state_loaded = note_changed && ds.state_note.as_deref().is_some_and(|n| n.starts_with("loaded "));
+    if note_changed {
+        ds.training.last_seen_state_note = ds.state_note.clone();
+    }
+
+    let reason = if !ds.training.enabled {
+        "training disabled"
+    } else if state_loaded {
+        "state loaded"
+    } else if mode_left_block_punish {
+        "dummy mode changed"
+    } else {
+        return;
+    };
+    release_punish_exec(ds, reason, frame);
+}
+
 /// Run one training-mode frame. Called from `Frontend::run_frame` after the
 /// bus-window refresh (reads see this frame's snapshot; writes drain to the
 /// live bus next frame).
@@ -636,6 +711,19 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
     // doc), which is exactly the frame-exact hook `playback::tick` needs
     // (docs/frames.md §3/§4 determinism — see `playback.rs`'s module doc).
     crate::playback::tick(ds, frame, p);
+
+    // MACRO_ACTIONS §10.1: three events can end an in-flight punish macro
+    // out from under its own state machine — a state LOAD rewrites the RAM
+    // it was playing into, a dummy-mode switch away from `BlockPunish`
+    // orphans the executor (nothing below advances or releases it once the
+    // mode stops selecting the BlockPunish arm), and disabling training
+    // entirely skips the rest of this function on every later frame. All
+    // three MUST release any held chord (Sai Throw's HP, Invisibility's
+    // held Block) rather than parking on it. Checked unconditionally, once
+    // per real emulated frame, so none of the three can race past it —
+    // this mirrors `playback::tick` above being unconditional for the same
+    // "must never be skippable" reason.
+    abort_disrupted_punish(ds, frame);
 
     if !ds.training.enabled {
         return;
@@ -668,10 +756,18 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
         }
         if ds.training.punish_exec.is_some() {
             ds.training.punish_gate_grace += 1;
-            let mut bits = None;
             if ds.training.punish_gate_grace > PUNISH_GATE_GRACE {
-                ds.training.punish_exec = None;
-            } else if ds.training.punish_wait > 0 {
+                // A real round end, not a hit-freeze blip: MUST release
+                // (§10.1) rather than just dropping the executor — the old
+                // code set `punish_exec = None` here with no injection at
+                // all, which left `injected_input2` parked at whatever the
+                // macro last held (e.g. mid-Sai-Throw HP) for the rest of
+                // the (now ungated) session.
+                release_punish_exec(ds, "gate closed too long", frame);
+                return;
+            }
+            let mut bits = None;
+            if ds.training.punish_wait > 0 {
                 // Ride out blockstun guarding, then release for a clean press.
                 ds.training.punish_wait -= 1;
                 bits = Some(if ds.training.punish_wait < PUNISH_RELEASE {
@@ -1523,6 +1619,194 @@ mod tests {
         assert!(ds.write_addr(sig, 1, 1));
         tick_with(&mut ds, 21, &p);
         assert_eq!(ds.training.punish_phase, "punishing: HP");
+    }
+
+    // ── §10.1 abort paths: a held chord must never survive a macro ending
+    //    without completing (MACRO_ACTIONS §10.1's motivating hazard) ───────
+
+    fn spec(json: &str) -> Vec<crate::profile::StepSpec> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// A hold-then-release macro (Sai-Throw-shaped) compiled against asurabld,
+    /// driven `n` real frames so the chord is GENUINELY held (not merely
+    /// constructed) before a test hands it to `ds.training.punish_exec` —
+    /// exercising the same object `block_punish` would have produced.
+    fn mid_hold_exec(p: &GameProfile, ds: &mut DebugState, n: usize) -> crate::macros::MacroExec {
+        let m = crate::macros::compile(
+            "test_hold",
+            &spec(r#"[{"hold":["Medium"],"min_frames":150},{"release":["Medium"]}]"#),
+            p,
+        )
+        .unwrap();
+        let mut ex = crate::macros::MacroExec::new(m);
+        for _ in 0..n {
+            let bits = ex.next(true).expect("still mid-hold");
+            for (i, on) in bits.iter().enumerate() {
+                ds.injected_input2[i] = if *on { 2 } else { 0 };
+            }
+        }
+        ex
+    }
+
+    /// Disabling training entirely mid-macro is the ONLY chance to release
+    /// it (the rest of `tick_with` returns immediately once `!enabled`, so
+    /// nothing downstream would ever call `ex.next()`/`ex.abort()` again).
+    #[test]
+    fn abort_disrupted_punish_releases_when_training_is_disabled_mid_macro() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::BlockPunish;
+        ds.training.dummy_prev = DummyMode::BlockPunish;
+        ds.training.punish_exec = Some(mid_hold_exec(&p, &mut ds, 5));
+        assert!(!held(&ds).is_empty(), "setup sanity: Medium is genuinely held");
+
+        ds.training.enabled = false; // the event under test
+        abort_disrupted_punish(&mut ds, 1);
+
+        assert!(ds.training.punish_exec.is_none(), "the orphaned executor must be cleared");
+        assert_eq!(ds.injected_input2, [0u16; 12], "abort must emit a neutral mask, not just drop state");
+        assert_eq!(ds.training.punish_phase, "aborted — training disabled");
+    }
+
+    /// A save-state LOAD rewrites the RAM an in-flight macro was playing
+    /// into; only a *successful load* counts (a save, or a failed load,
+    /// changes nothing underfoot and must NOT spuriously abort a live punish
+    /// — the over-abort failure mode the task warns about).
+    #[test]
+    fn abort_disrupted_punish_releases_on_a_successful_load_but_not_a_save_or_a_failed_load() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::BlockPunish;
+        ds.training.dummy_prev = DummyMode::BlockPunish;
+
+        // A SAVE must not touch the macro at all.
+        ds.training.punish_exec = Some(mid_hold_exec(&p, &mut ds, 5));
+        assert!(!held(&ds).is_empty());
+        ds.state_note = Some("saved shadow/arenas/current.state (4096 bytes) @ frame 10".into());
+        abort_disrupted_punish(&mut ds, 1);
+        assert!(ds.training.punish_exec.is_some(), "a save changes nothing underfoot — must not abort");
+        assert!(!held(&ds).is_empty(), "the chord must still be held after a mere save");
+
+        // A FAILED load must not touch the macro either (unserialize
+        // rejected the bytes — RAM is exactly as it was).
+        ds.state_note = Some("load /tmp/bad.state FAILED: core rejected the state".into());
+        abort_disrupted_punish(&mut ds, 2);
+        assert!(ds.training.punish_exec.is_some(), "a failed load changes nothing underfoot");
+        assert!(!held(&ds).is_empty());
+
+        // A SUCCESSFUL load must abort and release.
+        ds.state_note = Some("loaded shadow/arenas/current.state (4096 bytes) @ frame 11".into());
+        abort_disrupted_punish(&mut ds, 3);
+        assert!(ds.training.punish_exec.is_none(), "a real load must clear the stale executor");
+        assert_eq!(ds.injected_input2, [0u16; 12], "and release its held chord");
+        assert_eq!(ds.training.punish_phase, "aborted — state loaded");
+
+        // Re-observing the SAME note again (no new op) must not re-fire —
+        // there is nothing left to abort, and nothing should log twice.
+        ds.training.punish_exec = Some(mid_hold_exec(&p, &mut ds, 5));
+        abort_disrupted_punish(&mut ds, 4);
+        assert!(ds.training.punish_exec.is_some(), "an unchanged note is not a new load");
+    }
+
+    /// A dummy-mode switch AWAY from `BlockPunish` orphans the executor —
+    /// nothing in `tick_with`'s dispatch calls `ex.next()`/`ex.abort()` on it
+    /// again once the mode stops matching the `BlockPunish` arm. Staying on
+    /// `BlockPunish` (unchanged) must NOT abort — the over-abort guard.
+    #[test]
+    fn abort_disrupted_punish_releases_when_the_dummy_mode_leaves_block_punish() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::BlockPunish;
+        ds.training.dummy_prev = DummyMode::BlockPunish;
+        ds.training.punish_exec = Some(mid_hold_exec(&p, &mut ds, 5));
+        assert!(!held(&ds).is_empty());
+
+        // Unchanged mode: no abort.
+        abort_disrupted_punish(&mut ds, 1);
+        assert!(ds.training.punish_exec.is_some(), "staying on BlockPunish must not abort");
+        assert!(!held(&ds).is_empty());
+
+        // Switched away (panel dropdown / Lua / F1 — any mutation site):
+        ds.training.dummy = DummyMode::Block;
+        abort_disrupted_punish(&mut ds, 2);
+        assert!(ds.training.punish_exec.is_none(), "leaving BlockPunish must clear the orphaned executor");
+        assert_eq!(ds.injected_input2, [0u16; 12], "and release its held chord");
+        assert_eq!(ds.training.punish_phase, "aborted — dummy mode changed");
+    }
+
+    /// The gate-closed path is special: a punish rides out a SHORT closure
+    /// on purpose (hit-freeze), but a closure that outlasts the grace is a
+    /// real round end — the ONLY branch that calls `release_punish_exec`
+    /// directly rather than through `abort_disrupted_punish`. Regression
+    /// target: the old code just dropped `punish_exec = None` here with no
+    /// injection at all, leaving `injected_input2` parked at whatever the
+    /// macro last held.
+    #[test]
+    fn gate_closed_too_long_releases_the_held_chord_instead_of_orphaning_it() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::BlockPunish;
+        ds.training.dummy_prev = DummyMode::BlockPunish;
+        stage(&mut ds, &p, 200, 300, 0);
+        ds.training.punish_exec = Some(mid_hold_exec(&p, &mut ds, 5));
+        ds.training.punish_wait = 0;
+        assert!(!held(&ds).is_empty(), "setup sanity");
+
+        // KO: push health out of the gate's range — a real round end.
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 0));
+        assert!(!crate::gate::eval_gate(&ds, &p), "gate must actually be closed for this test");
+
+        let mut f = 0u64;
+        for _ in 0..PUNISH_GATE_GRACE {
+            f += 1;
+            tick_with(&mut ds, f, &p);
+        }
+        assert!(ds.training.punish_exec.is_some(), "still within grace — must ride out a short closure");
+
+        f += 1; // grace now exceeded
+        tick_with(&mut ds, f, &p);
+        assert!(ds.training.punish_exec.is_none(), "a real round end must clear the orphaned executor");
+        assert!(held(&ds).is_empty(), "and release its held chord, not park on it");
+        assert_eq!(ds.training.punish_phase, "aborted — gate closed too long");
+    }
+
+    /// The over-abort guard's positive twin: with nothing disrupting it, a
+    /// hold/release macro started under BlockPunish still runs to completion
+    /// through the ordinary `block_punish`/`tick_with` path — the new
+    /// per-frame `abort_disrupted_punish` check must not itself interfere
+    /// with a legitimately in-flight, undisturbed macro.
+    #[test]
+    fn a_macro_allowed_to_finish_still_completes_normally() {
+        let (p, mut ds) = asurabld_scene();
+        ds.training.dummy = DummyMode::BlockPunish;
+        ds.training.dummy_prev = DummyMode::BlockPunish;
+        stage(&mut ds, &p, 200, 300, 0); // opponent idle: no new trigger competes
+        let m = crate::macros::compile(
+            "test_hold",
+            &spec(r#"[{"hold":["Medium"],"min_frames":5},{"release":["Medium"]}]"#),
+            &p,
+        )
+        .unwrap();
+        ds.training.punish_exec = Some(crate::macros::MacroExec::new(m));
+        ds.training.punish_wait = 0;
+
+        let mut saw_it_held = false;
+        let mut f = 0u64;
+        for _ in 0..20 {
+            f += 1;
+            tick_with(&mut ds, f, &p);
+            if !held(&ds).is_empty() {
+                saw_it_held = true;
+            }
+            if ds.training.punish_exec.is_none() {
+                break;
+            }
+        }
+        assert!(saw_it_held, "the macro must have genuinely pressed its chord at some point");
+        assert!(ds.training.punish_exec.is_none(), "an undisturbed macro must finish on its own");
+        assert!(
+            !ds.training.punish_phase.starts_with("aborted"),
+            "a normal finish must never be reported as an abort: {}",
+            ds.training.punish_phase
+        );
     }
 
     // ── ReversalTiming (Fast / Delay / Late / Explicit) ─────────────────────

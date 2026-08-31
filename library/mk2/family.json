@@ -32,7 +32,7 @@
     "mileena": [
       { "name": "sai_throw",     "tags": ["special", "projectile", "charge"] },
       { "name": "teleport_kick", "tags": ["special", "side_swap"] },
-      { "name": "roll",          "tags": ["special", "low", "knockdown"] }
+      { "name": "roll",          "tags": ["special", "low", "knockdown", "side_swap"] }
     ]
   }
 }

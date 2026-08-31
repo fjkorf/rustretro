@@ -1932,7 +1932,11 @@ mod tests {
         assert_eq!(mileena, vec!["sai_throw", "teleport_kick", "roll"]);
         let (_, sai_throw) = p.specials_for(5)[0];
         assert_eq!(sai_throw[0].hold, vec!["HP"]);
-        assert_eq!(sai_throw[0].min_frames, Some(180));
+        // 34, not the transcribed 180: the charge threshold was bisected
+        // live (33 fails 3/3, 34 fires 3/3) -- see mk2.md's live-audited
+        // encodings section. The published "hold ~3 seconds" is ~5x the
+        // real requirement.
+        assert_eq!(sai_throw[0].min_frames, Some(34));
         assert_eq!(sai_throw[1].release, vec!["HP"]);
         assert_eq!(p.all_specials().len(), 7);
         // The arcade contact signal is the per-fighter `action_counter`
