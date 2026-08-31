@@ -3509,3 +3509,807 @@ Two items from §12 are also worth re-affirming with a third character's data:
 more sweeps with zero disagreements; and `guard_height` is now populated for
 three characters and has produced exactly one non-`mid` verdict per character
 kind — `unblockable` for the throw, `whiffs_vs_guard` at the geometric edge.
+
+## Closing the horizon debt: Reptile and Mileena re-scanned at 90 frames (2026-08-31, task P1)
+
+`docs/frames.md` §7 says in writing that Reptile's and Mileena's connect maps
+"must be re-scanned at 90 frames before their tables are called complete",
+because `DEFAULT_ANCHOR_FRAMES = 48` minus a 20-frame quiet window leaves a
+28-frame contact horizon and Reptile's close-LP throw contacts at f48. This is
+that re-scan: **every move × every rung of both committed ladders**
+(`gap-{0,5,15,30,45,60,70}` for the Reptile mirror,
+`m-gap-{0,15,25,30,35,39,45}` for Mileena-vs-Reptile), 112 cells, at
+`anchor_frames=90`.
+
+Rig: two headless FBNeo processes, `--pace 0`, MCP ports **4075** and **4076**
+(never 4025). Same profile-driven `framelab` block, same struct-health anchor
+`block+0x0E`, same two observables.
+
+### The headline, per character
+
+- **Mileena: NOTHING was hidden.** Her 56-cell map at 90 frames is
+  cell-for-cell identical to the shipped one — same damages, same contact
+  frames, same `connect_range` for all eight moves, same whiffs at 192/146 px.
+  Her table was complete and stays complete. Her throw (f24) really did squeak
+  inside the 28-frame horizon.
+- **Reptile: the throw came back, and four cells came back that nobody had
+  ever asked for.** The throw is the horizon cell §7 predicted. The other four
+  are a different failure that this run walked into head-first (below).
+
+### Reptile's map at 90 frames, stance lead-in 10
+
+`damage@contact-frame`, `[KD]` = the victim leaves its own resting `y`.
+Contact frames here are relative to a **10-frame** crouch lead-in, so a
+crouching move's number is 4 higher than the shipped table's 6-frame version;
+`first_active_frame` (contact − the move's own input frame) is unchanged and
+is the comparable quantity.
+
+| gap | HP | LP | HK | LK | cHP | cLP | cHK | cLK |
+|---|---|---|---|---|---|---|---|---|
+| 180 px (K=0) | — | — | — | — | — | — | — | — |
+| 172 px (K=5) | — | — | — | — | — | — | — | — |
+| 147 px (K=15) | — | — | — | — | — | — | — | — |
+| 110 px (K=30) | — | — | 32@f8 | 26@f8 | — | — | — | — |
+| 72 px (K=45) | 11@f11 | 8@f11 | 32@f8 | 26@f8 | 40@f18 [KD] | **6@f21** | **12@f24** | 6@f22 |
+| 62 px (K=60) | 24@f8 | **34@f48 [KD]** | 16@f11 | 16@f11 | 40@f18 [KD] | **6@f21** | **12@f24** | 6@f22 |
+| 62 px (K=70) | 24@f8 | **34@f48 [KD]** | 16@f11 | 16@f11 | 40@f18 [KD] | **6@f21** | **12@f24** | 6@f22 |
+
+Every previously-published cell reproduced exactly. `gap-5` (172 px) had never
+been scanned at all — it is a whiff at every button, as the rungs either side
+of it are.
+
+### What the 28-frame horizon hid: the throw, and it knocks down
+
+**`LP` at 62 px is a THROW: 34 damage, contact f48, `unblockable`, and it
+KNOCKS DOWN.** The damage and the unblockability were already in this file
+(task B3 measured 34 at f48 and proved it unblockable against a STANDING
+block); what the 90-frame scan adds is that the machine-produced map no longer
+prints `—` for it, that a CROUCH-blocking defender also takes the full 34
+(`framelab.guard`: 34 / 34 / 34), and — new — the §1.1 columns a knockdown
+actually owns:
+
+| char | move | gap | dmg | contact | guard | knockdown | **wakeup_window** | n |
+|---|---|---|---|---|---|---|---|---|
+| reptile | LP (throw) | 62 px | 34 | f48 | `unblockable` | yes | **25** | 2 |
+| mileena | LP (throw) | 61 px | 30 | f24 | `unblockable` | yes | **66** | 2 |
+
+§1.1 gives a throw no advantage number and neither row has one: `on_hit` and
+`on_block` are NULL, not 0. `wakeup_window` is the measurement instead —
+frames from contact to the victim's first manifest walk, by the identical
+act-again probe an advantage row uses, on both observables:
+
+- Reptile: 25 (`struct_velocity`, latency 1) and 26 (`pointer_x`, latency 2).
+- Mileena: 66 and 67.
+
+Both satisfy §8.4's ONE-SIDED rule exactly — `25−1 == 26−2` and
+`66−1 == 67−2` — so the stored value is in `struct_velocity`'s frame of
+reference, and the Rust loader collapses both cells without flagging.
+
+**The two throws are not the same shape, and the traces say why the wakeup
+windows differ by 41 frames.** Read through the victim's `obj+0x16`:
+
+- *Reptile's*: the grab starts at f13, the victim flies in ONE arc (y 85 →
+  20 at f31 → back to 85 at f48) and travels 312 px, and the damage register
+  writes on the LANDING frame, f48. So `airborne_until` (48) EQUALS the
+  contact frame — the arc precedes the damage rather than following it, which
+  is the opposite of a launcher like cHP and is worth knowing before anyone
+  reads `airborne_until` as "when the victim landed after being hit".
+- *Mileena's*: TWO arcs. The first (f2–f23) ends with the damage write at
+  f24; the second (f31–f52) is the throw proper, landing at f53 after only
+  69 px of travel. Her victim is still being thrown 29 frames after the
+  number that anchors the row.
+
+Both throws **cross sides** (the victim ends on the other side of the
+attacker), measured through the object pointer, which Mileena's roll is the
+only other move in this file known to do.
+
+Attacker-side numbers, measured but NOT stored (they are not an advantage and
+§1.1 forbids dressing them as one): Reptile's attacker manifests a walk at
+contact+22 against a victim who gets up at +25; Mileena's at contact+32
+against +66.
+
+### What the horizon did NOT hide, and what did: Reptile's crouching normals
+
+`cLP` and `cHK` were never in Reptile's connect map — his run scanned six
+moves, not eight — so **they are a coverage gap, not a horizon cell**: at a
+6-frame lead-in they contact at f17 and f20, comfortably inside the old
+28-frame window. They would have been found by the shipped defaults if anyone
+had asked for them.
+
+Asking for them ran into a **second silent cap of exactly the §7 shape, one
+layer down from the horizon.** At the shipped `stance_frames = 6`, *every*
+crouching normal on the Reptile ladder — including `cHP` and `cLK`, which are
+IN the shipped table — reported `—` at every rung. Swept, three trials per
+value, fully deterministic:
+
+| held `down` frames before the button | Reptile rungs (`gap-45`, `gap-60`) | Mileena rungs (`m-gap-39`, `m-gap-45`) |
+|---|---|---|
+| 4, 5 | nothing | nothing |
+| **6** | **nothing** | **40 dmg @ input+8** |
+| 7, 8, 9, 10 | 40 dmg @ input+8 | 40 dmg @ input+8 |
+
+The threshold is **7 on the Reptile ladder and 6 on Mileena's**, and it is a
+property of the ARENA, not the character: the Reptile rungs were saved before
+`settle_frames` existed (see her run's generator fixes), so the fighter is
+still mid-walk-animation on load — his `x` slides 607→609 on the first frame
+after the load — and the residual walk eats one frame of the stance
+transition. Mileena's ladder sits EXACTLY on its threshold; one frame of
+margin, and her whole crouching half depended on it.
+
+Below the threshold the move does not come out at all and the map prints `—`,
+the same glyph a genuine whiff gets. That is the identical failure mode §7
+records for the anchor horizon, and it is why the shipped `first_active_frame`
+values (contact − input frame) are the numbers to compare across runs: they
+are invariant to the lead-in, and they are what proved this re-scan measures
+the same moves.
+
+**No stance observable was found.** A whole-struct diff of a 14-frame held
+`down` against an identical neutral replay moves only `+0x6C` (128 vs 96, from
+f2) plus `+0x7C..0x7E` — and `+0x6C` is the input echo this file's own
+profile already DISQUALIFIED as an observable, while `+0x7C..0x7E` are nonzero
+on the Reptile arena and zero on Mileena's during the same input, so neither
+marks the stance transition. There is no validator; there is a knob
+(`--stance-frames` on `ladder`, `guard` and `punish`) and a documented
+measurement. Sweep the lead-in at the collision floor before trusting a
+crouching row on a new ladder.
+
+### The four new Reptile cells
+
+Measured by the full §4 protocol, `repeats=2` (every `actionable(N)` evaluated
+twice and required to agree), both observables on every sweep, `max_search=60`,
+0 refusals, 0 repeat-check failures, 0 cross-method disagreements. Probe-shape
+calibrations came out identical to his shipped run and to Mileena's and
+Baraka's (attacker 1/2, defender-on-hit 1/2, guarded defender 10/11), each
+confirmed hold-limited at anchor+70 and anchor+100.
+
+| move | variant | gap | dmg | chip | contact f | FAF | att free | def free (hit) | def free (blk) | **on hit** | **on block** | guard | n |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| cLP | — | 72 px | 6 | 2 | 21¹ | — | +16 | +23 | +19 | **+7** | **+3** | mid | 1 |
+| cLP | — | 62 px | 6 | 2 | 21¹ | 11 | +16 | +23 | +19 | **+7** | **+3** | mid | 2 |
+| cHK | — | 72 px | 12 | 3 | 24¹ | — | +39 | +14 | +19 | **−25** | **−20** | mid | 1 |
+| cHK | — | 62 px | 12 | 3 | 24¹ | 14 | +39 | +14 | +19 | **−25** | **−20** | mid | 2 |
+
+¹ replay-relative, with the 10-frame stance lead-in this run used; FAF is
+contact − 10 and is stored only at the 62 px floor (§4.4). `variant` is NULL
+on purpose: damage and contact frame are identical at 62 and 72 px, so there
+is no proximity boundary to name (§5) — the same shape Mileena's and Baraka's
+crouching normals have.
+
+`n=2` on the 62 px rows means a **cold second emulator process**, with its own
+calibration, reproduced every compared column (`framelab.ladder.compare_rows`:
+identical, 4/4 rows, zero differing columns). §8.1 satisfied.
+
+**They are Mileena's numbers to the frame.** Her cLP is +7/+3 and her cHK is
+−25/−20; his are identical, including `first_active_frame` (cLP 11, cHK 14)
+and damage (6 and 12) and chip (2 and 3). Baraka's cHK is also −25/−20. Three
+characters, one crouching kick.
+
+`guard_height` for all four: **`mid`** (open 6 → chip 2, open 12 → chip 3
+under BOTH standing and crouching Block), measured with `framelab.guard`, not
+inferred. Reptile's other rows still carry NULL there — that column was never
+measured for his kit.
+
+### A VERDICT CHANGED: cHK is Reptile's most unsafe normal
+
+The shipped section names far HK / far LK at **−16** as his most unsafe on
+block and far LK at −21 on hit. With cHK measured, both change:
+
+- **Most unsafe on block: cHK at −20** (was far HK/LK at −16).
+- **Most unsafe on hit: cHK at −25** (was far LK at −21).
+- **Safest: unchanged** — far HP and far LP at +13 on block / +4 on hit are
+  still the only PLUS-on-block normals in his kit. cLP at +3/+7 joins as his
+  safest crouching poke, replacing cLK's −4.
+
+Thrown through `framelab.punish` on `gap-60` (62 px), guard released at
+contact+1 per §8.3's correction:
+
+| rig | move | on block | def free (blk) | counter | first landing | attacker took |
+|---|---|---|---|---|---|---|
+| block | cHK @62 px | **−20** | +19 | HK | contact+**22** | chip 8 |
+| **control** | cHK @62 px, attacker does NOT guard | −20 | +19 | HK | contact+**22** | **full 32** |
+| **control** | cHK @62 px, guard HELD to the counter frame | −20 | +19 | HK | **never** (+14…+34) | — |
+| block | far HP @72 px (+13, the SAFE control) | +13 | +23 | HK | contact+**21** | chip 8 |
+
+Three things, all of which reproduce findings this file already carries, now
+on the character they were never tested on:
+
+1. **§8.3's guard-release rule holds.** Held to the counter frame, nothing
+   comes out at any N from +14 to +34. Released at +1, the identical sweep
+   lands from +22.
+2. **The `manifest − 2` rule fails on cHK again.** His defender manifests at
+   +19 and the earliest connecting counter is +22, not +17 — the same
+   direction and the same move shape it failed on for Mileena (+22/+24) and
+   Baraka (+24). Three characters; cHK is where that rule breaks.
+3. **"−20 on block" is an upper bound, not a verdict, for a third character —
+   and here the control is decisive.** With Reptile guarding after the move,
+   the counter that lands at +22 does chip 8; with `--no-attacker-guard`, the
+   SAME counter at the SAME frame does the full 32. So it is in range and on
+   time, and what stops it is that **his guard is back by contact+22 while his
+   walk does not manifest until +39 — a ≥17-frame gap** (Baraka's was ≥15,
+   Mileena's ≥7). The safe control behaves as the table says: far HP at +13
+   cannot be punished, only chipped.
+
+### `connect_range` is a bracket, and his ladder's brackets are coarser than hers
+
+Stored `connect_range` for the new cells is **72 px** for both cLP and cHK —
+the largest CONNECTING rung, per §5. Mileena's cHK carries 99. **That is not
+evidence that his crouching roundhouse is shorter than hers**: his ladder
+jumps 72 → 110 px with nothing in between, so all his bracket says is
+`72 < range ≤ 110`, and hers says `99 < range ≤ 114`. The two are compatible.
+Comparing his kit to hers at the reach boundary needs rungs he does not have.
+
+### Store and export
+
+Both are in `shadow/framelab/frames.db` and exported to
+`library/mk2/arcade.frames.json`. **The export was re-generated at the end of
+this run and verified row-for-row, column-for-column, against the store**
+(142 rows both sides, byte-identical dicts) — the two had silently diverged
+once before, so this is now checked rather than assumed.
+
+- 8 new rows for the four Reptile crouching cells (2 observables each).
+- 4 new rows for the two throws (2 observables each).
+- 142 rows / 71 cells total, up from 130 / 65. Every cell still carries
+  exactly two observations that AGREE — the Rust loader's own invariant test
+  passes on the new rows, including the throws' one-sided `wakeup_window`.
+
+**One consumer needs updating, and it is not this data.**
+`src/profile.rs`'s `frames_safety_extremes_match_shipped_data` asserts
+Reptile's most-unsafe `on_block` is **−16**. It is **−20** now, because cHK
+was measured. The safest (+13) is unchanged. That test is a SNAPSHOT of a
+verdict rather than an invariant, and it fails for the reason the neighbouring
+test's own comment warns about: "a test that fails because the lab did its job
+is a test that trains people to edit numbers until it passes." The assertion
+wants to become `Some(-20)`. Left alone here deliberately: this task's file
+scope excludes Rust. Everything else in the Rust suite passes (338/339).
+
+### Cost and provenance
+
+| phase | steps | loads | wall clock |
+|---|---|---|---|
+| Reptile map, 8 moves × 7 rungs @ 90 frames (stance 6, the false-whiff run) | 6,440 | 70 | 10 s |
+| Reptile map re-run at stance 10 | 7,640 | 82 | 14 s |
+| Mileena map, 8 moves × 7 rungs @ 90 frames | 7,740 | 83 | 12 s |
+| Mileena crouch map re-run at stance 10 (cross-check) | 3,720 | 40 | 7 s |
+| stance-threshold sweeps + the struct diff for a stance flag | ~4,000 | ~60 | ~15 s |
+| the four new cells, `repeats=2` | 158,990 | 2,557 | 224 s |
+| cold re-measure, 2 cells, fresh process | 84,049 | 1,319 | 116 s |
+| `guard_height`, 6 cells × 3 stances | 1,620 | 18 | 3 s |
+| both throws (wakeup windows) | 55,160 | 530 | ~200 s |
+| both throws again, cold process | 55,160 | 530 | ~200 s |
+| punish rigs (4 sweeps) | 5,590 | 67 | 8 s |
+
+**~390k confirmed steps and ~5.4k verified loads.** Every row carries
+`observable`, `method`, `input_latency_frames`, `guard_height` where measured,
+`sample_n`, `core_id` (`fbneo_libretro.dylib:sha256:972e8fb8c8394979`) and
+`rom_id` (`mk2.zip:sha256:e8d3f2f8cefe1aab`).
+
+### What this run says the harness still gets wrong
+
+1. **The anchor horizon is still a default that renders as a measurement.**
+   The default stays 48 (changing it would silently re-classify every earlier
+   whiff), but a `—` now travels with the window that produced it:
+   `ContactScan` records `anchor_frames` and `contact_horizon` on EVERY scan,
+   the whiff note names the last frame the search could have seen, the map
+   header prints the horizon and the stance lead-in, and the map now WARNS by
+   name about any move that whiffs at the tightest rung — the place a genuine
+   whiff is least likely. Run at the shipped defaults against the two cells
+   that actually fooled this project, it says so out loud:
+
+   ```
+   connect map: 2 moves x 2 rungs (anchor_frames=48, quiet_frames=20 ->
+     contacts later than f28 are NOT visible; stance_frames=6)
+       62px  LP=—  cHP=—
+      110px  LP=—  cHP=—
+     NOTE: 2 move(s) report no contact at the tightest rung (62px): LP, cHP.
+     At the collision floor a whiff is the LEAST likely explanation — check
+     the anchor horizon (throws contact as late as f48) and, for a crouching
+     move, the stance lead-in (docs/frames.md §7).
+   ```
+
+2. **The stance lead-in is the same bug with a different constant**, and
+   unlike the horizon it has no validator, because no struct field was found
+   that marks the stance transition. Open.
+3. **Un-settled arenas are not just imprecise, they change what inputs
+   work.** The Reptile ladder's missing `settle_frames` is why his crouch
+   threshold is 7 and hers is 6. Re-generating that ladder with
+   `settle_frames` + `reload_after_liveness` would make the two comparable;
+   it would also move his rungs (his "K=0" is 180 px from a 192 px base for
+   the liveness-probe reason §11 records), so it is a re-measurement of his
+   whole kit, not a fix-up.
+4. **A throw's `airborne_until` can PRECEDE its contact frame** (Reptile's
+   are the same frame). `ContactScan.airborne_until` is documented as the
+   frame the victim returns to resting `y` "after contact"; for a throw the
+   arc is the throw itself. The knockdown flag is still right; the window is
+   not what its name suggests.
+# Hitstop, measured (task P2)
+
+Evidence for `shadow_train.framelab.hitstop`, written to this file rather
+than `library/mk2/mk2.md` (owned by another agent this wave). House style
+follows `mk2.md`: VERIFIED claims are live-measured, negative results are
+kept, nothing is silently rounded.
+
+## 1. Two absolute methods were tried and rejected before the one that worked
+
+**(a) Whole-struct byte-diff, no input held, around a real contact.**
+Live, `gap-60.state` (Reptile mirror, 62px), Reptile HK on-hit, 45-frame
+window straddling contact (frame 11):
+
+- `block1` (attacker): 2 bytes change on the contact frame itself
+  (`+0x172..0x173`, an unrelated periodic idle-sway tick — see below), then
+  **zero further byte activity for the next 24 frames**, then the SAME
+  2-byte tick recurs at contact+25 (period ≈25 frames, present with or
+  without a hit — matches `mk2.md`'s own "idle-animation loop, ~150–500 ms
+  period" finding, line 365).
+- `block2` (defender/victim): 2 bytes change on the contact frame
+  (`+0xC` velocity, `+0xE` health), then **zero further byte activity for
+  24 frames**.
+
+This reproduces and extends `mk2.md`'s "twin-counter hunt" finding ("a
+fighter's struct is entirely static when untouched", "idle churn = 0 bytes"
+for a continuously-guarding defender under live contact): the WHOLE
+hitstun/blockstun window on this port, not just neutral idle, is
+byte-for-byte silent. Consequence: a naive freeze-span counter over this
+struct bundle cannot merely be fooled by an idle span (the hazard the task
+brief warns about) — it is BLIND, because "frozen because of a real hit"
+and "frozen because nothing is happening" produce IDENTICAL evidence, and a
+control comparison cannot catch it because the control reads identically
+too. `naive_freeze_span` in the shipped module exists only to demonstrate
+this in a unit test; nothing in the shipped code path uses it.
+
+**(b) The task brief's own candidate signal.** The brief cited "MK2 has a
+documented free-running animation counter (`block2+0x12` free-runs even at
+total idle)". Checked against the evidence doc before using it (docs/frames.md
+§7's explicit rule) — **that citation is `library/asurabld/asurabld.md`'s
+finding** ("block2's own `+0x12` free-runs `0`→`63` continuously even at
+total idle"), not MK2's. `library/mk2/mk2.md` documents no per-frame
+free-running byte in either fighter struct — finding (a) above is exactly
+why: MK2's own struct doesn't merely risk a false positive from such a
+counter, it has no such counter and is measured silent throughout. The
+citation was not ported across games (CLAUDE.md: never hardcode a
+cross-game fact any more than a cross-game address).
+
+## 2. What worked: the whiff-differenced attacker manifest
+
+`probe.sweep_actionable` already answers "first frame after ANCHOR this
+port's input diverges from a no-input control" for any anchor. Two runs of
+the identical attack script:
+
+- **connecting**, anchored on the move's real contact frame (`find_anchor`).
+- **whiff reference**, the SAME script thrown at a gap far enough it
+  provably misses (`scan_contact` → `connected=False`), anchored on
+  `script.total_frames` (NOT frame 0 — see the harness bug below).
+
+`hitstop(outcome) = manifest(connecting) − manifest(whiff)`. §1.2: hitstop
+only fires ON CONTACT, so the whiff run's attacker-actionable count is the
+move's intrinsic startup+recovery length with hitstop wired to exactly
+zero; subtracting isolates the freeze. Everything that moves on its own
+regardless of contact (injection latency, an observable's own manifestation
+margin, pushback if it existed on the attacker's own port) is identical in
+both terms of the subtraction and cancels — the same shape as `advantage`
+cancelling those terms, one level removed.
+
+**A harness bug found and fixed before any number shipped**: anchoring the
+whiff sweep at `N=0` (the frame the move's own button is asserted) gave a
+**perfectly reproducible (4/4 identical trials) but wrong** `first_true=0`
+on the live rig — not the documented one-frame transport flake (which does
+NOT reproduce on re-run), a probe/schedule interaction:
+`probe._schedule`'s precedence is "script < guard release < probe", so a
+walk-direction probe asserted on the SAME frame as the attack's own button
+REPLACES it (`hold_buttons` replaces, not ORs) in both the probe and the
+control run — the move never throws in either, so of course they never
+diverge relative to each other except by the walk itself. Anchoring at
+`script.total_frames` instead (well past the button's own hold) fixed it by
+construction; reproduced cleanly across repeat trials once corrected.
+
+**Cross-observable agreement (docs/frames.md §8.4).** `hitstop` is
+classified there as an anchor-based duration field (with
+`active`/`recovery`/`total`), held to EXACT agreement, not the one-sided
+margin rule — this falls out of the algebra above for free, since each
+observable's own manifestation margin appears once in each term of the
+subtraction and cancels regardless of which observable it belongs to.
+Measured: `struct_velocity` and `pointer_x` agreed to the frame on every
+cell measured (12/12/0/0/3/3/7 across two characters, 100% agreement, zero
+disagreements). `measure_hitstop_outcome` raises
+`CrossObservableHitstopError` rather than average a disagreement; none
+fired live.
+
+**A second sanity rule found live, not anticipated in the design**: hitstop
+can only ADD frames on top of a move's own recovery (§1.2), so a computed
+value can never legitimately be negative. It came out negative for
+`reptile.cLP` (−1, both gaps, both observables) and `mileena.cLK`/`cLP`
+(−2/−1). In every case the disagreement is EXACT and reproducible across
+both observables, which rules out transport noise — the real explanation is
+almost certainly that these crouching LIGHT normals proximity-fork the same
+way standing normals do (docs/frames.md §5), and the single `variant: None`
+label this dataset uses for them does not capture it, so the far-range
+"whiff reference" throw is a DIFFERENT animation than the one that connects
+at 61–72px. `measure_hitstop_outcome` now refuses (raises `HitstopError`)
+on any negative result rather than storing an impossible number — this is
+a new guard added specifically because of this live finding, with a unit
+test (`test_a_mismatched_whiff_reference_refuses_a_negative_hitstop`)
+reproducing the shape against a fake with a deliberately mismatched
+reference.
+
+## 3. Numbers
+
+All measured on `fbneo_libretro.dylib:sha256:972e8fb8c8394979` /
+`mk2.zip:sha256:e8d3f2f8cefe1aab`, cross-observable exact agreement on every
+row (`struct_velocity` == `pointer_x`), `on_hit == on_block` on every row
+where both were measured (no outcome-dependence detected on this kit, but
+NOT assumed — both were always measured independently; see §4).
+
+| char | move | variant | gap(s) px | hitstop | on_hit==on_block |
+|---|---|---|---|---|---|
+| reptile | HK | far | 72, 110 | **12** | yes |
+| reptile | LK | far | 72, 110 | **12** | yes |
+| reptile | HP | far | 72 | **0** | yes |
+| reptile | LP | far | 72 | **0** | yes |
+| reptile | cHK | (none) | 62, 72 | **3** | yes |
+| mileena | HK | far | 71, 83, 99 | **12** | yes |
+| mileena | LK | far | 71, 83, 99, 114 | **12** | yes |
+| mileena | HP | far | 71 | **0** | yes |
+| mileena | LP | far | 71, 83 | **0** | yes |
+| mileena | cHK | (none) | 61, 71, 83, 99 | **3** | yes |
+| mileena | cHP | (none, block-only — knockdown on hit) | 61, 71, 83 | **7** | n/a (block only) |
+| baraka | *(see run log — measured after this note was drafted; final numbers in the tool's closing report)* | | | | |
+
+**Pattern**: hitstop groups by move CLASS, identically across two
+characters so far, not by character: heavy kicks (HK/LK, 26–32 damage) =
+12 frames; light punches (HP/LP, 8–11 damage) = 0 frames; the crouching
+heavy kick (cHK, 12 damage) = 3 frames; the crouching launcher (cHP, 40
+damage, knockdown) = 7 frames on its block outcome. This reads as
+damage/move-class-scaled hitstop, not a flat per-hit constant — exactly the
+"do not assume one number" the task warned about, just scaled by MOVE
+rather than by outcome on this kit (every move measured gave `on_hit ==
+on_block` exactly; a hit/block split was never observed, though it was
+always independently measured, never assumed).
+
+## 4. What this implies for `PUNISH_DELAY`/the `Fast` floor
+
+The training dummy's fitted `PUNISH_DELAY = 26` and `Fast` floor of 21
+frames exist to compensate for "inputs during hit-freeze are eaten"
+(CLAUDE.md). Measured hitstop tops out at **12 frames** (the heavy
+normals) on this kit — well under half of 26. That means `PUNISH_DELAY`
+is NOT simply "hitstop, fitted": it is hitstop (≤12, and 0 for a fair
+fraction of the kit) PLUS whatever the dummy's own reaction/detection
+latency and input-buffering safety margin contribute on top. The `Fast`
+floor (21) sits between the measured hitstop ceiling (12) and the fitted
+delay (26), consistent with it covering "hitstop + a fast counter's own
+startup" for the quickest normals rather than hitstop alone.
+
+Concretely, `PUNISH_DELAY` is now DERIVABLE per matchup once hitstop is
+known for the move being punished: a punish window should open at
+`contact + hitstop(move, outcome) + counter_startup`, not at a single fitted
+constant across the whole kit — a heavy normal (hitstop 12) and a light one
+(hitstop 0) should not share one fixed delay. This is reported as an
+implication only; no Rust or dummy-constant changes were made (out of this
+task's scope by instruction).
+
+## 5. Coverage and what was skipped, named
+
+Store: `shadow/framelab/frames.db`, `move_frames` table (schema unchanged —
+`FrameStore.update()` added, no new column, no migration).
+
+**Measured and stored** (Reptile, Mileena so far — see run log for Baraka):
+every FAR-variant standing normal and every crouching HEAVY normal
+(`cHK`, `cHP`-block-only), both observables, `hitstop` cross-checked exact.
+
+**Explicitly skipped, with reasons** (docs/frames.md §7 — no silent caps):
+
+- **Every CLOSE-variant standing normal** (`HK`/`HP`/`LK`/`LP` close, and
+  `cHP`'s row, which this dataset also tags `variant: "close"`). MK2's
+  proximity-normal selection (§5) puts the close-range collision floor
+  (61–63px, per matchup) at the SAME distance a close normal's own reach
+  ends, so there is no gap left over that still resolves to the close move
+  and misses — building one would mean engineering a new arena right at a
+  move's connect edge, which §5 already names as unreproducible ("measure
+  specials at a rung well inside the connect region, never at its edge").
+  Judged out of "where it is cheap" scope.
+- **`cLK`/`cLP` on both characters** — measured, REFUSED (negative
+  result), not silently dropped. See §2's "second sanity rule" above: these
+  crouching light normals appear to proximity-fork the same way standing
+  normals do, and this dataset's `variant: None` label does not capture it,
+  so the far-range whiff throws a different animation than the one that
+  connects. Fixing this needs a distinct close/far split added to how these
+  rows are keyed — a labeling question for whoever owns the move-variant
+  taxonomy, out of this task's file scope (this task does not edit
+  `kit.py` or `mk2.md`).
+- **Special/macro moves** (`sai_throw`, `roll`, `teleport_kick`, and any
+  Baraka specials once measured) — this pass only rebuilds a `MoveSpec` for
+  plain button chords and their crouching (`down`+button) forms
+  (`hitstop._spec_for_move`); a macro's multi-step input program is a
+  different `MoveScript` this pass does not construct. Reported as skipped
+  with that reason, not attempted.
+
+**Determinism**: dry-run reproduced identically across two independent
+invocations for every measured Reptile cell before the real write (§7's
+re-measurement bar, applied before committing a number, not after).
+
+## 6. A note on `stance_frames` (found live, not part of this task's fix)
+
+`kit.py`'s `MoveSpec.stance_frames` default (6) does not reliably throw a
+crouching normal on the plain `shadow/arenas/mk2/gap-*` (Reptile-mirror)
+ladder — confirmed live here independently: `cLP`/`cHK` at `stance_frames=6`
+produced zero contacts in 48 frames on that ladder. `kit.py`'s own
+docstring (edited by another agent this same wave, discovered mid-task) now
+documents the same thing: needs 7 on the unsettled Reptile-mirror rungs,
+≥6 on the settled `m-gap-*`/`b-gap-*` ones. `hitstop._spec_for_move` uses 7
+unconditionally (satisfies both cases measured) rather than re-deriving
+which ladder a row's arena belongs to. Not a hitstop finding, but shipped
+in this module because it blocked measuring `cHK`/`cLK`/`cLP`/`cHP`
+without it, and is called out here in case anyone reconciles it against
+`kit.py`'s own note.
+# P3 — the ACTIVE window by teleport probe (MK2 arcade, Mileena)
+
+**Verdict: the method WORKS on this port.** All four kill criteria were tested
+and none of them killed it; one of them (defender animation phase) is real but
+is confined to a ~3 px band at each move's reach boundary, and there is a cheap
+test that detects it. `active`, `recovery` and `total` are measurable, and eight
+of Mileena's normals were measured end to end.
+
+Session: headless FBNeo, **MCP port 4078** (the user's 4025 was never touched),
+rig `shadow/arenas/mk2/m-gap-*.state` (Mileena P1 vs Reptile P2), two cold
+processes. Nothing was written to `shadow/framelab/frames.db`; the rows live in
+a scratch DB (`p3-active-scratch.db`, same schema, ready to merge).
+
+## The measurement
+
+Start the attack with the defender out of range; write the defender's x
+(`obj+0x12`) to a target gap at the END of frame N; watch the struct-health
+anchor (`block2+0x0E`). The write is in place for frame N+1, so a connecting
+trial contacts at `max(first_active, N+1)`, and the predicate over N is one
+contiguous run of TRUEs:
+
+```
+first_active_frame = contact frame of the earliest connecting trial
+last_active_frame  = (last connecting N) + 1
+active             = last - first + 1
+```
+
+`total` comes from a second, ordinary §4.2 differential probe run against a rig
+where the move never connects (a WHIFF — on hit or on block the timeline
+contains hitstop, which §1.2 keeps in its own column), and then
+`recovery = total - last_active_frame`.
+
+## Kill criterion 1 — does the write stick during an attack? NO KILL
+
+The doubt came from `asurabld`, where `block+0x54/0x56` are recomputed outputs.
+It does not transfer: MK2's object-pool x is an authoritative store for BOTH
+fighters, mid-animation.
+
+| written at | gap trace, frames after the write |
+|---|---|
+| end of f5  | `99` × 27, bit-exact, no drift |
+| end of f11 | `99` × 21 |
+| end of f14 | `99` × 18 |
+| end of f20 | `99` × 12 |
+| attacker's own x, end of f8 | `99` × 18 |
+
+**The one structural exception, and it is enforced in code.** Below the
+anti-overlap floor the game separates the bodies at **6 px/frame** until they
+reach 62–66 px, so a sub-floor target gap exists for exactly one frame:
+
+```
+write gap=30 -> 30 36 42 48 54 60 66 66 ...
+write gap=45 -> 45 51 57 63 63 ...
+write gap=55 -> 55 61 61 ...
+write gap=61 -> 61 61 61 ...   (at/above the floor: perfectly stable)
+```
+
+`active.CollisionFloorError` refuses a target gap under the profile's own
+`framelab.spacing.collision_floor_px`.
+
+## Kill criterion 2 — is a teleported defender a valid target? NO KILL
+
+A defender teleported at frame 0 from 192 px to gap G reproduces the NATIVE
+ladder arenas cell for cell — same contact frame, same damage, same whiffs:
+
+| gap | native arena (no writes) | teleported to that gap |
+|---|---|---|
+| 61 | `m-gap-45`: contact f8, 24 dmg (close HP) | contact f8, 24 dmg |
+| 71 | `m-gap-39`: contact f11, 11 dmg (far HP) | contact f11, 11 dmg |
+| 83 | `m-gap-35`: contact f11, 11 dmg | contact f11, 11 dmg |
+| 99 | `m-gap-30`: whiff | whiff |
+| 114 | `m-gap-25`: whiff | whiff |
+
+The game keys collision off the position we write, not off provenance. It even
+re-runs PROXIMITY selection from the written position (the 61 px row is the
+24-damage close HP), which is the next finding.
+
+## Kill criterion 3 — is the window the defender's animation phase? NO KILL at usable distances, REAL at the fringe
+
+Two independent phase tests at a deep gap, and both say the window belongs to
+the attack:
+
+**(a) Slide the attack against both idle animations.** Delaying the attack
+input by k = 0..7 idle frames moved the window by exactly k and never resized
+it, in two different arenas (`m-gap-30`, `m-gap-0`):
+
+```
+G=76, k=0..7:  active(run) = [11+k, 16+k]   ->  input-relative [11,16] for every k
+```
+
+**(b) Give the defender a completely different animation.** With Block held
+(chip damage instead of damage, block stance instead of idle) the window is
+bit-identical:
+
+```
+HP  guard=False active=[11,16] dmg=11   |  guard=True active=[11,16] chip=3
+cHK guard=False active=[20,24] dmg=12   |  guard=True active=[20,24] chip=3
+```
+
+**(c) And it is distance-invariant across the whole inner range**, which is a
+third way of saying the same thing:
+
+```
+HP  far:  G = 61 66 71 76 80 83 84  ->  active = [11,16] at every one
+cHK    :  G = 61 66 71 83 99 110 114 ->  active = [20,24] at every one
+cHP    :  G = 61 63 66 71 76 80 83 90 ->  active = [14,14] at every one
+```
+
+**THE FRINGE IS WHERE IT BITES, and it reproduces exactly the known hazard.**
+Within ~3 px of a move's reach the limb is still extending, and the window's
+START stops tracking the attack:
+
+| | |
+|---|---|
+| `m-gap-0`, G=85..87 | contact at run-frame **15**, not 11 |
+| `m-gap-0`, G=85, k=0..4 | start pinned at run-frame **15 regardless of k** — an ABSOLUTE clock (the defender's idle animation), not the attack's |
+| `m-gap-30`, G=85, k=0..7 | **never connects at any N** |
+
+So the same nominal gap connects from one arena and not from another, and its
+apparent window start ignores when the attack was thrown. That is precisely the
+"Blade Swipe at its reach boundary fires or misses depending on the defender's
+idle phase, and the reference DRIFTS" failure mode, reproduced and localised.
+
+**The defence, implemented as `measure_active(require_gap_agreement=True)`:**
+measure at ≥2 target gaps and refuse unless they agree. The fringe disagrees
+with the interior by construction; the interior agrees with itself everywhere.
+
+## Kill criterion 4 — does the teleport itself alter the interaction? NO KILL
+
+A NULL write (the defender's own current x written back) at frames 0, 3, 5, 6,
+9, 10, 11, 12, 15, 20:
+
+* on a natively connecting rig (`m-gap-35`, 83 px): contact f11, 11 dmg — every
+  time, identical to no write at all;
+* on a natively whiffing rig (`m-gap-30`, 99 px): whiff — every time.
+
+The write is inert. It is the POSITION that does the work.
+
+## Independent validations
+
+**1. The window START equals `first_active_frame` measured the other way.**
+The store's `first_active_frame` column for Mileena at the 61 px floor was
+measured by an unrelated protocol (§4.4, contact frame at minimum gap). The
+four crouching normals have no proximity variants, so the comparison is
+apples-to-apples — **four for four, to the frame**:
+
+| move | stored `first_active_frame` | this method (input-relative) |
+|---|---|---|
+| cHP | 8  | **8** |
+| cLP | 11 | **11** |
+| cLK | 10 | **10** |
+| cHK | 14 | **14** |
+
+The standing normals cannot be compared this way (the stored rows are the CLOSE
+variants; this method measures the FAR ones — see the limitation below), but the
+far HP's start of 11 equals the native contact frame at `m-gap-39` (71 px) and
+`m-gap-35` (83 px), which is the same check against a different reference.
+
+**2. Reach ordering matches the connect map.** The longer-reaching move has the
+later, and the sweep found each move's reach as a by-product:
+cHK reaches 114 px and is active [20,24]; far HP reaches 84–87 px and is active
+[11,16]; cHP reaches 90 px and is active [14,14]. Whiff boundaries agree with
+the stored connect map (cHK rows exist out to 99 px, LK far to 114 px).
+
+**3. A different write target gives the same window.** Teleporting the
+ATTACKER (`obj1+0x12`, opposite sign, different object-pool entry) instead of
+the defender:
+
+```
+HP  side=defender [11,16] dmg=11   |  side=attacker [11,16] dmg=11
+HK  side=defender  [8,13] dmg=32   |  side=attacker  [8,13] dmg=32
+cHK side=defender [20,24] dmg=12   |  side=attacker [20,24] dmg=12
+```
+
+**4. Cold-process reproduction.** The emulator was killed and relaunched and the
+sweep re-run from scratch. Six moves, six exact reproductions:
+
+```
+HP  [11,16]   HK  [8,13]   cHP [14,14]   cHK [20,24]   cLP [17,17]   cLK [16,17]
+```
+
+**5. §8.2 internal consistency** (`total >= FAF + active`) holds on all eight
+rows.
+
+## The numbers (Mileena, MK2 arcade, gap 66 px, agreement-checked at 66 and 76)
+
+All frames input-relative. `total` = earliest frame the attacker can START A
+WALK (the lab's standing convention; earliest-attack was measured at
+walk-manifest − 2). `recovery` = `total − last_active_frame`.
+
+| move | active window | active | damage | total | recovery | reach |
+|---|---|---|---|---|---|---|
+| HP (far)  | 11–16 | 6 | 11 | 21 | 5  | 84–87 |
+| LP (far)  | 11–16 | 6 | 8  | 21 | 5  | ≥76 |
+| HK (far)  | 8–13  | 6 | 32 | 39 | 26 | ≥76 |
+| LK (far)  | 8–13  | 6 | 26 | 39 | 26 | ≥76 |
+| cHP       | 8–8   | **1** | 40 | 29 | 21 | 90 |
+| cLP       | 11–11 | **1** | 6  | 28 | 17 | ≥76 |
+| cHK       | 14–18 | 5 | 12 | 50 | 32 | 114 |
+| cLK       | 10–11 | 2 | 6  | 33 | 22 | ≥76 |
+
+The whole table cost ~112 s of wall clock (66,490 frames, 1,159 loads).
+
+**A caution on `total`, which is NOT part of this spike's claim.** The whiff
+walk-manifest is a §4.2 differential probe anchored at `input+3` rather than at
+contact — the lab has never anchored a sweep on anything but contact, and the
+anchor has to sit after the button is committed or the walk hold cancels the
+move (at `anchor=0` every move reported `first_true=0`, i.e. it just walked).
+The predicates came out monotone and both observables agreed to the frame on
+every move, which is the cross-method check passing, but `total` and therefore
+`recovery` deserve their own validation pass before publication. `active` and
+`first_active_frame` do not depend on them.
+
+## What this method does NOT measure (all four are enforced or documented in `active.py`)
+
+1. **"The hitbox exists" — it measures "the hitbox covers THIS distance."** The
+   two coincide over the inner range (distance-invariant on every move tried)
+   but not at the fringe. A window measured at the fringe is a REACH
+   measurement in the active window's clothes.
+2. **A proximity CLOSE variant's window is not measurable this way.** Moving the
+   defender out of a close normal's range also moves it out of the bucket that
+   SELECTS the close normal. Measured: variant selection re-runs from the
+   written position, somewhere after frame 1 and before frame 8 —
+   `m-gap-30 → 61 px` at N=1 produced the 24-damage close HP, at N=2 the
+   11-damage far HP; and teleporting OUT at frames 0..7 turned `m-gap-45`'s
+   close HP into the far HP. Hence `MIN_TELEPORT_FRAME = 2` and the
+   `VariantDriftError` damage check. **A vertical probe (`obj+0x16`, also
+   write-authoritative) would preserve the horizontal proximity bucket and is
+   the obvious next experiment for close variants — untested here.**
+3. **Projectiles and travelling specials are out of scope.** For the sai, the
+   roll or the teleport kick, "frames during which something overlaps distance
+   G" is the PROJECTILE'S TRAVEL, not the move's active frames. Not measured.
+4. **Vertical extent is unswept.** Every trial is horizontal at the defender's
+   resting y; a hitbox live only above or below the defender reads as inactive.
+
+## Deliverables
+
+* `shadow/train/shadow_train/framelab/active.py` — the method, with all four
+  kill criteria and their evidence in the module docstring, and five refusals
+  (`CollisionFloorError`, `ClippedWindowError`, `NonMonotoneWindowError`,
+  `VariantDriftError`, `GapDisagreementError`).
+* `shadow/train/tests/test_framelab_active.py` — 20 tests against a toy hitbox
+  fighter that reproduces the anti-overlap floor, the proximity variant lock,
+  the extending-limb fringe and a free-running idle counter.
+* Scratch DB with the eight rows: `p3-active-scratch.db` (this job's tmp dir).
+  `shadow/framelab/frames.db` was NOT written.
+
+## What would have to happen next to ship this
+
+1. Validate `total`/`recovery` independently (a punish rig, as was used to
+   settle the 9-frame block-stance question) before those two columns are
+   published; `active` and `first_active_frame` are ready now.
+2. Decide the fringe rule as policy: the current one is "two gaps must agree,
+   both chosen at least ~4 px inside the measured reach". The reach itself is a
+   free by-product of the same sweep, so the harness can pick the gaps itself.
+3. Re-measure the close variants by the vertical probe, or record them NULL with
+   the reason — never with the far variant's window.
+
+### Status of the `active` rows (orchestrator note, 2026-08-31)
+
+The eight `active` measurements above live in a SCRATCH database, not in
+`shadow/framelab/frames.db`, and were deliberately not hand-merged:
+
+- their rows carry no `gap_walk_frames`, so they do not key onto the
+  existing cells without a mapping step;
+- `active` itself is validated (window start == the independently measured
+  `first_active_frame`, 4/4), but `total`/`recovery` rest on a
+  whiff-anchored probe that is new to this lab and has not had its own
+  punish-rig validation.
+
+Promoting them is a task, not a merge: key the rows, validate `total` and
+`recovery` independently, and write through the store's normal provenance
+path. Hand-editing rows into the shipped table to close a column faster is
+precisely how a wrong number gets blessed.

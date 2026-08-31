@@ -212,6 +212,12 @@ def main() -> None:  # pragma: no cover - the live-rig path
                          "whiff in ALL THREE stances and classifies as NULL — "
                          "which is how Baraka's f40 throw first looked. 90 is "
                          "enough for every MK2 throw measured so far.")
+    ap.add_argument("--stance-frames", type=int, default=None,
+                    help="held stance frames before a `:crouch` cell's button "
+                         "(default: MoveSpec's 6). Below the per-ladder "
+                         "threshold the crouching normal never comes out, all "
+                         "THREE stances read as whiffs and the verdict is NULL "
+                         "— see ladder.py's own --stance-frames.")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -234,7 +240,8 @@ def main() -> None:  # pragma: no cover - the live-rig path
     out = []
     for raw in args.cell:
         parts = raw.split(":")
-        spec = _parse_move(":".join(parts[:-1]), prof.attack_chords)
+        spec = _parse_move(":".join(parts[:-1]), prof.attack_chords,
+                           args.stance_frames)
         rung = Rung.from_sidecar(parts[-1])
         g = measure_guard_height(
             session, spec=spec, rung=rung, contact_read=contact_read,
