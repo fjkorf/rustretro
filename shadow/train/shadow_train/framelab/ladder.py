@@ -337,9 +337,21 @@ def _print_verdict(v: Dict[str, Any]) -> None:
 # ── operator entry point ──────────────────────────────────────────────────
 
 
-def _parse_move(raw: str, chords: Dict[str, Sequence[str]]) -> MoveSpec:
+def _parse_move(
+    raw: str, chords: Dict[str, Sequence[str]], stance_frames: Optional[int] = None
+) -> MoveSpec:
     """`HP` or `HP:crouch`. The buttons come from the profile's
-    `attack_chords`, never from this file."""
+    `attack_chords`, never from this file.
+
+    `stance_frames` overrides `MoveSpec`'s default lead-in. It is an operator
+    knob rather than a constant because the lead-in a crouching normal needs
+    is a property of the ARENA, not of the move: measured on this port, the
+    uppercut needs 7 held `down` frames from the Reptile ladder's rungs and 6
+    from Mileena's, because the Reptile rungs were saved mid-walk-animation
+    (no `settle_frames`) and the residual walk eats a frame of the stance
+    transition. Below the threshold the move does not come out AT ALL and the
+    connect map prints `—`, the same glyph a genuine whiff gets — the §7
+    silent-cap shape a second time. See `kit.MoveSpec.stance_frames`."""
     name, _, mod = raw.partition(":")
     if name not in chords:
         raise SystemExit(f"unknown move {name!r} (profile knows {sorted(chords)})")
@@ -348,8 +360,10 @@ def _parse_move(raw: str, chords: Dict[str, Sequence[str]]) -> MoveSpec:
         return MoveSpec(name=name, buttons=buttons)
     if mod != "crouch":
         raise SystemExit(f"unknown move modifier {mod!r} (only 'crouch')")
+    extra = {} if stance_frames is None else {"stance_frames": stance_frames}
     return MoveSpec(
         name=name, buttons=buttons, stance="crouching", stance_button="down",
+        **extra,
     )
 
 
@@ -394,6 +408,14 @@ def main() -> None:  # pragma: no cover - the live-rig path
                          "shipped 48 hides every MK2 throw (Baraka's contacts "
                          "at f40, Reptile's at f48). Raise it when a cell reads "
                          "'—' at the collision floor.")
+    ap.add_argument("--stance-frames", type=int, default=None,
+                    help="held stance frames before a `:crouch` move's button "
+                         "(default: MoveSpec's 6). MEASURED per ladder: the "
+                         "Reptile rungs need 7 and Mileena's need 6, and below "
+                         "the threshold the crouching normal never comes out "
+                         "while the map prints '—' — indistinguishable from a "
+                         "whiff. Verify with a stance sweep before trusting a "
+                         "crouching row on a new ladder.")
     ap.add_argument("--repeats", type=int, default=1,
                     help="evaluations per actionable(N); >1 requires them to "
                          "agree and raises otherwise (docs/frames.md §7)")
@@ -437,13 +459,21 @@ def main() -> None:  # pragma: no cover - the live-rig path
     )
     session.enforce_preconditions()
 
-    specs = [_parse_move(m, prof.attack_chords) for m in args.move]
+    specs = [_parse_move(m, prof.attack_chords, args.stance_frames)
+             for m in args.move]
     rungs = [Rung.from_sidecar(a) for a in args.arena]
     started = time.monotonic()
 
     cmap: Dict[Tuple[str, str], ContactScan] = {}
     if specs and rungs:
-        print(f"connect map: {len(specs)} moves x {len(rungs)} rungs")
+        # §7: the horizon is printed with the map, always. A `—` means "no
+        # contact WITHIN THIS WINDOW", and a reader who cannot see the window
+        # cannot tell a whiff from a cap.
+        print(f"connect map: {len(specs)} moves x {len(rungs)} rungs "
+              f"(anchor_frames={args.anchor_frames}, quiet_frames={quiet} -> "
+              f"contacts later than f{args.anchor_frames - quiet} are NOT "
+              f"visible; stance_frames="
+              f"{args.stance_frames if args.stance_frames is not None else 6})")
         cmap = connect_map(
             session, specs=specs, rungs=rungs, guard_buttons=guard,
             contact_read=contact_read, quiet_frames=quiet,
@@ -460,6 +490,22 @@ def main() -> None:  # pragma: no cover - the live-rig path
                     if s.connected else f"{spec.label}=—"
                 )
             print("  " + "  ".join(row))
+        # A whiff at the TIGHTEST rung is the cell least likely to be a real
+        # whiff and most likely to be a horizon or a stance short by a frame —
+        # both of which have now happened. Name them instead of leaving the
+        # reader to notice.
+        floor = min((r for r in rungs if r.gap_px is not None),
+                    key=lambda r: r.gap_px, default=None)
+        if floor is not None:
+            suspect = [s.label for s in specs
+                       if not cmap[(s.label, floor.arena)].connected]
+            if suspect:
+                print(f"  NOTE: {len(suspect)} move(s) report no contact at the "
+                      f"tightest rung ({floor.gap_px}px): {', '.join(suspect)}. "
+                      "At the collision floor a whiff is the LEAST likely "
+                      "explanation — check the anchor horizon (throws contact "
+                      "as late as f48) and, for a crouching move, the stance "
+                      "lead-in (docs/frames.md §7).")
     ranges = connect_ranges(cmap)
     if ranges:
         print("connect_range:", json.dumps(ranges, sort_keys=True))
@@ -476,7 +522,7 @@ def main() -> None:  # pragma: no cover - the live-rig path
               json.dumps(latencies, sort_keys=True))
     elif args.calibrate_on:
         raw_move, _, arena = args.calibrate_on.rpartition(":")
-        spec = _parse_move(raw_move, prof.attack_chords)
+        spec = _parse_move(raw_move, prof.attack_chords, args.stance_frames)
         rig = make_rig(arena, guard_buttons=guard, quiet_frames=quiet,
                        walk_directions_by_port=wdbp)
         scan = scan_contact(session, rig=rig, spec=spec, gap_px=None,
@@ -497,7 +543,8 @@ def main() -> None:  # pragma: no cover - the live-rig path
         parts = raw.split(":")
         variant = None if parts[-1] == "-" else parts[-1]
         arena = parts[-2]
-        spec = _parse_move(":".join(parts[:-2]), prof.attack_chords)
+        spec = _parse_move(":".join(parts[:-2]), prof.attack_chords,
+                           args.stance_frames)
         cells.append((spec, Rung.from_sidecar(arena), variant))
 
     ms, refusals = measure_ladder(

@@ -109,6 +109,31 @@ class ScanContactTest(unittest.TestCase):
         self.assertIsNone(scan.damage)     # §2.5: absent, never 0
         self.assertIsNone(scan.contact_frame)
 
+    def test_a_whiff_records_the_window_that_produced_it(self):
+        """§7: a `—` means "no contact WITHIN THIS WINDOW". Two separate runs
+        have now published a cap as a whiff (Baraka's f40 throw, Reptile's
+        f48), so the window a whiff was measured against travels WITH the
+        whiff instead of living only on the operator's command line."""
+        game = FakeGame(reach=10)
+        session = make_session(game)
+        rig = fake_rig(quiet_frames=20)
+        scan = kit.scan_contact(session, rig=rig, spec=PUNCH, gap_px=180,
+                                contact_read=contact_read, defender_guard=False,
+                                anchor_frames=48)
+        self.assertFalse(scan.connected)
+        self.assertEqual(scan.anchor_frames, 48)
+        self.assertEqual(scan.contact_horizon, 28)   # 48 - quiet_frames
+        self.assertIn("f28", scan.note)
+
+    def test_a_connecting_scan_records_the_window_too(self):
+        session = make_session(FakeGame())
+        scan = kit.scan_contact(session, rig=fake_rig(quiet_frames=20), spec=PUNCH,
+                                gap_px=62, contact_read=contact_read,
+                                defender_guard=False, anchor_frames=90)
+        self.assertTrue(scan.connected)
+        self.assertEqual(scan.anchor_frames, 90)
+        self.assertEqual(scan.contact_horizon, 70)
+
     def test_connect_records_damage_and_hits_from_the_anchor(self):
         session = make_session(FakeGame())
         scan = kit.scan_contact(session, rig=fake_rig(), spec=PUNCH, gap_px=62,

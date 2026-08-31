@@ -29,6 +29,7 @@ Two honesty rules drive every design choice here, both from §2.5 and §7:
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -68,6 +69,18 @@ REQUIRED_PROVENANCE_COLUMNS: tuple[str, ...] = (
 )
 
 SCHEMA_VERSION = 1
+
+# `update()`'s lock-contention retry (task P2: "the store may be written
+# concurrently by another agent this wave -- keep transactions short and
+# retry on lock contention rather than failing the run"). `sqlite3.connect`
+# already busy-waits up to its own `timeout` (5s default) before raising
+# `OperationalError("database is locked")`; this is a second, short layer on
+# top of that for the rare case two writers's 5s windows still overlap. Not a
+# sleep-as-a-fix (§2.4 is about measurement, not this) -- it is retrying an
+# actual observed failure, with backoff, and it still raises if contention
+# outlives it.
+_UPDATE_RETRY_ATTEMPTS = 8
+_UPDATE_RETRY_BACKOFF_S = 0.05
 
 _CREATE_V1 = """
 CREATE TABLE move_frames (
@@ -224,6 +237,73 @@ class FrameStore:
         self._conn.commit()
         assert cur.lastrowid is not None
         return cur.lastrowid
+
+    def update(self, row_id: int, values: dict) -> None:
+        """UPDATE a subset of one row's already-NULL MEASURED columns in
+        place -- the operation this store never had until `hitstop` needed
+        one (§11 reserved the column; nothing before task P2 ever filled it
+        after the fact for a row whose `on_hit`/`on_block` were already
+        measured and shipped).
+
+        Deliberately narrower than a raw SQL `UPDATE`:
+
+          * The identifying key (`REQUIRED_KEY_COLUMNS`) and provenance
+            (`REQUIRED_PROVENANCE_COLUMNS`) columns are REFUSED. This method
+            fills in a quantity a row did not have yet; it must not let a
+            caller change what the row is ABOUT or who vouches for it. Use
+            `delete()` + `insert()` for that (§7: "a number that fails
+            re-measurement is DELETED, not averaged" -- the same rule
+            applies to identity, doubly).
+          * `measured_at` is left untouched unless the caller explicitly
+            includes it in `values`: filling in `hitstop` does not re-measure
+            `on_hit`/`on_block`, and this table has only one timestamp column
+            for the whole row, so silently bumping it would misrepresent
+            when the OTHER columns were measured.
+          * Retries `sqlite3.OperationalError: database is locked` with a
+            short backoff (`_UPDATE_RETRY_ATTEMPTS`/`_UPDATE_RETRY_BACKOFF_S`)
+            on top of `sqlite3.connect`'s own busy-wait: this store may be
+            written CONCURRENTLY by another process's `FrameStore` this wave,
+            and a transient lock is not this row's fault.
+
+        Raises `ValueError` for an unknown column, a forbidden column, or a
+        `row_id` that does not exist (silently updating 0 rows is exactly
+        the kind of quiet no-op this project's honesty rules forbid).
+        """
+        if not values:
+            return
+        unknown = set(values) - set(MOVE_FRAMES_COLUMNS)
+        if unknown:
+            raise ValueError(f"unknown move_frames column(s): {sorted(unknown)}")
+        forbidden = (set(REQUIRED_KEY_COLUMNS) | set(REQUIRED_PROVENANCE_COLUMNS)) & set(
+            values
+        )
+        if forbidden:
+            raise ValueError(
+                f"update() refuses to touch identifying/provenance column(s) "
+                f"{sorted(forbidden)} -- it fills in a quantity a row did not "
+                "have yet, it does not change what the row is about or who "
+                "vouches for it. Use delete() + insert() for that."
+            )
+
+        cols = list(values)
+        set_clause = ",".join(f"{c} = ?" for c in cols)
+        sql = f"UPDATE move_frames SET {set_clause} WHERE id = ?"
+        params = [values[c] for c in cols] + [row_id]
+
+        attempt = 0
+        while True:
+            try:
+                cur = self._conn.execute(sql, params)
+                self._conn.commit()
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt >= _UPDATE_RETRY_ATTEMPTS - 1:
+                    raise
+                attempt += 1
+                time.sleep(_UPDATE_RETRY_BACKOFF_S * attempt)
+
+        if cur.rowcount == 0:
+            raise ValueError(f"update(): no move_frames row with id={row_id}")
 
     # ── reads ────────────────────────────────────────────────────────────
     def get(self, row_id: int) -> Optional[dict]:

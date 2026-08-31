@@ -230,6 +230,12 @@ def main() -> None:  # pragma: no cover - the live-rig path
                     help="do NOT have the attacker hold Block after the move")
     ap.add_argument("--on-hit", action="store_true",
                     help="sweep the ON-HIT rig (defender holds no guard)")
+    ap.add_argument("--stance-frames", type=int, default=None,
+                    help="held stance frames before a `:crouch` move's button "
+                         "(default: MoveSpec's 6). Below the per-ladder "
+                         "threshold the move never comes out and this rig "
+                         "exits with 'does not connect' — see ladder.py's own "
+                         "--stance-frames.")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -254,8 +260,8 @@ def main() -> None:  # pragma: no cover - the live-rig path
     rung = Rung.from_sidecar(args.arena)
     rig = make_rig(args.arena, guard_buttons=guard, quiet_frames=flspec.quiet_frames,
                    walk_directions_by_port=wdbp)
-    spec = _parse_move(args.move, prof.attack_chords)
-    counter = _parse_move(args.counter, prof.attack_chords)
+    spec = _parse_move(args.move, prof.attack_chords, args.stance_frames)
+    counter = _parse_move(args.counter, prof.attack_chords, args.stance_frames)
 
     guarded = not args.on_hit
     scan = scan_contact(session, rig=rig, spec=spec, gap_px=rung.gap_px,

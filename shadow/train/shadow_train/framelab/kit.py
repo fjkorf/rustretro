@@ -163,6 +163,22 @@ class MoveSpec:
     (Reptile's uppercut: contact at f14, 40 damage, defender launched). The
     lead-in is replayed identically in probe and control, so it cancels out of
     the differential exactly like a walk-in would.
+
+    **The default 6 is not a safe default — it is the THRESHOLD on one
+    ladder.** Swept live, three trials per value, fully deterministic: from
+    Mileena's rungs the uppercut needs 6 held `down` frames and comes out at
+    every value ≥ 6; from the Reptile mirror's rungs it needs 7, and at 6 it
+    does not come out AT ALL. The difference is the ARENA, not the character —
+    the Reptile rungs were saved without `settle_frames`, so the fighter is
+    still mid-walk-animation on load and the residual walk eats a frame of the
+    stance transition. Below the threshold every crouching cell prints `—`,
+    which is exactly what a genuine whiff prints: the same §7 silent-cap shape
+    as the anchor horizon, one layer down. No struct field was found that
+    marks the stance transition (a whole-struct diff of a held `down` against
+    neutral moves only the disqualified input echo at `+0x6C`), so there is no
+    validator yet — sweep the lead-in at the collision floor before trusting a
+    crouching row on a new ladder, and anchor well inside the threshold rather
+    than on it (the re-scan that found this used 10).
     """
 
     name: str
@@ -216,6 +232,15 @@ class ContactScan:
     §10 says is the only honest test on arcade (resting y is character- AND
     stage-dependent, so there is no scalar GROUND_Y to compare against — the
     fighter's own pre-contact y is the reference).
+
+    `anchor_frames`/`contact_horizon` are recorded on EVERY scan, connecting
+    or not, because a `connected=False` is only a whiff RELATIVE TO A WINDOW.
+    `find_anchor` needs `quiet_frames` of silence after the contact cluster
+    inside the trace, so the horizon is `anchor_frames - quiet_frames` and a
+    move contacting past it reports exactly like one that does not reach —
+    the §7 failure this project has now made twice. A reader of a stored or
+    printed whiff must be able to see which window produced it without
+    reading the operator's command line.
     """
 
     move: str
@@ -228,6 +253,8 @@ class ContactScan:
     note: str = ""
     knockdown: Optional[bool] = None
     airborne_until: Optional[int] = None
+    anchor_frames: Optional[int] = None
+    contact_horizon: Optional[int] = None
 
 
 @dataclass
@@ -334,6 +361,8 @@ def scan_contact(
     gap", not a missing cell and certainly not a zero.
     """
     script = move_script(spec)
+    horizon = anchor_frames - rig.quiet_frames
+    window = dict(anchor_frames=anchor_frames, contact_horizon=horizon)
     try:
         anchor = find_anchor(
             session,
@@ -345,13 +374,18 @@ def scan_contact(
         )
     except NoContactError as exc:
         return ContactScan(
-            move=spec.label, gap_px=gap_px, connected=False, note=str(exc).split(".")[0]
+            move=spec.label, gap_px=gap_px, connected=False,
+            note=(f"{str(exc).split('.')[0]} (searched {anchor_frames} frames; "
+                  f"a contact later than f{horizon} cannot be confirmed inside "
+                  f"it -- raise anchor_frames before calling this a whiff)"),
+            **window,
         )
     except ProbeError as exc:
         # e.g. contact too close to the end of the trace for the quiet window.
         return ContactScan(
             move=spec.label, gap_px=gap_px, connected=False,
             note=f"contact seen but unusable: {exc}",
+            **window,
         )
     before = anchor.trace[0]
     after = anchor.trace[anchor.contact_frame]
@@ -389,6 +423,7 @@ def scan_contact(
         anchor=anchor,
         knockdown=knockdown,
         airborne_until=airborne_until,
+        **window,
     )
 
 

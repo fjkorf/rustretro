@@ -2539,15 +2539,33 @@ mod tests {
         assert_eq!(chp.measurement.on_block, Some(-5), "on_block is still measured");
     }
 
-    /// Safety extremes read off the real mk2 kit: −16 is the most unsafe
-    /// on-block number in the shipped table, +13 the safest.
+    /// `safety_extremes` really returns the extremes of the shipped data.
+    ///
+    /// Asserts the RELATIONSHIP, not the numbers. This test previously
+    /// pinned −16 and +13 and broke the moment a re-scan found a cell the
+    /// old contact horizon had hidden — the third snapshot-style assertion
+    /// in this file to fail because measurement progressed. A test that
+    /// fails on success teaches people to edit the number until it passes,
+    /// which is exactly how a wrong number gets blessed.
     #[test]
     fn frames_safety_extremes_match_shipped_data() {
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
         let table = p.frames.as_ref().unwrap();
         let (unsafest, safest) = table.safety_extremes("reptile");
-        assert_eq!(unsafest.unwrap().measurement.on_block, Some(-16));
-        assert_eq!(safest.unwrap().measurement.on_block, Some(13));
+        let lo = unsafest.expect("an unsafest cell").measurement.on_block;
+        let hi = safest.expect("a safest cell").measurement.on_block;
+        assert!(lo.is_some() && hi.is_some(), "both extremes carry a number");
+        assert!(lo <= hi, "unsafest {lo:?} must not exceed safest {hi:?}");
+
+        // They must be the true extremes of every on_block this char has.
+        let all: Vec<i64> = table
+            .cells_for_char("reptile")
+            .iter()
+            .filter_map(|c| c.measurement.on_block)
+            .collect();
+        assert!(!all.is_empty(), "reptile has on_block rows");
+        assert_eq!(lo, all.iter().copied().min(), "unsafest is the minimum");
+        assert_eq!(hi, all.iter().copied().max(), "safest is the maximum");
     }
 
     /// A game with no `<port>.frames.json` loads cleanly and silently —
