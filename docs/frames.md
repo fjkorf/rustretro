@@ -151,7 +151,19 @@ A measurement run that skips any of these is void.
    fix: 0.91 ms/step, 200/200 landing, against a 41.1 ms baseline.)
    Use `run_frames(count)` to advance many frames in one call (~0.72
    ms/frame).
-6. **Confirm the input FOLD, not just the write.** Asserting a hold does
+6. **Confirm the input FOLD, not just the write** — and, where a frame has
+   already run, confirm what it EXECUTED. `get_input`'s `folded_*` is
+   re-folded every host tick whether or not a frame ran, so a post-step read
+   reports the current held set, not what the frame saw; `executed_*` is
+   sticky and answers that. The fold oracle still waits on `folded_*`
+   because it runs while PAUSED, before any frame exists — `executed_*`
+   cannot report a frame that has not happened.
+
+   Confirming what a frame executed is what separates a DIVERGED replay
+   (§4.5) from a WHIFF. Without it, a replay that stopped feeding input
+   looks exactly like a move that does not reach, and gets stored as one.
+
+6b. **Confirm the input FOLD, not just the write.** Asserting a hold does
    not mean the core has seen it: the host loop folds input and checks the
    frame gate in separate lock acquisitions, so a batch armed in one
    acquisition can run its first frame on the PREVIOUS input. Poll
@@ -250,8 +262,11 @@ replays.
   - `block+0x0E` steps by the whole damage in ONE frame (161→150 on hit,
     161→158 on block) and yielded `contact=55, hits=1` on every trial.
 
-  Blocked contact chips −3/−6, so the anchor fires for hits AND blocks; a
-  NO-change trial is a WHIFF.
+  Blocked contact chips −3/−6, so the anchor fires for hits AND blocks. A
+  NO-change trial is a WHIFF **only if the move actually came out** — with a
+  replay source it may instead be NO-EXECUTE (§4.5), and the two must not be
+  conflated: one says the move does not reach, the other says nothing was
+  thrown.
 
   **General rule this exposes: never anchor on a DRAWN value.** Anything the
   game animates toward a target reports a smear of edges where the event had
@@ -408,6 +423,61 @@ measurement is contaminated by travel and hurtbox extension, so FAF is
 stored only for the minimum-gap row and is NULL elsewhere. Variant discrimination (§5) therefore
 cannot key on FAF — it keys on measured differences in damage, advantage, or
 connect behaviour at explicit gaps.
+
+## 4.5 Replay-sourced measurement
+
+A move may come from a synthesized script OR from a recorded input slot
+(`record_inputs`/`play_inputs`, `shadow/inputs/<family>/`). A replay is a
+real execution and connects the lab to actual play — but **a slot is valid
+only against the state it was recorded from**, so its timing is a hypothesis,
+never an anchor.
+
+**The rule: a row anchors on OBSERVED contact, never on the replay's
+expected contact.** Classify, and refuse what cannot be vouched for:
+
+| classification | meaning | row? |
+|---|---|---|
+| `ON-TIME` | contact at the expected frame | yes |
+| `RETIMED` | contact at a DIFFERENT frame | **yes** — re-anchored, delta recorded |
+| `WHIFF` | move came out, no contact | no (a valid result) |
+| `NO-EXECUTE` | no attack signal at all | no — refusal, counted |
+| `DIVERGED` | executed input stream ≠ the slot's | no — refusal, counted |
+
+RETIMED is not an error. Measured live: a Reptile HP slot recorded at 72 px
+is `ON-TIME` there and `RETIMED` by **−3 frames** at the 62 px floor, because
+at that distance the same transcript is the CLOSE HP — a different move by
+proximity. Anchoring on the recording's frame would have put the whole sweep
+3 frames off with nothing in the row to say so.
+
+**Divergence is an INPUT test, not a state test.** A different arena is
+supposed to produce a different state trace; what must match is the executed
+input stream against the slot's own masks. The state-trace comparison belongs
+only in the determinism check below.
+
+### 4.6 Determinism is a session alarm, not a failed cell
+
+Replaying one slot twice from one state must produce identical traces. A
+failure means every measurement on that session is suspect — it is a SYSTEM
+ALARM, reported separately from any cell's result, and its scope must be
+recorded (a narrow all-clear must never overwrite a wide alarm).
+
+Measured, and it found a real defect — now FIXED. `resume → load → poll →
+pause` let an uncapped core run a VARIABLE number of free frames inside the
+window (10–15 over 16 loads), so every "identical" replay started from the
+saved state plus a variable-length prefix. Any frame-counting field recorded
+it (`block1+0x1C == free_frames + 1`, no exceptions). Whole-struct scope
+alarmed 12/16 in one measurement and 16/16 in another; the profile's active
+observables 0/16 — which is why no shipped number was corrupted, and that was
+luck rather than design.
+
+**The fix is `load_state(pause_after: true)`**: the load and the pause happen
+in the same lock scope on the emulation thread, so the caller gets back an
+emulator paused at exactly the loaded state. Measured after: free frames
+`[0]×16`, whole-struct determinism 0/16 alarms. **The lab must never bracket
+a load with `resume`/`pause` again** — plain `pause` remains fire-and-forget
+(it sets a flag without confirming the in-flight frame finished), and a
+`pause_after` load following a plain `pause()` was observed picking up a
+stray free frame. Never a sleep.
 
 ## 5. The spacing ladder
 

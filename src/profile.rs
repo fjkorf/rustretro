@@ -483,6 +483,378 @@ impl<'de> Deserialize<'de> for SignedHex {
     }
 }
 
+// ── frame lab data (docs/frames.md) ─────────────────────────────────────────
+//
+// `library/<family>/<port>.frames.json` is a MEASUREMENTS STORE (§6), not a
+// profile constant — exported by the Python harness
+// (`shadow_train.framelab`), never authored or edited by Rust. It is
+// entirely optional: a game with no export simply has `GameProfile.frames ==
+// None`, silently (no warning, §7's "no silent caps" is about a run that
+// SKIPPED something, not about a port that never ran the lab at all).
+//
+// The export currently carries TWO ROWS PER (char, move, variant, gap) cell,
+// one per observable (`docs/frames.md` §12) — on MK2 arcade always
+// `struct_velocity` and `pointer_x`. The two have agreed on every sweep
+// across two independent full runs (52 sweeps in the second alone), so the
+// chosen rule is: COLLAPSE agreeing observables into one row. A field where
+// the observables DISAGREE is the exceptional case (never yet observed) and
+// is surfaced rather than silently resolved — the collapsed value for that
+// field is left `None` and the field's name is recorded in
+// `FrameCell::disagreements`, while each observable's own raw value survives
+// unedited in `FrameCell::observations` for audit.
+
+/// One raw row exactly as `shadow_train.framelab.export` writes it. Field
+/// names/nullability mirror the Python schema (`docs/frames.md` §6) —
+/// `#[serde(default)]` on every optional field means an export that OMITS a
+/// null field (rather than writing `"field": null`) still loads, and an
+/// absent value never becomes `0` (§2.5).
+#[derive(Deserialize, Debug, Clone)]
+struct RawFrameRow {
+    family: String,
+    port: String,
+    char: String,
+    #[serde(rename = "move")]
+    move_name: String,
+    #[serde(default)]
+    variant: Option<String>,
+    #[serde(default)]
+    gap_walk_frames: Option<i64>,
+    #[serde(default)]
+    gap_px: Option<f64>,
+    #[serde(default)]
+    first_active_frame: Option<i64>,
+    #[serde(default)]
+    active: Option<i64>,
+    #[serde(default)]
+    recovery: Option<i64>,
+    #[serde(default)]
+    total: Option<i64>,
+    #[serde(default)]
+    hits: Option<i64>,
+    #[serde(default)]
+    hitstop: Option<i64>,
+    #[serde(default)]
+    on_hit: Option<i64>,
+    #[serde(default)]
+    on_block: Option<i64>,
+    #[serde(default)]
+    wakeup_window: Option<i64>,
+    /// Raw 0/1 (or null = not measured either way). Converted to
+    /// `Option<bool>` in [`FrameMeasurement`] — never conflated with the
+    /// unmeasured case.
+    #[serde(default)]
+    knockdown: Option<i64>,
+    #[serde(default)]
+    juggle: Option<i64>,
+    /// Schema reserves this (docs/frames.md §12: NULL in every row measured
+    /// so far); kept as raw JSON rather than guessing a concrete type ahead
+    /// of the first non-null sample.
+    #[serde(default)]
+    guard_height: Option<serde_json::Value>,
+    #[serde(default)]
+    connect_range: Option<i64>,
+    #[serde(default)]
+    rig_guard_state: Option<String>,
+    #[serde(default)]
+    damage: Option<i64>,
+    observable: String,
+    method: String,
+    #[serde(default)]
+    input_latency_frames: Option<i64>,
+    #[serde(default)]
+    sample_n: Option<i64>,
+    #[serde(default)]
+    confidence: Option<String>,
+    #[serde(default)]
+    measured_at: Option<String>,
+    #[serde(default)]
+    core_id: Option<String>,
+    #[serde(default)]
+    rom_id: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    id: Option<i64>,
+}
+
+/// The export wrapper — `library/<family>/<port>.frames.json`'s top level.
+#[derive(Deserialize, Debug, Clone)]
+struct FramesExport {
+    family: String,
+    port: String,
+    #[serde(default)]
+    generated_at: Option<String>,
+    #[serde(default)]
+    schema_version: Option<i64>,
+    #[serde(default)]
+    moves: Vec<RawFrameRow>,
+}
+
+/// The measured quantities proper — everything a `RawFrameRow` carries
+/// EXCEPT identity (char/move/variant/gap, the cell key) and provenance
+/// (observable/method/latency/sample_n/confidence/measured_at/core_id/
+/// rom_id/rig_guard_state, which live on [`FrameObservation`] instead).
+/// `PartialEq` is what makes collapsing possible: two observations collapse
+/// on a field exactly when their `FrameMeasurement`s agree on it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FrameMeasurement {
+    pub gap_px: Option<f64>,
+    pub first_active_frame: Option<i64>,
+    pub active: Option<i64>,
+    pub recovery: Option<i64>,
+    pub total: Option<i64>,
+    pub hits: Option<i64>,
+    pub hitstop: Option<i64>,
+    pub on_hit: Option<i64>,
+    pub on_block: Option<i64>,
+    pub wakeup_window: Option<i64>,
+    pub knockdown: Option<bool>,
+    pub juggle: Option<i64>,
+    pub guard_height: Option<serde_json::Value>,
+    pub connect_range: Option<i64>,
+    pub damage: Option<i64>,
+}
+
+impl FrameMeasurement {
+    fn from_raw(r: &RawFrameRow) -> Self {
+        FrameMeasurement {
+            gap_px: r.gap_px,
+            first_active_frame: r.first_active_frame,
+            active: r.active,
+            recovery: r.recovery,
+            total: r.total,
+            hits: r.hits,
+            hitstop: r.hitstop,
+            on_hit: r.on_hit,
+            on_block: r.on_block,
+            wakeup_window: r.wakeup_window,
+            knockdown: r.knockdown.map(|v| v != 0),
+            juggle: r.juggle,
+            guard_height: r.guard_height.clone(),
+            connect_range: r.connect_range,
+            damage: r.damage,
+        }
+    }
+}
+
+/// Collapse a cell's per-observable measurements into one, field by field.
+/// A field collapses to `Some`/`None` only when every observation agrees on
+/// it; a disagreement leaves that field `None` in the result AND records the
+/// field's name — never picks a winner silently (docs/frames.md §7, §12).
+fn collapse_measurements(raws: &[FrameMeasurement]) -> (FrameMeasurement, Vec<&'static str>) {
+    let mut out = FrameMeasurement::default();
+    let mut disagreements = Vec::new();
+    macro_rules! field {
+        ($name:ident) => {{
+            let mut it = raws.iter().map(|m| &m.$name);
+            let first = it.next().expect("cell has at least one observation");
+            if it.all(|v| v == first) {
+                out.$name = first.clone();
+            } else {
+                disagreements.push(stringify!($name));
+            }
+        }};
+    }
+    field!(gap_px);
+    field!(first_active_frame);
+    field!(active);
+    field!(recovery);
+    field!(total);
+    field!(hits);
+    field!(hitstop);
+    field!(on_hit);
+    field!(on_block);
+    field!(wakeup_window);
+    field!(knockdown);
+    field!(juggle);
+    field!(guard_height);
+    field!(connect_range);
+    field!(damage);
+    (out, disagreements)
+}
+
+/// One observable's contribution to a cell — the provenance §12 asks for:
+/// "a row without provenance is the `action_counter` mistake in another
+/// costume." Never collapsed away, even when its measurement agrees with its
+/// sibling observation(s) and folds into [`FrameCell::measurement`].
+#[derive(Debug, Clone)]
+pub struct FrameObservation {
+    pub observable: String,
+    pub method: String,
+    pub input_latency_frames: Option<i64>,
+    pub sample_n: Option<i64>,
+    pub confidence: Option<String>,
+    pub measured_at: Option<String>,
+    pub core_id: Option<String>,
+    pub rom_id: Option<String>,
+    /// The rig's probe shape for this observation (§2.6/§3.1), e.g.
+    /// "held+none" (attacker) or "held" (guarded defender).
+    pub rig_guard_state: Option<String>,
+    pub raw: FrameMeasurement,
+}
+
+/// One (char, move, variant, gap) cell — the collapse of every observable
+/// row measured for it.
+#[derive(Debug, Clone)]
+pub struct FrameCell {
+    pub char: String,
+    pub move_name: String,
+    pub variant: Option<String>,
+    pub gap_walk_frames: Option<i64>,
+    /// Collapsed measurement; a field is `None` either because nothing
+    /// measured it or because the observables disagreed (see
+    /// `disagreements`) — the two are NOT distinguished here on purpose:
+    /// callers that care check `disagreements` explicitly rather than
+    /// silently treating a disagreement as "unmeasured".
+    pub measurement: FrameMeasurement,
+    /// `FrameMeasurement` field names where this cell's observations
+    /// disagreed. Empty on every shipped MK2 arcade cell so far (§12).
+    pub disagreements: Vec<&'static str>,
+    pub observations: Vec<FrameObservation>,
+}
+
+impl FrameCell {
+    pub fn agrees(&self) -> bool {
+        self.disagreements.is_empty()
+    }
+
+    /// The smallest per-observable `sample_n` behind this cell — the honest
+    /// number for "how many independent full measurements support this",
+    /// not a sum (docs/frames.md's `kit.py`: `sample_n` counts independent
+    /// re-measurements, not retries).
+    pub fn min_sample_n(&self) -> Option<i64> {
+        self.observations.iter().filter_map(|o| o.sample_n).min()
+    }
+}
+
+/// The loaded `<port>.frames.json`, queryable by character/move/gap.
+#[derive(Debug, Clone)]
+pub struct FrameTable {
+    pub family: String,
+    pub port: String,
+    pub generated_at: Option<String>,
+    pub schema_version: Option<i64>,
+    pub cells: Vec<FrameCell>,
+}
+
+impl FrameTable {
+    fn from_export(export: FramesExport) -> Result<FrameTable, String> {
+        let mut groups: BTreeMap<(String, String, Option<String>, Option<i64>), Vec<RawFrameRow>> =
+            BTreeMap::new();
+        for row in export.moves {
+            if row.family != export.family || row.port != export.port {
+                return Err(format!(
+                    "{}.frames.json: row family/port ('{}'/'{}') != export-level ('{}'/'{}')",
+                    export.port, row.family, row.port, export.family, export.port
+                ));
+            }
+            let key =
+                (row.char.clone(), row.move_name.clone(), row.variant.clone(), row.gap_walk_frames);
+            groups.entry(key).or_default().push(row);
+        }
+        let mut cells = Vec::new();
+        for ((char, move_name, variant, gap_walk_frames), rows) in groups {
+            let observations: Vec<FrameObservation> = rows
+                .iter()
+                .map(|r| FrameObservation {
+                    observable: r.observable.clone(),
+                    method: r.method.clone(),
+                    input_latency_frames: r.input_latency_frames,
+                    sample_n: r.sample_n,
+                    confidence: r.confidence.clone(),
+                    measured_at: r.measured_at.clone(),
+                    core_id: r.core_id.clone(),
+                    rom_id: r.rom_id.clone(),
+                    rig_guard_state: r.rig_guard_state.clone(),
+                    raw: FrameMeasurement::from_raw(r),
+                })
+                .collect();
+            let raws: Vec<FrameMeasurement> = observations.iter().map(|o| o.raw.clone()).collect();
+            let (measurement, disagreements) = collapse_measurements(&raws);
+            cells.push(FrameCell {
+                char,
+                move_name,
+                variant,
+                gap_walk_frames,
+                measurement,
+                disagreements,
+                observations,
+            });
+        }
+        Ok(FrameTable {
+            family: export.family,
+            port: export.port,
+            generated_at: export.generated_at,
+            schema_version: export.schema_version,
+            cells,
+        })
+    }
+
+    pub fn chars(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self.cells.iter().map(|c| c.char.as_str()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    pub fn cells_for_char<'a>(&'a self, ch: &str) -> Vec<&'a FrameCell> {
+        self.cells.iter().filter(|c| c.char == ch).collect()
+    }
+
+    pub fn moves_for_char(&self, ch: &str) -> Vec<&str> {
+        let mut v: Vec<&str> =
+            self.cells_for_char(ch).into_iter().map(|c| c.move_name.as_str()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Distinct measured gaps for a character, sorted ascending (walk-frames
+    /// is the reproducible fallback key per §5, so it — not `gap_px` — is
+    /// the grid's column key).
+    pub fn gaps_for_char(&self, ch: &str) -> Vec<i64> {
+        let mut v: Vec<i64> =
+            self.cells_for_char(ch).into_iter().filter_map(|c| c.gap_walk_frames).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    pub fn cell(&self, ch: &str, mv: &str, gap_walk_frames: Option<i64>) -> Option<&FrameCell> {
+        self.cells
+            .iter()
+            .find(|c| c.char == ch && c.move_name == mv && c.gap_walk_frames == gap_walk_frames)
+    }
+
+    /// (most unsafe, safest) measured move for a character, by `on_block`.
+    /// Only cells with a collapsed (non-disagreeing) `on_block` value count —
+    /// "is this safe" must not be answered from a number the loader itself
+    /// couldn't resolve.
+    pub fn safety_extremes(&self, ch: &str) -> (Option<&FrameCell>, Option<&FrameCell>) {
+        let measured: Vec<&FrameCell> = self
+            .cells_for_char(ch)
+            .into_iter()
+            .filter(|c| c.measurement.on_block.is_some())
+            .collect();
+        let most_unsafe = measured.iter().min_by_key(|c| c.measurement.on_block.unwrap()).copied();
+        let safest = measured.iter().max_by_key(|c| c.measurement.on_block.unwrap()).copied();
+        (most_unsafe, safest)
+    }
+}
+
+/// Load `<fam_dir>/<port>.frames.json` if it exists. Absence is normal and
+/// silent (`Ok(None)`) — most games have no frame lab data. A PRESENT but
+/// malformed file is a real error, loud like every other profile load.
+fn load_frame_table(fam_dir: &Path, port: &str) -> Result<Option<FrameTable>, String> {
+    let path = fam_dir.join(format!("{port}.frames.json"));
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let export: FramesExport =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    FrameTable::from_export(export).map(Some)
+}
+
 // ── the resolved profile ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -490,6 +862,10 @@ pub struct GameProfile {
     pub dir: PathBuf,
     pub family: Family,
     pub port: PortProfile,
+    /// `library/<family>/<port>.frames.json`, if it exists (docs/frames.md
+    /// §6/§9). Optional — most games have no frame lab data, and that is
+    /// normal, not a warning.
+    pub frames: Option<FrameTable>,
 }
 
 impl GameProfile {
@@ -727,7 +1103,9 @@ impl GameProfile {
                 }
             }
         }
-        Ok(GameProfile { dir: fam_dir, family, port })
+        let frames = load_frame_table(&fam_dir, &port.port)?;
+
+        Ok(GameProfile { dir: fam_dir, family, port, frames })
     }
 
     /// Resolve a game path to (family_dir, profile_path).
@@ -1941,5 +2319,128 @@ mod tests {
         let obj_ptr = p.port.memory.blocks.object_ptr.as_ref().unwrap();
         assert_eq!(obj_ptr.off.0, -0xC);
         assert_eq!(obj_ptr.encoding, "tms34010_bitaddr");
+    }
+
+    // ── frame lab loader (docs/frames.md) ───────────────────────────────
+
+    /// The shipped `library/mk2/arcade.frames.json` (20 raw rows, 2 per
+    /// cell) parses and collapses to 10 cells, all agreeing.
+    #[test]
+    fn mk2_frames_json_parses_and_collapses_agreeing_observables() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let table = p.frames.as_ref().expect("mk2 arcade ships a frames.json");
+        assert_eq!(table.family, "mk2");
+        assert_eq!(table.port, "arcade");
+        assert_eq!(table.cells.len(), 10, "20 raw rows / 2 observables per cell");
+        for cell in &table.cells {
+            assert!(
+                cell.agrees(),
+                "{} {:?} disagreed on {:?}",
+                cell.move_name,
+                cell.gap_walk_frames,
+                cell.disagreements
+            );
+            assert_eq!(cell.observations.len(), 2);
+        }
+
+        // A specific close-range cell: HK at gap_walk_frames 60.
+        let hk_close = table
+            .cell("reptile", "HK", Some(60))
+            .expect("HK close cell present");
+        assert_eq!(hk_close.measurement.on_hit, Some(-7));
+        assert_eq!(hk_close.measurement.on_block, Some(-14));
+        assert_eq!(hk_close.measurement.first_active_frame, Some(11));
+        assert_eq!(hk_close.variant.as_deref(), Some("close"));
+
+        // The moves/gaps/chars accessors.
+        assert_eq!(table.chars(), vec!["reptile"]);
+        assert!(table.moves_for_char("reptile").contains(&"cHP"));
+        assert_eq!(table.gaps_for_char("reptile"), vec![30, 45, 60]);
+    }
+
+    /// A knockdown move's `on_hit` is absent (NULL) because a knockdown has
+    /// a wakeup clock, not a hit-advantage number (§1.1) — and absent must
+    /// never collapse to 0.
+    #[test]
+    fn frames_null_on_hit_survives_as_absent_not_zero() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let table = p.frames.as_ref().unwrap();
+        let chp = table.cell("reptile", "cHP", Some(60)).expect("cHP cell present");
+        assert_eq!(chp.measurement.on_hit, None, "knockdown gates on_hit to NULL, not 0");
+        assert_ne!(chp.measurement.on_hit, Some(0));
+        assert_eq!(chp.measurement.knockdown, Some(true));
+        assert_eq!(chp.measurement.on_block, Some(-5), "on_block is still measured");
+    }
+
+    /// Safety extremes read off the real mk2 kit: −16 is the most unsafe
+    /// on-block number in the shipped table, +13 the safest.
+    #[test]
+    fn frames_safety_extremes_match_shipped_data() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let table = p.frames.as_ref().unwrap();
+        let (unsafest, safest) = table.safety_extremes("reptile");
+        assert_eq!(unsafest.unwrap().measurement.on_block, Some(-16));
+        assert_eq!(safest.unwrap().measurement.on_block, Some(13));
+    }
+
+    /// A game with no `<port>.frames.json` loads cleanly and silently —
+    /// asurabld ships none today.
+    #[test]
+    fn game_with_no_frames_file_loads_cleanly() {
+        let p = GameProfile::load(Path::new("library/asurabld")).expect("asurabld profile loads");
+        assert!(p.frames.is_none());
+    }
+
+    /// The collapse rule, tested directly: agreeing observations collapse
+    /// field-by-field; a disagreeing field is left `None` and named, rather
+    /// than one observable's value winning silently (§7, §12).
+    #[test]
+    fn collapse_measurements_flags_disagreement_without_picking_a_winner() {
+        let mut a = FrameMeasurement::default();
+        a.on_hit = Some(7);
+        a.on_block = Some(-16);
+        a.damage = Some(32);
+
+        let mut b = a.clone();
+        b.on_block = Some(-9); // the two observables disagree here
+
+        let (collapsed, disagreements) = collapse_measurements(&[a, b]);
+        assert_eq!(collapsed.on_hit, Some(7), "agreeing field still collapses");
+        assert_eq!(collapsed.damage, Some(32));
+        assert_eq!(collapsed.on_block, None, "disagreeing field is NOT silently resolved");
+        assert_eq!(disagreements, vec!["on_block"]);
+    }
+
+    /// The agreement path, tested directly (not just via the shipped file):
+    /// identical observations collapse with zero disagreements.
+    #[test]
+    fn collapse_measurements_agreement_path_has_no_disagreements() {
+        let mut a = FrameMeasurement::default();
+        a.on_hit = Some(4);
+        a.on_block = Some(13);
+        a.knockdown = Some(false);
+        let b = a.clone();
+
+        let (collapsed, disagreements) = collapse_measurements(&[a.clone(), b]);
+        assert!(disagreements.is_empty());
+        assert_eq!(collapsed, a);
+    }
+
+    /// A malformed (but present) frames.json is a loud error, not a silent
+    /// `None` — absence and corruption are different conditions.
+    #[test]
+    fn malformed_frames_json_is_a_loud_error() {
+        let tmpbase = make_test_dir("badframes");
+        let game_dir = tmpbase.join("mygame");
+        fs::create_dir(&game_dir).unwrap();
+        let family_json = r#"{"family":"mygame","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+        let port_json = r#"{"family":"mygame","port":"arcade","core":{"library_name":"","provenance_game":"mygame","provenance_core":"mygame"},"memory":{"blocks":{"block1":"0x0","block2":"0x0","stride":"0x0"},"fighter_fields":[],"globals":{}},"gate":[],"enforcement":{"health_max":255,"refill_below":1,"timer_hold":[0,0],"credits_target":0,"credits_min":0},"calibration":{},"attack_chords":{}}"#;
+        fs::write(game_dir.join("mygame.profile.json"), port_json).unwrap();
+        fs::write(game_dir.join("arcade.frames.json"), "not json").unwrap();
+
+        let err = GameProfile::load(&game_dir).unwrap_err();
+        assert!(err.contains("arcade.frames.json"), "{err}");
+        let _ = fs::remove_dir_all(&tmpbase);
     }
 }

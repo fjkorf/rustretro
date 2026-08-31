@@ -88,6 +88,7 @@ class FakeClient:
         self.calls: list[tuple[str, dict]] = []
         self.training_enabled = True
         self.writes_enabled = False
+        self.paused = False
         self.frame_count = 0
         self._steps_total = 0
         self._held: dict[int, str | None] = {0: None, 1: None}
@@ -132,9 +133,11 @@ class FakeClient:
         return {"ok": True, "writes_enabled": True}
 
     def _tool_resume(self) -> dict:
+        self.paused = False
         return {"ok": True, "paused": False}
 
     def _tool_pause(self) -> dict:
+        self.paused = True
         return {"ok": True, "paused": True}
 
     def _tool_get_state(self) -> dict:
@@ -143,7 +146,7 @@ class FakeClient:
     def _key_for(self, slot=None, path=None) -> str:
         return str(slot) if path is None else path
 
-    def _tool_load_state(self, slot=None, path=None) -> dict:
+    def _tool_load_state(self, slot=None, path=None, pause_after=False) -> dict:
         if not self.writes_enabled:
             return {"error": "writes are locked; call enable_writes first"}
         key = self._key_for(slot, path)
@@ -154,7 +157,11 @@ class FakeClient:
         if self.jitter_reload_px and key != "base":
             x = struct.unpack("<H", self._read(OBJ1 + 0x12, 2))[0]
             self._write(OBJ1 + 0x12, struct.pack("<H", x + self.jitter_reload_px))
-        return {"ok": True, "op": "load"}
+        # Mirrors `src/mcp/server.rs::state_op_roundtrip`: a successful load
+        # with `pause_after=True` forces `paused` in the same response.
+        if pause_after:
+            self.paused = True
+        return {"ok": True, "op": "load", "paused": self.paused}
 
     def _tool_save_state(self, slot=None, path=None) -> dict:
         key = self._key_for(slot, path)

@@ -35,6 +35,7 @@ use crate::debug::panels::{
     hex_dump::HexDump,
     matchup::MatchupPanel,
     hunt::HuntPanel,
+    framelab::FramelabPanel,
     input_log::InputLogPanel,
     input_monitor::InputMonitor,
     ram_search::RamSearchPanel,
@@ -73,13 +74,14 @@ pub enum Tab {
     Training,
     Matchup,
     Hunt,
+    FrameLab,
 }
 
 /// Every Tab variant. Drives layout reconciliation (`load_layout` appends any
 /// variant missing from a saved sidecar) and the toolbar Panels menu — adding
 /// a variant without extending this list is a compile-time-invisible bug, so
 /// the `default_layout_contains_all_tabs` test cross-checks it.
-pub const ALL_TABS: [Tab; 18] = [
+pub const ALL_TABS: [Tab; 19] = [
     Tab::FrameInspector,
     Tab::HexDump,
     Tab::TileViewer,
@@ -98,6 +100,7 @@ pub const ALL_TABS: [Tab; 18] = [
     Tab::Training,
     Tab::Matchup,
     Tab::Hunt,
+    Tab::FrameLab,
 ];
 
 impl Tab {
@@ -121,6 +124,7 @@ impl Tab {
             Tab::Training => "🎯 Training",
             Tab::Matchup => "🥊 Matchup",
             Tab::Hunt => "🔍 Signal Hunt",
+            Tab::FrameLab => "🔬 Frame Lab",
         }
     }
 }
@@ -145,6 +149,7 @@ pub struct Panels {
     pub training_panel: TrainingPanel,
     pub matchup_panel: MatchupPanel,
     pub hunt_panel: HuntPanel,
+    pub framelab_panel: FramelabPanel,
 }
 
 impl Panels {
@@ -167,6 +172,7 @@ impl Panels {
             training_panel: TrainingPanel::new(),
             matchup_panel: MatchupPanel::new(),
             hunt_panel: HuntPanel::new(),
+            framelab_panel: FramelabPanel::new(),
         }
     }
 }
@@ -267,6 +273,13 @@ impl<'a> egui_dock::TabViewer for DockViewer<'a> {
                     ui.label("Error: Could not acquire debug state lock");
                 }
             }
+            Tab::FrameLab => {
+                if let Ok(mut ds) = self.state.lock() {
+                    self.panels.framelab_panel.show(ui, &mut ds);
+                } else {
+                    ui.label("Error: Could not acquire debug state lock");
+                }
+            }
 
             // shape: &mut self, ui, &mut DebugState
             Tab::Disasm => {
@@ -343,6 +356,7 @@ pub fn default_layout() -> DockState<Tab> {
         vec![
             Tab::RamSearch,
             Tab::Hunt,
+            Tab::FrameLab,
             Tab::Triggers,
             Tab::Regions,
                     Tab::FrameLog,

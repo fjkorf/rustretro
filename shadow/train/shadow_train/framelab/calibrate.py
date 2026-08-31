@@ -38,11 +38,12 @@ Preconditions from §3, and which of them this module enforces:
      ensure this (e.g. don't pass `--shadow`, or make sure Shift+F5 is off).
   3. `hold_buttons`/`release_buttons` only, `press_buttons` BANNED — ENFORCED
      BY CONSTRUCTION: this module calls exactly `hold_buttons`/
-     `release_buttons`/`load_state`/`step`/`run_lua`/`enable_writes`/`pause`/
-     `get_state` (the last three only to arm `load_state`, to make `step`
-     frame-exact, and to CONFIRM a step landed — see `_load_state`/`_step`)
-     and nothing else; grep this file for "press_buttons" and find no call
-     site.
+     `release_buttons`/`load_state`/`step`/`run_lua`/`enable_writes`/
+     `get_state` (the last two only to arm `load_state` and to CONFIRM a step
+     landed — see `_load_state`/`_step`) and nothing else; grep this file for
+     "press_buttons" and find no call site. `load_state` is always called
+     with `pause_after=True` (task G5 / §4.6) — this module never calls the
+     plain `resume`/`pause` tools around a load.
 
      A live smoke test surfaced why `_step` needs that confirmation: `step`
      USED TO BE fire-and-forget server-side (it set a flag and returned
@@ -142,33 +143,43 @@ def _arm_writes(client: Any) -> None:
     _call_ok(client, "enable_writes")
 
 
-def _pause(client: Any) -> None:
-    _call_ok(client, "pause")
-
-
 def _load_state(client: Any, spec: Union[str, int], liveness_fn: LivenessFn) -> None:
+    """`pause_after=True` (task G5 / docs/frames.md §4.6): the load and the
+    pause happen atomically in one lock scope on the emulation thread, so
+    this never calls the plain `resume`/`pause` tools around the load. That
+    bracket used to exist here (an unconditional `pause()` after the load,
+    to compensate for the possibility that `liveness_fn` "may itself
+    resume/sleep to watch a free-running oracle byte") and it is exactly the
+    shape of the defect §4.6 measured: an uncapped core running a VARIABLE
+    number of free frames (10-15 over 16 loads) inside the old
+    resume-load-poll-pause window, plus its residual hazard (a
+    `pause_after` load picking up a stray frame when it directly follows an
+    old-style plain `pause()`, because `pause` is fire-and-forget -- and this
+    module's own `_record_trace` loop calls `_load_state` back-to-back
+    across trials, so that plain `pause()` was directly ahead of the NEXT
+    call's load every time).
+
+    §3 precondition 4 (re-verify liveness EVERY time, not once at capture)
+    is still enforced: `liveness_fn` runs immediately after the atomic
+    load-and-pause, with the emulator CONFIRMED paused already (the
+    response's own `"paused"` field), never inferred from a settle."""
     try:
         slot = int(spec)
-        _call_ok(client, "load_state", slot=slot)
+        r = _call_ok(client, "load_state", slot=slot, pause_after=True)
     except (TypeError, ValueError):
-        _call_ok(client, "load_state", path=str(spec))
-    # §3 precondition 4: re-verify EVERY time, not once at capture. Whatever
-    # `liveness_fn` does internally (it may itself resume/sleep to watch a
-    # free-running oracle byte — see CLAUDE.md's "MCP / agent workflow"), we
-    # explicitly (re-)pause afterward, unconditionally: the trace this feeds
-    # is stepped one core frame at a time (`_step`), which is only
-    # frame-EXACT while paused ("For frame-exact work: pause -> step/reads
-    # -> resume" — CLAUDE.md). Skipping this made a live smoke test of this
-    # module measure real-time jitter instead of frames (input_latency
-    # samples of 32/21/47/44/38 across 5 supposedly-identical trials);
-    # pausing first fixed it.
+        r = _call_ok(client, "load_state", path=str(spec), pause_after=True)
+    if not r.get("paused"):
+        raise CalibrationError(
+            f"load_state({spec!r}, pause_after=True) reported ok but not "
+            f"paused=true (got {r!r}) -- docs/frames.md §4.6's atomic "
+            "load-and-pause guarantee did not hold."
+        )
     if not liveness_fn(client):
         raise CalibrationError(
             f"arena {spec!r} failed its liveness check immediately after "
             "load_state -- docs/frames.md §3 precondition 4. Nothing "
             "measured from here would be trustworthy."
         )
-    _pause(client)
 
 
 def _hold(client: Any, buttons: Sequence[str], port: int) -> None:

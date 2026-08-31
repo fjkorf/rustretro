@@ -173,10 +173,12 @@ class FakeGame:
         self.paused = False
         return {"ok": True}
 
-    def _tool_load_state(self, slot=None, path=None):
+    def _tool_load_state(self, slot=None, path=None, pause_after=False):
         if not self.writes_enabled:
             return {"error": "writes are locked; call enable_writes first"}
         if self.swallow_loads:
+            # Simulates the atomic guarantee NOT holding (docs/frames.md
+            # §4.6): "ok" but never actually `paused`.
             return {"ok": True, "op": "load"}
         if self.pipeline_schedule:
             self.pipeline = self.pipeline_schedule[
@@ -185,7 +187,11 @@ class FakeGame:
         self.loads += 1
         self._reset()
         self.frame += 1          # a real load lets the core run a frame
-        return {"ok": True, "op": "load"}
+        # Mirrors `src/mcp/server.rs::state_op_roundtrip`: a successful load
+        # with `pause_after=True` forces `paused` in the same response.
+        if pause_after:
+            self.paused = True
+        return {"ok": True, "op": "load", "paused": self.paused}
 
     def _tool_hold_buttons(self, buttons, port=0):
         self.held[port] = tuple(buttons)
@@ -465,23 +471,31 @@ class PreconditionsTest(unittest.TestCase):
             s.run_frames(5)
 
     def test_a_load_that_never_lands_raises_instead_of_measuring_the_old_state(self):
+        # docs/frames.md §4.6: a `pause_after=True` load that comes back "ok"
+        # but without `paused: true` means the atomic guarantee did not hold
+        # -- this is now the failure mode a swallowed load simulates.
         game = FakeGame(swallow_loads=True)
         s = make_session(game)
         with self.assertRaises(LabError) as ctx:
             s.load_state("fake.state")
-        self.assertIn("§3.6", str(ctx.exception))
+        self.assertIn("§4.6", str(ctx.exception))
 
-    def test_load_state_resumes_then_pauses(self):
-        # §3.6: loads do not drain while paused. Resume, load, verify, pause.
+    def test_load_state_requests_pause_after_and_never_calls_resume_pause(self):
+        # task G5 / docs/frames.md §4.6: the load and the pause happen
+        # atomically via `pause_after=True` -- `LabSession.load_state` must
+        # never bracket the load with the plain `resume`/`pause` tools
+        # (that bracket is exactly the free-frame defect §4.6 measured, and
+        # its residual hazard is a `pause_after` load picking up a stray
+        # frame right after an old-style plain `pause()`).
         game = FakeGame()
         s = make_session(game)
         s.load_state("fake.state")
         order = [t for t, _ in game.calls]
-        i_resume = order.index("resume")
-        i_load = order.index("load_state")
-        i_pause = len(order) - 1 - order[::-1].index("pause")
-        self.assertLess(i_resume, i_load)
-        self.assertLess(i_load, i_pause)
+        self.assertNotIn("resume", order)
+        self.assertNotIn("pause", order)
+        load_calls = [kw for t, kw in game.calls if t == "load_state"]
+        self.assertEqual(len(load_calls), 1)
+        self.assertIs(load_calls[0].get("pause_after"), True)
         self.assertTrue(game.paused)
 
     def test_load_state_never_calls_press_buttons(self):

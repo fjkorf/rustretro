@@ -1118,6 +1118,18 @@ pub struct DebugState {
     /// --load-state flag, and the MCP save_state/load_state tools all set this;
     /// `Frontend::drain_state_op` resolves slots and performs the core FFI).
     pub pending_state_op: Option<StateOp>,
+    /// Set alongside `pending_state_op` (same lock acquisition) when the
+    /// caller wants load-and-pause to be ATOMIC: on a successfully drained
+    /// LOAD, `Frontend::drain_state_op` forces `paused = true` in the same
+    /// critical section that publishes `state_op_result`, instead of the
+    /// caller racing to pause afterwards (`docs/frames.md` §4.6 — the
+    /// `resume → load → poll → pause` protocol measured a variable 14/15/17
+    /// free frames because those are three separate round trips, each
+    /// racing an uncapped emu loop). Ignored for saves and for a failed
+    /// load. Always consumed (reset to `false`) by the same drain that
+    /// takes `pending_state_op`, so a later plain load/save never
+    /// accidentally inherits a stale request.
+    pub pending_state_op_pause_after: bool,
     /// Result of the most recently drained `pending_state_op`: `Ok(done)` or
     /// `Err(message)`. The MCP thread polls this and clears it on read.
     pub state_op_result: Option<Result<StateOpDone, String>>,
@@ -1272,6 +1284,7 @@ impl DebugState {
             pending_lua: None,
             pending_lua_result: None,
             pending_state_op: None,
+            pending_state_op_pause_after: false,
             state_op_result: None,
             state_note: None,
             state_dir: None,

@@ -27,9 +27,11 @@ per-game tunable.
 `client` is exactly `calibrate.py`'s contract: any object with a
 `.call(tool_name, **kwargs) -> dict` method (`McpClient.call`'s signature).
 Every MCP call this module makes is one of `run_lua`, `enable_writes`,
-`resume`, `pause`, `get_state`, `load_state`, `save_state`, `read_memory`,
-`hold_buttons`, `release_buttons`, `step` -- `press_buttons` is BANNED here
-exactly as it is in `calibrate.py` (docs/frames.md §3 precondition 3).
+`get_state`, `load_state`, `save_state`, `read_memory`, `hold_buttons`,
+`release_buttons`, `step` -- `press_buttons` is BANNED here exactly as it is
+in `calibrate.py` (docs/frames.md §3 precondition 3). `load_state` is always
+called with `pause_after=True` (task G5 / §4.6); this module never calls the
+plain `resume`/`pause` tools around a load.
 
 Preconditions from §3, and how this module honors them:
 
@@ -43,8 +45,9 @@ Preconditions from §3, and how this module honors them:
      measured or saved from that load.
   5. Every `step` confirmed to have landed -- `_step` polls `get_state`'s
      `frame_count`, identically to `calibrate.py`'s `_step`.
-  6. Every `load_state` confirmed to have landed -- `_load_state_raw` resumes
-     first (loads do not drain while paused), then re-pauses.
+  6. Every `load_state` confirmed to have landed -- `_load_state_raw` passes
+     `pause_after=True` and checks the response's own `"paused"` field
+     (docs/frames.md §4.6); it never resumes/re-pauses around the load.
   7. Zero-point calibration -- N/A: this module measures POSITION, not
      act-again timing, so §3.1's input-latency number is not consumed here.
 
@@ -161,27 +164,28 @@ def _arm_writes(client: Any) -> None:
     _call_ok(client, "enable_writes")
 
 
-def _resume(client: Any) -> None:
-    _call_ok(client, "resume")
-
-
-def _pause(client: Any) -> None:
-    _call_ok(client, "pause")
-
-
 def _load_state_raw(client: Any, spec: Union[str, int]) -> None:
-    """`load_state` does NOT drain while paused (docs/frames.md §3
-    precondition 6 / CLAUDE.md's MCP workflow note): resume, load, then
-    re-pause. Landing is confirmed by the caller via a liveness/position
-    read immediately after -- there is no game-agnostic "known field" this
-    module can check on its own."""
-    _resume(client)
+    """`load_state(pause_after=True)` (task G5 / docs/frames.md §4.6): the
+    load and the pause happen atomically in one lock scope on the emulation
+    thread, so this never resumes/re-pauses around the load -- that bracket
+    is exactly the defect §4.6 measured (a VARIABLE number of free frames,
+    10-15 over 16 loads, from an uncapped core running inside the old
+    resume-load-poll-pause window). Landing is confirmed two ways: the
+    response's own `"paused"` field must be true (the atomic guarantee), and
+    the caller separately re-verifies liveness/position immediately after --
+    there is no game-agnostic "known field" this module can check on its
+    own."""
     try:
         slot = int(spec)
-        _call_ok(client, "load_state", slot=slot)
+        r = _call_ok(client, "load_state", slot=slot, pause_after=True)
     except (TypeError, ValueError):
-        _call_ok(client, "load_state", path=str(spec))
-    _pause(client)
+        r = _call_ok(client, "load_state", path=str(spec), pause_after=True)
+    if not r.get("paused"):
+        raise ArenaGenerationError(
+            f"load_state({spec!r}, pause_after=True) reported ok but not "
+            f"paused=true (got {r!r}) -- docs/frames.md §4.6's atomic "
+            "load-and-pause guarantee did not hold."
+        )
 
 
 def _hold(client: Any, buttons: Sequence[str], port: int) -> None:
