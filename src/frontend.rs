@@ -716,9 +716,23 @@ impl Frontend {
     /// After a successful LOAD it forces a full bus-window refresh
     /// (`refresh_bus_windows(Some(0))`, ignoring per-window intervals) so the
     /// debugger/recorder see the restored RAM immediately.
+    ///
+    /// ATOMIC load-and-pause (docs/frames.md §4.6): when the queued op came
+    /// in with `pending_state_op_pause_after` set, a successfully-drained
+    /// LOAD forces `paused = true` in the SAME lock acquisition that
+    /// publishes `state_op_result` below — see [`state_op_forces_pause`]
+    /// for why that single critical section is sufficient (no
+    /// `fold_generation`-style condvar dance needed here) and
+    /// `RetroMcpServer::load_state`'s doc for the caller-facing contract.
+    /// `pause_after` is taken out of `DebugState` in the SAME `try_lock` as
+    /// `pending_state_op` itself, so the two can never be observed
+    /// separately by a racing submitter.
     fn drain_state_op(&mut self) {
-        let op = match self.debug_state.try_lock() {
-            Ok(mut ds) => ds.pending_state_op.take(),
+        let (op, pause_after) = match self.debug_state.try_lock() {
+            Ok(mut ds) => (
+                ds.pending_state_op.take(),
+                std::mem::take(&mut ds.pending_state_op_pause_after),
+            ),
             Err(_) => return,
         };
         let Some(op) = op else { return };
@@ -789,6 +803,16 @@ impl Frontend {
                     path.display()
                 ),
             });
+            // Atomic load-and-pause: force it in THIS lock acquisition, the
+            // same one that's about to publish `state_op_result` a line
+            // below — any thread that later locks `debug_state` to read the
+            // result observes `paused == true` together with it, never a
+            // result without the pause or a pause without the result (see
+            // `state_op_forces_pause`'s doc for why a single critical
+            // section suffices instead of a fold_generation-style wait).
+            if state_op_forces_pause(pause_after, is_load, published.is_ok()) {
+                ds.paused = true;
+            }
             ds.state_op_result = Some(published);
         }
 
@@ -2033,6 +2057,34 @@ pub struct InputsLive {
     pub p1: Option<bool>,
 }
 
+/// Whether a just-drained state op should force `paused = true`, per
+/// `docs/frames.md` §4.6's atomic load-and-pause fix. Factored out as a pure
+/// function (no lock, no core) so the decision itself is unit-testable
+/// without a real `Frontend`/core — `drain_state_op` is the only caller, and
+/// applies the result inside the SAME lock acquisition that publishes
+/// `state_op_result`.
+///
+/// Only a LOAD that actually SUCCEEDED forces the pause: a failed load
+/// leaves the previous (unloaded) machine state running exactly as before,
+/// so forcing a pause on failure would be a surprising side effect for a
+/// call that didn't change anything; a save is never state that needs
+/// "landing" from the caller's point of view. `pause_after: false` (the
+/// default — existing `resume → load → poll → pause` callers never set it)
+/// always returns `false`, so old callers see byte-for-byte the same
+/// behavior as before this fix: `paused` is untouched by the drain.
+///
+/// This is deliberately simpler than `run_frames`' `fold_generation`/condvar
+/// wait: that pattern exists to prove a SEPARATE thread's fold observed a
+/// mutation before a gate opens. Here there is only one emulation thread,
+/// and `run_frame` is only ever re-entered by that same thread's own next
+/// loop iteration — so setting `paused` before this function returns (still
+/// holding the lock `run_frame` will next acquire) is already
+/// happens-before the very next `run_frame` call's pause check, by plain
+/// single-thread program order. No cross-thread visibility race to close.
+fn state_op_forces_pause(pause_after: bool, is_load: bool, succeeded: bool) -> bool {
+    pause_after && is_load && succeeded
+}
+
 /// Whether `path` lives under an `arenas` directory component — the signal
 /// that gates the sidecar + liveness probe. Matches the `shadow/arenas/
 /// <family>/` convention the Arena panel writes to; a caller that routes a
@@ -2260,9 +2312,91 @@ fn sha1_hex(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod state_tests {
-    use super::state_slot_path;
+    use super::{state_op_forces_pause, state_slot_path};
     use crate::debug::{DebugState, StateOp, StateOpDone};
     use std::path::{Path, PathBuf};
+
+    // ── atomic load-and-pause (docs/frames.md §4.6) ─────────────────────────
+
+    #[test]
+    fn state_op_forces_pause_only_on_a_successful_load_with_pause_after_requested() {
+        // The one case that must force a pause.
+        assert!(state_op_forces_pause(true, true, true));
+
+        // Everything else must NOT — each flips exactly one input off `true`.
+        assert!(!state_op_forces_pause(false, true, true), "pause_after not requested");
+        assert!(!state_op_forces_pause(true, false, true), "a save, not a load");
+        assert!(!state_op_forces_pause(true, true, false), "the load FAILED");
+        assert!(!state_op_forces_pause(false, false, false));
+    }
+
+    #[test]
+    fn state_op_forces_pause_default_false_matches_pre_fix_behavior() {
+        // Existing `resume -> load -> poll -> pause` callers never set
+        // pause_after, so the drain must never touch `paused` for them —
+        // byte-for-byte the same as before this fix existed.
+        for is_load in [true, false] {
+            for succeeded in [true, false] {
+                assert!(!state_op_forces_pause(false, is_load, succeeded));
+            }
+        }
+    }
+
+    /// The DebugState-level handoff, extended from `state_op_queue_handoff`
+    /// below: `pending_state_op_pause_after` travels alongside
+    /// `pending_state_op` (queued together, taken together by
+    /// `drain_state_op`'s single `try_lock`), and a successful load with it
+    /// set forces `paused = true` in the SAME critical section that
+    /// publishes `state_op_result` — mirroring `drain_state_op` exactly, but
+    /// without needing a real core.
+    #[test]
+    fn pause_after_travels_with_the_op_and_is_applied_atomically_with_the_result() {
+        let mut ds = DebugState::new();
+        assert!(!ds.paused);
+        assert!(!ds.pending_state_op_pause_after);
+
+        // Requesting side (MCP load_state{pause_after: true}) queues both
+        // fields under one lock.
+        ds.pending_state_op = Some(StateOp::LoadSlot(1));
+        ds.pending_state_op_pause_after = true;
+
+        // Emu-thread drain takes both together (drain_state_op's contract).
+        let op = ds.pending_state_op.take();
+        let pause_after = std::mem::take(&mut ds.pending_state_op_pause_after);
+        assert_eq!(op, Some(StateOp::LoadSlot(1)));
+        assert!(pause_after);
+        assert!(!ds.pending_state_op_pause_after, "consumed, not left dangling for the next op");
+
+        // Drain "succeeds" (stand-in for a real do_load_state Ok) and, in
+        // the SAME lock acquisition, forces the pause before publishing the
+        // result — exactly what a caller polling `state_op_result` needs to
+        // never observe one without the other.
+        let done = StateOpDone { loaded: true, path: PathBuf::from("/saves/mk2.state1"), bytes: 4096 };
+        if state_op_forces_pause(pause_after, op.as_ref().map_or(false, |o| matches!(o, StateOp::Load(_) | StateOp::LoadSlot(_))), true) {
+            ds.paused = true;
+        }
+        ds.state_op_result = Some(Ok(done.clone()));
+
+        assert!(ds.paused, "pause_after load must leave the emulator paused");
+        assert_eq!(ds.state_op_result.take(), Some(Ok(done)));
+    }
+
+    #[test]
+    fn pause_after_is_not_sticky_across_a_later_plain_op() {
+        // Regression for the "always consumed" half of the contract: a
+        // pause_after request must not leak onto a later op that never
+        // asked for it.
+        let mut ds = DebugState::new();
+        ds.pending_state_op = Some(StateOp::LoadSlot(1));
+        ds.pending_state_op_pause_after = true;
+        let _ = ds.pending_state_op.take();
+        let _ = std::mem::take(&mut ds.pending_state_op_pause_after);
+
+        // A second, later op queued WITHOUT pause_after...
+        ds.pending_state_op = Some(StateOp::LoadSlot(2));
+        let pause_after = std::mem::take(&mut ds.pending_state_op_pause_after);
+        assert!(!pause_after, "must not inherit the previous request");
+    }
 
     #[test]
     fn slot_path_follows_sidecar_convention() {

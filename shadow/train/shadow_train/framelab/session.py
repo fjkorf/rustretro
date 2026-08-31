@@ -12,9 +12,20 @@ measured failure that produced a confident wrong number:
     from a real result — it briefly convinced one agent that held input cannot
     reach the core while stepping. It can: +72 and +63 units over 30
     CONFIRMED frames, control 0.
-  * `load_state` does not drain while paused (same GUI-frame mechanism), so a
-    probe that loads while paused silently measures the PREVIOUS state.
-    `LabSession.load_state` therefore resumes, loads, VERIFIES, and re-pauses.
+  * `load_state` used to require resuming around it (loads did not drain
+    while paused, same GUI-frame mechanism), which let an uncapped core run a
+    VARIABLE number of free frames inside the resume window (docs/frames.md
+    §4.6: 10-15 frames over 16 loads on the old three-round-trip
+    `resume → load → poll → pause` protocol). `load_state(pause_after=True)`
+    (task G5) closed this: the load and the pause happen atomically in one
+    lock scope on the emulation thread, so `LabSession.load_state` never
+    calls `resume`/`pause` at all — measured after: `[0]` free frames over 16
+    loads, 0/16 whole-struct determinism alarms (previously 12/16 and 16/16
+    in two separate measurements). The residual hazard is the plain `pause`
+    tool, which stays fire-and-forget (sets a flag without confirming the
+    in-flight frame finished) — a `pause_after` load observed picking up a
+    stray frame when it directly followed one. The lab's protection is
+    never calling `resume`/`pause` around a load at all, not fixing `pause`.
   * `press_buttons` is BANNED (§3.3): its countdown decrements on every GUI
     frame including while paused, so a chord can evaporate between the press
     and the step. The ban is enforced by construction here — `LabSession.call`
@@ -54,6 +65,23 @@ that nothing observes (a replay's whole pre-window prefix) cost one round trip
 for the segment instead of one per frame. **Its per-port masks are not used
 to change input** — that is the race `confirm_fold` documents.
 
+## `get_input` grew a third reading (task G1), and it changed only ONE thing
+
+`get_input` now reports `executed_mask`/`executed_buttons` beside
+`asserted_*` and `folded_*`: what the last frame that actually ran `core.run()`
+saw, written atomically with the decision to run and therefore STICKY.
+`folded_*` is re-folded on every host-loop tick whether or not that tick ran a
+frame, so while paused it drifts back to agreeing with the held set — which
+makes it useless for asking, afterwards, what a specific landed frame saw.
+
+The fold ORACLE (`confirm_fold`) did NOT change: it runs before any frame
+exists, and `executed_*` cannot report a frame that has not happened yet, so
+`asserted == folded` remains the only evidence available at that moment (and
+the one with a 0/400 record). What is new is the after-the-fact check —
+`confirm_executed` / `LabSession.verify_executed` — which `folded_*`
+structurally could not provide. See `confirm_fold`'s docstring for the full
+argument.
+
 Wall-clock note (§2.4): waiting for a step or a batch to land is transport
 bookkeeping, not measurement. Nothing in this module expresses a DURATION in
 wall-clock; frames are the only unit that leaves it.
@@ -67,18 +95,21 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 __all__ = [
     "LabError",
     "PreconditionError",
+    "ExecutedInputError",
     "LabSession",
     "Preconditions",
     "BANNED_TOOLS",
     "MAX_RUN_FRAMES",
     "call_ok",
+    "confirm_executed",
     "confirm_fold",
     "confirm_step",
+    "executed_input",
     "frame_count",
     "hold_buttons",
     "release_all",
@@ -93,9 +124,6 @@ BANNED_TOOLS = frozenset({"press_buttons"})
 # for more than this (~10 s at 60 fps). Batches longer than one segment are
 # split here rather than refused, so callers never have to know the cap.
 MAX_RUN_FRAMES = 600
-
-_LOAD_SETTLE_POLL_S = 0.002
-_LOAD_TIMEOUT_S = 5.0
 
 # `confirm_fold`: how long to wait for an asserted held set to reach the
 # core's input fold, and how often to ask. Both are transport bookkeeping
@@ -123,6 +151,15 @@ class LabError(RuntimeError):
 class PreconditionError(LabError):
     """A `docs/frames.md` §3 precondition is not satisfied. Never downgraded
     to a warning: "a measurement run that skips any of these is void.\""""
+
+
+class ExecutedInputError(LabError):
+    """The frame that ACTUALLY RAN did not see the input we asserted.
+
+    Distinct from `PreconditionError` because it is not a setup mistake: it
+    is the §3.6 failure caught after the fact rather than before it, and the
+    frames already run under the wrong input cannot be un-run. Whatever they
+    measured is void."""
 
 
 # ── free functions: the raw MCP primitives ────────────────────────────────
@@ -319,6 +356,27 @@ def confirm_fold(
     one will), so waiting for them to agree is a real confirmation, not a
     duration. §2.4 permits it for the same reason it permits confirming a
     load landed — it is transport bookkeeping, and no wall-clock leaves it.
+
+    ## Why `executed_*` did NOT replace the predicate here (task G1)
+
+    `get_input` now also reports `executed_mask`/`executed_buttons`: what the
+    last frame that actually ran `core.run()` saw, updated atomically with the
+    decision to run and therefore STICKY. `folded_*` by contrast is refreshed
+    on every host-loop tick whether or not that tick's frame ran, so it drifts
+    back to matching the held set while paused.
+
+    That makes `executed_*` strictly better for reading BACKWARDS — see
+    `confirm_executed` — and strictly UNUSABLE for the wait above, which runs
+    FORWARDS: this function is called while paused, before any frame runs, and
+    `executed_*` cannot report a frame that has not happened yet. Waiting for
+    `asserted == executed` here would block until the timeout on every single
+    input change in a paused session. `asserted == folded` is the only
+    evidence that exists before the frame, so the predicate is unchanged, and
+    the measured 0/400 record it earned stands. The addition is a second,
+    AFTER-the-fact check (`confirm_executed`), which `folded_*` structurally
+    could not provide: a post-`step` read of `folded_*` shows the current held
+    set, not what the frame that ran saw, so it agrees with itself even when
+    the frame ran on stale input.
     """
     deadline = time.monotonic() + timeout_s
     while True:
@@ -340,6 +398,65 @@ def confirm_fold(
                 "host loop may not be running frames at all."
             )
         time.sleep(poll_s)
+
+
+def executed_input(
+    client: Any, port: int, *, error_cls: type = LabError
+) -> Optional[frozenset]:
+    """What the LAST FRAME THAT ACTUALLY RAN saw on `port`, as a frozenset of
+    button names — or `None` if this server does not report it.
+
+    `None` is "this build predates `executed_*`", NOT "the port held nothing":
+    an empty held set is `frozenset()`, and conflating the two would turn a
+    missing instrument into a measurement (§2.5, "absent means absent").
+
+    Read from `get_input`'s `executed_buttons`, which `src/mcp/server.rs`
+    updates only on frames that ran `core.run()`, atomically with the decision
+    to run. That is what makes it safe to read AFTER a `step`/`run_frames`
+    without racing a later host-loop tick — the property `folded_buttons`
+    does not have, because it is re-folded every tick whether a frame ran or
+    not and therefore drifts back to agreeing with the held set.
+    """
+    r = call_ok(client, "get_input", error_cls=error_cls, port=port)
+    names = r.get("executed_buttons")
+    if names is None:
+        return None
+    return frozenset(str(n).lower() for n in names)
+
+
+def confirm_executed(
+    client: Any,
+    port: int,
+    expected: Sequence[str],
+    *,
+    error_cls: type = ExecutedInputError,
+    where: str = "",
+) -> Optional[frozenset]:
+    """Assert that the frame that actually ran saw exactly `expected` on
+    `port`. Returns the executed set, or `None` when the server does not
+    report one (older build — the check is SKIPPED, and the caller is told so
+    by the `None` rather than being told it passed).
+
+    This is the after-the-fact half of §3.6. `confirm_fold` proves the input
+    reached the fold BEFORE the frame; this proves the frame that ran saw it.
+    The two are not redundant: the fold oracle cannot see a frame that runs
+    later on a re-fold, and `folded_*` read afterwards cannot see it either
+    (it is overwritten every host tick). Only `executed_*` is sticky enough
+    to answer "what did THAT frame see".
+    """
+    got = executed_input(client, port, error_cls=error_cls)
+    if got is None:
+        return None
+    want = frozenset(str(b).lower() for b in expected)
+    if got != want:
+        raise error_cls(
+            f"port {port}: the frame that actually ran saw {sorted(got)}, not "
+            f"the asserted {sorted(want)}"
+            + (f" ({where})" if where else "")
+            + ". docs/frames.md §3.6 -- a frame run on the wrong input is a "
+            "silently wrong measurement, and it has already run."
+        )
+    return got
 
 
 def set_training_enforcement(
@@ -390,6 +507,7 @@ class LabSession:
         ports: Sequence[int] = (0, 1),
         input_settle_s: float = _INPUT_SETTLE_S,
         confirm_folds: bool = True,
+        verify_executed: bool = False,
         error_cls: type = LabError,
     ):
         self.client = client
@@ -397,7 +515,16 @@ class LabSession:
         self.ports = tuple(ports)
         self.input_settle_s = input_settle_s
         self.confirm_folds = confirm_folds
+        # OFF by default, deliberately. It costs one `get_input` round trip
+        # per port per advance (against ~0.72 ms/frame batched, that is not
+        # free at ~200 replays per cell), and it is WRONG for any port this
+        # session does not itself drive -- a `play_inputs` playback replaces
+        # the held set from inside the frame, so the session's notion of "what
+        # I asserted" is not what that port executed, by design. Turn it on
+        # for a run whose whole point is transport integrity.
+        self.verify_executed = verify_executed
         self.error_cls = error_cls
+        self._asserted: Dict[int, Tuple[str, ...]] = {}
         self._frame: Optional[int] = None
         self.preconditions: Optional[Preconditions] = None
         # Counters, purely for the report ("what did this run actually do").
@@ -483,10 +610,23 @@ class LabSession:
         return self._frame
 
     def load_state(self, spec: Union[str, int]) -> None:
-        """§3.6 + §3.4, in one operation: RESUME (loads do not drain while
-        paused), load, confirm the load LANDED by advancing at least one real
-        frame and running the injected arena verifier, then PAUSE (frame-exact
-        stepping is only meaningful while paused).
+        """§3.4 + §4.6, in one atomic operation: load with `pause_after=True`
+        so the load and the pause happen in the SAME lock scope on the
+        emulation thread (`src/mcp/server.rs::state_op_roundtrip`), then
+        confirm it LANDED and run the injected arena verifier.
+
+        This never calls `resume`/`pause` around the load. That bracket is
+        the defect §4.6 measured: an uncapped core ran a VARIABLE number of
+        free frames (10-15 over 16 loads) inside the old `resume → load →
+        poll → pause` window, so every "identical" replay actually started
+        from the saved state plus a variable-length prefix. `pause_after`
+        removes the window instead of narrowing it — there is nothing to
+        poll for here, because the response's own `"paused"` field (read in
+        the same lock acquisition as the load result, server-side) already
+        confirms the atomic pause landed. The residual hazard is calling the
+        plain `pause` tool anywhere near a load (it is fire-and-forget and
+        can leave one stray frame) — so this method, and every other load
+        path in the lab, must never do that either.
 
         Raises `PreconditionError` if the verifier says the arena is not the
         live situation it is supposed to be — §3.4 requires this after EVERY
@@ -498,36 +638,29 @@ class LabSession:
         # cross-contamination between probe and control).
         for port in self.ports:
             release_all(self.client, port, error_cls=self.error_cls)
+            self._asserted[port] = ()
 
-        self.resume()
-        before = frame_count(self.client, error_cls=self.error_cls)
         try:
             slot = int(spec)
-            self.call("load_state", slot=slot)
+            r = self.call("load_state", slot=slot, pause_after=True)
         except (TypeError, ValueError):
-            self.call("load_state", path=str(spec))
+            r = self.call("load_state", path=str(spec), pause_after=True)
         self.loads_done += 1
+        self._frame = None
 
-        # Two independent confirmations, because `load_state` returning ok is
-        # not one (§3.6 — loads do not drain while paused):
-        #   a) the core actually ran a frame across the load, so the queue the
-        #      load sits in is being serviced at all;
-        #   b) `verify_fn` below, which reads the loaded state and checks it is
-        #      the arena we asked for. (b) is the real check; (a) catches the
-        #      "everything returns ok but nothing is running" case in which (b)
-        #      would pass on the PREVIOUS state.
-        if before is not None:
-            deadline = time.monotonic() + _LOAD_TIMEOUT_S
-            while frame_count(self.client, error_cls=self.error_cls) == before:
-                if time.monotonic() >= deadline:
-                    raise self.error_cls(
-                        f"load_state({spec!r}) never advanced frame_count while "
-                        "resumed -- the load did not drain, so anything read "
-                        "from here is the PREVIOUS state (docs/frames.md §3.6)."
-                    )
-                time.sleep(_LOAD_SETTLE_POLL_S)
-
-        self.pause()
+        # `call_ok` already raised if `r` was `{"ok": false, ...}` or a bare
+        # `{"error": ...}` (write gate). What is left to check is the atomic
+        # guarantee itself: a successful `pause_after=True` load forces
+        # `paused: true` in that same lock scope, so anything else here means
+        # the guarantee did not hold and this is a §4.6 SESSION ALARM, not a
+        # retryable hiccup.
+        if not r.get("paused"):
+            raise self.error_cls(
+                f"load_state({spec!r}, pause_after=True) reported ok but not "
+                f"paused=true (got {r!r}) -- docs/frames.md §4.6's atomic "
+                "load-and-pause guarantee did not hold. Treat this as a "
+                "session alarm: nothing measured after it is trustworthy."
+            )
 
         if self.verify_fn is not None and not self.verify_fn(self):
             raise PreconditionError(
@@ -575,23 +708,46 @@ class LabSession:
             hold_buttons(self.client, buttons, port, error_cls=self.error_cls)
         else:
             release_all(self.client, port, error_cls=self.error_cls)
+        self._asserted[port] = tuple(buttons)
         if self.confirm_folds:
             confirm_fold(self.client, port, error_cls=self.error_cls)
 
     def release(self, port: int) -> None:
         release_all(self.client, port, error_cls=self.error_cls)
+        self._asserted[port] = ()
         if self.confirm_folds:
             confirm_fold(self.client, port, error_cls=self.error_cls)
 
     def release_all_ports(self) -> None:
         for port in self.ports:
             release_all(self.client, port, error_cls=self.error_cls)
+            self._asserted[port] = ()
+
+    # ── what the frame that RAN actually saw (task G1) ───────────────────
+    def executed(self, port: int) -> Optional[frozenset]:
+        """`executed_input` for `port` — the sticky record of the last frame
+        that really ran. `None` when the server does not report it."""
+        return executed_input(self.client, port, error_cls=self.error_cls)
+
+    def _verify_executed(self, where: str) -> None:
+        """Post-frame half of §3.6, opt-in via `verify_executed`. Checks only
+        ports this session has actually asserted something on: a port driven
+        by something else (a `play_inputs` playback) legitimately executes an
+        input this session never asserted, and flagging that would be a false
+        alarm, not a finding."""
+        if not self.verify_executed:
+            return
+        for port, buttons in self._asserted.items():
+            confirm_executed(
+                self.client, port, buttons, error_cls=ExecutedInputError, where=where
+            )
 
     # ── stepping ─────────────────────────────────────────────────────────
     def step(self) -> None:
         self._frame = confirm_step(self.client, error_cls=self.error_cls)
         self.steps_taken += 1
         self.step_calls += 1
+        self._verify_executed("after step")
 
     def run_frames(
         self, count: int, holds: "Optional[dict[int, Iterable[str]]]" = None
@@ -628,6 +784,7 @@ class LabSession:
         self.steps_taken += count
         self.batch_calls += 1
         self.frames_batched += count
+        self._verify_executed(f"after run_frames({count})")
 
     def step_n(self, n: int) -> None:
         self.run_frames(n)

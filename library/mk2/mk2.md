@@ -1582,3 +1582,28 @@ were the cap guard doing its job — far HK's defender frees at `first_true`
 refused rather than reported; re-run at `max_search=58` it reproduces the
 stored numbers exactly. That is worth keeping in mind for the next kit: 45 is
 too tight for a 32-damage roundhouse's victim.
+
+## Health RAMPS at round start — not damage (2026-08-30)
+
+Found by the harvest tool while mining real recordings, and worth knowing
+well beyond it. **Every MK2 arcade round after the first opens with several
+dozen zero-input frames during which `health` visibly ramps** `4 → 6 → 8 →
+… → 161`, +2 per frame — a round-intro fill animation, not damage.
+
+Anything that watches health EDGES will see a large fake contact at every
+round boundary. The harvest tool manufactured exactly that until it was
+fixed; the fix is to start scanning only from the round's first frame with
+any input on either port — the same zero-input signal this profile's own
+evidence already uses to detect demo rounds.
+
+Consumers to keep in mind: the block-punish dummy triggers on
+`hitstun_sources` (the HUD health pair) and could fire spuriously in that
+window, the same class as the already-recorded "one spurious punish per
+refill". The frame lab is NOT affected — it anchors on health drops from a
+mid-fight arena, never across a round boundary — but a future measurement
+that spans a round start would be.
+
+Also found in the same pass: **`Block` appears in both MK2 ports'
+`attack_chords`** (it is needed for macro chords like the slide), so any
+code that treats every entry in that table as an ATTACK will attribute
+contacts to "Block". Attribution must exclude it.

@@ -1683,7 +1683,19 @@ impl RetroMcpServer {
     /// the same deferred round-trip as `run_lua` (core FFI only happens on the
     /// emu thread; `Frontend::drain_state_op` services the queue every frame,
     /// paused or not).
-    fn state_op_roundtrip(&self, op: StateOp) -> Value {
+    ///
+    /// `pause_after` (docs/frames.md §4.6 — only meaningful for a load) is
+    /// queued in the SAME lock acquisition as `pending_state_op` itself, so
+    /// the drain side can never observe one without the other. When it lands
+    /// on a successful load, `drain_state_op` forces `paused = true` in the
+    /// very same critical section that publishes `state_op_result` — so the
+    /// `"paused"` field read below (taken from that SAME lock acquisition
+    /// as the result, not a separate follow-up read) is guaranteed to
+    /// already reflect it. Callers that want the old three-round-trip
+    /// `resume → load → poll → pause` protocol keep working unchanged by
+    /// passing `pause_after: false` (or omitting it) — the drain then never
+    /// touches `paused` at all, exactly as before this parameter existed.
+    fn state_op_roundtrip(&self, op: StateOp, pause_after: bool) -> Value {
         // Submit.
         {
             let mut ds = match self.debug.lock() {
@@ -1694,6 +1706,7 @@ impl RetroMcpServer {
                 return json!({ "ok": false, "error": "another state operation is in flight" });
             }
             ds.state_op_result = None;
+            ds.pending_state_op_pause_after = pause_after;
             ds.pending_state_op = Some(op);
         }
 
@@ -1703,14 +1716,19 @@ impl RetroMcpServer {
             std::thread::sleep(Duration::from_millis(8));
             if let Ok(mut ds) = self.debug.lock() {
                 if let Some(res) = ds.state_op_result.take() {
+                    // Read in the SAME lock acquisition as the result so
+                    // this reflects `drain_state_op`'s atomic pause exactly
+                    // — never a stale read from before it landed.
+                    let paused = ds.paused;
                     return match res {
                         Ok(done) => json!({
                             "ok": true,
                             "op": if done.loaded { "load" } else { "save" },
                             "path": done.path.display().to_string(),
                             "bytes": done.bytes,
+                            "paused": paused,
                         }),
-                        Err(e) => json!({ "ok": false, "error": e }),
+                        Err(e) => json!({ "ok": false, "error": e, "paused": paused }),
                     };
                 }
             }
@@ -1718,6 +1736,7 @@ impl RetroMcpServer {
                 // Clear our request so we don't wedge future calls.
                 if let Ok(mut ds) = self.debug.lock() {
                     ds.pending_state_op = None;
+                    ds.pending_state_op_pause_after = false;
                 }
                 return json!({
                     "ok": false,
@@ -1731,19 +1750,30 @@ impl RetroMcpServer {
     /// NOT gated — it reads game state and writes only a state file.
     fn save_state(&self, slot: Option<u64>, path: Option<&str>) -> Value {
         match parse_state_target(slot, path, false) {
-            Ok(op) => self.state_op_roundtrip(op),
+            Ok(op) => self.state_op_roundtrip(op, false),
             Err(e) => json!({ "ok": false, "error": e }),
         }
     }
 
     /// `load_state`: restore the core from a slot file or explicit path.
     /// GATED — it replaces the entire game state.
-    fn load_state(&self, slot: Option<u64>, path: Option<&str>) -> Value {
+    ///
+    /// `pause_after` (docs/frames.md §4.6): when `true`, the load and
+    /// leaving the emulator paused happen ATOMICALLY — see
+    /// `state_op_roundtrip`'s doc for the exact guarantee. This is the
+    /// fix for the frame lab's measured defect (`resume → load → poll →
+    /// pause` running a variable 14/15/17 free frames per load on an
+    /// uncapped core): a caller that stays paused throughout and passes
+    /// `pause_after: true` never needs to call `resume` at all, so there is
+    /// no window for a free-running core to advance anything between the
+    /// load being requested and it landing. Defaults to `false` so existing
+    /// callers that resume/pause around this call themselves are unaffected.
+    fn load_state(&self, slot: Option<u64>, path: Option<&str>, pause_after: bool) -> Value {
         if let Err(e) = self.check_writes_armed() {
             return json!({ "error": e });
         }
         match parse_state_target(slot, path, true) {
-            Ok(op) => self.state_op_roundtrip(op),
+            Ok(op) => self.state_op_roundtrip(op, pause_after),
             Err(e) => json!({ "ok": false, "error": e }),
         }
     }
@@ -2410,6 +2440,24 @@ impl RetroMcpServer {
             });
             Arc::new(schema.as_object().unwrap().clone())
         };
+        // Schema for { slot?, path?, pause_after? } (load_state only — adds
+        // the docs/frames.md §4.6 atomic load-and-pause flag to the shared
+        // save/load shape above).
+        let load_state_schema = || -> Arc<Map<String, Value>> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "slot": { "type": "integer", "description": "Save-state slot 1-9 → <save_dir>/<rom>.state<N> (default 1 when `path` is absent)" },
+                    "path": { "type": "string", "description": "Explicit state-file path (mutually exclusive with `slot`)" },
+                    "pause_after": {
+                        "type": "boolean",
+                        "description": "Atomic load-and-pause (docs/frames.md §4.6): on a successful load, force the emulator paused in the SAME servicing pass, before returning. Use this instead of resume/load/poll/pause — that three-round-trip protocol lets an uncapped core run a variable number of free frames between the calls. Default false (unchanged legacy behavior)."
+                    }
+                },
+                "required": []
+            });
+            Arc::new(schema.as_object().unwrap().clone())
+        };
         // Schema for { addr } (unfreeze / breakpoint ops / run_to).
         let addr_only_schema = || -> Arc<Map<String, Value>> {
             let schema = json!({
@@ -2685,7 +2733,7 @@ impl RetroMcpServer {
                 "save_state",
                 "Snapshot the ENTIRE machine state (retro_serialize) to a file: slot 1-9 \
                  (<save_dir>/<rom>.state<N>, default slot 1) or an explicit `path`. Returns \
-                 {ok, path, bytes}. Read-only w.r.t. the game (no enable_writes needed) — \
+                 {ok, path, bytes, paused}. Read-only w.r.t. the game (no enable_writes needed) — \
                  pair with load_state to bank and replay exact game situations.",
                 state_target_schema(),
             ),
@@ -2694,9 +2742,12 @@ impl RetroMcpServer {
                 "Restore the machine from a save-state file (retro_unserialize): slot 1-9 \
                  or an explicit `path`. REPLACES the entire game state, so it REQUIRES \
                  enable_writes first. Bus-window snapshots are refreshed immediately after \
-                 the load, so memory reads see the restored RAM on the same frame. Returns \
-                 {ok, path, bytes}.",
-                state_target_schema(),
+                 the load, so memory reads see the restored RAM on the same frame. Pass \
+                 `pause_after: true` for an ATOMIC load-and-pause with zero free frames \
+                 (docs/frames.md §4.6) — the frame lab's replacement for the racy \
+                 resume/load/poll/pause protocol; stay paused throughout and never call \
+                 resume at all. Returns {ok, path, bytes, paused}.",
+                load_state_schema(),
             ),
             Tool::new(
                 "load_shadow",
@@ -3339,7 +3390,8 @@ impl ServerHandler for RetroMcpServer {
                     let v = if name == "save_state" {
                         this.save_state(slot, path)
                     } else {
-                        this.load_state(slot, path)
+                        let pause_after = args.get("pause_after").and_then(|v| v.as_bool()).unwrap_or(false);
+                        this.load_state(slot, path, pause_after)
                     };
                     Ok(CallToolResult::success(vec![Self::json_content(&v)?]))
                 }
@@ -4493,7 +4545,7 @@ mod tests {
     fn load_state_gated_save_state_validates_without_queueing() {
         let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
         // load_state is a write tool: refused while locked, nothing queued.
-        let refused = srv.load_state(Some(1), None);
+        let refused = srv.load_state(Some(1), None, false);
         assert_eq!(
             refused["error"].as_str(),
             Some("writes are locked; call enable_writes first")
@@ -4506,9 +4558,126 @@ mod tests {
         assert!(srv.debug.lock().unwrap().pending_state_op.is_none());
         // Armed load_state with bad args also errors without queueing.
         let _ = srv.enable_writes();
-        let bad2 = srv.load_state(Some(1), Some("/x"));
+        let bad2 = srv.load_state(Some(1), Some("/x"), false);
         assert_eq!(bad2["ok"], false);
         assert!(srv.debug.lock().unwrap().pending_state_op.is_none());
+    }
+
+    // ── atomic load-and-pause (docs/frames.md §4.6, pause_after) ────────────
+
+    /// `pause_after: false` (the default) must leave `state_op_roundtrip`'s
+    /// submission byte-for-byte what it queues today: `false`, never left
+    /// over from a previous call. Exercises the real submission path (no
+    /// stand-in emu thread — this only checks what got queued).
+    #[test]
+    fn load_state_pause_after_defaults_false_and_is_queued_alongside_the_op() {
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let _ = srv.enable_writes();
+        let debug = srv.debug.clone();
+        // Drain immediately in the background so the roundtrip doesn't
+        // block for the full STATE_TIMEOUT; assert on the QUEUED state
+        // before it does.
+        let queued_pause_after = Arc::new(std::sync::atomic::AtomicBool::new(true)); // sentinel: overwritten
+        let qpa = queued_pause_after.clone();
+        std::thread::spawn(move || {
+            loop {
+                {
+                    let ds = debug.lock().unwrap();
+                    if ds.pending_state_op.is_some() {
+                        qpa.store(ds.pending_state_op_pause_after, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut ds = debug.lock().unwrap();
+            ds.pending_state_op = None;
+            ds.state_op_result = Some(Ok(crate::debug::StateOpDone {
+                loaded: true,
+                path: std::path::PathBuf::from("/tmp/x.state1"),
+                bytes: 1,
+            }));
+        });
+        let v = srv.load_state(Some(1), None, false);
+        assert_eq!(v["ok"], true, "{v}");
+        assert!(
+            !queued_pause_after.load(std::sync::atomic::Ordering::SeqCst),
+            "pause_after must default to false when the caller omits it"
+        );
+    }
+
+    /// The headline guarantee: `pause_after: true` on a load that succeeds
+    /// forces `paused = true`, and the roundtrip's own `"paused"` field
+    /// (read in the SAME lock acquisition as the result, per
+    /// `state_op_roundtrip`'s doc) reports it — a caller never needs a
+    /// second round trip to confirm the emulator is now paused. The
+    /// background thread stands in for `Frontend::drain_state_op`, applying
+    /// `paused = true` and publishing `state_op_result` in one lock
+    /// acquisition, exactly like the production code.
+    #[test]
+    fn load_state_pause_after_true_forces_paused_and_reports_it_atomically() {
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let _ = srv.enable_writes();
+        assert!(!srv.debug.lock().unwrap().paused, "starts unpaused");
+        let debug = srv.debug.clone();
+        std::thread::spawn(move || {
+            loop {
+                {
+                    let ds = debug.lock().unwrap();
+                    if ds.pending_state_op.is_some() {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut ds = debug.lock().unwrap();
+            assert!(ds.pending_state_op_pause_after, "pause_after must have been queued");
+            ds.pending_state_op = None;
+            ds.pending_state_op_pause_after = false;
+            // Mirror drain_state_op: force the pause in the SAME lock
+            // acquisition that publishes the result.
+            ds.paused = true;
+            ds.state_op_result = Some(Ok(crate::debug::StateOpDone {
+                loaded: true,
+                path: std::path::PathBuf::from("/tmp/x.state1"),
+                bytes: 1,
+            }));
+        });
+        let v = srv.load_state(Some(1), None, true);
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["paused"], true, "response must reflect the atomic pause, no second round trip needed");
+        assert!(srv.debug.lock().unwrap().paused, "the emulator must actually be paused");
+    }
+
+    /// A FAILED load must not force a pause — the machine state never
+    /// changed, so leaving `paused` exactly as the caller left it is the
+    /// non-surprising behavior.
+    #[test]
+    fn load_state_pause_after_true_does_not_force_paused_on_failure() {
+        let srv = RetroMcpServer::new(Arc::new(Mutex::new(DebugState::new())));
+        let _ = srv.enable_writes();
+        let debug = srv.debug.clone();
+        std::thread::spawn(move || {
+            loop {
+                {
+                    let ds = debug.lock().unwrap();
+                    if ds.pending_state_op.is_some() {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut ds = debug.lock().unwrap();
+            ds.pending_state_op = None;
+            ds.pending_state_op_pause_after = false;
+            // Failed load: do NOT touch `paused` (mirrors state_op_forces_pause's
+            // `succeeded` gate in drain_state_op).
+            ds.state_op_result = Some(Err("core rejected the state".to_string()));
+        });
+        let v = srv.load_state(Some(1), None, true);
+        assert_eq!(v["ok"], false, "{v}");
+        assert_eq!(v["paused"], false, "a failed load must not force a pause");
+        assert!(!srv.debug.lock().unwrap().paused);
     }
 
     // ── ROM-map writeback ───────────────────────────────────────────────────

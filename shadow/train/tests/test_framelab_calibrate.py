@@ -34,6 +34,7 @@ class FakeClient:
         self.calls: list[tuple[str, dict]] = []
         self.training_enabled = True
         self.writes_enabled = False
+        self.paused = False
         self.live = True
 
         self._load_count = -1
@@ -62,13 +63,18 @@ class FakeClient:
         return {"ok": True, "writes_enabled": True}
 
     def _tool_pause(self) -> dict:
+        self.paused = True
         return {"ok": True, "paused": True}
+
+    def _tool_resume(self) -> dict:
+        self.paused = False
+        return {"ok": True, "paused": False}
 
     def _tool_get_state(self) -> dict:
         # Real get_state has no "ok"/"error" wrapper -- just the snapshot.
         return {"frame_count": self._frame}
 
-    def _tool_load_state(self, slot=None, path=None) -> dict:
+    def _tool_load_state(self, slot=None, path=None, pause_after=False) -> dict:
         if not self.writes_enabled:
             # Matches the real server's write-gate short-circuit shape for
             # load_state: {"error": ...} with NO "ok" key at all.
@@ -81,7 +87,11 @@ class FakeClient:
         self._frame = 0
         self._position = {0: 0, 1: 0}
         self._held = {0: None, 1: None}
-        return {"ok": True}
+        # Mirrors `src/mcp/server.rs::state_op_roundtrip`: a successful load
+        # with `pause_after=True` forces `paused` in the same response.
+        if pause_after:
+            self.paused = True
+        return {"ok": True, "paused": self.paused}
 
     def _tool_hold_buttons(self, buttons, port=0) -> dict:
         self._held[port] = buttons[0] if buttons else None
@@ -158,9 +168,30 @@ class ZeroPointCalibrationTest(unittest.TestCase):
         self.assertNotIn("press_buttons", tool_names)
         # Only the documented tool set was used.
         self.assertTrue(tool_names <= {
-            "run_lua", "enable_writes", "load_state", "pause", "hold_buttons",
+            "run_lua", "enable_writes", "load_state", "hold_buttons",
             "release_buttons", "step", "get_state", "get_input",
         })
+
+    def test_every_load_state_requests_pause_after_and_never_brackets_a_load(self):
+        # task G5 / docs/frames.md §4.6: the atomic `pause_after=True` load
+        # replaces the old `resume -> load -> poll -> pause` bracket, and the
+        # residual hazard (a `pause_after` load picking up a stray frame
+        # right after a plain fire-and-forget `pause()`) means the lab must
+        # never call the plain `resume`/`pause` tools at all here -- this
+        # module's own `_record_trace` loop calls `_load_state` back-to-back
+        # across every trial/direction, so a single leftover bracket would
+        # show up on every call, not just the first.
+        client = FakeClient(latency=2)
+        zero_point_calibration(
+            client, arena="0", observable_fn=observable_p0, liveness_fn=always_live,
+        )
+        load_calls = [(name, kw) for name, kw in client.calls if name == "load_state"]
+        self.assertGreater(len(load_calls), 0)
+        for _, kwargs in load_calls:
+            self.assertIs(kwargs.get("pause_after"), True)
+        tool_names = [name for name, _ in client.calls]
+        self.assertNotIn("pause", tool_names)
+        self.assertNotIn("resume", tool_names)
 
     def test_disables_training_enforcement_before_measuring(self):
         client = FakeClient(latency=2)

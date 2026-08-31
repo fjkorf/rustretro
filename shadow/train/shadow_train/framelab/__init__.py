@@ -37,9 +37,10 @@ from .probe import (
     calibrate_probe_latency,
     find_anchor,
     measure_advantage,
-    replay,
+    replay as probe_replay,
     sweep_actionable,
 )
+from . import replay  # the module; probe's helper is re-exported above as probe_replay
 from .session import LabError, LabSession, PreconditionError, Preconditions
 from .store import (
     MOVE_FRAMES_COLUMNS,
@@ -75,6 +76,7 @@ __all__ = [
     "calibrate_probe_latency",
     "find_anchor",
     "measure_advantage",
+    "probe_replay",
     "replay",
     "sweep_actionable",
     "LabError",
