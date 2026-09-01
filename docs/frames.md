@@ -54,10 +54,59 @@ advantage = (frame the defender becomes actionable)
 punishable ⟺ advantage ≤ −(opponent's fastest first_active_frame)
              AND the post-contact gap is inside that move's connect range
              AND the defender's GUARD has not already returned
+             AND the attacker is not holding a SPECIAL-MOVE input
 ```
 
 The range clause is not a footnote. A move that is −8 but shoves the
 defender past their own connect range is safe in practice.
+
+**The FOURTH clause: MK2 arcade has PUNCH-LEAD special cancelling**,
+measured 2026-08-31/09-01 on rev L3.1.
+
+> **This clause was OVERSTATED when first written and is corrected here.**
+> The run that discovered cancelling used only PUNCH leads and generalised
+> to "specials come out at every frame from 2". A follow-up run added kick
+> leads and the generalisation fails.
+
+| lead | walk floor | special gate | margin | verdict |
+|---|---|---|---|---|
+| far HP (hitstop 0) | 20 | **2** | 18 | **CANCEL** |
+| far HK (hitstop 12), whiff | 34 | 33 | 1 | **LINK** — inside §8.4 slop, refused |
+| far HK, hit or block | 46 | 45 | 1 | **LINK** |
+
+**Out of a kick there is no cancel at all, only a link.** A 1-frame margin
+is inside cross-observable slop and the classifier's own `min_margin`
+refuses it rather than rounding to an answer.
+
+**Startup is UNCHANGED — the special starts later, never slower.** Measured
+from the TRIGGER PRESS (not the macro start), Reptile's slide reaches
+displacement in 3 frames and contact in 11 in every condition: no lead,
+punch lead on hit/whiff/block, kick lead on hit/block/whiff, five gaps, and
+again from a cold process. `force_ball` agrees at matched gaps. Cancelling
+buys the lead's recovery, not a faster special.
+
+**Hitstop is NOT bypassed, and this independently corroborates the hitstop
+column.** Contact shifts the gate by exactly **+12** — the hitstop measured
+for that move class by an entirely different method (whiff-differenced
+attacker manifest). Two unrelated measurements agree to the frame: 33 → 45
+on contact for hitstop-12 leads at two whiff gaps and two contact gaps, 0
+shift for hitstop-0 leads. That is the independent-rig confirmation §8.4
+cannot supply.
+
+So the over-estimate is real but NARROWER than first stated: an
+actionability number over-estimates commitment **for a fighter holding a
+PUNCH-cancellable special's input**, not universally.
+
+It also FALSIFIES the only published description (ded_'s GameFAQs combo
+guide, disclaimed for our exact revision), which calls it a "Just Frame"
+cancellable "on the frame of contact": the cancel needs no contact at all —
+at 180 px where the lead normal WHIFFS entirely the slide's onset is
+identical — and the window is open-ended, not one frame.
+
+Confidence medium-high; §8 acceptance is NOT met — one character, one gap,
+`sample_n = 1`, no cold re-run, and **nothing measured on block**, which is
+the gap to close first. No `cancel` COLUMN is needed: this is a global
+button-class rule, not a per-move property.
 
 **The third clause was missing from the first draft and it changes verdicts.**
 This lab measures "the earliest frame the fighter can start a WALK", but
@@ -737,6 +786,24 @@ the same protocol reproduces the same systematic error perfectly.
 - ~~MK2 arcade has no trusted position source.~~ **CLOSED** — the
   `block-0xC` object pointer (§5). Overlay markers and pixel gaps are
   unblocked.
+- ~~Jumping normals are unmeasurable — the probe is a walk and an airborne
+  fighter cannot walk.~~ **REFUTED 2026-08-31.** The premise is true and the
+  conclusion false: the probe is not blind mid-flight, it is DEFERRED to
+  after landing. No new observable was needed — both existing ones worked
+  unchanged and agreed on all 70 sweeps. Three gates were: an AIR-CONTROL
+  SCAN (hold every direction at every airborne frame, differenced against a
+  no-input control, window capped at landing — **0 divergences in 152
+  evaluations per arena**), a calibration point derived from each run's own
+  landing rather than a constant, and a refusal for any boundary landing
+  before the fighter does.
+  Note why that scan had to be run explicitly: **neither of this contract's
+  safeguards can see air control.** Differencing does not protect you (the
+  control is not drifting) and §8.4 cannot either (both observables would
+  move together). It took a dedicated experiment.
+  Measured: Reptile's neutral jump HP swings **−2 → +3 on block across one
+  arc** — 4 frames, same move, by contact height alone — decomposing to
+  `landing + 7` on every row, the same `landing + 7` Mileena's airborne
+  teleport gave. Gap-independent.
 - ~~MK2 arcade has no mapped `y`.~~ **CLOSED** — `obj+0x16`, signed, traced
   through a full jump arc. **But there is no scalar `GROUND_Y` for arcade**:
   resting y is character- AND stage-dependent (85 vs 83 on one stage, 89 vs
@@ -801,3 +868,40 @@ the same protocol reproduces the same systematic error perfectly.
 - **`hitstop`, `active`, `recovery`, `total`, `wakeup_window` and
   `guard_height` are NULL in every row measured so far.** The columns exist;
   nothing measures them yet.
+
+## 13. Open contract gaps (2026-09-01, from the specials/airborne/cancel runs)
+
+1. **§8.4 misclassifies a whiff-anchored `total`/`recovery`.** They are listed
+   as anchor-based (exact cross-observable agreement required), but a
+   whiff-anchored duration is ONE-SIDED and carries each observable's margin.
+   Reptile's invisibility reads 40/41 — agreement under the one-sided rule,
+   disagreement under the rule `collapse_measurements` actually applies. **No
+   `total` can be stored until this is fixed**, and the same blocker holds
+   the active-frames spike's `total`/`recovery` in scratch.
+2. **No way to record "measured, nothing to report".** Invisibility is fully
+   measured — 0 damage, 0 contacts in 200 frames, 3/3 — and produces no
+   storable row, so a reader cannot distinguish it from never-measured. The
+   overloaded-absent problem (§7) at cell granularity rather than field.
+3. **The cap rule (§4.3/§7) is stated only for the UPPER edge of a search.**
+   `force_ball` recovers BEFORE its own projectile lands, so a
+   contact-anchored sweep returns `first_true = 0` instead of a negative —
+   plausible, and silently 5 frames late.
+4. **§4.2's blocked-direction hazard has a DYNAMIC form.** A launched victim
+   landing on the attacker is pushed apart by anti-overlap at exactly walking
+   speed, so probe and control produce identical `x` for 5 frames — a
+   *differential* collision, where the game itself moves the fighter at the
+   probe's own speed. And a fighter being separated from an overlap is
+   genuinely not actionable, so §4.3's "non-monotone means a one-frame-early
+   hold or an unsound observable" is not exhaustive.
+5. **A move's signature is NOT gap-invariant**, though §4.3 implies it is: the
+   slide travels 112 px from 182 px away and 62 px from 107 px, because it
+   stops on contact. A threshold tuned at one rung refuses a correct move at
+   another.
+6. **§5's settle advice understates its own consequence.** A mid-walk rung
+   does not merely shift pixels — it leaves a direction LATCHED, so a motion
+   special's first tap is not a fresh onset and the special does not come
+   out. The lab then measures the NORMAL that does, under the special's name.
+   This is the THIRD distinct cause of the `acid_spit` failure mode. No
+   sidecar field records whether the fighter was at rest.
+7. **Travel is a STEP function of gap, not a ramp** — interpolating a
+   projectile's advantage between measured rungs invents numbers.

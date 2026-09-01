@@ -1,13 +1,15 @@
 """Unit tests for `framelab.specials` — docs/frames.md applied to SPECIAL
-moves, and the three assumptions Mileena's kit breaks (charge/projectile,
-airborne, side-swap + knockdown).
+moves, and the five assumptions two kits break: Mileena's charge/projectile,
+airborne and side-swap+knockdown, plus Reptile's damageless move (no anchor
+at all) and his low (a guard-stance question a normal never asks).
 
 Everything here runs against fakes: `special_script` and the facing /
-signature / manifest logic are pure, and the two functions that drive the
-emulator (`observe_move`, `preemption_scan`, `sweep_side`) are exercised by
-substituting the one collaborator they call (`replay` / `sweep_actionable`)
-with a stub. That keeps the refusal rules — which are the point of this
-module — under test without a live rig.
+signature / manifest / verdict logic are pure, and every function that drives
+the emulator (`observe_move`, `preemption_scan`, `sweep_side`,
+`origin_invariance`, `measure_guard_height`, `screen_preemption_scan`) is
+exercised by substituting the one collaborator it calls (`replay` /
+`sweep_actionable`) with a stub. That keeps the refusal rules — which are the
+point of this module — under test without a live rig.
 """
 
 from __future__ import annotations
@@ -44,6 +46,29 @@ def fake_profile(**overrides):
                 ],
             }
         }
+    }
+    # Reptile's two shapes that Mileena has none of: a NON-TERMINAL release
+    # (`invisibility`) and a projectile that is not a charge (`acid_spit`).
+    port_raw["special_inputs"]["reptile"] = {
+        "acid_spit": [
+            {"dirs": ["forward"], "frames": 3},
+            {"dirs": ["forward"], "frames": 3},
+            {"press": ["HP"], "frames": 3},
+        ],
+        "slide": [
+            {"dirs": ["back"], "press": ["LK", "LP", "Block"], "frames": 8},
+        ],
+        "force_ball": [
+            {"dirs": ["back"], "frames": 3},
+            {"dirs": ["back"], "press": ["HP", "LP"], "frames": 3},
+        ],
+        "invisibility": [
+            {"dirs": ["up"], "while_held": ["Block"], "frames": 3},
+            {"dirs": ["up"], "while_held": ["Block"], "frames": 3},
+            {"dirs": ["down"], "while_held": ["Block"], "frames": 3},
+            {"release": ["Block"]},
+            {"press": ["HP"], "frames": 3},
+        ],
     }
     port_raw.update(overrides.pop("port_raw", {}))
     return SimpleNamespace(
@@ -123,7 +148,10 @@ class ScriptFromEncoding(unittest.TestCase):
         with self.assertRaises(sp.SpecialEncodingError):
             sp.special_script(prof, "mileena", "roll", facing="right")
 
-    def test_a_non_terminal_release_is_refused_rather_than_guessed(self):
+    def test_a_release_followed_by_a_re_hold_of_the_same_class_is_refused(self):
+        """A falling edge this playback cannot express: every step's mask is
+        the port's WHOLE held set, so the release and the re-hold would
+        collapse into one continuous hold."""
         prof = fake_profile()
         prof.port_raw["special_inputs"]["mileena"]["sai_throw"] = [
             {"hold": ["HP"], "min_frames": 34},
@@ -132,6 +160,28 @@ class ScriptFromEncoding(unittest.TestCase):
         ]
         with self.assertRaises(sp.SpecialEncodingError):
             sp.special_script(prof, "mileena", "sai_throw", facing="right")
+
+    def test_a_non_terminal_release_of_a_different_class_is_the_neutral_gap(self):
+        """Reptile's `invisibility`: `[BLK] U U D`, release BLK, then HP. The
+        `step_gap` neutral frames between steps ARE the released window, and
+        the HP step already holds only HP because a step's mask is the port's
+        entire held set."""
+        s = sp.special_script(fake_profile(), "reptile", "invisibility",
+                              facing="right")
+        self.assertEqual([(st.frames, st.buttons) for st in s.steps],
+                         [(3, ("up", "l")), (2, ()),
+                          (3, ("up", "l")), (2, ()),
+                          (3, ("down", "l")), (2, ()),
+                          (3, ("y",))])
+        self.assertEqual(s.total_frames, 18)
+        # The frames where Block is NOT held are exactly the neutral gaps --
+        # nothing silently carries the chord into the trigger step.
+        self.assertNotIn("l", s.steps[-1].buttons)
+
+    def test_a_non_terminal_release_needs_a_gap_to_be_released_on(self):
+        with self.assertRaises(sp.SpecialEncodingError):
+            sp.special_script(fake_profile(), "reptile", "invisibility",
+                              facing="right", step_gap=0)
 
     def test_an_unknown_attack_class_raises(self):
         prof = fake_profile()
@@ -352,6 +402,79 @@ class SweepRefusals(unittest.TestCase):
         self.assertIsNone(out["struct_velocity"].manifest)
 
 
+class DifferentialCollisionRetry(unittest.TestCase):
+    """Reptile's `force_ball`: the anti-overlap push moves the attacker at
+    almost exactly walking speed, so in ONE direction the probe and the
+    control produce identical `obj+0x12` over the whole window and the
+    predicate acquires a FALSE island 40 frames past the boundary. In the
+    other direction (walk and push have opposite signs) both observables are
+    monotone and return the SAME boundary."""
+
+    def _run(self, by_direction, dirs=("left", "right"), **kw):
+        rig = Rig(arena="a.state", attacker_port=0, defender_port=1,
+                  guard_buttons=("l",),
+                  walk_directions_by_port={0: dirs})
+        script = sp.special_script(fake_profile(), "reptile", "force_ball",
+                                   facing="right")
+        seen = []
+
+        def fake_sweep(session, **k):
+            d = k["rig"].walk_directions_by_port[0]
+            seen.append((tuple(d), tuple(k["observables"])))
+            # `sweep_actionable` picks the first candidate that diverges.
+            chosen = next((c for c in d if c in by_direction), d[0])
+            return {o: by_direction[chosen][o] for o in k["observables"]}
+
+        orig = sp.sweep_actionable
+        sp.sweep_actionable = fake_sweep
+        try:
+            out = sp.sweep_side(
+                None, rig=rig, script=script, who="attacker", port=0,
+                origin=19, origin_kind="input_end+1",
+                observables=["struct_velocity", "pointer_x"], sample_fn=None,
+                input_latency_frames={"struct_velocity": 1, "pointer_x": 2},
+                defender_guard=False, max_search=90, **kw)
+        finally:
+            sp.sweep_actionable = orig
+        return out, seen
+
+    @staticmethod
+    def _island(first_true, lo, hi, max_search=90):
+        pred = [i >= first_true for i in range(max_search + 1)]
+        for i in range(lo, hi + 1):
+            pred[i] = False
+        return sweep(first_true, predicate=pred, monotone=False,
+                     max_search=max_search)
+
+    def test_only_the_broken_observable_is_re_swept_and_it_agrees(self):
+        left = {"struct_velocity": sweep(44, max_search=90),
+                "pointer_x": self._island(44, 83, 87)}
+        right = {"struct_velocity": sweep(44, max_search=90),
+                 "pointer_x": sweep(44, window=4, max_search=90)}
+        out, seen = self._run({"left": left, "right": right})
+        self.assertEqual(out["pointer_x"].sweep.first_true, 44)
+        self.assertEqual(out["pointer_x"].rejected_directions, ("left",))
+        # The clean observable was NOT re-swept, and the retry asked only for
+        # the broken one.
+        self.assertEqual(out["struct_velocity"].rejected_directions, ())
+        self.assertEqual(seen[1][1], ("pointer_x",))
+
+    def test_a_direction_that_is_also_broken_still_refuses(self):
+        broken = {"struct_velocity": sweep(44, max_search=90),
+                  "pointer_x": self._island(44, 83, 87)}
+        with self.assertRaises(ProbeError):
+            self._run({"left": broken, "right": broken})
+
+    def test_the_retry_can_be_turned_off(self):
+        left = {"struct_velocity": sweep(44, max_search=90),
+                "pointer_x": self._island(44, 83, 87)}
+        right = {"struct_velocity": sweep(44, max_search=90),
+                 "pointer_x": sweep(44, window=4, max_search=90)}
+        with self.assertRaises(ProbeError):
+            self._run({"left": left, "right": right},
+                      retry_other_direction=False)
+
+
 class PreemptionScan(unittest.TestCase):
     def test_it_reports_which_probe_frames_killed_the_move(self):
         rig = Rig(arena="a.state", attacker_port=0, defender_port=1,
@@ -437,6 +560,412 @@ class Collapsing(unittest.TestCase):
     def test_all_null_stays_null(self):
         m = self._m()
         self.assertIsNone(m.agreed({"struct_velocity": None, "pointer_x": None}))
+
+
+class AttackerOrigin(unittest.TestCase):
+    def _script(self):
+        return sp.special_script(fake_profile(), "reptile", "acid_spit",
+                                 facing="right")
+
+    def test_contact_origin_is_the_anchor(self):
+        self.assertEqual(sp.attacker_origin(self._script(), "contact", 51), 51)
+
+    def test_a_projectile_starts_its_clock_one_frame_after_its_own_input(self):
+        s = self._script()
+        self.assertEqual(s.total_frames, 13)
+        self.assertEqual(sp.attacker_origin(s, "input_end+1", 51), 14)
+
+    def test_a_charge_uses_the_same_arithmetic_under_a_different_name(self):
+        s = self._script()
+        self.assertEqual(sp.attacker_origin(s, "release+1", 51),
+                         sp.attacker_origin(s, "input_end+1", 51))
+
+    def test_an_unknown_origin_kind_is_refused_not_defaulted(self):
+        with self.assertRaises(ProbeError):
+            sp.attacker_origin(self._script(), "whenever", 51)
+
+
+class OriginInvariance(unittest.TestCase):
+    """The check that validates a whiff anchor against the contact anchor."""
+
+    def _run(self, per_origin, **kw):
+        rig = Rig(arena="a.state", attacker_port=0, defender_port=1,
+                  guard_buttons=("l",))
+        script = sp.special_script(fake_profile(), "reptile", "acid_spit",
+                                   facing="right")
+        calls = []
+
+        def fake_sweep(session, **k):
+            calls.append(k["anchor"])
+            ft = per_origin[k["anchor"]]
+            return {"struct_velocity": sweep(ft, window=3,
+                                             max_search=k["max_search"])}
+
+        orig = sp.sweep_actionable
+        sp.sweep_actionable = fake_sweep
+        try:
+            return sp.origin_invariance(
+                None, rig=rig, script=script, who="attacker", port=0,
+                origins=[(14, "input_end+1"), (51, "contact")], end_frame=141,
+                observables=["struct_velocity"], sample_fn=None,
+                input_latency_frames={"struct_velocity": 1},
+                defender_guard=False, **kw)
+        finally:
+            sp.sweep_actionable = orig
+
+    def test_two_origins_that_land_on_the_same_absolute_frame_agree(self):
+        # 14 + 46 + 3 == 51 + 9 + 3 == 63
+        got = self._run({14: 46, 51: 9})
+        self.assertEqual(got["struct_velocity"],
+                         {"input_end+1": 63, "contact": 63})
+
+    def test_a_manifest_that_depends_on_the_origin_is_refused(self):
+        with self.assertRaises(sp.OriginDependenceError):
+            self._run({14: 46, 51: 12})
+
+    def test_an_origin_clipped_from_below_cannot_participate(self):
+        """first_true=0 cannot tell 'free exactly here' from 'free earlier' —
+        a sweep starts at N=0 and has no negative side."""
+        with self.assertRaises(ProbeError):
+            self._run({14: 46, 51: 0})
+
+    def test_a_side_that_never_diverged_cannot_participate(self):
+        with self.assertRaises(ProbeError):
+            self._run({14: 46, 51: None})
+
+    def test_one_origin_is_not_an_invariance_check(self):
+        rig = Rig(arena="a.state", attacker_port=0, defender_port=1,
+                  guard_buttons=("l",))
+        script = sp.special_script(fake_profile(), "reptile", "acid_spit",
+                                   facing="right")
+        with self.assertRaises(ValueError):
+            sp.origin_invariance(
+                None, rig=rig, script=script, who="attacker", port=0,
+                origins=[(14, "input_end+1")], end_frame=141,
+                observables=["struct_velocity"], sample_fn=None,
+                input_latency_frames={"struct_velocity": 1},
+                defender_guard=False)
+
+
+class GuardHeightVerdict(unittest.TestCase):
+    """The pure half: which stance actually stopped the move, read off damage."""
+
+    @staticmethod
+    def _t(variant, connected, damage):
+        return sp.GuardTrial(variant=variant, guard_buttons=("l",),
+                             connected=connected, damage=damage,
+                             contact_frame=21 if connected else None,
+                             victim_knockdown=False)
+
+    def test_chip_under_both_stances_is_a_mid(self):
+        v, _ = sp.guard_height_verdict(
+            13, [self._t("standing", True, 3), self._t("crouching", True, 3)])
+        self.assertEqual(v, "mid")
+
+    def test_full_damage_through_a_standing_guard_is_a_low(self):
+        v, note = sp.guard_height_verdict(
+            13, [self._t("standing", True, 13), self._t("crouching", True, 3)])
+        self.assertEqual(v, "low")
+        self.assertIn("NOT blocked", note)
+
+    def test_full_damage_through_a_crouching_guard_is_an_overhead(self):
+        v, _ = sp.guard_height_verdict(
+            13, [self._t("standing", True, 3), self._t("crouching", True, 13)])
+        self.assertEqual(v, "overhead")
+
+    def test_a_stance_that_made_the_move_whiff_did_not_block_it(self):
+        """§2.6 in the other direction: zero damage means WHIFF, not block."""
+        v, note = sp.guard_height_verdict(
+            13, [self._t("standing", True, 3),
+                 self._t("crouching", False, None)])
+        self.assertIsNone(v)
+        self.assertIn("did not connect at all", note)
+
+    def test_no_unguarded_reference_means_no_verdict(self):
+        v, note = sp.guard_height_verdict(None, [self._t("standing", True, 3)])
+        self.assertIsNone(v)
+        self.assertIn("whiff", note)
+
+    def test_neither_stance_blocking_is_null_not_unblockable_by_default(self):
+        v, note = sp.guard_height_verdict(
+            13, [self._t("standing", True, 13), self._t("crouching", True, 13)])
+        self.assertIsNone(v)
+        self.assertIn("unblockable", note)
+
+
+class GuardHeightRig(unittest.TestCase):
+    def test_each_stance_is_driven_and_never_inferred(self):
+        """§2.6: the lab holds the stance, so it KNOWS it — the damage only
+        has to say whether the hit was reduced."""
+        rig = Rig(arena="a.state", attacker_port=0, defender_port=1,
+                  guard_buttons=("l",))
+        script = sp.special_script(fake_profile(), "reptile", "slide",
+                                   facing="right")
+        seen = []
+
+        def fake_replay(session, **k):
+            held = tuple(k["rig"].guard_buttons) if k["defender_guard"] else ()
+            seen.append(held)
+            dmg = {(): 13, ("l",): 13, ("l", "down"): 3}[held]
+            return ([{"c": 161, "ax": 474, "ay": 85, "vx": 654, "vy": 85}] * 21
+                    + [{"c": 161 - dmg, "ax": 580, "ay": 85,
+                        "vx": 700, "vy": 85}] * 10)
+
+        orig = sp.replay
+        sp.replay = fake_replay
+        try:
+            gh = sp.measure_guard_height(
+                None, rig=rig, script=script, contact_read=lambda s: None,
+                reads={k: (lambda s: None) for k in
+                       ("attacker_x", "attacker_y", "victim_x", "victim_y")},
+                stances={"standing": ("l",), "crouching": ("l", "down")})
+        finally:
+            sp.replay = orig
+        self.assertEqual(seen, [(), ("l",), ("l", "down")])
+        self.assertEqual(gh.unguarded_damage, 13)
+        self.assertEqual(gh.verdict, "low")
+        self.assertEqual(gh.by_variant("standing").damage, 13)
+
+
+class WhiffRecoveryAnchor(unittest.TestCase):
+    def _rig_script(self):
+        rig = Rig(arena="a.state", attacker_port=0, defender_port=1,
+                  guard_buttons=("l",))
+        script = sp.special_script(fake_profile(), "reptile", "invisibility",
+                                   facing="right")
+        return rig, script
+
+    def test_an_anchor_inside_the_moves_own_input_is_refused(self):
+        """`hold_buttons` REPLACES: a probe on the move's own button frame
+        means no move came out in either run, and the sweep reports a
+        REPRODUCIBLE first_true=0 that is the fighter walking."""
+        rig, script = self._rig_script()
+        for bad in (0, 5, script.total_frames):
+            with self.assertRaises(sp.WhiffAnchorError):
+                sp.measure_whiff_recovery(
+                    None, rig=rig, script=script, port=0,
+                    observables=["struct_velocity"], sample_fn=None,
+                    origin=bad)
+
+    def test_a_run_that_connects_is_not_a_whiff(self):
+        rig, script = self._rig_script()
+        orig = sp.replay
+        sp.replay = lambda session, **k: (
+            [{"c": 161, "ax": None, "ay": None, "vx": None, "vy": None}] * 30
+            + [{"c": 150, "ax": None, "ay": None, "vx": None, "vy": None}] * 30)
+        try:
+            with self.assertRaises(ProbeError):
+                sp.measure_whiff_recovery(
+                    None, rig=rig, script=script, port=0,
+                    observables=["struct_velocity"], sample_fn=None,
+                    contact_read=lambda s: None)
+        finally:
+            sp.replay = orig
+
+    def test_total_is_input_relative_and_null_when_nothing_diverged(self):
+        _, script = self._rig_script()
+        wr = sp.WhiffRecovery(
+            move="invisibility", arena="a.state", origin=19,
+            origin_kind="input_end+1", attack_input_frame=0,
+            sweeps={"struct_velocity": sp.SideManifest(
+                who="attacker", origin=19, origin_kind="input_end+1",
+                sweep=sweep(20, window=3))},
+            latencies={"struct_velocity": 1}, cal_points=(70, 100))
+        self.assertEqual(wr.total("struct_velocity"), 42)
+        null = sp.WhiffRecovery(
+            move="invisibility", arena="a.state", origin=19,
+            origin_kind="input_end+1", attack_input_frame=0,
+            sweeps={"struct_velocity": sp.SideManifest(
+                who="attacker", origin=19, origin_kind="input_end+1",
+                sweep=sweep(None))},
+            latencies={"struct_velocity": 1}, cal_points=(70, 100))
+        self.assertIsNone(null.total("struct_velocity"))
+
+
+def _png(width, height, fill):
+    """A minimal 8-bit RGBA, non-interlaced, filter-0 PNG — the shape
+    `app://screen` serves."""
+    import struct
+    import zlib
+
+    rows = []
+    for y in range(height):
+        row = bytearray(b"\x00")
+        for x in range(width):
+            row += bytes(fill(x, y))
+        rows.append(bytes(row))
+    raw = b"".join(rows)
+
+    def chunk(typ, data):
+        return (struct.pack(">I", len(data)) + typ + data
+                + struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b""))
+
+
+class ScreenWitness(unittest.TestCase):
+    """The framebuffer, for the one move with no memory observable at all."""
+
+    def test_the_decoder_round_trips_an_rgba_png(self):
+        blob = _png(4, 3, lambda x, y: (x * 10, y * 10, 5, 255))
+        w, h, px = sp.decode_png_rgba(blob)
+        self.assertEqual((w, h), (4, 3))
+        self.assertEqual(px[:4], bytes((0, 0, 5, 255)))
+        self.assertEqual(px[(2 * 4 + 3) * 4:(2 * 4 + 3) * 4 + 4],
+                         bytes((30, 20, 5, 255)))
+
+    def test_a_non_png_is_a_refusal(self):
+        with self.assertRaises(sp.ScreenWitnessError):
+            sp.decode_png_rgba(b"not a png at all")
+
+    def test_the_region_read_crops_and_refuses_an_out_of_bounds_rect(self):
+        blob = _png(4, 3, lambda x, y: (x, y, 0, 255))
+        client = SimpleNamespace(read_resource=lambda uri: blob)
+        read = sp.make_screen_region_read(client, region=(1, 0, 3, 2))
+        self.assertEqual(read(None), bytes((1, 0, 0, 255, 2, 0, 0, 255,
+                                            1, 1, 0, 255, 2, 1, 0, 255)))
+        bad = sp.make_screen_region_read(client, region=(0, 0, 99, 2))
+        with self.assertRaises(sp.ScreenWitnessError):
+            bad(None)
+
+    def test_pixel_diff_counts_pixels_not_bytes(self):
+        a = bytes((1, 2, 3, 4)) * 3
+        b = bytes((1, 2, 3, 4)) + bytes((9, 9, 9, 9)) * 2
+        self.assertEqual(sp.region_pixel_diff(a, b), 2)
+        with self.assertRaises(sp.ScreenWitnessError):
+            sp.region_pixel_diff(a, a + b"\x00\x00\x00\x00")
+
+    def _scan(self, **kw):
+        rig = Rig(arena="a.state", attacker_port=0, defender_port=1,
+                  guard_buttons=("l",))
+        script = sp.special_script(fake_profile(), "reptile", "invisibility",
+                                   facing="right")
+        control = sp.MoveScript(name="trigger-only", steps=(script.steps[-1],))
+        runs = []
+
+        def fake_replay(session, **k):
+            runs.append((k["script"].name, k["total_frames"], k.get("probe_at")))
+            # A toy fighter drawn at his own x -- unless the move came out, in
+            # which case nothing is drawn at all and the crop is constant.
+            invisible = (k["script"] is script
+                         and (k.get("probe_at") is None
+                              or k["probe_at"] > script.total_frames))
+            walked = 7 if k.get("probe_at") is not None else 0
+            crop = bytes(4000) if invisible else bytes(
+                [walked] * 400 + [0] * 3600)
+            return [None] * k["total_frames"] + [{"screen": crop}]
+
+        orig = sp.replay
+        sp.replay = fake_replay
+        try:
+            got = sp.screen_preemption_scan(
+                None, rig=rig, script=script, control_script=control,
+                origin=script.total_frames, n_range=(0, 1, 2),
+                directions=("left",), screen_read=lambda s: None, **kw)
+        finally:
+            sp.replay = orig
+        return got, runs, script
+
+    def test_zero_displacement_means_the_fighter_is_not_drawn(self):
+        got, _, script = self._scan(capture_after=6)
+        # N=0 puts the probe on the move's own last input frame, where it
+        # replaces the trigger: he stays DRAWN, so walking him moves pixels.
+        self.assertEqual(got[0]["left"], 100)
+        # One frame later the move is already out and the walk moves nothing.
+        self.assertEqual(got[1]["left"], 0)
+        self.assertEqual(got[2]["left"], 0)
+
+    def test_the_witness_carries_its_own_validity_check_at_every_n(self):
+        """If the walk does not move a fighter who IS drawn, a zero on the
+        real script means nothing."""
+        got, _, _ = self._scan(capture_after=6)
+        for n in (0, 1, 2):
+            self.assertEqual(got[n]["left_drawn_control"], 100)
+
+    def test_every_pair_it_compares_is_the_same_number_of_frames(self):
+        _, runs, script = self._scan(capture_after=6)
+        for n in (0, 1, 2):
+            end = script.total_frames + n + 6
+            at_end = [r for r in runs if r[1] == end]
+            # one still/moved pair for the script, one for the drawn control
+            self.assertEqual(len(at_end), 4, f"N={n}")
+            self.assertEqual({r[0] for r in at_end},
+                             {"invisibility", "trigger-only"})
+
+    def test_a_capture_on_the_probe_frame_itself_is_refused(self):
+        with self.assertRaises(sp.ScreenWitnessError):
+            self._scan(capture_after=0)
+
+
+class ReptileSignatures(unittest.TestCase):
+    def test_the_retracted_move_is_gated_on_the_damage_that_discriminates_it(self):
+        """`acid_spit`'s previous 'verification' was a close HP normal at
+        point blank (24 damage). The signature is 15."""
+        self.assertEqual(sp.MK2_REPTILE_SIGNATURES["acid_spit"].damage, 15)
+        self.assertNotEqual(sp.MK2_REPTILE_SIGNATURES["acid_spit"].damage, 24)
+
+    def test_a_damageless_move_has_no_signature_to_check(self):
+        self.assertNotIn("invisibility", sp.MK2_REPTILE_SIGNATURES)
+
+    def test_the_slide_is_gated_on_travel_and_the_victims_own_y(self):
+        s = sp.MK2_REPTILE_SIGNATURES["slide"]
+        self.assertTrue(s.victim_knockdown)
+        self.assertIsNotNone(s.min_attacker_travel_px)
+
+
+class PerPassRefusal(unittest.TestCase):
+    """§4.3: `on_hit` and `on_block` are separate columns and must not be
+    derived from each other. That cuts both ways — a refusal on one outcome
+    must not throw the other one away. Measured need: `force_ball` launches
+    its victim onto the attacker, and the separation that follows makes the
+    ATTACKER'S own predicate non-monotone on the hit rig while the blocked rig
+    sweeps cleanly."""
+
+    def test_a_refused_hit_pass_still_leaves_the_block_pass(self):
+        rig = Rig(arena="a.state", attacker_port=0, defender_port=1,
+                  guard_buttons=("l",))
+        script = sp.special_script(fake_profile(), "reptile", "force_ball",
+                                   facing="right")
+        frame = {"c": 161, "ax": 474, "ay": 85, "vx": 656, "vy": 85}
+        hit = ([frame] * 71 + [{**frame, "c": 145}] * 60)
+        blk = ([frame] * 71 + [{**frame, "c": 157}] * 60)
+
+        def fake_replay(session, **k):
+            return blk if k["defender_guard"] else hit
+
+        def fake_cal(session, **k):
+            return {"struct_velocity": 1}
+
+        def fake_sweep(session, **k):
+            if k["who"] == "attacker" and not k["defender_guard"]:
+                raise ProbeError("predicate is not monotone (the separation)")
+            n = {("attacker", True): 40, ("defender", False): 30,
+                 ("defender", True): 26}[(k["who"], k["defender_guard"])]
+            return {"struct_velocity": sp.SideManifest(
+                who=k["who"], origin=k["origin"], origin_kind=k["origin_kind"],
+                sweep=sweep(n, window=3, max_search=90))}
+
+        saved = (sp.replay, sp.calibrate_for_move, sp.sweep_side)
+        sp.replay, sp.calibrate_for_move, sp.sweep_side = (
+            fake_replay, fake_cal, fake_sweep)
+        try:
+            m = sp.measure_special(
+                None, rig=rig, script=script, observables=["struct_velocity"],
+                sample_fns={0: None, 1: None}, contact_read=lambda s: None,
+                reads={k: (lambda s: None) for k in
+                       ("attacker_x", "attacker_y", "victim_x", "victim_y")},
+                expect=sp.Signature(damage=16, hits=1),
+                attacker_origin_kind="input_end+1")
+        finally:
+            sp.replay, sp.calibrate_for_move, sp.sweep_side = saved
+        self.assertIn("attacker/hit", m.refusals)
+        self.assertIn("not monotone", m.refusals["attacker/hit"])
+        self.assertIsNone(m.on_hit["struct_velocity"])
+        self.assertIsNotNone(m.on_block["struct_velocity"])
+        self.assertTrue(any("REFUSED" in n for n in m.notes))
 
 
 class Conventions(unittest.TestCase):
