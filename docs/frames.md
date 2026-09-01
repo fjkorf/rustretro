@@ -723,16 +723,28 @@ the same protocol reproduces the same systematic error perfectly.
    observable (struct divergence vs `+0xC0` edge, or `struct_velocity` vs
    `pointer_x`), and:
 
+   The class is **not a property of the field's name** — it is a property of
+   whether the value carries a probe manifest's manifestation margin, which
+   depends on how the row was actually measured. Three shapes, not two:
+
    - **DIFFERENCE quantities agree to the frame, exactly.** `advantage`
      (`on_hit`/`on_block`) is a difference of two manifest frames measured
      with the SAME observable (§4.3's `manifest(defender) − manifest(attacker)`),
      so that observable's own manifestation margin appears in both terms and
-     cancels out of the subtraction. `first_active_frame` and the duration
-     fields (`active`/`recovery`/`total`/`hitstop`) are anchor-based (§4.4),
-     not probe manifests at all, so they carry no observable margin either
-     and are held to the same exact-frame rule. Criterion 1 catches noise;
-     only exact cross-observable agreement on these catches a constant
-     offset, and a 3-frame systematic error passes criteria 1–3 unnoticed.
+     cancels out of the subtraction. **`hitstop` is also a difference
+     quantity** — connecting manifest minus whiffing manifest — even though
+     it is a duration: the margin cancels the same way advantage's does, so
+     it is held to the same exact-frame rule and must NOT be given the
+     one-sided leniency below. It has agreed exactly on every cell measured
+     so far, across three characters.
+   - **ANCHOR-BASED quantities are bracketed by two reads of the SAME anchor
+     signal (§4.1), never a behavioural probe**, so neither endpoint carries
+     a manifestation margin and they too are held to exact agreement —
+     for a different reason than a difference quantity (no margin ever
+     entered the number, rather than two margins entering and cancelling).
+     `first_active_frame` (the contact signal relative to a fixed,
+     software-controlled input frame) and `active` (the first and last
+     contact-signal reads across a gap sweep) are both this shape.
    - **ONE-SIDED quantities carry the observable's margin directly, and
      legitimately differ by it.** `wakeup_window` (and any future raw
      single-sided manifest, e.g. an `actionable_after_contact` column) is
@@ -745,6 +757,22 @@ the same protocol reproduces the same systematic error perfectly.
      A one-sided row's two raw values must satisfy
      `value₁ − latency₁ == value₂ − latency₂`; anything else is still a real
      disagreement and must still be flagged.
+     **`total` and `recovery` are this shape too, corrected 2026-09-01.**
+     They were originally grouped with the anchor-based fields on the
+     reasoning that they are "measured from an anchor rather than a probe
+     manifest" — that reasoning holds for `first_active_frame` and `active`,
+     which bracket against the contact signal itself, but not for
+     `total`/`recovery`: under the only measurement protocol this project has
+     (§4), "recovered" has no anchor signal of its own — it is read from a
+     fixed anchor to the SAME act-again probe manifest a knockdown's
+     `wakeup_window` uses, so it carries exactly one margin, identically.
+     This is not a hypothetical: a WHIFF-anchored duration has no contact to
+     bracket against at all, so its `total` can *only* come from the
+     act-again probe. Reptile's invisibility does no damage and reads
+     `total` 40 (`struct_velocity`, latency 1) / 41 (`pointer_x`, latency 2)
+     — agreement under this rule (`40 − 1 == 41 − 2`), disagreement under the
+     rule this document previously specified. See §13 item 1 (closed) for
+     the blocker this caused.
 
    **Worked example — Mileena's roll.** `wakeup_window` reads 77 from
    `struct_velocity` (`input_latency_frames = 1`) and 78 from `pointer_x`
@@ -758,6 +786,19 @@ the same protocol reproduces the same systematic error perfectly.
    which observable's frame a stored one-sided number is in; a bare "77"
    that means different things depending on which row it came from is
    exactly the ambiguity §7 exists to prevent.
+
+   **This is a fact about the current protocol, not a permanent fact about
+   these field names.** If a future observable can read "recovery ended"
+   directly off an anchor signal (no probe involved) for a CONTACT-anchored
+   move, that row would be anchor-based, not one-sided — and today's schema
+   has no column to say which shape a given row is; the loader infers it
+   from the field name because every row this project has produced so far
+   follows the current protocol. The honest fix is a per-row column (e.g.
+   `anchor_kind: "dual_anchor" | "anchor_to_probe"`) so collapsing reads the
+   shape off the row instead of assuming it from the field's name — proposed
+   in §12, not yet implemented: nothing populates it (that's the Python
+   harness's job, out of scope for a Rust-only change), and a column nothing
+   ever writes is not a real fix.
 5. **Sanity against an external table**, if one is obtained. Not required to
    match — required to be reconciled in writing.
 
@@ -868,16 +909,40 @@ the same protocol reproduces the same systematic error perfectly.
 - **`hitstop`, `active`, `recovery`, `total`, `wakeup_window` and
   `guard_height` are NULL in every row measured so far.** The columns exist;
   nothing measures them yet.
+- **Proposed: a per-row `anchor_kind` column** (§8.4, from closing §13 item
+  1). The collapse rule currently infers whether a field carries a probe
+  manifest's margin from the FIELD'S NAME — correct today only because every
+  row this project has produced follows the one measurement protocol this
+  document describes (§4). `anchor_kind: "dual_anchor" | "anchor_to_probe"`
+  (naming the two shapes in §8.4) would let a future row declare which shape
+  it is, so a duration measured a genuinely different way — e.g. a future
+  observable reading "recovery ended" directly off an anchor signal for a
+  contact-anchored move, with no probe involved — collapses correctly
+  without a code change. Not implemented: it must be populated by
+  `shadow_train.framelab` at export time, which is out of scope for the
+  Rust-only fix that closed §13 item 1, and an unpopulated column is not a
+  real fix — `src/profile.rs`'s `collapse_measurements` still infers the
+  shape from the field name (`total`/`recovery` now join `wakeup_window`;
+  `first_active_frame`/`active` stay with `on_hit`/`on_block`/`hitstop`).
 
 ## 13. Open contract gaps (2026-09-01, from the specials/airborne/cancel runs)
 
-1. **§8.4 misclassifies a whiff-anchored `total`/`recovery`.** They are listed
-   as anchor-based (exact cross-observable agreement required), but a
-   whiff-anchored duration is ONE-SIDED and carries each observable's margin.
-   Reptile's invisibility reads 40/41 — agreement under the one-sided rule,
-   disagreement under the rule `collapse_measurements` actually applies. **No
-   `total` can be stored until this is fixed**, and the same blocker holds
-   the active-frames spike's `total`/`recovery` in scratch.
+1. ~~**§8.4 misclassifies a whiff-anchored `total`/`recovery`.**~~ **CLOSED
+   2026-09-01.** `total`/`recovery` are read from a fixed anchor to the same
+   act-again probe manifest `wakeup_window` uses, under the only measurement
+   protocol this project has (§4) — that holds regardless of whether the
+   anchor end was a contact or a whiff, so both fields are ONE-SIDED, not
+   anchor-based, unconditionally. Reptile's invisibility reads 40
+   (`struct_velocity`)/41 (`pointer_x`) — agreement under the one-sided rule
+   (`40−1 == 41−2`), the disagreement the old rule reported. Fixed in
+   `src/profile.rs`'s `collapse_measurements` (`total`/`recovery` moved from
+   `exact_field!` to `one_sided_field!`); `hitstop` was checked separately
+   and correctly stays exact — it is a DIFFERENCE of two manifests
+   (connecting − whiffing), not a probe manifest itself, so its margin
+   cancels the way advantage's does. The residual gap — that this
+   classification is inferred from the field name rather than declared per
+   row — is tracked as the proposed `anchor_kind` column in §12, since
+   nothing populates it yet.
 2. **No way to record "measured, nothing to report".** Invisibility is fully
    measured — 0 damage, 0 contacts in 200 frames, 3/3 — and produces no
    storable row, so a reader cannot distinguish it from never-measured. The
