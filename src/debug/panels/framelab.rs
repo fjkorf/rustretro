@@ -503,17 +503,23 @@ fn cell_hover_text(cell: Option<&FrameCell>) -> String {
                 format!("hits: {}", opt_i64(c.measurement.hits)),
                 format!("min sample_n: {}", opt_i64(c.min_sample_n())),
             ];
-            if let Some(w) = c.measurement.wakeup_window {
-                // wakeup_window is ONE-SIDED (docs/frames.md §4.2/§8.4): the
-                // number means "frames until actionable" only relative to
-                // the observable that produced it, so name that observable
-                // rather than printing a bare, ambiguous frame count.
-                let frame = c
-                    .one_sided_reference
-                    .get("wakeup_window")
-                    .map(|o| format!(" ({o}'s frame of reference)"))
-                    .unwrap_or_default();
-                lines.push(format!("wakeup_window: {w}{frame}"));
+            // wakeup_window/total/recovery are ONE-SIDED (docs/frames.md
+            // §4.2/§8.4): each number means "frames until actionable" only
+            // relative to the observable that produced it, so name that
+            // observable rather than printing a bare, ambiguous frame count.
+            for (field, value) in [
+                ("wakeup_window", c.measurement.wakeup_window),
+                ("total", c.measurement.total),
+                ("recovery", c.measurement.recovery),
+            ] {
+                if let Some(v) = value {
+                    let frame = c
+                        .one_sided_reference
+                        .get(field)
+                        .map(|o| format!(" ({o}'s frame of reference)"))
+                        .unwrap_or_default();
+                    lines.push(format!("{field}: {v}{frame}"));
+                }
             }
             if !c.agrees() {
                 lines.push(format!("⚠ disagreement: {}", c.disagreements.join(", ")));

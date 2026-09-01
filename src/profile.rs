@@ -504,15 +504,26 @@ impl<'de> Deserialize<'de> for SignedHex {
 // for audit) — EXCEPT that "agree" means something different depending on
 // what kind of quantity the field is (`docs/frames.md` §8.4, corrected):
 //
+// The class is NOT a property of a field's name — it is a property of HOW
+// THE ROW WAS MEASURED, specifically whether the value carries a probe
+// manifest's manifestation margin (`docs/frames.md` §8.4, corrected a second
+// time 2026-09-01):
+//
 // - **Difference quantities** (`on_hit`, `on_block` — a manifest frame minus
 //   another manifest frame, both from the SAME observable) have their
 //   observable's own margin cancel out of the subtraction. Two observables
-//   must therefore agree EXACTLY. `first_active_frame` and the still-NULL
-//   duration fields (`active`/`recovery`/`total`/`hitstop`) are anchor-based
-//   (§4.4), not probe manifests at all, so they carry no per-observable
-//   margin either and are held to the same exact-agreement rule.
-// - **One-sided quantities** (currently just `wakeup_window`) are a raw
-//   single-sided probe manifest and carry the measuring observable's own
+//   must therefore agree EXACTLY. `hitstop` is also a difference quantity —
+//   connecting manifest minus whiffing manifest — for the same reason, and
+//   for the same reason stays exact even though it is a duration.
+// - **Anchor-based quantities** are bracketed by two reads of the SAME
+//   anchor signal (§4.1), never a behavioural probe, so neither endpoint
+//   carries a manifestation margin. `first_active_frame` (the contact signal
+//   relative to a fixed, software-controlled input frame) and `active` (the
+//   first and last contact-signal reads across a gap sweep) are both this
+//   shape. Held to exact agreement, like a difference quantity, but for a
+//   different reason (no margin ever entered the number, rather than two
+//   margins entering and cancelling).
+// - **One-sided quantities** carry a raw single-sided probe manifest's own
 //   manifestation margin `m` directly: `value = A_rel + m`, and — because
 //   §3.1 calibrates the OBSERVABLE, not the move — the very same `m` is
 //   baked into that observable's `input_latency_frames = l + m` (`l` the
@@ -524,6 +535,35 @@ impl<'de> Deserialize<'de> for SignedHex {
 //   latency 1) vs 78 (`pointer_x`, latency 2) is this agreement, not a
 //   disagreement (77 − 1 == 78 − 2 == 76). A one-sided field that does NOT
 //   satisfy this invariant is a REAL disagreement and is still flagged.
+//   `wakeup_window` (an anchor-to-actionable-manifest read for a knockdown)
+//   was the first field recognised as this shape. `total` and `recovery`
+//   are the SAME shape: under the only measurement protocol this project has
+//   (§4, the act-again probe), "recovered" has no anchor signal of its own —
+//   it is read the identical way `wakeup_window` is, from a fixed anchor to
+//   the actionable-again probe manifest, so it carries exactly one margin
+//   too. This was misclassified as anchor-based in the first cut of this
+//   rule (`docs/frames.md` §13 item 1): it cost nothing to notice on a
+//   contact-anchored move, because nothing has measured `total`/`recovery`
+//   there yet, but it blocked every WHIFF-anchored one outright — Reptile's
+//   invisibility has no contact to anchor on, so its `total` can ONLY come
+//   from the act-again probe, and reads 40 (`struct_velocity`, latency 1) /
+//   41 (`pointer_x`, latency 2) — agreement under this rule (40−1 == 41−2),
+//   disagreement under the old exact-match rule. Reclassifying is not
+//   loosening the check: it is applying the SAME rule already proven correct
+//   for `wakeup_window` to a field that is measured exactly the same way.
+//
+// This is a true statement about the CURRENT protocol, not a permanent fact
+// about these field names — if a future observable can read "recovery ended"
+// directly off an anchor signal (no probe involved), that measurement would
+// be anchor-based instead. The schema has no way to say which shape a given
+// row is; today it is inferred from the field name because every row this
+// project has produced follows the current protocol. The correct fix is a
+// per-row column recording how the duration was bounded (e.g. `anchor_kind:
+// "dual_anchor" | "anchor_to_probe"`) so collapsing reads that off the row
+// instead of assuming it from the field's name — proposed in
+// `docs/frames.md` §12, not implemented here: nothing in this project's
+// scope (`shadow_train.framelab`, which would populate it) can be touched
+// from `src/profile.rs`, and a column nothing ever writes is not a real fix.
 //
 // A one-sided field's collapsed value is the raw reading of whichever
 // observable in the cell has the SMALLEST `input_latency_frames` — by the
@@ -693,10 +733,11 @@ fn collapse_measurements(
     let mut disagreements = Vec::new();
     let mut one_sided_reference = BTreeMap::new();
 
-    // Difference quantities (on_hit/on_block) and anchor-based absolutes
-    // (first_active_frame, and the still-unmeasured active/recovery/total/
-    // hitstop) carry no per-observable margin, so two observations must
-    // agree to the frame.
+    // Difference quantities (on_hit/on_block/hitstop, each a manifest minus
+    // a manifest from the SAME observable) and anchor-based absolutes
+    // (first_active_frame, active — both endpoints are reads of the same
+    // anchor signal, never a probe) carry no per-observable margin, so two
+    // observations must agree to the frame.
     macro_rules! exact_field {
         ($name:ident) => {{
             let mut it = items.iter().map(|o| &o.raw.$name);
@@ -709,7 +750,7 @@ fn collapse_measurements(
         }};
     }
 
-    // One-sided quantities (currently just wakeup_window) carry the
+    // One-sided quantities (wakeup_window, total, recovery) carry the
     // measuring observable's own manifestation margin directly, so raw
     // values legitimately differ by the observables' latency delta. The
     // module comment above derives `value − input_latency_frames` as the
@@ -717,6 +758,12 @@ fn collapse_measurements(
     // matches for both. Falls back to plain exact-agreement when latency
     // data is absent (older/uncalibrated exports), rather than treating
     // every such row as an automatic disagreement.
+    //
+    // `total`/`recovery` join `wakeup_window` here, not `exact_field!`: under
+    // the only measurement protocol this project has, both are read from a
+    // fixed anchor to the SAME act-again probe manifest `wakeup_window` uses
+    // for a knockdown, so they carry the identical single margin (module
+    // comment above, and docs/frames.md §8.4/§13 item 1).
     macro_rules! one_sided_field {
         ($name:ident) => {{
             let correctable: Vec<(i64, i64, &str)> = items
@@ -758,13 +805,13 @@ fn collapse_measurements(
     exact_field!(gap_px);
     exact_field!(first_active_frame);
     exact_field!(active);
-    exact_field!(recovery);
-    exact_field!(total);
     exact_field!(hits);
     exact_field!(hitstop);
     exact_field!(on_hit);
     exact_field!(on_block);
     one_sided_field!(wakeup_window);
+    one_sided_field!(total);
+    one_sided_field!(recovery);
     exact_field!(knockdown);
     exact_field!(juggle);
     exact_field!(guard_height);
@@ -2711,6 +2758,102 @@ mod tests {
             vec!["wakeup_window"],
             "no latency to correct with on one side -- exact match applies"
         );
+        assert!(one_sided.is_empty());
+    }
+
+    /// `total`/`recovery` are now ONE-SIDED, not anchor-based (docs/frames.md
+    /// §8.4/§13 item 1, corrected): a whiff-anchored duration has no contact
+    /// to bracket against, so it can only be measured the same way
+    /// `wakeup_window` is — anchor to the act-again probe manifest — and
+    /// therefore carries the same single margin. This is Reptile's
+    /// invisibility: `total` reads 40 (`struct_velocity`, latency 1) and 41
+    /// (`pointer_x`, latency 2), which is agreement (40−1 == 41−2), not the
+    /// disagreement the old exact-match rule reported. Before this fix NO
+    /// `total` could be stored for a whiff-anchored move at all.
+    #[test]
+    fn collapse_measurements_whiff_anchored_total_agrees_within_latency_delta() {
+        let mut a = FrameMeasurement::default();
+        a.total = Some(40);
+        let mut b = FrameMeasurement::default();
+        b.total = Some(41);
+
+        let (collapsed, disagreements, one_sided) = collapse_measurements(&[
+            ci("struct_velocity", Some(1), &a),
+            ci("pointer_x", Some(2), &b),
+        ]);
+        assert!(
+            disagreements.is_empty(),
+            "40 vs 41 at latencies 1 vs 2 is agreement, not disagreement: {disagreements:?}"
+        );
+        assert_eq!(collapsed.total, Some(40));
+        assert_eq!(
+            one_sided.get("total").map(String::as_str),
+            Some("struct_velocity"),
+            "collapsed value is in the smaller-latency (zero-margin) observable's frame"
+        );
+    }
+
+    /// The same field differing by anything OTHER than the latency delta is
+    /// still a real disagreement — reclassifying `total` corrected what
+    /// "agreement" means for it, it did not delete the check.
+    #[test]
+    fn collapse_measurements_whiff_anchored_total_disagreeing_by_more_than_latency_is_flagged() {
+        let mut a = FrameMeasurement::default();
+        a.total = Some(40);
+        let mut b = FrameMeasurement::default();
+        b.total = Some(45); // off by 5, not the latency delta of 1
+
+        let (collapsed, disagreements, one_sided) = collapse_measurements(&[
+            ci("struct_velocity", Some(1), &a),
+            ci("pointer_x", Some(2), &b),
+        ]);
+        assert_eq!(disagreements, vec!["total"]);
+        assert_eq!(collapsed.total, None, "not silently resolved to either value");
+        assert!(one_sided.is_empty());
+    }
+
+    /// `recovery` gets the identical treatment as `total`, for the identical
+    /// reason: both are read from a fixed anchor to the act-again probe
+    /// manifest under the current protocol, so both carry exactly one
+    /// observable margin.
+    #[test]
+    fn collapse_measurements_recovery_is_one_sided_like_total() {
+        let mut a = FrameMeasurement::default();
+        a.recovery = Some(20);
+        let mut b = FrameMeasurement::default();
+        b.recovery = Some(21);
+
+        let (collapsed, disagreements, one_sided) = collapse_measurements(&[
+            ci("struct_velocity", Some(1), &a),
+            ci("pointer_x", Some(2), &b),
+        ]);
+        assert!(disagreements.is_empty());
+        assert_eq!(collapsed.recovery, Some(20));
+        assert_eq!(
+            one_sided.get("recovery").map(String::as_str),
+            Some("struct_velocity")
+        );
+    }
+
+    /// `hitstop` is a DIFFERENCE quantity (connecting manifest minus
+    /// whiffing manifest, §8.4) even though it is a duration — it must stay
+    /// EXACT and must NOT get the one-sided leniency `total`/`recovery` just
+    /// did, because unlike them it has agreed exactly on every cell measured
+    /// so far across three characters, and reclassifying `total`/`recovery`
+    /// must not disturb that.
+    #[test]
+    fn collapse_measurements_hitstop_disagreement_is_still_flagged_exactly() {
+        let mut a = FrameMeasurement::default();
+        a.hitstop = Some(10);
+        let mut b = FrameMeasurement::default();
+        b.hitstop = Some(11); // == latency delta below, but hitstop isn't one-sided
+
+        let (collapsed, disagreements, one_sided) = collapse_measurements(&[
+            ci("struct_velocity", Some(1), &a),
+            ci("pointer_x", Some(2), &b),
+        ]);
+        assert_eq!(disagreements, vec!["hitstop"]);
+        assert_eq!(collapsed.hitstop, None);
         assert!(one_sided.is_empty());
     }
 
