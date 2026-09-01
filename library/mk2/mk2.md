@@ -4313,3 +4313,1998 @@ Promoting them is a task, not a merge: key the rows, validate `total` and
 `recovery` independently, and write through the store's normal provenance
 path. Hand-editing rows into the shipped table to close a column faster is
 precisely how a wrong number gets blessed.
+
+### CORRECTION — Baraka's hitstop coverage was mis-reported (2026-08-31)
+
+PR #43's commit message and body state Baraka's hitstop as **2/48**. That is
+**wrong; it is 30/48**, and has been since before that commit was written.
+
+Cause, worth more than the number: the coverage was read from the committed
+**export** rather than from the **store**. The interrupted agent's rows had
+landed in `shadow/framelab/frames.db`, but the export was regenerated before
+they did — and crucially **the row counts MATCHED** (142 in both), so the
+"verified the export contains my rows" check passed while the `hitstop`
+column was stale for an entire character.
+
+This is the third store/export divergence, and the first to put a wrong
+claim into a merged commit. A count check is precisely the check that cannot
+catch a stale-value drift.
+
+Fixed structurally rather than by procedure: `framelab.export.export_frames`
+now reads the file back and compares it to the store **row by row and field
+by field**, raising `ExportVerificationError` on any mismatch. An export that
+does not match its source is no longer possible to produce silently.
+
+Baraka's numbers (30/48, the rest refused or named): heavy kicks far **12**,
+light punches far **0**, `cHK` **3**, `cHP` block-only **7** — gap-invariant,
+`on_hit == on_block` exactly, cross-observable exact on every row. `cLK`/`cLP`
+refused as negative (12 refusals, same proximity-fork shape as the other two
+characters); close-range HP/HK/LK at 63 px skipped because his collision
+floor coincides with close-normal reach, so there is no safe whiff reference.
+30 + 12 + 6 = 48, nothing unaccounted for.
+
+**The move-class prediction held on a third character.** Heavy kicks 12,
+light punches 0, cHK 3, cHP 7 — identical across reptile, mileena and baraka
+despite different per-move damage. Three characters, four classes, zero
+disagreements. Hitstop is a property of the MOVE CLASS on this game.
+# Reptile's four specials — a projectile that is PLUS, a low that is not a low, and a move with no anchor at all (2026-09-01, task Q2)
+
+*(House-style section drafted for `library/mk2/mk2.md`; that file is outside
+this task's write scope, so it lives here.)*
+
+Reptile's normals were finished in task B3 and his specials were named "the
+obvious next cell" at the end of task M5. Four moves, and between them they
+add two shapes `docs/frames.md` has no vocabulary for: a move that deals **no
+damage at all**, and a move whose blocking STANCE is part of the answer. They
+also produce the first projectile in this table that is *plus*, which makes
+the cross-character comparison with Mileena's sai a result rather than a
+restatement.
+
+New code: `shadow_train/framelab/specials.py` only.
+
+## Rig
+
+`shadow/arenas/mk2/gap-{0,5,15,30,60}.state` — the Reptile mirror ladder
+(`char_id` 9 both sides), P1 (`block1`, port 0) at 182 / 170 / 145 / 107 /
+62 px from P2 (`block2`, port 1). Headless FBNeo, `--pace 0`, MCP port
+**4082**, with a second cold-started emulator on **4083** for reproduction.
+Never 4025. Contact anchored on the victim's fighter-struct health
+`block+0x0E` (§4.1). Both observables (`struct_velocity` `block+0x0B..0x0D`
+and pointer-resolved `x` `obj+0x12`) sampled from the same runs. Encodings
+from the profile's `special_inputs`, played back exactly as
+`src/macros.rs::MacroExec` does (each step's mask for its `frames`,
+`STEP_GAP = 2` neutral frames between).
+
+`core_id fbneo_libretro.dylib:sha256:972e8fb8c8394979`,
+`rom_id mk2.zip:sha256:e8d3f2f8cefe1aab`.
+
+### The ladder needs a 10-frame SETTLE, and without it the acid spit is a lie
+
+Reptile's `gap-*` arenas were saved **without settle frames** — §5's own
+warning, from the other side. The fighter is still mid-walk on load, so
+`forward` is already down and the macro's first tap is not a fresh onset,
+which is exactly what M1's rule ("the direction must be down at least one
+frame BEFORE the press") says a motion special needs. Played straight off the
+rungs, `F · F · HP` produced:
+
+| rung | gap | what actually came out | damage |
+|---|---|---|---|
+| gap-0 | 180 px | acid spit | 15 |
+| gap-5 | 172 px | acid spit | 15 |
+| gap-15 | 147 px | **nothing at all** | — |
+| gap-30 | 110 px | **the far HP NORMAL** | 11 |
+| gap-45 | 72 px | **the close HP NORMAL** | 24 |
+| gap-60 | 62 px | **the close HP NORMAL** | 24 |
+
+That is the retracted `acid_spit` verification reappearing from a different
+cause: at 110 px and closer the harness would have recorded advantage numbers
+for "acid_spit" that belong to a normal, and only the damage (15 against
+11/24) tells them apart. Inserting **10 neutral frames before the move's own
+input** fixes all six rungs. The lead-in is replayed identically in probe and
+control, so it cancels out of the differential exactly as a walk-in ladder's
+walk does (`LADDER_SETTLE = 10`).
+
+**Two-point control, because a settle is exactly the kind of constant that
+gets tuned until the answer looks right.** `acid_spit` re-measured with
+`--settle 16` on the second emulator: contact moves 34 → 40 and 51 → 57 (the
+six extra frames, as it must) and **`on_hit` and `on_block` are unchanged at
+both rungs**. The settle shifts the clock, not the answer.
+
+## What was measured
+
+Frames are relative to each side's own origin; advantage is the difference of
+the two ABSOLUTE manifest frames (§4.3). `input_end` is the frame the move's
+own input finishes; `travel = contact − input_end`.
+
+| move | rung | gap | dmg | chip | contact | travel | att free | def free (hit) | def free (blk) | **on hit** | **on block** | wakeup | guard |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `acid_spit` | 0 | 182 px | 15 | 4 | f51 | 28 | input_end+40 | contact+26 | contact+23 | **+14** | **+11** | — | — |
+| `acid_spit` | 5 | 170 px | 15 | 4 | f51 | 28 | input_end+40 | contact+26 | contact+23 | **+14** | **+11** | — | — |
+| `acid_spit` | 15 | 145 px | 15 | 4 | f34 | 11 | input_end+40 | contact+26 | contact+23 | **−3** | **−6** | — | — |
+| `acid_spit` | 60 | 62 px | 15 | 4 | f34 | 11 | input_end+40 | contact+26 | contact+23 | **−3** | **−6** | — | — |
+| `force_ball` | 0 | 182 px | 16 | 4 | f71 | 53 | input_end+48 | *knockdown* | contact+19 | **NULL** | **+24** | **72** | — |
+| `force_ball` | 5 | 170 px | 16 | 4 | f67 | 49 | input_end+48 | *knockdown* | contact+19 | **NULL** | **+20** | **72** | — |
+| `force_ball` | 15 | 145 px | 16 | 4 | f58 | 40 | input_end+48 | *knockdown* | contact+19 | **NULL** | **+11** | **72** | — |
+| `force_ball` | 30 | 107 px | 16 | 4 | f46 | 28 | input_end+48 | *knockdown* | contact+19 | **NULL** | **−1** | **80** | — |
+| `force_ball` | 60 | 62 px | 16 | 4 | f46 | 28 | input_end+48 | *knockdown* | contact+19 | **NULL** | **−1** | **80** | — |
+| `slide` | 0 | 182 px | 13 | 3 | f23 | — | — | *knockdown* | contact+23 | **NULL** | **−12** | **61** | **mid** |
+| `slide` | 30 | 107 px | 13 | 3 | f21 | — | — | *knockdown* | contact+23 | **NULL** | **−12** | **61** | **mid** |
+| `invisibility` | 0 | 182 px | **0** | — | *never fires* | — | input+40 | — | — | **NULL** | **NULL** | — | — |
+
+`wakeup` is quoted in the `struct_velocity` frame of reference (`pointer_x`
+reads one higher — §8.4's one-sided rule: `72 − 1 == 73 − 2`).
+`first_active_frame`, `active`, `recovery`, `total`, `hitstop` and
+`connect_range` are NULL in every row: none of them is a by-product of this
+protocol (§4.4, §12).
+
+**22 rows in `shadow/framelab/frames.db`** (11 cells × two observables; the
+store went 164 → 186). Checked after writing: every difference/anchor field
+agrees EXACTLY between the two observables in all 11 cells, and every
+`wakeup_window` agrees under §8.4's one-sided rule
+(`value − input_latency_frames` equal) — 0 disagreements.
+`invisibility` deliberately produces no row; see contract gap 3.
+
+---
+
+## 1. Both projectiles decompose exactly the way the sai does — and one of them is PLUS
+
+M5 decomposed Mileena's sai into two constants plus travel time and asked
+whether Reptile's two do the same. **They do, and the decomposition is
+tighter than hers**: her ladder had four rungs and one constant per side;
+this has nine rungs across two moves and the same two-constant form fits
+every one of them.
+
+```
+acid_spit    att free = input_end + 40    def free = contact + 26 (hit) / +23 (block)
+             on_hit  = travel − 14        on_block = travel − 17
+             travel  = 28 f at 182/170 px,  11 f at 145/107/62 px
+
+force_ball   att free = input_end + 48    def free = contact + 19 (block)
+             on_block = travel − 29
+             travel  = 53 / 49 / 40 / 28 / 28 f at 182 / 170 / 145 / 107 / 62 px
+```
+
+`travel − 29` reproduces `+24, +20, +11, −1, −1` exactly, at four distinct
+travel times. `travel − 14` and `travel − 17` reproduce all eight acid-spit
+numbers.
+
+**The sai's conclusion does NOT generalise, and that is the finding.** M5
+concluded "the attacker recovers while the sai travels is FALSE on this port:
+51 frames of recovery outlast a 24-frame flight, so the sai is negative
+everywhere, merely less negative further out." Reptile's acid spit has 40
+frames of recovery against a 28-frame flight and is **+14 on hit and +11 on
+block at 182 px** — plus, not less-minus. The form is a property of
+projectiles; the sign is a property of the move, and one character's kit was
+not enough to tell those apart.
+
+**Both attackers' recoveries are byte-identical on hit and on block** — 63
+and 66 (absolute frames), the same in both rigs at every rung. That is what a
+projectile should do, since the thrower never touches anyone, and it is the
+sai's own falsifiable prediction confirmed on a second character and a second
+move.
+
+**The curve is a STEP, not a ramp.** Both projectiles' contact frames are
+constant across bands of gap and then jump: the acid spit contacts at f51 for
+182 and 170 px and at f34 for everything from 145 px down to the 62 px
+collision floor; the force ball plateaus at f46 for 107 px and closer. So the
+advantage is not a smooth function of distance — the acid spit is +14/+11
+beyond about 150 px and −3/−6 at every distance inside it, with nothing in
+between on this ladder. A renderer that interpolates between measured rungs
+would invent numbers the game does not have.
+
+### The one-frame difference the contact anchor cannot express
+
+At 182 px the force ball's thrower is free at **contact − 5**: he has
+recovered before his own projectile arrives. §4.3's formula anchors both
+sides on contact, and a sweep starts at N = 0 and has no negative side, so a
+contact-anchored attacker sweep there returns `first_true = 0` — "free
+exactly at contact" — which is not what happened. This is the concrete case
+M5 predicted in the abstract, and it is why the attacker's clock has to start
+at the end of his own input.
+
+`origin_invariance` (new here) is the check that makes that a measurement
+rather than a preference: sweep the same side from BOTH origins over the same
+absolute frame range and require the absolute manifests to match.
+
+| move | rung | `input_end+1` | `contact` | verdict |
+|---|---|---|---|---|
+| `acid_spit` | 0 / 5 / 15 / 60 | 63 (`struct_velocity`), 64 (`pointer_x`) | 63 / 64 | **agree, 4/4 rungs, both observables** |
+| `force_ball` | 0 / 5 | 66 / 67 | — | **refused**: the contact sweep is clipped from below (`first_true = 0`) |
+
+The acid spit is the move that VALIDATES the new anchor, because it has a
+contact signal to check it against and its attacker recovers after contact at
+every rung; the force ball is the move that shows why the anchor is needed.
+Neither result is available from one move alone.
+
+---
+
+## 2. The act-again probe has a failure mode nobody has hit before: a DIFFERENTIAL COLLISION
+
+`force_ball` launches its victim **toward and past** the thrower (`x`
+656 → 510 while `y` arcs 85 → 3 → 85, a smooth 3.5 px/frame the whole
+flight), so the victim lands on top of the attacker and MK2's anti-overlap
+separation shoves them apart. Measured on the attacker's own act-again sweep,
+gap-5, absolute frames 102–106:
+
+```
+probe   x: 475 473 472 470 468 466      struct_velocity: 00feff (walking)
+control x: 475 473 472 470 468 466      struct_velocity: 000000 (standing)
+```
+
+The positions are IDENTICAL for the whole comparison window. The separation
+pushes him left at very nearly walking speed, so `obj+0x12` cannot tell the
+walk from the push — and the differential, whose entire job is to cancel
+self-motion, cancels the walk along with it. The predicate acquires a
+five-frame FALSE ISLAND forty frames past a boundary both observables
+otherwise agree on (44 and 44), and §4.3's monotonicity gate correctly
+refuses the cell.
+
+This is §4.2's blocked-direction hazard in a form the contract does not
+describe. §4.2 states it statically — "a fighter cannot walk into a wall, and
+cannot walk into the OPPONENT'S BODY either" — and prescribes trying the
+other direction when an observable never diverges *at all*. Here the
+direction works at N and again at N+6 and not in between, and the observable
+diverges perfectly well everywhere else.
+
+**Swept in the opposite direction, where the walk and the push have opposite
+signs, both observables are monotone and both return the same 44.**
+`sweep_side` now retries a non-monotone observable in the remaining
+directions, which is the existing per-observable direction rule extended from
+"this direction never diverged" to "this direction produced something that is
+not a predicate". It is bounded by the rig's own candidate list, the
+alternate must itself be monotone, and the §8.4 cross-observable check on
+`first_true` is what would catch a direction that produced a *different*
+boundary rather than a cleaner one. Gaps 182 and 170 px are rescued by it.
+
+At 145 px **both directions fail on `pointer_x`**, and at 107 and 62 px
+`struct_velocity` fails as well — the velocity word itself goes to zero for
+six frames while the separation runs. The second one is not an observable
+artifact at all: the fighter genuinely cannot walk while the game is pushing
+him out of an overlap, so his act-again predicate is genuinely non-monotone.
+The lab refuses those three attacker/hit sweeps and says so.
+
+**A refusal on one pass no longer costs the other.** §4.3 says `on_hit` and
+`on_block` "are separate columns and MUST NOT be derived from each other" —
+which cuts both ways. On the blocked rig nobody is launched, there is no
+overlap and no separation, and the attacker sweeps cleanly at every rung; the
+`on_block` column above is complete for all five force-ball rungs even though
+three of their attacker/hit sweeps were refused. Before this change the first
+refusal aborted the whole invocation and silently dropped every later rung.
+
+---
+
+## 3. `slide` — a low that standing Block stops, and a knockdown
+
+13 damage, one contact, the attacker travels 112 px from 182 px away and
+62 px from 107 px away (it stops when it connects — see below), and the
+victim is LAUNCHED: `y` 85 → off its own resting value, back at f55. §1.1's
+knockdown gate therefore applies and is enforced in `special_row` rather than
+left to the operator: **`on_hit` is NULL with `knockdown` set**, and the
+measurement is the wakeup window, **61** frames from contact
+(`struct_velocity`; 62 by `pointer_x`).
+
+`on_block` is **−12** and blockstun is `contact + 23`, both identical at 182
+and 107 px.
+
+**`guard_height` is the first non-NULL value in this column, and the answer
+is "mid".** The identical script was run against three defender states:
+
+| stance | held | damage | reading |
+|---|---|---|---|
+| none | — | 13 | full |
+| standing | `Block` | 3 | chip — **blocked** |
+| crouching | `Block` + `down` | 3 | chip — **blocked** |
+
+Reptile's slide does NOT have to be blocked low on this port. That was worth
+measuring rather than assuming: the genre convention says a slide is a low,
+and MK2 disagrees. Reproduced at both rungs and on the second emulator.
+
+The verdict is read off damage, not off a hit/block flag, and §2.6's warning
+applies in both directions — "zero damage means WHIFF, not block", so a
+stance under which the move does not connect at all is reported as neither
+(`guard_height_verdict` returns NULL with the reason, never a guess).
+
+**A signature threshold tuned at one rung refused the same move at another.**
+The slide's first signature required 100 px of attacker travel, measured at
+gap-0. At gap-30 the identical 13-damage slide travels only 62 px, because it
+stops when it connects — and the run refused a correct cell. The threshold is
+now 40 px: what it has to discriminate is the crouching normal the chord
+degenerates into, which travels ~0 px, not the slide's own reach.
+
+---
+
+## 4. `invisibility` — no damage, so no advantage; a real recovery, and a witness for it
+
+The contact signal never fires: **0 contacts in 200 frames, 3/3 trials**, and
+the run refuses to be measured as an advantage at all. §1.1 has a row for
+this — *whiff: attacker's recovery only, advantage NOT meaningful* — so
+`on_hit` and `on_block` are NULL, and that is the correct answer rather than
+a gap.
+
+Its recovery is still a real quantity, and it is **40 frames from the frame
+its input starts** (`struct_velocity`; `pointer_x` reads 41, and
+`40 − 1 == 41 − 2`). The move's own input occupies 18 of those frames, so he
+is free 22 frames after the last one. The predicate is cleanly monotone (18 F
+then T for all 73 remaining N) in both observables, which agree on
+`first_true = 18` exactly; the probe shape was calibrated on this move at
+origin+70 and origin+100 and required to agree (1 / 2, identical to the
+grounded attacker shape).
+
+### The whiff anchor, and the two things that had to be true before the number meant anything
+
+The anchor is `script.total_frames + 1`, not contact — there is no contact.
+`hitstop.measure_whiff_reference` had already found what anchoring at frame 0
+does: the probe's walk lands on the same frame as the move's own button,
+`hold_buttons` REPLACES rather than ORs, no move comes out in either the
+probe or the control, and the sweep returns a perfectly reproducible
+`first_true = 0` (4/4 trials) that is the fighter walking. `measure_whiff_recovery`
+refuses an anchor at or before the input's last frame by construction, and
+that is the only defence available to a move with no anchor to witness the
+failure. Two independent validations were run instead of trusting it:
+
+**(a) The anchor STYLE, checked against the established one on a move that
+can witness it.** `origin_invariance` on `acid_spit` (above): the same
+side's absolute manifest is 63 / 64 whether swept from `input_end+1` or from
+`contact`, at all four rungs and in both observables. An origin is only a
+re-parameterisation, and here it demonstrably is one.
+
+**(b) The move itself, witnessed on the framebuffer.** Invisibility deals no
+damage and has no memory observable — M1's search for a flag is an explicit
+negative (188 candidate bytes, all inside a sprite display list that REORDERS
+when any sprite leaves). The framebuffer is the only witness, and getting it
+right took three attempts, two of which failed in ways §4.2 already names:
+
+1. **Two stored reference screens** ("is this crop nearer the invisible pole
+   or the visible one"). Correct for the positive case, useless for the
+   negative one: a run in which the probe had cancelled the move came out
+   4,840 px from one pole and 4,292 px from the other — a third state, and
+   the classifier correctly refused to call it.
+2. **Differencing the move against its own trigger** (the same script minus
+   the `U U D` motion). That measures whether the MOTION changed the screen,
+   which it does either way — `[BLK] U U D` visibly crouches him. Measured:
+   4,254 px of "effect" in a run where the move provably had not come out.
+3. **Displacing the fighter and asking whether the picture notices.** If he
+   is drawn, walking him moves his pixels; if he is not drawn, walking him
+   moves nothing. This one is a differential of the shape §4.2 mandates and
+   it separates the states completely:
+
+| probe asserted at | pixels the walk moves | same walk where he IS drawn | reading |
+|---|---|---|---|
+| input_end+1 | **0** (left), **0** (right) | 4,110 / 5,175 | not drawn — the move came out |
+| input_end+2 | **0**, **0** | 4,095 / 5,520 | not drawn |
+| input_end+3 | **0**, **0** | 4,095 / 5,520 | not drawn |
+| input_end−3 (inside the HP's own hold) | **4,800** | — | DRAWN — the probe replaced the trigger and cancelled the move |
+
+Zero is exact, not thresholded: the crop is bit-identical at capture points
+from +1 to +40 frames after the probe. The right-hand column is the witness's
+own validity check, measured per N rather than assumed — if the walk did not
+move a fighter who IS drawn, a zero would mean nothing.
+
+Two mechanical constraints the first two attempts taught, both now enforced:
+every pair of screens compared is taken at the SAME frame count (the same two
+runs compared at different lengths differ in 9,765 px across the full width
+of the screen; at the same length, 4,268 px inside one 62×133 sprite box and
+nowhere else), and the capture must be a few frames after the probe rather
+than sixty — the probe's hold never ends, and a long tail walks the fighter
+out of a fixed crop.
+
+The crop `(77,99)-(139,232)` was LOCATED by differencing two screens, not
+assumed: no port profile carries a sprite bounding box, and a pixel rect is
+exactly the kind of fact CLAUDE.md forbids putting in code, so it is a
+command-line argument.
+
+---
+
+## Cross-checks nobody designed in
+
+1. **Blockstun takes exactly two values across Reptile's specials, and they
+   are the same two his normals produced.** Task B3 measured "+19 close, +23
+   everything else". Here: `acid_spit` +23, `slide` +23, `force_ball` **+19**
+   — measured on three moves with completely different geometry, on a rig
+   none of them shares with a normal. The force ball taking the CLOSE value
+   at 182 px is the surprise, and it is recorded as measured.
+2. **Hitstun is `contact + 26` for the acid spit** — the same value M5
+   measured for Mileena's sai and teleport kick. Three moves, two characters,
+   one number.
+3. **The two observables agreed on `first_true` in every sweep that was not
+   refused**, across four moves, eleven cells and two emulator processes.
+4. **The four probe-shape latencies came out identical to the profile's**
+   (1/2 attacker, 1/2 defender-on-hit, 10/11 defender-on-block) on every
+   move, including the whiff-anchored one — re-measured per move, not read
+   from the table.
+5. **Cold-start reproduction.** `acid_spit` at 182 and 145 px (on a second
+   emulator, and with a different settle constant), `slide` at both rungs and
+   `force_ball` at 182 and 107 px reproduced every advantage, wakeup window
+   and guard verdict EXACTLY. Those cells carry `sample_n = 2`.
+
+## What was NOT measured, and why
+
+- **`force_ball`'s `on_hit` at any rung** — the victim is launched, so §1.1's
+  knockdown gate applies and `on_hit` is NULL by rule, with the wakeup window
+  in its own column.
+- **`force_ball`'s attacker/hit sweep at 145, 107 and 62 px** — refused: the
+  anti-overlap separation that follows the launch makes the attacker's own
+  predicate non-monotone in BOTH walk directions and in both observables
+  (above). The `on_block` and `wakeup_window` columns for those rungs are
+  measured and unaffected.
+- **`acid_spit` at 107 and 72 px** — not run. 62 px (the collision floor) and
+  145 px give identical numbers, so the plateau is already established at
+  both ends; two more rungs inside it would add rows, not information.
+- **`slide` at more than two rungs**, and any `travel` figure for it — it is
+  not a projectile; it closes the distance itself, so §5's gap key describes
+  where it STARTED, not where it hit.
+- **`first_active_frame`, `active`, `recovery`, `total`, `hitstop`,
+  `connect_range`** — none is a by-product of this protocol (§4.4, §12).
+  `invisibility`'s recovery IS a `total`, and it is deliberately not stored;
+  see gap 3 below.
+- **`guard_height` for the other three moves.** Two are projectiles, whose
+  "stance" question is different (both stances chip for 4), and invisibility
+  never touches anyone.
+
+## Contract gaps these four expose
+
+1. **§4.3's advantage formula still has no room for a per-side origin, and
+   now there is a case where the contact origin is not merely inelegant but
+   WRONG.** M5 raised this for the sai and could only argue it in the
+   abstract, because her recovery outlasted her projectile's flight at every
+   rung. The force ball at 182 px recovers at `contact − 5`. A sweep starts at
+   N=0 and cannot return a negative boundary, so a contact-anchored sweep
+   reports `first_true = 0` — a plausible number that means "free exactly at
+   contact" and is silently five frames late. §7's cap rule is stated only
+   for the UPPER edge of the search; this is the same failure at the lower
+   edge and the contract does not name it.
+2. **§4.2's blocked-direction hazard is stated as a static property of a
+   direction, and it has a dynamic form.** A direction can be usable at N,
+   unusable at N+40 because a scripted push happens to match walking speed,
+   and usable again at N+46 — while the opposite direction is clean
+   throughout. Proposed rule: a non-monotone predicate is grounds for
+   retrying the OTHER direction before it is grounds for refusing the cell,
+   and the retry must be recorded on the row (`rejected_directions`).
+   Separately, a fighter being separated from an overlap is genuinely NOT
+   actionable, so the act-again predicate is not always monotone, and §4.3's
+   "that is a one-frame-early hold or an unsound observable" is not
+   exhaustive.
+3. **§8.4 classifies `total` and `recovery` as ANCHOR-based fields requiring
+   exact cross-observable agreement, and a whiff-anchored `total` is not
+   one.** It is `origin + first_true + window`, a ONE-SIDED manifest carrying
+   that observable's margin — measured here as 40 (`struct_velocity`) and 41
+   (`pointer_x`), which is agreement under §8.4's own one-sided rule
+   (`40 − 1 == 41 − 2`) and a disagreement under the rule the loader actually
+   applies to `total` (`src/profile.rs::collapse_measurements`). **No
+   `total` was written for `invisibility` for that reason**, and the number
+   lives only here. The same argument applies to the `total`/`recovery`
+   columns the active-frames spike left in a scratch database; both are
+   whiff-anchored manifests, so promoting them will hit this first.
+4. **The store has no column for a cell whose only result is a refusal or a
+   recovery.** `invisibility` is fully measured — no damage, no advantage,
+   recovery 40 — and produces no storable row at all: `on_hit`/`on_block`/
+   `damage`/`knockdown` are legitimately NULL, `total` is unstorable per gap
+   3, and there is no reason/evidence column (§12's first item) to say why.
+   A reader of the exported table cannot distinguish "invisibility was
+   measured and has no advantage" from "nobody has measured invisibility".
+5. **A move's SIGNATURE is not gap-invariant, and §4.3 implies it is.** "A
+   move must be identified by its measured signature" is right, but a
+   signature calibrated at one rung can refuse the same move at another: the
+   slide travels 112 px from 182 px away and 62 px from 107 px away, because
+   it stops when it connects. Distance-dependent signature fields need a
+   floor chosen against what they must DISCRIMINATE, not against what the
+   move does at the rung where it was first seen.
+6. **§5's ladder recipe needs a settle requirement, not just a settle
+   warning.** §5 says "a rung saved mid-walk samples the oscillation; settle
+   before saving" as advice about pixel gaps. The stronger consequence is
+   that a mid-walk rung suppresses MOTION SPECIALS entirely — the direction
+   is already latched, so the macro's first tap is not a fresh onset — and
+   what comes out instead is a NORMAL that the frame lab will happily
+   measure under the special's name. An arena sidecar should record whether
+   the fighter was at rest, and the lab should refuse or compensate; there is
+   no field for it.
+
+## Reproduce
+
+```sh
+python -m shadow_train.framelab.specials \
+  --url http://127.0.0.1:4082/mcp --game library/mk2 \
+  --core ../FBNeo/src/burner/libretro/fbneo_libretro.dylib \
+  --rom ~/games/roms/mk2.zip --char reptile --settle 10 \
+  --arena shadow/arenas/mk2/gap-0.state --arena shadow/arenas/mk2/gap-5.state \
+  --arena shadow/arenas/mk2/gap-15.state --arena shadow/arenas/mk2/gap-60.state \
+  --move acid_spit --projectile acid_spit --origin-check \
+  --db shadow/framelab/frames.db
+
+python -m shadow_train.framelab.specials ... --settle 10 \
+  --arena shadow/arenas/mk2/gap-0.state --arena shadow/arenas/mk2/gap-5.state \
+  --arena shadow/arenas/mk2/gap-15.state --arena shadow/arenas/mk2/gap-30.state \
+  --arena shadow/arenas/mk2/gap-60.state \
+  --move force_ball --projectile force_ball --origin-check
+
+python -m shadow_train.framelab.specials ... --settle 10 \
+  --arena shadow/arenas/mk2/gap-0.state --arena shadow/arenas/mk2/gap-30.state \
+  --move slide --guard-height slide
+
+python -m shadow_train.framelab.specials ... --settle 10 \
+  --arena shadow/arenas/mk2/gap-0.state \
+  --whiff-move invisibility --screen-region 77,99,139,232 --screen-settle 6
+```
+## Reptile's neutral jump punch — and §10's "jumping normals are unmeasurable", retracted (2026-08-31, task Q1)
+
+`docs/frames.md` §10 and three run reports in this file say the same thing in
+almost the same words:
+
+> **Jumping normals**: still out — the act-again observable is a WALK and an
+> airborne fighter cannot walk.
+
+**The first half is true and the conclusion does not follow.** The evidence
+that refutes it was already in this file: `specials.py` measured Mileena's
+`teleport_kick`, which is airborne for its whole flight (`y` +200 underground
+to −131 above the screen), and its number came out clean — `first_true = 28`,
+read honestly as *"the first frame she can walk again after landing"*. The
+probe is not blind mid-flight. It is **deferred**, and a deferred probe still
+answers a well-posed question, as long as three things are established rather
+than assumed. This section establishes them for a jumping NORMAL and then
+measures the move.
+
+New code: `shadow_train/framelab/airborne.py` only. The differential act-again
+protocol (`probe.py`), the §3 preconditions (`session.py`), the per-side
+manifests and signature/knockdown gates (`specials.py`) and the profile's
+`framelab` block are unchanged and do the work. **No new observable was
+needed** — the port's existing `struct_velocity` and `pointer_x` both work,
+and agree.
+
+### Rig
+
+`shadow/arenas/mk2/gap-60.state` (Reptile mirror, 62 px) and
+`shadow/arenas/mk2/gap-30.state` (107 px settled; its sidecar says 110).
+Reptile is `block1`/port 0 and
+jumps; Reptile is `block2`/port 1 and stands. Headless FBNeo, `--pace 0`, MCP
+ports **4080** (first pass) and **4081** (cold-start re-measurement). Never
+4025. Contact anchored on the victim's fighter-struct health `block+0x0E`
+(§4.1). Both observables sampled from the same runs.
+
+**A NEUTRAL jump was chosen deliberately.** It has no horizontal movement, so
+the gap is constant through the whole arc — measured x drift over the 38
+airborne frames: **0 px on both arenas**, and the gap trace is a flat 62 / 107
+from the loaded frame to the landing frame.
+
+That number was 2 / 3 px until the measurement was split. Both arenas move the
+attacker's `x` on the FIRST frame after the load (607 → 609, 546 → 549) and
+then never again — §5's "the gap OSCILLATES inside the floor; settle before
+saving", showing up in a ladder that was already saved. It is ARENA SETTLE,
+not jump drift, and folded into one max-minus-min it reads as a drift and
+impugns the jump. `JumpArc` therefore reports `x_drift_px` (airborne window
+only) and `settle_px` (loaded frame → take-off) separately.
+
+**A consequence worth recording: `gap-30.state`'s sidecar says 110 px and its
+settled gap is 107 px.** The stored rows carry 107, the gap measured at the
+frame the punch's own input starts, because that is the distance the
+measurement actually happened at.
+
+### 1. The jump itself, measured (not assumed)
+
+| quantity | value | how |
+|---|---|---|
+| `up` held for the jump | **2 frames** | 1 frame never leaves the ground (70 frames of resting y); 2, 3 and 6 give the identical arc |
+| resting `y` | **85** | read on this rig — §10 forbids a scalar `GROUND_Y` |
+| take-off | **f6** | 5 pre-jump frames after the input |
+| apex | **y = −10** at f23–f26 | 95 units above her own resting y |
+| resting y regained | **f44** | airtime 38 frames |
+| x drift | 2 px | this is what makes it a *neutral* jump |
+
+The 1-frame hold matters as a refusal, not as trivia: an attack scripted on
+top of it would have been a **standing** punch recorded under a jumping name —
+§4.3's "a move is identified by its measured signature" with a direction
+standing in for the attack. `measure_jump_arc` raises `NotAirborneError`
+rather than measuring it.
+
+### 2. There is NO air control — and that is what licenses everything else
+
+This is the load-bearing experiment, and it is the one the earlier "needs a
+different observable" verdict never ran.
+
+If holding a direction moved the fighter at all while airborne, the act-again
+sweep would report TRUE at an airborne N for a fighter who is **drifting**,
+not acting. And note that §4.2's differencing does **not** save you here: the
+control replay is not drifting, so a real air-drift is a real difference.
+Neither would §8.4's cross-observable check, because both observables would
+move together. The predicate would be monotone, plausible, and wrong.
+
+So it is scanned. `air_control_scan` holds each direction at **every airborne
+frame** and differences against an identical no-input replay, with two
+properties that make a clean result mean something:
+
+- **every comparison window ends at or before the landing frame**
+  (`min(12, landing − n)`), so anything it sees is unambiguously mid-air;
+- **a post-landing control frame** is scanned with the same code, where the
+  answer must be a divergence.
+
+| arena | airborne frames × directions × observables | mid-air divergences | ground control (f64) |
+|---|---|---|---|
+| gap-60 (62 px) | 38 × 2 × 2 = **152** | **0** | diverges — scan is sensitive |
+| gap-30 (110 px) | 38 × 2 × 2 = **152** | **0** | diverges — scan is sensitive |
+
+Corroborated independently by the sweeps themselves: every attacker predicate
+is cleanly monotone `F…F T…T`, and `measure_njp`'s `MidAirManifestError` — a
+boundary landing before the fighter does — **never fired once** across the 32
+attacker sweeps of the gap-60 pass, the 6 of the gap-30 pass, or the 32 of the
+cold-start reproduction. And by the earlier exploratory form of the same test — a hold
+asserted at f42 (2 frames before landing) produces no divergence at all until
+**f51**, i.e. it waits for the ground exactly as a hold asserted after landing
+does.
+
+The `sensitive` column is not decoration. A scan that finds nothing anywhere
+is a broken scan, not a clean one — that is §4.2's liveness-probe mistake
+(an absolute test reporting a CPU-driven port as live) with the polarity
+flipped, and `measure_njp` refuses a cell whose scan cannot see the
+divergence it should see.
+
+### 3. Where the punch connects in the arc
+
+`J` is the frame the punch button is first asserted, counted from the jump
+input (so the fighter is at arc frame `J`, and airborne from f6). One replay
+per J:
+
+| J | 12–15 | 16–30 | 31 | 32 | 33 | 34 | 35 | 36–39 |
+|---|---|---|---|---|---|---|---|---|
+| contact (hit) | — | **f39** | f40 | f41 | f42 | f43 | f44 | — |
+| attacker y at contact | — | 42 | 50 | 58 | 66 | 75 | 85 | — |
+| height above her rest | — | 43 | 35 | 27 | 19 | 10 | **0** | — |
+| damage | — | 16 | 16 | 16 | 16 | 16 | 16 | — |
+
+Two regimes, and telling them apart is the whole value of sweeping J:
+
+- **Geometry-limited (J = 16…30).** Contact is pinned at **f39**, the first
+  frame the boxes overlap — she is simply too high before that. Her descent
+  reaches y = 42 at f39, and 42 is where the punch's box first meets a
+  standing hurtbox.
+- **Startup-limited (J = 30…35).** Contact tracks **J + 9** exactly, six
+  throws in a row (J = 30 sits exactly on the boundary: `30 + 9 = 39`). That
+  is a measured `first_active_frame = 9`.
+
+`first_active_frame` is claimed only because **six** throws agree on `J + 9`;
+one throw hitting at `J + 9` could be the geometry coinciding.
+**§4.4's "minimum reproducible gap" rule does not bind for this move**,
+because contact is gap-INDEPENDENT here (§6 below) — the contaminant §4.4
+worries about is travel, and a neutral jump has none.
+
+**Damage 16 is the move's signature.** Reptile's standing HP is 24 close /
+11 far, so 16 discriminates the jumping punch from either of the grounded
+normals it could otherwise have been (§4.3).
+
+**The whiffs at both ends are results, not gaps.** Too late (J ≥ 36) she
+lands before the startup finishes; too early (J ≤ 15) the hitbox's active
+window expires before the arc brings her down to f39.
+
+**`active` is BRACKETED at 15, and deliberately NOT stored.** With
+`first_active_frame = 9` and the overlap opening at f39, J = 16 connecting
+gives `active ≥ 39 − 16 − 9 + 1 = 15` and J = 15 whiffing gives
+`active ≤ 39 − 15 − 9 = 15`. The bracket closes on a single value, but it is
+DERIVED from a boundary while `active.py` measures the hitbox window directly
+(by teleporting the defender to a target gap on a chosen frame). §7's
+provenance rule is exactly why a derived value must not be shipped in the same
+column as a measured one, so `airborne.py` reports it and writes NULL.
+
+### 4. What was measured — the curve
+
+Advantage is the difference of the two ABSOLUTE manifest frames (§4.3); the
+attacker's is **landing-relative** and the defender's is contact-relative, and
+that asymmetry is the entire content of a jump-in number.
+
+`shadow/arenas/mk2/gap-60.state`, 62 px, `njHP`, damage 16 / chip 5:
+
+| J | contact (hit / blk) | height | airtime left | att free | def free (hit) | def free (blk) | **on hit** | **on block** |
+|---|---|---|---|---|---|---|---|---|
+| 16 | f39 / f38 | 43 | 13 | f59 | f65 | f57 | **+6** | **−2** |
+| 24 | f39 / f38 | 43 | 13 | f59 | f65 | f57 | **+6** | **−2** |
+| 30 | f39 / f39 | 43 | 13 | f59 | f65 | f58 | **+6** | **−1** |
+| 31 | f40 / f40 | 35 | 12 | f59 | f66 | f59 | **+7** | **0** |
+| 32 | f41 / f41 | 27 | 11 | f59 | f67 | f60 | **+8** | **+1** |
+| 33 | f42 / f42 | 19 | 10 | f59 | f68 | f61 | **+9** | **+2** |
+| 34 | f43 / f43 | 10 | 9 | f59 | f69 | f62 | **+10** | **+3** |
+| 35 | f44 / f44 | **0** | 0 | f60 | f70 | f63 | **+10** | **+3** |
+
+Frames are replay-absolute (frame 0 = the loaded arena). "Free" is that
+side's walk manifest.
+
+**The curve decomposes into two constants plus the contact frame.** Her walk
+manifests at **f59 on EVERY row from J = 16 to 34, on hit and on block
+alike** — that is `landing (f52) + 7`, and f52 is the arc's own f44 plus the
+8 frames of contact hitstop that freeze both fighters. The victim's is
+`contact + 26` on hit and `contact + 19` on block at every J. So
+
+```
+on_hit(J)   = contact(J) − 33          on_block(J) = contact_blk(J) − 40
+```
+
+reproduces all sixteen numbers exactly. **A jump punch's advantage is not a
+property of the move; it is the frame it landed on.** Hit shallow (43 units
+up, 13 frames of fall still to come) and it is +6 / −2; hit deep (10 units up)
+and it is +10 / +3 — a **4-frame swing across one arc**, from "unsafe on
+block" to "plus on block", with nothing about the punch changing.
+
+`landing + 7` is worth flagging: Mileena's `teleport_kick` recovers at
+`contact + 31` = **landing + 7** as well. Two different airborne moves, two
+different characters, the same landing-recovery constant, measured
+independently.
+
+**Three side observations the sweep gave for free:**
+
+- **The blocked contact is one frame EARLIER (f38) for J ≤ 29.** A guarding
+  Reptile is caught a frame sooner than an open one — and at J = 30 he is
+  not, because the punch is not active until f39 (`30 + 9`). The block rig's
+  own anchor catches this because §4.3's rule that the two rigs get separate
+  anchors was followed; reusing the hit anchor would have shifted every
+  `on_block` here by one frame.
+- **J = 35 is a GROUNDED contact** — height 0, she is back at her resting y on
+  the contact frame. `airborne.py` records it and labels it rather than
+  refusing it: it is the deep end of the curve, and it is where the
+  landing-relative reading stops applying (her manifest is f60, not f59).
+- **`on_hit` − `on_block` = 7** wherever the two rigs share a contact frame,
+  which is just hitstun (26) − blockstun (19), both of which this file already
+  carries as Reptile's constants. It is **8** at J = 16 and J = 24, and that
+  extra frame is not noise — it is the blocked contact landing at f38 instead
+  of f39. A run that had reused one anchor for both rigs would have printed 7
+  everywhere and hidden it.
+
+### 5. The probe shape, and its calibration — measured, not inherited
+
+§3.1's rule ("calibrate the probe's OWN input shape") is the one that has
+already produced a confident silent wrong answer once in this project, so the
+landing-recovery shape was calibrated on this move, at **two** points
+(contact + 70 and contact + 100), with agreement required. The calibration
+point is DERIVED from each run's own landing rather than being a constant —
+`max(70, (landing − contact) + 40)` — because "far enough past contact that
+the fighter is certainly free" is not a constant when the fighter is in the
+air.
+
+| probe shape | `struct_velocity` | `pointer_x` |
+|---|---|---|
+| attacker/hit (airborne → landing → walk) | **1** | **2** |
+| attacker/block | 1 | 2 |
+| defender/hit | 1 | 2 |
+| defender/block (release Block + walk) | 10 | 11 |
+
+**Identical to the grounded table** in `library/mk2/mk2.profile.json`. That is
+a RESULT, not an assumption — the transition really is the same once she is
+standing — and it is the same answer the teleport gave. It cost ~20 replays
+per shape per cell to know rather than hope.
+
+**Cross-observable agreement (§8.4): 64 sweeps, zero disagreements.**
+`first_true` is identical for `struct_velocity` and `pointer_x` in every
+attacker and defender sweep of both rigs at all eight J. The absolute
+manifests differ by exactly 1, which is the `pointer_x` margin and is what
+§8.4 says a one-sided quantity must do; the advantage, being a difference,
+is identical.
+
+### 6. The advantage is gap-INDEPENDENT, which is a testable claim and it held
+
+At a fixed gap the arc quantises contact height, so the natural worry is that
+the curve is really a gap curve in disguise. It is not. `gap-30.state`
+(**107 px** settled — 45 px further away) reproduces the hit half **exactly**:
+
+| J | 62 px contact / on_hit | 107 px contact / on_hit |
+|---|---|---|
+| 16 | f39 / **+6** | f39 / **+6** |
+| 32 | f41 / **+8** | f41 / **+8** |
+| 35 | f44 / **+10** | f44 / **+10** |
+
+Damage 16 at both, `first_active_frame` 9 at both, geometry frame f39 at both,
+active bracket [15, 15] at both. That is what a downward-angled air normal
+against a standing hurtbox looks like: within its reach, what gates contact is
+HEIGHT, not distance.
+
+**Reach is a bracket, and on-block is NULL at 107 px.** The punch connects at
+62 px, at gap-45's 72 px rung and at 107 px, and whiffs at gap-15's 147 px and
+gap-0's 180 px, so `110 < connect_range ≤ 147` on the ladder's own units.
+Against a *blocking* defender at 107 px it does not connect at all — a whiff,
+not a block, so there is no `on_block` number there and §4.3 forbids deriving
+one from the hit run. This is the same phenomenon this file already records
+for Baraka's far normals ("connects against an open defender and WHIFFS
+against a standing-blocking one").
+
+**One wart, stated rather than smoothed over.** The `njHP` rows carry
+`gap_px = 107` for `gap-30.state` (the gap measured at the punch's own input
+frame) while every existing row measured on the same arena carries the
+sidecar's **110**, and `connect_range = 110` here is in the ladder's units so
+it stays comparable with the rest of the table. Two units for one rung is
+exactly the kind of ambiguity §7 exists to prevent; the fix is to re-probe the
+ladder's sidecars against the settled gap, which §11 already lists as an open
+gap ("arena sidecars cannot be re-probed without re-saving").
+
+### 7. What was refused
+
+- **J ≤ 15 and J ≥ 36: no rows.** Whiffs, both ends, for two different
+  reasons, and a whiff has no advantage number (§1.1).
+- **`on_block` at 110 px: NULL.** The guarded rig saw no contact.
+- **`active` (15): reported, not stored.** Derived from a boundary; §7.
+- **`hitstop` (8 frames, visible as the arc's landing moving f44 → f52 on
+  contact): reported, not stored.** It is inferred from the airborne window
+  rather than measured by `hitstop.py`'s own protocol.
+- **Forward and back jump-ins: not attempted.** They re-introduce exactly the
+  gap-key discontinuity a neutral jump was chosen to avoid, and they are a
+  different measurement.
+- **Other buttons (LP/HK/LK) and other characters: not attempted.** One
+  character, one button, done properly.
+- **A juggle / airborne VICTIM: out of scope.** Here the airborne fighter is
+  the ATTACKER; the victim never leaves his resting y (`knockdown` = 0,
+  checked every cell), which is what makes `on_hit` a legitimate number at all
+  (§1.1).
+
+### 8. The corrected wording
+
+The retracted claim lives in four places. All four say the same thing and all
+four are wrong in the same way — they infer "unmeasurable" from "the probe
+cannot answer DURING the flight", when the question the table needs answered
+is about the frames after it.
+
+**`docs/frames.md` §10** — replace the jumping clause of the `y` bullet, and
+add the limitation that actually remains:
+
+> - ~~MK2 arcade has no mapped `y`.~~ **CLOSED** — `obj+0x16`, signed, traced
+>   through a full jump arc. **But there is no scalar `GROUND_Y` for arcade**:
+>   resting y is character- AND stage-dependent (85 vs 83 on one stage, 89 vs
+>   87 on another), so "airborne" must be derived relative to that fighter's
+>   own resting y on that stage, never against a profile constant.
+> - ~~**Jumping normals are unmeasurable**: the act-again observable is a WALK
+>   and an airborne fighter cannot walk, so the probe cannot answer "is this
+>   fighter actionable" mid-jump; measuring jump-ins needs a different
+>   observable.~~ **RETRACTED — measured, and no new observable was needed.**
+>   The premise is true and the conclusion does not follow: an airborne
+>   ATTACKER'S probe is DEFERRED, not blind, and what it returns is "the
+>   first frame she can walk again AFTER LANDING" — a real advantage number
+>   with a stated convention, exactly as `teleport_kick`'s already was.
+>   Three things make the deferral sound, and a jumping normal must not be
+>   measured without all three (`framelab/airborne.py`):
+>   1. **an AIR-CONTROL SCAN**, holding each direction at every airborne
+>      frame with the comparison window capped at the landing frame, and a
+>      post-landing control frame to prove the scan is sensitive. If a held
+>      direction moved the fighter mid-flight, the sweep's first TRUE would be
+>      that drift — and neither §4.2's differencing (the control is not
+>      drifting) nor §8.4's cross-observable check (both observables would
+>      move) can see it. Measured on Reptile: 0 divergences in 152 evaluations
+>      per arena.
+>   2. **a calibration point DERIVED FROM THE LANDING** rather than a
+>      constant — §3.1's point must be hold-limited, and a fighter still in
+>      the air reads residual airtime as injection latency.
+>   3. **a refusal when the sweep's manifest lands before the landing frame**
+>      (`MidAirManifestError`), the airborne twin of the preemption gate.
+>
+>   What remains genuinely open is narrower and should be stated as such:
+>   **an airborne VICTIM** still has no advantage number (§1.1: the juggle
+>   owns the timing), and **jumps with horizontal movement** re-introduce the
+>   gap-key discontinuity §5 describes and have not been measured.
+
+**And add to §1's archetypes / §4.3's conventions:**
+
+> An AIRBORNE attacker's side of the advantage is landing-relative, not
+> contact-relative, so a jumping normal's advantage is dominated by its
+> REMAINING AIRTIME at contact and is a CURVE over contact height rather than
+> a scalar. Measured on Reptile's neutral jump HP: +6 → +10 on hit and −2 →
+> +3 on block across one arc, with the move unchanged. A renderer that prints
+> one number for a jumping normal is printing the midpoint of a curve, and
+> the stored rows are keyed by the arc frame and carry the measured contact
+> height for that reason.
+
+**`library/mk2/mk2.md`** — the three "Jumping normals: still out" bullets
+(Reptile normals, the kit re-run, and Baraka's "What was NOT measured") should
+each be replaced by a pointer to this section rather than edited in place, so
+the retraction is visible where the claim was made:
+
+> - ~~**Jumping normals**: still out — the act-again observable is a WALK and
+>   an airborne fighter cannot walk.~~ **Superseded** — see "Reptile's neutral
+>   jump punch", which measures one and says what the number means. Not
+>   measured *for this character/kit*, which is a scope statement, not a
+>   limitation of the method.
+
+### Reproduction — a cold-started second process, 8/8 cells exact
+
+Criterion §8.1 was run in the strong form: a **second emulator process,
+booted from scratch on port 4081**, re-ran the whole gap-60 pass. Every
+number matched — the arc (resting y, take-off, landing, apex, drift), the J
+connect scan (contact frame, damage and contact height for all 28 throws,
+`first_active_frame`, geometry frame, active bracket), the air-control scan
+(0 divergences, sensitive), and for all 8 cells every latency, both
+calibration points, every `first_true`, every window, every direction, every
+predicate shape and every advantage. **Zero differences.** `sample_n = 2` on
+those rows is that, not a retry count.
+
+### Store and export
+
+`shadow/framelab/frames.db`: **22 new rows**, 142 → **164**. Eleven cells
+(8 on gap-60 at 62 px, `n = 2`; 3 on gap-30 at 107 px, `n = 1`) × 2
+observables, under `char = reptile`, `move = njHP`,
+`variant = throw@<J>/h<contact height>`. Every cell carries both observables
+and they AGREE. `first_active_frame = 9` is stored only on the
+startup-limited rows (J = 30…35); `connect_range = 110` on all of them (the
+largest connecting rung — a bracket, §5: `110 < range ≤ 147`). `active`,
+`recovery`, `total`, `hitstop`, `wakeup_window` and `guard_height` are NULL,
+as everywhere else. The three 107 px rows carry `on_block` NULL and
+`rig_guard_state = "none"`.
+
+The variant key is not cosmetic: two rows of this move at the same gap are
+genuinely different measurements, and §5 forbids averaging them into one.
+
+The export (`library/mk2/arcade.frames.json`) was **not** regenerated by this
+task — the Rust loader collapses per-cell observations and other characters'
+runs are writing the same store this wave, so re-exporting from here would
+race them. Regenerate once the wave settles.
+
+### Cost and provenance
+
+| phase | cost |
+|---|---|
+| jump-arc trace | 1 replay |
+| J connect scan (28 throws) | 28 replays |
+| air-control scan | 152 replay pairs |
+| one full cell (hit + block, 2 sides, 2 calibration points) | ~35,000 core frames / ~390 loads / ~60 s |
+| gap-60, 8 cells | ~10 min (297,576 core frames / 3,305 loads) |
+| gap-30, 3 cells | ~4 min |
+| cold-start reproduction of gap-60 | ~10 min |
+
+Core/ROM identity stamped per row (`core_id`/`rom_id`, §6).
+
+**Test baselines:** Python 502 → 574 with this task's 39 new tests in
+`tests/test_framelab_airborne.py` (the rest of the growth is other tasks in
+this wave). Rust 339, unchanged — this task touched no Rust. One Rust test
+(`macros::tests::executor_emits_port_correct_slide_masks`) failed once on a
+truncated `family.json` under the SHARED test temp dir
+`/T/rustretro_tests/…` while another agent's `cargo test` was running, and
+passes on re-run. That is a cross-process temp-dir race in the test fixture,
+not a regression, and it is worth fixing: the fixture directory should be
+unique per process.
+# Does cancelling change the SPECIAL'S OWN STARTUP? (task R1)
+
+Evidence for the `StartupArm` / `compare_startup` / `hitstop_shift` half of
+`shadow_train.framelab.cancels`. Written here rather than into
+`docs/frames.md` or `library/mk2/mk2.md` — both out of this job's file scope.
+
+ROM `mk2.zip` rev **L3.1**, from-source FBNeo core, headless, `--pace 0`, MCP
+port **4088**. The user's 4025 session was never contacted (`assert "4025"
+not in URL` in `q3lib.py`). Reptile mirror. Every trial reloads its arena with
+`load_state(pause_after)`; `hold_buttons` only, `press_buttons` never;
+training enforcement off, no shadow runner. ~1,100 replays total.
+
+---
+
+## 0. Answer
+
+**(A). Earlier permission, unchanged startup.** The cancel never shortens the
+special's own clock, in any condition measured.
+
+From its **trigger press**, Reptile's slide reaches its x-displacement onset in
+**3 frames** and the defender's health step in **11 frames** (at 72 px) —
+in every single one of the 16 arms below: no lead, a punch lead on hit, a punch
+lead on whiff, a punch lead on block, a kick lead on hit, a kick lead on block,
+a kick lead on whiff, at five gaps (62/72/110/147/180 px), and again from a
+cold second emulator process. `force_ball` agrees at matched gaps: **31**
+frames from trigger at a 76 px gap with and without a punch lead, **56** at a
+188 px gap with and without a whiffing kick lead.
+
+Not one arm produced a `shortened` verdict. There is no evidence for (B).
+
+**And a second finding that was not being looked for, which contradicts the
+FOURTH clause as written: special cancelling on MK2 is a PUNCH-lead
+phenomenon.** After a KICK the special is not merely delayed, it does not come
+out at all for 33 frames (whiffing) or 45 frames (connecting) — and the WALK
+returns at 34 / 46. A 1-frame margin is inside §8.4's cross-observable slop,
+so out of a kick there is **no cancel at all**, only a link. §1 currently
+generalises "every frame from 2, delay identically 0" to specials as a class;
+it is true of punch leads only, and the prior run measured only punch leads.
+
+---
+
+## 1. Definitions, stated before the numbers
+
+* **Trigger press** — the frame the special's own attack BUTTON is asserted,
+  not the frame its macro starts. `slide` is one step (`B + LK+LP+Block`), so
+  trigger = macro start. `force_ball` is `B · B+HP+LP`; its trigger lands
+  **5 frames later**. Shipped as `cancels.trigger_frame`.
+* **`startup`** = `onset − trigger`. Two observables:
+  * `pointer_x` — the attacker's own `obj+0x12`. The slide travels +52 px
+    (72 px arena) / +120 px (180 px arena); no Reptile normal moves him more
+    than +2. Immune to whatever the lead does to the DEFENDER.
+  * `struct_health` — `block2+0x0E`, the §4.1 anchor. A different data
+    structure on a different fighter, so the two are a genuine §8.4
+    cross-method pair.
+* **`gate`** = the smallest TRIGGER frame beginning an unbroken tail of trials
+  in which the special came out. Permission, not speed.
+* **Arms** are named by the LEAD's outcome (`hit`/`block`/`whiff`/`none`),
+  which the rig KNOWS (§2.6) — the defender's guard is driven, never inferred.
+
+Damage arithmetic validates every trial: slide 13, far HP 11, far LP 8, far HK
+32, far LK 26, close HK 16, force_ball 16. Sums are unique (24, 45, 39, 27, 48,
+29), so "both landed" is read off the health delta, never assumed.
+
+---
+
+## 2. The headline: startup is 3, everywhere
+
+`slide`, startup = trigger → attacker x onset (tolerance >6 px).
+
+| arena | gap | lead | outcome | lead hitstop | **gate** | **startup** | N swept |
+|---|---|---|---|---|---|---|---|
+| gap-45 | 72 | — | none | — | 2 | **3** | 2–30 |
+| gap-45 | 72 | far HP | hit | 0 | 2 | **3** | 2–30 |
+| gap-45 | 72 | far HK | hit | 12 | **45** | **3** | 2–70 |
+| gap-45 | 72 | far LK | hit | 12 | **45** | **3** | 2–60 |
+| gap-45 | 72 | — | none (guard held) | — | 2 | **3** | 2–60 |
+| gap-45 | 72 | far HP | **block** | 0 | 2 | **3** | 2–60 |
+| gap-45 | 72 | far HK | **block** | 12 | **45** | **3** | 2–60 |
+| gap-30 | 110 | far HK | hit | 12 | **45** | **3** | 25–50 |
+| gap-60 | 62 | close HK | hit | NULL | 42 | **3** | 25–50 |
+| gap-15 | 147 | far HK | **whiff** | n/a | **33** | **3** | 25–50 |
+| gap-0 | 180 | — | none | — | 2 | **3** | 2–50 |
+| gap-0 | 180 | far HP | **whiff** | n/a | 2 | **3** | 2–50 |
+| gap-0 | 180 | far HK | **whiff** | n/a | **33** | **3** | 2–50 |
+| gap-0 | 180 | far LK | **whiff** | n/a | **33** | **3** | 2–50 |
+
+`compare_startup(no-lead baseline, arm)` returns **`unchanged`, delta 0**, for
+every arm with a same-gap baseline. Nothing returns `shortened`.
+
+**Second observable, same rows.** Timing the slide by the DEFENDER's health
+step instead of the attacker's position gives startup **11** at 72 px and
+**14** at 180 px, again constant across every arm (no lead / HP-hit / HK-hit /
+HK-whiff). The two observables differ by a constant travel term, as a
+one-sided pair must (§8.4), and neither moves between arms. A shortened
+startup would have moved both.
+
+---
+
+## 3. The hitstop three-way
+
+The comparison the task asked for, run on the slide because it is the only
+instrument immune to the lead's knockback (far HK throws the defender **+83 px**
+downrange, which is why `force_ball` timed by contact cannot answer this — §5).
+
+| lead | contact | lead's hitstop | slide gate (trigger frame) | startup |
+|---|---|---|---|---|
+| far HP | **hit**, 72 px | **0** | **2** (no gate) | 3 |
+| far HP | **whiff**, 180 px | none | **2** (no gate) | 3 |
+| far HK | **hit**, 72 px | **12** | **45** | 3 |
+| far HK | **hit**, 110 px | **12** | **45** | 3 |
+| far HK | **block**, 72 px | **12** | **45** | 3 |
+| far HK | **whiff**, 147 px | none | **33** | 3 |
+| far HK | **whiff**, 180 px | none | **33** | 3 |
+| far LK | **hit**, 72 px | **12** | **45** | 3 |
+| far LK | **whiff**, 180 px | none | **33** | 3 |
+| — (neutral) | n/a | n/a | **2** | 3 |
+
+`hitstop_shift(whiff, contact)` over those pairs:
+
+| lead | whiff gate | contact gate | **shift** | measured hitstop | agree? |
+|---|---|---|---|---|---|
+| far HK | 33 @180 px | 45 @72 px (hit) | **+12** | 12 | ✓ |
+| far HK | 33 @147 px | 45 @110 px (hit) | **+12** | 12 | ✓ |
+| far HK | 33 @180 px | 45 @72 px (**block**) | **+12** | 12 | ✓ |
+| far LK | 33 @180 px | 45 @72 px (hit) | **+12** | 12 | ✓ |
+| far HP | 2 @180 px | 2 @72 px (hit) | 0 | 0 | ✓ |
+
+**Hitstop is NOT bypassed.** The cancel window opens exactly `hitstop` frames
+later on contact than on whiff, for a lead whose hitstop is 12 and for a lead
+whose hitstop is 0, and the shift is the same on BLOCK — which is what a
+contact-triggered freeze does and is not what a hit-only reaction would do.
+
+**Gap is excluded as the cause.** Two different whiff gaps (147, 180) give 33;
+two different contact gaps (72, 110) give 45. Contact is the only variable that
+tracks the shift.
+
+**The startup is unchanged across that same shift.** The special starts LATER,
+never SLOWER: 3 in every row of both tables.
+
+### 3.1 A prediction this makes, recorded but NOT claimed
+
+Close HK (62 px, 16 damage — a different move from far HK, FAF 11 vs 8) gates
+at **42**, i.e. +9 against far HK's whiff gate of 33. If the +hitstop rule
+holds, close HK's hitstop is 9 — a cell that is NULL in
+`library/mk2/arcade.frames.json` today. It is **not** a measurement: close HK
+exists only inside 64 px and therefore has no whiff arm of its own, so the 33
+it is being differenced against belongs to a different move. Recorded as a
+hypothesis for the hitstop module, not as a number.
+
+---
+
+## 4. The gate is not a cancel — the walk comparison
+
+`cancels.classify` needs a GATE to compare against, and §1's own actionability
+number is that gate. Measured in the same rig, differentially (probe = the
+lead then a direction held from frame N; control = the identical schedule with
+nothing held; observable `pointer_x`, whose calibrated latency is 2):
+
+| arena | lead | outcome | walk manifest clamp | **walk floor** | **special gate** | margin |
+|---|---|---|---|---|---|---|
+| gap-45 72 px | — | none | none (N+2 from N=2) | — | 2 | — |
+| gap-45 72 px | far HP | hit | 22 for N=7…20 | **20** | 2 | **18** → cancel |
+| gap-45 72 px | far HK | hit | 48 for N=33…46 | **46** | 45 | **1** → inconclusive |
+| gap-0 180 px | far HK | whiff | 36 for N=21…34 | **34** | 33 | **1** → inconclusive |
+
+The HP row reproduces the prior run's walk floor of 20 exactly (clamp at
+manifest 22, latency 2), which is the cross-validation that this harness and
+the earlier one are measuring the same thing.
+
+The two HK rows are the finding: **a 1-frame margin, which `classify`'s
+`min_margin=2` already refuses to call a cancel** — the same threshold that
+demoted `HP → LK` in the prior run. Out of a kick, the special is available at
+the same instant the WALK is; nothing was skipped. Out of a punch, the special
+is available 18 frames before the walk, which is a cancel.
+
+The walk floor itself moves 34 → 46 with contact: **+12 again**. Hitstop
+freezes everything, uniformly; it is not something the cancel steps over.
+
+---
+
+## 5. `force_ball` — agreement, and one honest refusal
+
+`force_ball` is timed by the defender's health step (`struct_health`), so its
+startup carries the projectile's travel time. That is fine where the target
+does not move and fatal where it does.
+
+| arena | lead | outcome | gap at trigger | gate | startup |
+|---|---|---|---|---|---|
+| gap-45 | — | none | 76 px | 7 (N=2) | **31** |
+| gap-45 | far HP | hit | 70–76 px | 7 (N=2) | **31** (all 59 trials) |
+| gap-45 | far HK | hit | 70–159 px | **45** (N=40) | **REFUSED** — 43…46 |
+| gap-0 | — | none | 188 px | 7 (N=2) | **56** |
+| gap-0 | far HK | whiff | 182–188 px | **33** (N=28) | 53…56 by gap |
+
+* **Agreement with the slide, exact.** `force_ball`'s trigger is N+5, and its
+  gates land at trigger frames **7 / 45 / 33** — the same three gates the slide
+  produced at N = 2 / 45 / 33. Two specials with different input lengths
+  agreeing on the same trigger frame, in three separate conditions, is the
+  strongest internal check in this run. Measured from the MACRO START they
+  would have looked like different mechanisms (N = 2/40/28 vs 2/45/33); this
+  is exactly the trap the task's measurement note names.
+* **(A) confirmed, at matched gaps.** 76 px: neutral 31, HP-lead 31 (`delta 0`).
+  188 px: neutral 56, whiffing-HK-lead 56 over 12 trials (`delta 0`).
+* **The refusal.** `StartupArm.startup` RAISES for the HK-hit arm rather than
+  averaging 43…46, because the HK threw the defender from 76 px to 159 px and
+  the number is travel, not startup. The whiff arm's 53/54/55/56 is the same
+  effect in miniature and is diagnostic rather than noisy: gap-at-trigger
+  182/184/186/188 → 53/54/55/56, one frame per 2 px, exactly a constant-speed
+  projectile. Restricted to the matched 188 px rows it is 56, flat.
+  `compare_startup` also returns `not-comparable` (rather than a finding) for
+  any arm whose gap differs from its baseline.
+
+---
+
+## 6. Cold re-run
+
+The emulator process was killed and a fresh one started on 4088; the headline
+rows were re-measured by BOTH observables (`q3_cold.py` → `q3-cold.json`).
+
+| case | first run | cold re-run |
+|---|---|---|
+| slide, no lead, 72 px | gate 2, startup 3 / contact 11 | **identical** |
+| slide, HP hit, 72 px | gate 2, startup 3 / contact 11, both land from N=10 | **identical** |
+| slide, HK hit, 72 px | gate **45**, startup 3 / contact 11, 45 dmg | **identical** (44 → nothing, 45 → slide) |
+| slide, HK whiff, 180 px | gate **33**, startup 3 / contact 14 | **identical** (32 → nothing, 33 → slide) |
+| force_ball, no lead, 72 px | startup 31 | **identical** |
+| force_ball, HK hit, 72 px | gate N=40 (trigger 45) | **identical** (39 → nothing, 40 → ball) |
+
+One row differs and it is understood: at 180 px, N=50, the contact startup
+reads 13 instead of 14 with attacker travel +112 instead of +120 — the arena's
+own settling oscillation (§5, "the gap OSCILLATES inside the floor"), present
+in the first run at the same N. It moves the travel term, not the gate and not
+the `pointer_x` startup.
+
+---
+
+## 7. What was refused, and what was not measured
+
+* **`force_ball` after a connecting kick, as a STARTUP number** — refused by
+  the shipped code, not by prose. The observable is contaminated by 83 px of
+  knockback. Its GATE is still valid (a binary came-out test) and is reported.
+* **A hitstop-3 lead (cHK) as a dose-response second point** — attempted and
+  refused. A 2-frame `down+HK` produced **32 damage**, which is far HK's
+  signature, not cHK's 12 (§4.3: identify a move by its measured signature,
+  not by the buttons pressed); the run is listed in the tables as `down+HK`
+  and is a duplicate far-HK arm, not a crouching one. A 6-frame crouch then
+  `down+HK` did produce a crouching move but it WHIFFED at 72 px (cHK's
+  connect range is 72), so it had no hitstop to shift and gated at nothing.
+  Getting cHK to connect needs 62 px, where it has no whiff arm — the same
+  no-whiff-reference problem as §3.1. Left open.
+* **One character** (Reptile) still, and **one direction of facing**. Mileena
+  and Baraka untested; a per-character kick gate is plausible and unmeasured.
+* **Jump attacks** (ded_'s JP/JK) untested, as before.
+* `sample_n` is 1 per (arm, N) cell in the sweeps, with the headline cells
+  re-run cold; the constancy of `startup` across 14 arms and ~350 connecting
+  trials is what carries the claim, not repetition of one cell.
+* Nothing was written to `frames.db` or `library/mk2/arcade.frames.json`.
+
+---
+
+## 8. Consequences for `docs/frames.md` §1 (NOT applied — out of scope)
+
+The FOURTH clause is right that cancelling exists and right that the published
+"Just Frame on the frame of contact" description is wrong. Three of its
+sentences are now falsified as stated, all by the same omission — the prior run
+only ever used a PUNCH as the lead:
+
+| §1 as written | measured now |
+|---|---|
+| "`slide` and `force_ball` come out at **every frame from 2, with delay identically 0**" | true after far HP/LP (hitstop 0). After far HK or far LK the special does not come out **at all** until trigger frame 33 (whiffing) or 45 (connecting). |
+| "every actionability number here is a walk-based OVER-ESTIMATE of commitment" | true after a punch (special 2 vs walk 20). **False after a kick**: special 45 vs walk 46, and 33 vs 34 — a 1-frame margin the module's own `min_margin` refuses to call a cancel. |
+| "This is a global button-class rule, not a per-move property" — so "no `cancel` COLUMN is needed" | the rule is global in the LEAD's button class, not in the follow-up's: punch-leads cancel, kick-leads do not. That is still not a per-move column, but the clause should say which side of the pair it is quantified over. |
+
+The clause should also gain the two things it does not currently say and that
+this run establishes:
+
+1. **The cancel does not shorten the special.** Startup from the trigger press
+   is identical cancelled and uncancelled — 3 frames (`pointer_x`) / 11
+   (contact) for the slide, 31 / 56 for `force_ball` at matched gaps. Cancelling
+   buys the lead's recovery and nothing else.
+2. **Hitstop is not bypassed.** The window opens exactly `hitstop` frames later
+   on contact than on whiff (+12 for two hitstop-12 leads, at two gaps each,
+   on hit AND on block; 0 for a hitstop-0 lead). "Nothing gates a special" was
+   an artefact of measuring only leads whose hitstop is 0.
+
+§8 acceptance is closer but still not met: two observables now agree exactly,
+the headline is reproduced from a cold process, and block is measured — but it
+remains one character.
+
+---
+
+## Artefacts
+
+All under `/Users/frankkorf/.claude/jobs/5cc8b3da/tmp/`:
+`q3lib.py` (rig), `q3_base.py`, `q3_sweep.py`, `q3_chk.py`, `q3_walk.py`,
+`q3_cold.py`, `q3_summ.py`, `q3_verdict.py` (drives the shipped API over every
+sweep and prints §2–§5), and the `q3-*.json` sweeps they wrote.
+# Baraka's hitstop, measured — closing the P2 column (task Q3)
+
+Written here, not `library/mk2/mk2.md` (owned by another agent this wave, per
+this task's file-scope constraint). Continues `hitstop-evidence.md` in this
+same directory, which drafted the method and Reptile/Mileena's numbers and
+left Baraka as "see run log — measured after this note was drafted; final
+numbers in the tool's closing report." This is that closing report.
+
+## State found at the start of this task
+
+The task brief described Baraka as 2/48 (only far HK landed) and named this
+as the gap to close. On inspection, `shadow/framelab/frames.db` already held
+a complete, self-consistent 30/48 for Baraka — `baraka_dry.json` and
+`baraka_real.json` in this same tmp directory (from the interrupted prior
+pass) show a dry run and a real run agreeing key-for-key, value-for-value,
+error-for-error, and even `steps=119324 loads=2583` identically, and the DB's
+live rows match `baraka_real.json`'s `updated` list exactly (`hitstop`,
+`on_hit`, `on_block` all equal, per row). `hitstop.py` itself is already
+committed (`git log` shows it landed via PR #43, "frames: hitstop measured
+(partially)..."), unmodified from what this task would have written. So the
+prior agent's "interrupted mid-character, no closing report" failure mode
+was exactly that — the measurement and the store write both completed and
+were merged; only the report never went out. Nothing further needed
+measuring; this task's job became verification + the missing report.
+
+Verification performed before trusting the pre-existing state:
+- Cross-observable agreement re-checked directly against the DB for every
+  one of the 30 stored rows: `struct_velocity == pointer_x` on all of them.
+- `on_hit == on_block` re-checked directly against the DB for every row
+  where both were measured (all `held+none` cells) — exact agreement, no
+  exceptions.
+- Dry vs. real run diffed programmatically (not just by eye): identical
+  `updated`/`skipped`/`errors` sets, identical per-row hitstop/on_hit/
+  on_block, identical steps/loads counts.
+- `core_id`/`rom_id`/`method` on Baraka's rows match Reptile's and Mileena's
+  exactly (`fbneo_libretro.dylib:sha256:972e8fb8c8394979` /
+  `mk2.zip:sha256:e8d3f2f8cefe1aab` / `linear_sweep`).
+- Baselines re-run, not assumed: `cargo test --profile release-dev` → 339
+  passed (unchanged); `shadow/train/.venv/bin/python -m pytest shadow/train/tests`
+  → 502 passed (unchanged). Neither shrank; this task changed no code.
+
+## Numbers
+
+| char | move | variant | gap(s) px | hitstop | on_hit==on_block |
+|---|---|---|---|---|---|
+| baraka | HK | far | 72, 84 | **12** | yes |
+| baraka | LK | far | 72, 84, 99 | **12** | yes |
+| baraka | HP | far | 72, 84 | **0** | yes |
+| baraka | LP | far | 72, 84 | **0** | yes |
+| baraka | cHK | (none) | 63, 72, 84 | **3** | yes |
+| baraka | cHP | (none, block-only — knockdown on hit) | 63, 72, 84 | **7** | n/a (block only) |
+
+Every far-variant and every crouching-heavy value is gap-invariant across all
+rungs it was measured at (identical hitstop, on_hit, and on_block at every
+gap for a given move) — the same invariance Reptile's and Mileena's far
+normals showed.
+
+## The move-class prediction: CONFIRMED on a third character
+
+The prediction was that hitstop groups by move class, not by character, and
+that Baraka's single pre-existing row (far HK = 12) was consistent with it.
+The full column now bears this out with no exceptions:
+
+- Heavy kicks (HK/LK) = **12** on all three characters (Reptile, Mileena,
+  Baraka), despite Baraka's HK/LK doing different damage (32/26) than
+  Reptile's or Mileena's.
+- Light punches (HP/LP) = **0** on all three characters.
+- Crouching heavy kick (cHK) = **3** on all three characters.
+- Crouching launcher (cHP), block-only = **7** on all three characters
+  (Mileena and Baraka both measured it; Reptile's cHK/cHP set didn't include
+  this exact cell in the same way, but where compared it agrees).
+
+Three characters, four move classes, zero disagreements. This is now a
+finding about the GAME, not a coincidence of one kit: MK2 arcade appears to
+assign hitstop by move class/animation, not per-character or by damage
+within a class (Baraka's HK does 32 dmg vs. Reptile's differing damage, same
+12 frames). The hypothesis is confirmed, not merely "not broken."
+
+## Refused, not stored
+
+`cLK` and `cLP` computed negative on every gap and every observable —
+refused per `HitstopError`'s negative-result guard, exactly as
+`reptile.cLP` (−1) and `mileena.cLK`/`cLP` (−2/−1) were refused:
+
+- **`cLK`**: hitstop = **−2** at 63, 72, and 84 px, both observables (3 gaps
+  × 2 observables = 6 refusals).
+- **`cLP`**: hitstop = **−1** at 63, 72, and 84 px, both observables (3 gaps
+  × 2 observables = 6 refusals).
+
+Total: **12 refusals**, all exact and reproducible (identical value on every
+gap, both observables, and identical between the dry and real runs). This is
+the third character showing the identical failure shape for the identical
+two moves (`cLK`, `cLP` — the crouching LIGHT normals), which strengthens
+the module's existing diagnosis: these moves proximity-fork like standing
+normals do, and the dataset's `variant: None` label doesn't capture it, so
+the far-range whiff reference throws a different animation than the one
+that connects. No new failure shape appeared; the existing guard caught it
+correctly a third time.
+
+## Skipped, named
+
+**Close-range variants** (`HP`, `HK`, `LK` at Baraka's 63 px close rung) —
+6 rows (3 moves × 2 observables) skipped with reason "close-range variant
+has no safe whiff reference" (his 63 px collision floor sits at the same
+distance his close normals' own reach ends, per the module docstring's
+already-documented reasoning — unchanged by a third character).
+
+## Coverage as a fraction
+
+**30/48** rows carry a measured `hitstop` value. Everything else in the 48 is
+named, not silently absent:
+- 6 skipped (close-range variant, no safe whiff reference)
+- 12 refused (computed negative — `cLK`/`cLP`, proximity-fork suspected)
+- 30 + 6 + 12 = 48. No row is unaccounted for.
+
+This is the same shape as Reptile (16/30 = same 3 close-variant + 2 refused
+moves, scaled to his smaller kit) and Mileena (34/64 = same skip/refuse
+pattern plus her extra cHP-block-only row), not a partial column dressed up
+to look complete.
+
+## Anything not done
+
+- Baraka's specials (Blade Fury, Blade Swipe, Blade Spin) — out of this
+  module's scope by construction (`_spec_for_move` only rebuilds plain
+  button chords and their crouching forms; a macro needs its own
+  `MoveScript`, another task's file).
+- His `LP` close-range throw (63 px, contact f40, unblockable, knockdown,
+  per the A3 normals evidence in `library/mk2/mk2.md`) carries no hitstop
+  row and was not attempted — it has no `move_frames` row keyed as a normal
+  cell for this module to pick up (§1.1 gives throws no advantage row
+  either, on the same evidence doc).
+- `active`/`recovery`/`total` remain NULL for Baraka, as for the other two —
+  a separate P3-style measurement, not a byproduct of this module.
+- No re-measurement against a cold emulator process was performed by this
+  task specifically for hitstop (Reptile's cells got that treatment per the
+  earlier evidence file); Baraka's cross-check here rests on the
+  dry-run/real-run agreement plus cross-observable agreement, both exact.
+
+## Determinism
+
+Dry run and real run: `steps=119324 loads=2583` identical, and every one of
+the 30 updated rows, 6 skips, and 12 errors identical key-for-key and
+value-for-value between the two invocations — the §7 re-measurement bar,
+satisfied before (in the prior, interrupted pass) the real write landed.
+# Does MK2 (1993 arcade) support special cancelling?
+
+Research + experiment design for the RustRetro frame lab.
+ROM under test: `mk2.zip`, rev **L3.1** (`library/mk2/mk2.profile.json` `_STATUS`).
+
+---
+
+## 0. Answer up front
+
+**Yes. We measured it (§4), on our own ROM, and it is far more permissive than
+anything the community documents.**
+
+A special-move input is **never delayed by a normal in progress** — zero delay
+at every frame from 2 to 30 after the normal's press, on hit and on whiff —
+while at the very same frames the fighter cannot walk (floor 20), cannot throw
+a kick (floor 19), and a punch is buffered or swallowed. The lead normal still
+lands if the special's trigger press is at frame 10 or later.
+
+The community half-knew this. One FAQ author (ded_, writing explicitly for
+**rev L3.1 — our ROM**) documents a normal→special cancel but describes it as a
+one-frame, contact-frame-only "Just Frame". **Both halves of that description
+are wrong**: the window is open-ended and contact is not required. A second
+source (SuperCombo) is contaminated with MK1 text. So the honest headline is:
+*published as a narrow glitch, measured as a broad engine property.*
+
+Confidence summary (research half; the measured half is §5):
+
+| Claim | Confidence | Basis |
+|---|---|---|
+| MK2 has NO dial-a-combo / chain combos | **High** | universal across sources; dial-a-combo is an MK3 introduction |
+| MK2's combo system is juggles | **High** | every source; whole structure of the community combo lists |
+| A normal can be cancelled into a special on the **frame of contact** ("glitch cancel", 1-frame) | **Medium** | one named author (ded_), explicitly for rev L3.1; notated `gc`; only ONE combo in his own list actually uses it |
+| LP/HP can be cancelled by *another attack button* or by Block ("kara jab") | **Low for MK2** | SuperCombo MK2/System page, but that section is copy-pasted MK1 text |
+| A jab's corner **pushback/"iceskate"** can be cancelled with any special | **Low–Medium** | SuperCombo MK2/System, same contaminated page |
+| Uppercut→teleport "with no frame lost" (Raiden pseudo-infinite) | **Low–Medium** | SuperCombo MK2/System, no inputs/frames given |
+| Cancelling is a general, reliable offensive system in MK2 | **Low / contradicted** | absent from the 1995 rev-3.1 glitch FAQ; absent from character pages; our own rig has already measured a second attack press inside a first attack's startup producing *nothing* |
+
+---
+
+## 1. What the community actually says
+
+### 1.1 The one direct source: ded_'s MK2 Combo Guide (GameFAQs, updated 2020-06-23)
+
+This is the only source found that makes an explicit normal→special cancel
+claim for MK2. Its disclaimer is unusually relevant to us:
+
+> "This Combo FAQ is for Revision L3.1 (and L3.2 Europe) only. Earlier
+> revisions of the game had different hit and pause limits for some of the
+> special moves, and physics are also changed here and there."
+
+**Our ROM is exactly the revision this FAQ was written for.** That is the
+single most useful fact in this whole document.
+
+Section II, "Glitch Canceling", verbatim:
+
+> "Many special moves in MK have a number of hits you can do before that move
+> is locked. MKII did not really have a feature like this, but they start
+> implementing time limit usage on moves. You can cancel a LP, HP, JP, or JK on
+> the frame of contact, into a special move with a hit limit, one hit beyond
+> that limit. In other games this technique is referred to as 'Just Frames'
+> meaning essentially you have just one frame in 60 to get this to work. In
+> MKII anyway you can glitch cancel almost every special move but the real
+> glitch canceling is in UMK3/MKT where you can get an extra hit before some
+> special move is locked. In MKII the only similar special move like this is
+> Kitana's Fan Lift which has a hit limit of 0 i.e. you can glitch cancel it
+> with HP, LP, JK, JP and SUJK."
+
+Reading this carefully, it asserts:
+
+1. **The cancellable normals are exactly LP, HP, JP, JK** — the light/heavy
+   standing punches and the two jump attacks. Notably **no kicks** and **no
+   crouching normals** are listed.
+2. **The window is "the frame of contact"** — i.e. the cancel is *hit-confirm
+   only*, not a whiff/startup cancel, and it is one frame wide ("one frame in
+   60").
+3. **"In MKII anyway you can glitch cancel almost every special move"** — the
+   *destination* is nearly unrestricted; the hit-limit clause is about what the
+   cancel BUYS you (an extra hit past the limit), which in MK2 only matters for
+   Kitana's Fan Lift.
+
+The FAQ's own notation table defines `gc` = glitch cancel. **Across the entire
+guide — ~150 combos over 12 characters — `gc` appears exactly once**: Kitana
+combo #18, "(corner) JK, gc Fan Lift, SUJK, SUJK, Air Fan, Uppercut (6 Hits,
+100%)". That is a striking internal signal: the author says you can do it with
+almost every special, then never uses it anywhere the Fan Lift hit-limit
+exploit isn't the point. That is consistent with the cancel being real but
+*worthless* (it saves a handful of frames on a move whose recovery you were
+going to eat anyway), and equally consistent with it being over-claimed.
+
+The guide is corroborated only by a credits list (Shock, ChaiN, Konqrr,
+Scheisse, Alex) and a YouTube demonstration link, not by an independent write-up.
+
+### 1.2 SuperCombo Wiki, *Mortal Kombat II/System* (last edited 2023-10-10)
+
+**Handle with care: this page is contaminated with MK1 text.** It says "there
+is no pushback for this scenario in MK1", "Kara Jabs is basicaly the same thing
+in MK1", "BTW there are no crossover JKs/JPs in MK1 LOL!", and its entire
+Glitch Canceling section reads "Explained in Sub-Zero's Guide since he is the
+only one that has real glitch cancel in MK1." A page that keeps saying *MK1*
+under an *MK2* heading is exactly the anachronism hazard the brief warns about.
+
+With that caveat, it contains three cancel-adjacent claims:
+
+- **Jabs / Kara Jabs** — "You can cancel a LP or HP by tapping any other attack
+  button, canceling forward direction with LP or HP and then immidiately
+  blocking will not allow the opponent to hit you." This is a normal→normal /
+  normal→block cancel, *not* a special cancel, and the sentence immediately
+  after attributes it to MK1.
+- **Pushback** — "If you juggle someone in the corner with LP/HP jab, or a jab
+  after just about any other hit, you will be pushed back, but you can cancel
+  this with any special move. The same thing applies to when you throw out 3
+  jabs in succession and they are blocked, the third punch frame will freeze
+  and you will be pushed back. At any time during the 'iceskate', you can
+  cancel out with a special move." **This is the strongest general
+  special-cancel claim in the corpus** — it says an arbitrary special cancels
+  the jab's post-contact pushback state, and gives a *window* ("at any time
+  during the iceskate") rather than one frame.
+- **The Throw/Uppercut "Brokeness"** — "Canceling attack with uppercut, then
+  teleport with no frame lost and uppercut again" (Raiden pseudo-infinite);
+  and a 2P-only unblockable from throw→special "immidiately after the throw
+  without loosing any frames". No inputs, no frame counts, no character
+  coverage. Reads like folklore.
+
+The page also independently confirms our `sprite_lag_frames` convention:
+"Character sprites are behind by one tick in MK, so you can block things upon
+the frame they connect." (docs/frames.md §2.3.)
+
+### 1.3 The negative evidence
+
+- **Rat's *MK2 Glitch FAQ* v5 (1995-04-14), written explicitly against
+  "Mortal Kombat II (rev 3.1)"** — the contemporaneous, exhaustive,
+  personally-verified bug list for **our exact revision** — documents 11
+  glitches plus 4 "didn't make it in" ones, and **none of them is a cancel of
+  any kind.** For a technique that "works on almost every special move", total
+  absence from the canonical rev-3.1 bug catalogue is meaningful.
+- **SuperCombo's per-character MK2 pages** (checked: Reptile) list move
+  properties, basic and advanced combos, and infinites, and **never mention
+  cancelling**. Reptile's advanced combo list is identical to ded_'s, so the
+  wiki is downstream of the same FAQ.
+- **The MK2 arcade TASvideos submission thread (#8946)** contains only routing
+  and AI-manipulation notes — no engine documentation, no cancel discussion.
+- Community discussion of the *phrase* "special cancel in Mortal Kombat" is
+  dominated by MK9/MKX/MK11 results, where it means something entirely
+  different (a meter-spending or dial-string cancel). None of it is evidence
+  about 1993.
+
+### 1.4 Sources I could not reach
+
+- `testyourmight.com` — 403 to direct fetch and blocked at the browser
+  extension's domain permission layer. Its "MK2 Combo FAQ" thread appears from
+  search snippets to be a repost of ded_'s FAQ, i.e. probably not independent.
+- `mksecrets.net` — 403 / domain-blocked. ded_ names MKSecrets' forums as his
+  home, so it is likely the same source again rather than corroboration.
+- `web.archive.org` — blocked for this session; no snapshot fallback available.
+- `mkw.mortalkombatonline.com/mk2/` — dead (error page).
+- The leaked MK2 source code is **out of scope by docs/frames.md §7** (active
+  DMCA takedown; and this lab measures).
+
+---
+
+## 2. Cancels vs links vs juggles, as they apply to MK2
+
+This distinction is the whole reason the question is worth asking, because
+almost every "combo" in the MK2 corpus is *not* a cancel.
+
+- **Juggle — this is MK2's actual combo system.** Every 100% in ded_'s guide is
+  a juggle: a launcher (Fan Lift, Forceball, Spin, aaHP, uppercut, JK) puts the
+  opponent airborne, and subsequent hits connect because the victim is *in the
+  air and cannot act*, not because the attacker skipped recovery. The guide's
+  own system sections are about juggle bookkeeping — "you are allowed to do 3
+  anti air hits before your character is pushed away", "Lie Frames", "Uppercut
+  Interrupts". docs/frames.md §1.1 already says airborne hits produce **no
+  advantage number**: gravity owns the timing. A juggle needs no cancel and is
+  not evidence of one.
+- **Link — the default explanation for everything else.** MK2's on-hit
+  advantage numbers are large and positive for the light normals: our own table
+  has Reptile far HP at **+4 on hit** and far LP at **+4**, close HP at **+8**,
+  cLP at **+7**. A special with a short startup, started *after* the normal
+  fully recovers, will connect off any of those purely as a link. **This is the
+  confound.** "aaHP, Acid Spit" in the combo lists is fully explained as a link
+  and is not evidence of cancelling.
+- **Cancel — the actual question.** The special's startup begins *before* the
+  normal's recovery would have released the character. The observable signature
+  is unambiguous and is stated in §3.
+- **Chain / dial-a-combo — absent.** No source attributes a button-string chain
+  to MK2; dial-a-combo is universally credited to MK3. Do not import it.
+- **Glitch/exploit status.** ded_ files his cancel under "Glitch Canceling",
+  notates it `gc`, and calls it a Just Frame. If it exists it is a
+  one-frame exploit, not a system mechanic — and per his own disclaimer, hit
+  and pause limits **differ between revisions**, so a finding on L3.1 does not
+  generalise backwards and a *failure* on some other revision would not refute
+  it. Our ROM being L3.1 means we are testing the exact revision the claim was
+  made about.
+
+**Bottom line for the frame table:** even under the most generous reading, MK2
+does not have a per-move `cancellable` property in the Street Fighter sense.
+If anything exists, it is a single global rule ("LP/HP/JP/JK, on the contact
+frame only"), which belongs in `docs/frames.md` prose or one boolean column —
+never as per-move cancel windows.
+
+---
+
+## 3. How we would settle it ourselves
+
+### 3.1 The signature
+
+A cancel means: **the special's own clock starts earlier than the normal's
+recovery permits.** Define, all in logic frames from the normal's press frame:
+
+- `S0` = the frame the special *manifests* when thrown from neutral, with **no
+  normal at all**, from the identical rig — i.e. the special's own startup.
+- `A_norm` = the frame the attacker becomes actionable after the normal
+  (the act-again probe's manifest, already the lab's core measurement).
+- `M(N)` = the frame the special manifests when its input is begun at frame `N`
+  after the normal's press.
+
+Then:
+
+- **Link** ⟹ `M(N) ≈ max(N, A_norm) + S0`. The special cannot start before the
+  normal releases you, so `M(N)` is *floored* by `A_norm`, and sweeping `N`
+  downward makes the curve go **flat** at `A_norm + S0`.
+- **Cancel** ⟹ for some `N`, `M(N) < A_norm + S0`. The floor is broken. The
+  curve keeps descending below the link floor.
+
+**That flat-vs-descending shape is the whole experiment.** It is a within-rig
+comparison against a floor the same rig measured, so it does not depend on any
+published number.
+
+### 3.2 The confound, stated precisely
+
+The confound is *not* just "the special came out because the normal finished".
+There are four ways to get a false positive, and the design must kill each:
+
+1. **Link masquerading as a cancel.** Killed by the floor test above: the link
+   hypothesis makes a *quantitative* prediction (`M(N)` flat at `A_norm + S0`),
+   not a qualitative one. We do not ask "did the special come out?"; we ask
+   "did it come out **sooner than `A_norm + S0`**?"
+2. **The normal never came out.** If the special input's first direction step
+   eats the normal's press, we measure a bare special and call it a cancel.
+   Killed by requiring the **damage arithmetic to show BOTH hits**
+   (`Δhealth = dmg_normal + dmg_special`), and by picking a pair whose sum is
+   unique.
+3. **The special never came out; the normal's damage is being credited to it.**
+   This is *exactly* the `acid_spit` retraction that this project has already
+   suffered once. Killed by the same damage arithmetic, in the other direction,
+   plus a **no-special control** (same rig, same normal, special input
+   omitted) and a **no-normal control** (special alone, which is how `S0` is
+   obtained).
+4. **The probe cancels the move it measures.** Already a known hazard
+   (docs/frames.md). Here we must NOT use the walk-probe to detect the special;
+   the probe's own inputs could themselves be the cancel. Detection must be
+   passive.
+
+### 3.3 What we can actually observe — and what we cannot
+
+**There is no animation-id or move-id field in MK2 arcade.** `mk2.profile.json`
+`_STATUS`: *"Block-stance flag and a general animation/state-id field were
+searched for and NOT found (P1's whole fighter struct is otherwise static
+outside char_id/health)."* So "which move is playing" is **not directly
+readable**, and the experiment must be built from indirect observables:
+
+| Observable | Where | Use here | Caveat |
+|---|---|---|---|
+| `health` | `block+0x0E` | **primary** — damage arithmetic identifies *which* moves landed | the standing anchor; never the HUD pair |
+| `action_counter` | `block+0xC0` | candidate onset detector — "fires on ENTERING an attack (160→192 on a live Reptile HP)" | **must be calibrated first.** mk2.md already warns: "'Came out and whiffed' and 'did not come out' are NOT distinguishable by `action_counter`" |
+| `struct_velocity` | `block+0x0B..0x0E` | the lab's calibrated actionability observable — gives `A_norm` | latency 1 (attacker) |
+| `x` (world) | globals `0x6CBA`/`0x6CFC` | Reptile's **slide** displaces the attacker tens of px — a movement fingerprint no normal produces | the 0x42-stride pool caveat; the gap ladder proves it works in the lab rig |
+
+The honest reading: `health` + `x` are trustworthy, `action_counter` is a
+*hypothesis under test* and must be validated against a known-answer case
+before any verdict rests on it.
+
+### 3.4 The design
+
+Character: **Reptile**, because his damage values separate cleanly and one of
+his specials moves him.
+
+Rig: `shadow/arenas/mk2/gap-*` (Reptile mirror). Use a rung well inside the
+connect region — **never at a special's reach boundary** (mk2.md: Blade Swipe
+at 117 px is irreproducible and the phase reference *drifts across a session*).
+
+Preconditions (docs/frames.md §3, all mandatory): training enforcement OFF,
+shadow runner disabled, `hold_buttons`/`release_buttons` only (`press_buttons`
+BANNED), arena liveness re-verified after **every** `load_state`, and the input
+FOLD confirmed before any input-sensitive work.
+
+**Move pair.** Normal = **far HP, 11 damage, hitstop 0, on_hit +4**; special =
+**acid_spit, ~10 damage**. Sum = 21, and 21 is not any single move's damage in
+Reptile's table (8, 11, 12, 16, 24, 26, 32, 34, 40, 6). Hitstop 0 matters: a
+hitstop-12 move would eat injected input during the freeze (§1.2) and blur the
+frame numbering. A second pair — normal = **cLP, 6 damage** into **slide,
+8 damage** — gives an independent read with an `x`-displacement confirmation,
+and cLP is one of the normals ded_ does *not* list, so it is a useful negative
+control on his own claim.
+
+**Procedure.**
+
+- **Step 0 — calibrate `action_counter`.** Throw the normal alone; record the
+  `+0xC0` edge frame. Throw the special alone; record its edge frame. If
+  `+0xC0` does not produce one clean edge per move onset in this rig, drop it
+  and run on damage + `x` only. Do not skip this: an uncalibrated onset
+  detector is how `action_counter` got mistaken for a contact signal the first
+  time.
+- **Step 1 — measure `S0`.** Special alone from the identical arena, defender
+  idle. `S0` = frames from the special's final button press to the health
+  drop. Repeat ≥3×; must be identical.
+- **Step 2 — measure `A_norm`.** The existing act-again probe on the normal,
+  `struct_velocity`, attacker port. This is the link floor. (Reptile far HP is
+  already `on_hit +4`; `A_norm` is the raw manifest that number came from.)
+- **Step 3 — the sweep.** For `N` from large down to 0: press the normal at
+  frame 0, begin the special's encoding at frame `N`, run to completion,
+  read total damage and the health-drop frames.
+  - Classify each trial: `21` = both landed; `11` = normal only (special
+    dropped); `10` = special only (**normal was eaten — discard, do not count
+    as a cancel**); `0` = nothing.
+  - For the `21` trials, record `M(N)` = the frame of the *second* health drop.
+- **Step 4 — the verdict.** Plot `M(N)` against `N`. If `min_N M(N) ≥
+  A_norm + S0` (to the frame), **there is no cancel** — every connecting
+  special is a link. If some `N` gives `M(N) < A_norm + S0`, the floor is
+  broken and the cancel is real; report the `N` window and its width.
+- **Step 5 — the contact-frame prediction.** ded_'s specific claim is testable
+  and *falsifiable*: the window should be **one frame wide** and should sit at
+  the normal's **contact frame**, which we already know
+  (`first_active_frame`/`connect_range` are measured). If a window exists at a
+  totally different `N`, the community claim is wrong even if cancelling is
+  right. If the window is many frames wide, "Just Frames" is wrong.
+
+**Encoding-timing hazards that will otherwise sink the run** (all from
+mk2.md, learned the expensive way):
+
+- `acid_spit` is `F · F · HP` with **fresh direction onsets**: consecutive
+  steps need **≥2 neutral frames** between them, and a held direction does not
+  count as repeated taps. The shipped encoding is 3 frames per step.
+- A **direction+button chord needs ≥2 overlapping frames**; 1 frame produces
+  nothing (proven for `blade_swipe`).
+- Motions have **span caps**: `blade_spark` dies past `max_span_frames: 16`,
+  `blade_shredder` past 34. If the cancel window turns out to be narrow, the
+  motion's own multi-frame length may make some specials *physically
+  unreachable* as cancels regardless of whether the engine allows it — a
+  three-step motion cannot be "input on the frame of contact". **This is a
+  first-class result, not a nuisance**: it may be why ded_'s cancel is only
+  ever used on Fan Lift.
+- The `double_kick` STEP_GAP=2 disproof is a **strong prior against
+  cancelling**: two HK presses 5 frames apart — the second inside the first's
+  startup — produced *a single close HK, indistinguishable from one press*.
+  The engine dropped the second input entirely. Whatever cancelling exists is
+  not "inputs are accepted during another move".
+
+### 3.5 Where the code goes
+
+A new `shadow/train/shadow_train/framelab/cancels.py` plus tests. It must not
+touch `framelab/{airborne,specials,hitstop,kit,arenas,active,export}.py`, and
+no result goes into `library/mk2/arcade.frames.json`, `library/mk2/mk2.md`, or
+`docs/frames.md` from this job.
+
+---
+
+## 4. Measurement — it ran, and the answer is yes
+
+Rig: `mk2.zip` rev L3.1 on the from-source FBNeo core, headless, `--pace 0`,
+MCP port **4086** (the user's 4025 session untouched; `assert "4025" not in URL`
+in every script). Reptile mirror, `shadow/arenas/mk2/gap-45.state` = **72 px**
+(the far-normal rung; the collision floor is 62 and the boundary between far
+and close normals sits at 62–64, so 72 is comfortably inside the far region
+and nowhere near a special's reach edge). Defender idle, unguarding.
+Preconditions verified: `training_enforcement='off'`, `shadow_runner='no-model'`,
+writes armed. Every trial reloads the arena. `hold_buttons` only.
+
+Conventions below: **frame 0 = the lead normal's press frame**; all frames are
+absolute replay frames. Contact = a step in the defender's struct health
+(`block2+0x0E`). Position = the attacker's `obj+0x12`. Single trials
+(`sample_n = 1`), so these are first measurements, not a re-measured table.
+
+### 4.1 Baselines — each move alone from the same arena
+
+| move | first contact | damage | attacker travel | note |
+|---|---|---|---|---|
+| far LP | f11 | 8 | 0 | |
+| far HP | f11 | 11 | 0 | |
+| far LK | f8 | 26 | 0 | |
+| **slide** | f11 | 13 | **+52 px** | victim launched |
+| **force_ball** | f36 | 16 | +7 px | victim launched |
+| `acid_spit` *as encoded* | f18 | **24** | +13 px | **not the spit — see 4.5** |
+
+The slide's +52 px of attacker travel is a signature no Reptile normal
+produces, and it works with no opponent in range. That is what makes the
+hit-vs-whiff control in §4.4 possible at all.
+
+### 4.2 The gates — what the fighter genuinely cannot do yet
+
+All measured after **HP@0** (which contacts at f11), in the same rig.
+
+**WALK** (measured after LP@0; differential act-again, direction held from
+frame N, attacker `pointer_x` vs an identical no-probe control):
+
+| N | 2 … 20 | 21 | 22 | 23 | … |
+|---|---|---|---|---|---|
+| first frame x diverges | **22** (constant) | 23 | 24 | 25 | N+2 |
+
+A hard clamp at frame 22 for every N ≤ 20, then N+2 — and +2 is exactly the
+profile's calibrated `pointer_x` `attacker/hit` latency. **Walk floor = frame
+20.**
+
+**A follow-up KICK** (`HP@0 -> LK@N`), run twice, with a 2-frame and an
+8-frame hold — byte-identical results:
+
+| N | 2 … 18 | 19 | 20 | 21 | 22 |
+|---|---|---|---|---|---|
+| contacts | **(11,)** — no kick at all | (11, 27) | (11, 28) | (11, 29) | (11, 30) |
+| damage | 11 | 37 | 37 | 37 | 37 |
+
+**Kick floor = frame 19.** Below it the kick is not delayed, it is *destroyed*.
+
+**A follow-up PUNCH** (`HP@0 -> LP@N`, and `LP@0 -> HP@N` — same shape), again
+identical at 2-frame and 8-frame holds:
+
+| N | 2 … 10 | 11 … 14 | **15 … 18** | 19 … |
+|---|---|---|---|---|
+| second contact | **21** (constant) | N+11 | **none at all** | N+11 |
+| damage | 19 | 19 | **11** | 19 |
+
+Three separate behaviours: **clamped** (buffered, executes at frame 10 however
+early you press), then free, then a **4-frame blackout** where the input is
+swallowed outright, then free. `undelayed_from` for a punch follow-up is
+therefore **19**, not 10.
+
+### 4.3 The specials — never delayed, at any N
+
+`HP@0 -> slide@N`, slide timed by its own x-displacement onset, against a
+control that is the identical schedule with the HP button removed:
+
+| N | 2 | 5 | 9 | 10 | 15 | 16 | 17 | 18 | 20 | 26 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| slide onset (with HP) | 5 | 8 | 12 | 13 | 18 | 19 | 20 | 21 | 23 | 29 |
+| slide onset (control) | 5 | 8 | 12 | 13 | 18 | 19 | 20 | 21 | 23 | 29 |
+| **delay** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
+| HP still lands? | no | no | no | **yes** | yes | yes | yes | yes | yes | yes |
+| total damage | 13 | 13 | 13 | **24** | 24 | 24 | 24 | 24 | 24 | 24 |
+
+**Delay is 0 at every single N from 2 to 30.** The lead normal costs the
+special nothing, anywhere. Identical result with LP as the lead (delay 0 at
+every N ∈ [2,30], total 8+13 = 21 from N=10) — so this is not an artefact of
+the slide chord sharing the LP button.
+
+`HP@0 -> force_ball@N` (a three-step motion: `B` at N, the `B+HP+LP` trigger
+at N+5):
+
+| N | 2 … 4 | 5 … 24 |
+|---|---|---|
+| force_ball contact | N+36 | N+36 |
+| delay vs control | **0** | **0** |
+| HP still lands? | no | **yes** |
+| total damage | 16 | **27** |
+
+The boundary at which the lead survives is N=5 for force_ball and N=10 for the
+slide — **and both put the special's TRIGGER press at frame 10**, one frame
+before the normal's own contact at f11. Two specials with completely different
+input lengths agreeing on the same trigger frame is the strongest internal
+consistency check in this run.
+
+### 4.4 The confound controls, one at a time
+
+1. **Is this a link?** No. A link requires the follow-up to be clamped below
+   the lead's recovery. The special is never clamped: delay = 0 at N=2, where
+   the lead normal has not even become active.
+2. **Is the fighter just free?** No. At the *same* N the fighter cannot walk
+   (until 20), cannot kick (until 19), and a punch is either buffered or
+   swallowed. **At N = 15, 16, 17, 18 a follow-up normal produces literally
+   nothing while a special comes out with zero delay** — same rig, same lead,
+   same frame. That one comparison is the whole finding.
+3. **Is it a hold-length artefact?** No. The kick and punch follow-ups were
+   re-run with an 8-frame hold, matching the slide chord's 8 frames. Results
+   byte-identical.
+4. **Did the lead actually come out?** Damage arithmetic, per trial:
+   8+13 = 21, 11+13 = 24, 11+16 = 27, 11+26 = 37, and a bare 11 or 13 where
+   only one landed. Trials where the lead did not land are reported as
+   `overrides`, never counted as cancels.
+5. **Does it need contact?** **No — and this falsifies the published claim.**
+   Re-run at `gap-0.state` (180 px) where the LP whiffs completely: the slide's
+   onset is N+3 with delay 0 for every N ∈ [2,30], *identical to the 72 px hit
+   case*. The cancel is not hit-confirm; it works on whiff.
+6. **Is it button-sharing?** No. The slide chord contains LP and Block; the
+   force_ball chord contains neither Block nor LK; both behave identically, and
+   the lead was run as both LP and HP.
+
+### 4.5 An incidental finding the lab should know about
+
+**The shipped `reptile/acid_spit` encoding does not produce the acid spit at
+72 px.** Played from `gap-45.state` it yields contact at f18 for **24 damage**
+with +13 px of forward travel — that is Reptile's *close* HP (24 damage, FAF 8,
+pressed at f10 after the `F,F` walks him from 72 px into the close-normal
+region below 64). This is the exact retracted failure mode reproducing live.
+Reported, not fixed: `mk2.profile.json` is out of scope for this job and is
+being edited by another agent.
+
+### 4.6 Classifier output
+
+`framelab.cancels.classify` (`min_margin=2`) over the measured sweeps:
+
+| pair | verdict | undelayed from | both land from | strictest closed gate | margin |
+|---|---|---|---|---|---|
+| HP → slide | **cancel** | N=2 | N=10 | walk, 20 | 18 |
+| HP → force_ball | **cancel** | N=2 | N=5 | walk, 20 | 18 |
+| LP → slide | **cancel** | N=2 | N=10 | walk, 20 | 18 |
+| HP → LK | inconclusive | N=19 | N=19 | walk, 20 | 1 |
+| HP → LP | inconclusive | N=19 | N=19 | walk, 20 | 1 |
+
+The two `inconclusive` rows are deliberate: a 1-frame margin between a
+contact-timed follow-up and a `pointer_x`-timed walk gate is inside
+docs/frames.md §8.4's cross-observable slop and must not be called a cancel.
+That threshold exists *because* the first run classified `HP → LK` as a cancel
+on a margin of 1.
+
+### 4.7 What was NOT measured
+
+One character (Reptile), one gap (72 px, plus a 180 px whiff control), one
+guard state (defender idle — **nothing here is measured on block**), two
+specials, `sample_n = 1`, no independent re-run from a second emulator process.
+Jump attacks (ded_'s JP/JK) were not tested at all. Nothing was written to
+`frames.db` or `arcade.frames.json`.
+
+---
+
+## 5. Verdict
+
+**MK2 arcade rev L3.1 supports special cancelling. Measured, not inferred.**
+
+The precise mechanism, as measured:
+
+1. **A special-move input is never gated by a normal in progress.** At every
+   frame from 2 to 30 after a normal's press — during its startup, its active
+   frame, its recovery, and inside the 4-frame window where the game refuses
+   normals outright — a special comes out with **exactly zero delay**, at the
+   same frame it would come out from neutral.
+2. **Normals are gated, and that is the control that makes it a cancel.**
+   After the same HP: a kick is impossible until frame 19, a punch is buffered
+   to frame 10 and then swallowed entirely at 15–18, and the fighter cannot
+   walk until frame 20.
+3. **The lead normal survives if the special's trigger press lands at frame 10
+   or later** (one frame before the normal's own contact at f11) — confirmed
+   independently by two specials with different input lengths. Earlier than
+   that, the special *overrides* the normal, which is a real behaviour but not
+   a combo.
+4. **Contact is not required.** The identical result on a whiffing normal at
+   180 px.
+
+**Basis: both, and they disagree in an instructive way.**
+
+The community was right that the thing exists and right that our exact revision
+is the one it was documented on. It was wrong about the shape:
+
+| ded_'s claim (GameFAQs, L3.1) | measured |
+|---|---|
+| "on the frame of contact" | works at **every** frame, contact or whiff |
+| "Just Frames… one frame in 60" | the window is **open-ended**, not one frame |
+| cancellable normals are LP, HP, JP, JK | LP and HP confirmed; kicks untested |
+
+SuperCombo's "you can cancel a LP or HP by tapping any other attack button" is
+also wrong on this ROM as stated: a punch chains into another **punch** at
+frame 10, but into a **kick** not until frame 19. Its "you can cancel this
+[jab pushback] with any special move" is the claim that best matches what we
+measured — specials are never gated.
+
+**Consequence for the frame table:** it does NOT need a per-move `cancel`
+column. What was found is a global button-class rule, not a per-move property,
+and it is the wrong shape for `MOVE_FRAMES_COLUMNS`. What the table *should*
+eventually carry is a per-character/per-lead **`normal_followup_floor`** and
+the observation that the walk-based actionability number is an over-estimate of
+commitment for anyone holding a special-move input — which is a docs/frames.md
+§1 amendment (a fourth item after "walk", "guard returns earlier"), not a
+column. Neither change was made here; both are out of this job's file scope.
+
+**Confidence: medium-high.** The signal is enormous (an 18-frame margin, delay
+identically 0 across ~120 trials, two specials agreeing on the same trigger
+frame, hit and whiff agreeing exactly), which is why one character at
+`sample_n = 1` is already worth reporting. It is medium rather than high
+because docs/frames.md §8 acceptance is not met: no independent re-run, no
+second observable on the special's onset, no block state, and one character.
+The next step is `HP → slide` re-measured from a cold second emulator process
+and on a blocked lead.
+
+---
+
+## Sources
+
+- [Mortal Kombat II — Combo Guide (ARC) by ded_, GameFAQs, updated 2020-06-23](https://gamefaqs.gamespot.com/arcade/583600-mortal-kombat-ii/faqs/78427) — the only direct normal→special cancel claim; explicitly scoped to rev L3.1/L3.2.
+- [Mortal Kombat II/System — SuperCombo Wiki, last edited 2023-10-10](https://wiki.supercombo.gg/w/Mortal_Kombat_II/System) — Jabs/Kara Jabs, Pushback/"iceskate" cancel, Throw/Uppercut brokenness; **contaminated with MK1 text**.
+- [Reptile (MK2) — SuperCombo Wiki](https://wiki.supercombo.gg/w/Reptile_(MK2)) — move list and combos; no cancel content. Lists Acid Spit as `F, F, HP`.
+- [Mortal Kombat II/FAQ — SuperCombo Wiki](https://wiki.supercombo.gg/w/Mortal_Kombat_II/FAQ) — CPU strategy only; no system mechanics.
+- [Mortal Kombat II — Glitch FAQ v5 (ARC) by Rat, 1995-04-14](https://gamefaqs.gamespot.com/arcade/583600-mortal-kombat-ii/faqs/717) — contemporaneous rev-3.1 bug catalogue; **contains no cancel of any kind** (negative evidence).
+- [TASVideos topic 25250 — Arcade Mortal Kombat II submission](https://tasvideos.org/Forum/Topics/25250) — routing/AI notes only; no engine documentation.
+- [How Mortal Kombat's Dial-a-Combo System Impacts the Initial Learning Curve](https://inthirdperson.com/2019/04/26/phone-a-friend-how-mortal-kombats-dial-a-combo-system-impacts-the-initial-learning-curve/) — dial-a-combo dates from MK3, not MK2.
+- Unreachable: `testyourmight.com` (403 + domain-blocked), `mksecrets.net` (403 + domain-blocked), `web.archive.org` (blocked), `mkw.mortalkombatonline.com` (dead).
+
+### The collapse rule caught a KEYING bug (orchestrator note, 2026-09-01)
+
+The Rust loader refused the NJP rows with `njHP None disagreed on
+["gap_px", "on_block"]`. It was **not** a measurement disagreement — it was
+the first thing that rule has caught that was neither a real disagreement
+nor a units error.
+
+NJP was measured at two gaps (62 px and 107 px) and stored with
+`gap_walk_frames = NULL`, so two different SPACINGS collapsed into one cell
+carrying four observations. They differ legitimately: `gap_px` 62 vs 107,
+and `on_block` is NULL at 107 px because a guarded defender is not hit at
+all there. Averaging or picking a winner would have silently merged two
+spacings of a move whose whole finding is that advantage varies across the
+arc.
+
+Fixed by keying the 22 rows to their ladder rungs (62 px → K=60,
+107 px → K=30), giving 11 cells of exactly 2 agreeing observations.
+
+Worth recording because the rule was designed for a different threat.
+Field-by-field collapse with a named `disagreements` list was built so a
+cross-observable disagreement could not be silently resolved; it also
+happens to detect **rows keyed too coarsely**, which nothing else in the
+pipeline checks.

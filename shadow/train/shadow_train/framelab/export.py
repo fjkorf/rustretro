@@ -17,6 +17,10 @@ from typing import Optional, Union
 
 from .store import SCHEMA_VERSION, FrameStore
 
+class ExportVerificationError(RuntimeError):
+    """The written export does not match the store it was generated from."""
+
+
 __all__ = ["default_export_path", "export_frames"]
 
 # shadow_train/framelab/export.py -> framelab/ -> shadow_train/ -> train/ ->
@@ -57,4 +61,24 @@ def export_frames(
     path = Path(out_path) if out_path is not None else default_export_path(family, port)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+    # Read back and compare VALUES, not counts. The store and the committed
+    # export have silently diverged three times, and the third time the row
+    # counts MATCHED (142 == 142) while `hitstop` was stale for a whole
+    # character — 2 of 48 in the export against 30 of 48 in the store. That
+    # went into a merged commit message as a coverage claim. A count check is
+    # exactly the check that cannot catch a stale-value drift.
+    written = json.loads(path.read_text())["moves"]
+    if written != rows:
+        stale = [
+            (a.get("char"), a.get("move"), k)
+            for a, b in zip(written, rows)
+            for k in set(a) | set(b)
+            if a.get(k) != b.get(k)
+        ]
+        raise ExportVerificationError(
+            f"{path} does not match the store after writing: "
+            f"{len(written)} rows written vs {len(rows)} in store, "
+            f"first mismatches {stale[:5]}"
+        )
     return path
