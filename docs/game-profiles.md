@@ -48,9 +48,13 @@ supported experiment, not an accident).
 2. **Logic lives once.** The gate is evaluated from the condition list by
    one evaluator per language surface (Rust native; Python mirrors it;
    Lua ASKS via a binding — it never re-implements). The condition
-   vocabulary is closed: `byte_zero`, `word_zero`, `word_masked_not_all`, `health_in_range`,
+   vocabulary is closed: `byte_zero`, `byte_nonzero`, `word_zero`,
+   `word_masked_not_all`, `health_in_range`,
    `bcd_valid_nonzero`. A game that needs more gets a Lua adapter hook —
-   an explicit decision, not a schema creep.
+   an explicit decision, not a schema creep. (`byte_nonzero` is the
+   complement of `byte_zero`, for a flag whose PRESENCE marks the in-fight
+   state — MK2 arcade's `fight_active` closes the equal-health-timeout
+   GAME-OVER leak the other terms miss; see library/mk2/mk2.md.)
 3. **Class lists size the model heads.** Nothing may hardcode 9 moves /
    6 attacks; trainer and runner size from the class lists (meta.json is
    authoritative for a loaded model; the profile for new fits).

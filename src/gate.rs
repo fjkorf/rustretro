@@ -1,7 +1,8 @@
 //! The in-fight controllable gate — ONE shared predicate evaluated by the
 //! training enforcer, the Lua `game.controllable()` binding, and (in spirit)
 //! the recorder's composite. See docs/game-profiles.md for the condition
-//! vocabulary and semantics: byte_zero / word_zero / word_masked_not_all / health_in_range /
+//! vocabulary and semantics: byte_zero / byte_nonzero / word_zero /
+//! word_masked_not_all / health_in_range /
 //! bcd_valid_nonzero. Reads go through the same `DebugState::read_addr` path
 //! as every other binding; out-of-map reads collapse to 0, matching the
 //! recorder's `unwrap_or(0)` semantics. 16-bit reads honor the profile's
@@ -24,7 +25,8 @@ fn rd16(ds: &DebugState, addr: u32, little: bool) -> u16 {
 /// Lua `game.controllable()` binding, and (in spirit) the recorder's
 /// composite; a lua_engine unit test locks Lua and the recorder together.
 /// The condition vocabulary is closed (docs/game-profiles.md): byte_zero /
-/// word_zero / health_in_range / bcd_valid_nonzero. Reads go through the same
+/// byte_nonzero / word_zero / word_masked_not_all / health_in_range /
+/// bcd_valid_nonzero. Reads go through the same
 /// `DebugState::read_addr` path as every other binding; out-of-map reads
 /// collapse to 0, matching the recorder's `unwrap_or(0)` semantics. 16-bit
 /// reads honor the profile's `memory.endianness` per the contract.
@@ -35,6 +37,7 @@ pub(crate) fn eval_gate(ds: &DebugState, p: &GameProfile) -> bool {
     let ga = |name: &str| p.global(name).unwrap_or(0);
     p.port.gate.iter().all(|cond| match cond {
         GateCond::ByteZero { global } => rd8(ds, ga(global)) == 0,
+        GateCond::ByteNonzero { global } => rd8(ds, ga(global)) != 0,
         GateCond::WordZero { global } => rd16(ds, ga(global), little) == 0,
         GateCond::WordMaskedNotAll { global, mask } => {
             let m = mask.0 as u16;
@@ -77,11 +80,14 @@ mod tests {
             interval: 1,
             flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
         }));
-        // Both fighters alive so only screen_state decides.
+        // Both fighters alive so only screen_state (and fight_active) decide.
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
         let scr = p.global("screen_state").unwrap() as usize;
+        let fa = p.global("fight_active").unwrap() as usize;
+        // A live fight has fight_active != 0 (mk2.md gate probe 2026-09-02).
+        assert!(ds.write_addr(fa, 1, 1));
 
         for (value, in_fight) in [
             (0u32, true),    // 1P fight / post-KO
@@ -99,5 +105,22 @@ mod tests {
                 "screen_state {value} (0x{value:X}) should read in_fight={in_fight}"
             );
         }
+
+        // Regression: the equal-health-timeout GAME OVER / "battle plan"
+        // ending screen. screen_state=259 (a live 2-human FIGHT value, mask
+        // leaves the gate open), round_over=0, both healths maxed and
+        // in-range — every OLD gate term reads in-fight. Only fight_active,
+        // which drops to 0 there, closes the leak (mk2.md gate-leak probe).
+        assert!(ds.write_addr(scr, 2, 259));
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 161));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 161));
+        assert!(ds.write_addr(p.global("round_over").unwrap() as usize, 1, 0));
+        assert!(ds.write_addr(fa, 1, 1));
+        assert!(eval_gate(&ds, &p), "sanity: the same fields WITH fight_active=1 are in-fight");
+        assert!(ds.write_addr(fa, 1, 0)); // the ending screen
+        assert!(
+            !eval_gate(&ds, &p),
+            "equal-health-timeout ending must NOT read in-fight (fight_active=0 closes it)"
+        );
     }
 }

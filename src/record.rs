@@ -264,6 +264,9 @@ fn gate_cond_json(cond: &GateCond) -> serde_json::Value {
         GateCond::ByteZero { global } => {
             serde_json::json!({"kind": "byte_zero", "global": global})
         }
+        GateCond::ByteNonzero { global } => {
+            serde_json::json!({"kind": "byte_nonzero", "global": global})
+        }
         GateCond::WordZero { global } => {
             serde_json::json!({"kind": "word_zero", "global": global})
         }
@@ -1041,6 +1044,16 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}_{}.jsonl", std::process::id()))
     }
 
+    /// MK2's gate now also requires `fight_active` (0xC336) != 0 — the
+    /// discriminator that closes the equal-health-timeout GAME-OVER leak
+    /// (mk2.md gate probe 2026-09-02). Stage it so an in-fight mk2 scene opens
+    /// the gate; a no-op for a profile that does not declare the global.
+    fn stage_fight_active(ds: &mut DebugState, p: &GameProfile) {
+        if let Some(a) = p.global("fight_active") {
+            assert!(ds.write_addr(a as usize, 1, 1));
+        }
+    }
+
     fn cleanup(path: &Path) {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path.with_extension("meta.json"));
@@ -1237,6 +1250,7 @@ mod tests {
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
         assert!(ds.write_addr((p.block1() + coff) as usize, 1, 7));
         assert!(ds.write_addr((p.block2() + coff) as usize, 1, 9));
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p));
 
         let path = tmp("shadow_rec_mk2");
@@ -1264,11 +1278,12 @@ mod tests {
         // Set membership (Value maps sort): gate globals + record_globals.
         // `hit_counter` left both in the W2 cleanup (P1-victim-only, nothing
         // downstream consumed the column — mk2.profile.json _STATUS).
-        assert_eq!(gkeys, vec!["p1_health_hud", "p2_health_hud", "round_over", "screen_state"]);
-        // Serialized order is gate order (word-read screen_state, round_over)
-        // then record_globals order (the hitstun-source HUD pair).
+        assert_eq!(gkeys, vec!["fight_active", "p1_health_hud", "p2_health_hud", "round_over", "screen_state"]);
+        // Serialized order is gate order (screen_state, round_over,
+        // fight_active — the equal-health-timeout leak discriminator) then
+        // record_globals order (the hitstun-source HUD pair).
         assert!(text.contains(
-            "\"globals\":{\"screen_state\":0,\"round_over\":0,\
+            "\"globals\":{\"screen_state\":0,\"round_over\":0,\"fight_active\":1,\
              \"p1_health_hud\":0,\"p2_health_hud\":0}"
         ));
         assert!(text.contains("\"block1\":{\"char_id\":7,\"health\":100,\"action_counter\":0}"));
@@ -1351,6 +1366,7 @@ mod tests {
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
         install_mk2_object(&mut ds, &p, 1, 0x2000, 7, 222, -10);
         install_mk2_object(&mut ds, &p, 2, 0x4000, 9, 400, -20);
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p));
 
         let path = tmp("shadow_rec_objptr_ok");
@@ -1406,6 +1422,7 @@ mod tests {
         install_mk2_object(&mut ds, &p, 1, 0x2000, 7, 222, -10);
         install_mk2_object(&mut ds, &p, 2, 0x4000, 9, 400, -20);
         assert!(ds.write_addr(0x4000 + 0x3E, 1, 99)); // corrupt the cross-check for block2
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p));
 
         let path = tmp("shadow_rec_objptr_stale");
@@ -1457,6 +1474,7 @@ mod tests {
         // and falls back to its "left fighter is P1" default (`record.rs`'s
         // `opp_right` doc) — which matches the facing this test wants
         // (block1 left/facing right, block2 right/facing left).
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p));
 
         let path = tmp("shadow_rec_specials");
@@ -1737,6 +1755,7 @@ mod tests {
         let h2 = (p.block2() + hoff) as usize;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr(h2, 1, 90));
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p));
 
         let path = tmp("shadow_rec_mk2_decrease");

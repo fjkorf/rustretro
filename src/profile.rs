@@ -408,6 +408,14 @@ pub struct RecordGlobal {
 pub enum GateCond {
     /// u8 at global == 0.
     ByteZero { global: String },
+    /// u8 at global != 0. The complement of `byte_zero`, for a flag whose
+    /// PRESENCE marks the in-fight state. MK2 arcade uses it on `fight_active`
+    /// (0xC336): the equal-health-timeout GAME OVER / "battle plan" ending
+    /// screen reads screen_state=0, round_over=0, health 161/161 — every
+    /// other gate term stays open — but `fight_active` drops to 0 there,
+    /// while reading 1 across all 26 committed fight arenas (mk2.md gate probe
+    /// 2026-09-02).
+    ByteNonzero { global: String },
     /// u16 (guest order) at global == 0.
     WordZero { global: String },
     /// `u16 (guest order) at global & mask != mask` — "these bits are not
@@ -1826,6 +1834,7 @@ impl GateCond {
     pub fn global_name(&self) -> Option<&str> {
         match self {
             GateCond::ByteZero { global }
+            | GateCond::ByteNonzero { global }
             | GateCond::WordZero { global }
             | GateCond::BcdValidNonzero { global }
             | GateCond::WordMaskedNotAll { global, .. } => Some(global),

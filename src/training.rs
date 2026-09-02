@@ -1522,6 +1522,16 @@ mod tests {
     /// inside the [0xC000,0xF000) scan window.
     const MK2_1P_TIMER_BASE: u32 = 0xDC42;
 
+    /// MK2's gate now also requires `fight_active` (0xC336) != 0 — the
+    /// discriminator that closes the equal-health-timeout GAME-OVER leak
+    /// (mk2.md gate probe 2026-09-02). Stage it so an in-fight mk2 scene opens
+    /// the gate; a no-op for a profile that does not declare the global.
+    fn stage_fight_active(ds: &mut DebugState, p: &GameProfile) {
+        if let Some(a) = p.global("fight_active") {
+            assert!(ds.write_addr(a as usize, 1, 1));
+        }
+    }
+
     /// MK2 in a bus window with an open gate. The countdown record is NOT
     /// staged here — each test stages it (or a near-miss) itself.
     fn mk2_timer_scene() -> (GameProfile, DebugState) {
@@ -1537,6 +1547,7 @@ mod tests {
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 161));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 161));
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p), "gate must be open");
         ds.training.enabled = true;
         (p, ds)
@@ -1701,6 +1712,7 @@ mod tests {
         // health. (Blocked contact always chips on this port — 3/6/8 — so
         // the struct-health delta sees blocked hits too; mk2.md.)
         let sig = (p.block2() + hoff) as usize;
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p));
 
         ds.training.enabled = true;
@@ -2067,6 +2079,7 @@ mod tests {
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
         // No x staged: mk2's x is pointer-resolved (the DISPROVEN p1_x/p2_x
         // globals are removed), and the button guard doesn't need geometry.
+        stage_fight_active(&mut ds, &p);
         ds.training.enabled = true;
         ds.training.dummy = DummyMode::BlockPunish;
         ds.training.punish_pool = vec![(crate::macros::PunishOption::Attack("HP".into()), 1)];
@@ -2101,6 +2114,7 @@ mod tests {
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p));
         ds.training.enabled = true;
         ds.training.dummy = DummyMode::BlockPunish;
@@ -2468,6 +2482,7 @@ mod tests {
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
         // No x staged: mk2's x is pointer-resolved (the DISPROVEN p1_x/p2_x
         // globals are removed) and the button-block dummy needs no geometry.
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p), "gate must be open for this test");
 
         ds.training.enabled = true;
@@ -2522,6 +2537,7 @@ mod tests {
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        stage_fight_active(&mut ds, &p);
         ds.training.enabled = true;
         ds.training.dummy = DummyMode::Block;
         tick_with(&mut ds, 1, &p);
