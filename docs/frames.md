@@ -264,9 +264,15 @@ A measurement run that skips any of these is void.
    After the fold oracle: 52 exhaustive sweeps, 2,626 repeat-checked
    evaluations, no settle — **0 repeat-check failures, 0 non-monotone
    refusals**.
-7. **Every `load_state` confirmed to have LANDED.** Loads do not drain while
-   paused. Resume, load, verify against a known field, then pause. Skipping
-   this silently measures the PREVIOUS state.
+7. **Every `load_state` confirmed to have LANDED.** ~~Loads do not drain
+   while paused.~~ (Corrected 2026-09-01: in the current binary a paused
+   load applies SYNCHRONOUSLY — measured, RAM verified while still paused —
+   so the old resume/load/verify/pause dance is no longer necessary.) The
+   rule that stands: use `load_state(pause_after: true)` (§4.6, the atomic
+   form) and verify against a known field either way; and never read the
+   FRAMEBUFFER as a phase oracle until ≥1 frame has run after the load —
+   it shows the pre-load screen until then, which has already faked one
+   "input-dead arena" finding.
 8. **Zero-point calibration current** (§3.1) for this core build and ROM.
 
 Note on §2.4: waiting in wall-clock for a step or load to LAND is transport

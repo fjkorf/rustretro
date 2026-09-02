@@ -251,7 +251,7 @@ Known imperfections, stated honestly:
 |---|---|
 | health refill | **WORKS** via `write_memory` — write 161 to all four health bytes (`0xC05E`, `0xC1D8`, `0xBCA0`, `0xBC88`). Verified live: bar refills, fight continues. Must be a periodic rewrite (freeze is a no-op on this core, see gotchas). |
 | health_max | **161** (`0xA1`) — fill target observed at round start, MAME cheat's fill value, and the write-verified full-bar value. |
-| timer hold | ~~**NOT functional** — no authoritative store found (above).~~ **Store found 2026-09-01** (the `0xD630` countdown task record, write-verified both directions — see "The round timer, closed" below); enforcement wiring queued (wave 2). |
+| timer hold | ~~**NOT functional** — no authoritative store found (above).~~ **Store found 2026-09-01** (the `0xD630` countdown task record, write-verified both directions — see "The round timer, closed" below); **wired 2026-09-01 (W2)** — the guarded `enforcement.timer_hold` form; see "timer_hold wired functional" below. |
 | credits top-up | **NOT possible via memory** — credits live in T-Unit CMOS (`0x01400000` bit range, handler-mapped), which is OUTSIDE the exposed region. Two coin presses produced exactly two byte deltas in work RAM: the ASCII HUD digit and a transient counter (`0x5E0C`, disproven — dropped 161→24 on a screen change). Coin-up works fine through input (`select`), which is how a training harness should do it. |
 
 ## Disproven / dead ends (don't re-chase these)
@@ -285,7 +285,8 @@ via core descriptors). Coin=`select`, Start=`start`, both live-verified.
 1. **Player Y** — the one missing fighter field (jump features blind).
 2. **Authoritative round timer** — needed for `timer_hold`; reads work.
    *(Found 2026-09-01: the `0xD630` countdown task record — see "The round
-   timer, closed" below.)*
+   timer, closed" below. Wired into `enforcement.timer_hold` W2 — this item
+   is CLOSED.)*
 3. `src/training.rs` `resolve()` requires `health2`/`x`/`y` fields and
    `round_timer`/`round_state`/`credits`/`abort`/`match_end` globals to arm
    at all — MK2's map can't satisfy that contract yet (x lives at a
@@ -344,7 +345,7 @@ chip-damage/blocking replay; passes the neutral-noise control)
 
 | address | field | evidence |
 |---|---|---|
-| `0xD3FE` | **hit/combo counter** (u8, GLOBAL — not inside either fighter struct) | 0 at rest; increments by exactly 1 at the *same poll* `health` (P1, `0xC05E`) drops, for **every** hit in an 11-hit combo (both single pokes and the mid-combo launcher) and again for a run of **blocked/chip** hits (161→159→157→155, `0xD3FE` 0→1→2→3 in lock-step) — fires identically for hitstun and blockstun. Resets to 0 after a **~200-370 ms gap with no new hit** (12-22 frames @ ~55-60 fps) — closely matches the profile's existing `HITSTUN_RECENT_FRAMES: 20` calibration constant, which this finding now retroactively justifies. Zero false-fires: constant 0 across a 6-sample pre-contact neutral control (fake "hit" instants at t=0.15/.25/.35/.45/.55/.65s, all before the CPU's first real hit). |
+| `0xD3FE` | **hit/combo counter** (u8, GLOBAL — not inside either fighter struct) | 0 at rest; increments by exactly 1 at the *same poll* `health` (P1, `0xC05E`) drops, for **every** hit in an 11-hit combo (both single pokes and the mid-combo launcher) and again for a run of **blocked/chip** hits (161→159→157→155, `0xD3FE` 0→1→2→3 in lock-step) — fires identically for hitstun and blockstun. Resets to 0 after a **~200-370 ms gap with no new hit** (12-22 frames @ ~55-60 fps) — closely matches the profile's existing `HITSTUN_RECENT_FRAMES: 20` calibration constant~~, which this finding now retroactively justifies~~ *(Withdrawn 2026-09-01, W2: the counter is P1-victim-only — see "Contact-signal correction" — so its reset window cannot justify a both-players constant. The constant's real basis is asurabld's measured hit-gap distribution; see "Disproven-globals cleanup".)*. Zero false-fires: constant 0 across a 6-sample pre-contact neutral control (fake "hit" instants at t=0.15/.25/.35/.45/.55/.65s, all before the CPU's first real hit). |
 
 This is exactly the asurabld-style "combo counter as hitstun proxy"
 (CLAUDE.md: *"hitstun = counter changed within 20 frames"*) — a training
@@ -665,14 +666,21 @@ Rig note: `shadow/arenas/mk2/reptile-vs-reptile.state` is 1P-vs-CPU, so
 injected dummy input CANNOT drive P2 there — BlockPunish end-to-end
 testing requires a 2-human match (controller 2 joins).
 
-**Arena restore hazard (found 2026-09-01):** `b-v-r.state`, `r-v-r.state`
-and `gap-30.state` all restore INPUT-DEAD on a FRESH emulator instance —
-RAM verifies (char ids, healths) but the machine comes up on a non-fight
-countdown screen and held directions move nothing. Only `m-v-r.state` has
-been verified to restore live cross-session. Details and the verification
-recipe in "The round timer, closed" below; do not trust a committed arena's
-`inputs_live` sidecar across a process boundary without a fresh
-differential walk test.
+> **~~Arena restore hazard (found 2026-09-01)~~ — REFUTED the same day by a
+> dedicated differential re-test.** All committed arenas (`m-v-r`, `b-v-r`,
+> `r-v-r`, the whole gap ladder sampled) restore LIVE and gate-OPEN on fresh
+> instances, every load path tried, re-capture list empty. The "input-dead"
+> observation was a measurement artifact with a mechanical reproduction:
+> **the framebuffer shows the PRE-LOAD screen until one frame runs** (a
+> fresh headless MK2 sits on the CMOS "ERRORS DETECTED" boot screen
+> indefinitely, so an immediate post-load screenshot shows it while RAM
+> verifies perfectly), and input asserted while paused drains before a
+> frame consumes it. Lessons that DO stand: run ≥1 frame after any load
+> before reading the framebuffer; probe collision-floor rungs by walking the
+> fighters APART (walking together yields ±1–6 px at the floor and mimics
+> deadness); and note that a paused `load_state` now applies SYNCHRONOUSLY
+> in the current binary (the old "loads don't drain while paused" law no
+> longer holds — `pause_after` remains the recommended atomic form).
 
 ## CORRECTION: the contact signal is the health delta after all (2026-08-28)
 
@@ -1141,7 +1149,8 @@ needs one new schema concept — a *pointer-relative* fighter field:
    be dropped.
 5. Keep `p1_x`/`p2_x`/`p1_screen_x` in `globals` **only** if something still
    reads them, and mark them DISPROVEN in `_STATUS`; nothing should use them
-   for position or for liveness.
+   for position or for liveness. *(Resolved 2026-09-01, W2: the consumer
+   audit found nothing live — removed. See "Disproven-globals cleanup".)*
 6. `calibration.GROUND_Y` must stay **0** / unused for arcade — see the
    honest limit above; a per-fighter resting-y baseline is the right shape
    and does not exist in the schema yet.
@@ -6604,16 +6613,117 @@ scr=0/ro=0-or-1 with stale healths (a 30-frame-sampled run "found" ro=1 that
 was really attract garbage 2400 frames later). Screenshots are the phase
 oracle.
 
-**Arena restore hazard (cross-session):** `b-v-r.state`, `r-v-r.state` and
-`gap-30.state` all restore INPUT-DEAD on a FRESH emulator instance — RAM
-verifies (cids, healths) but the machine comes up on a non-fight countdown
-screen and held directions move nothing (world-X globals read 215/233, not
-the meta's 469/661). Only `m-v-r.state` restored live cross-session (walk
-test x 1130→1170 under held right; an HP press dealt 24; `screen_state`→276,
-the documented 2-human first-contact value). The b-v-r meta claims live
-inputs; the discrepancy is unexplained and worth its own session. One
-baseline run on b-v-r was caught by screenshots and discarded.
+**~~Arena restore hazard (cross-session)~~ — REFUTED 2026-09-01** by a
+dedicated re-test (see the corrected note at the reptile-vs-reptile rig
+paragraph above for the full artifact analysis): every state named here
+restores live; the "non-fight countdown screen" was the pre-load
+framebuffer, stale because no frame had run after the load, over a
+perfectly restored RAM state. The discarded b-v-r baseline in this
+session's run was the right call for the wrong reason. Retained lesson:
+screenshots are a phase oracle ONLY after at least one post-load frame.
 
 Status: the store is KNOWN and write-verified; `timer_hold` enforcement
-WIRING is queued (wave 2) — the profile still carries the placeholder until
-it lands.
+LANDED 2026-09-01 (W2) — see "timer_hold wired functional" below.
+
+## timer_hold wired functional: the guarded enforcement form (2026-09-01, W2)
+
+Closes the "enforcement WIRING is queued (wave 2)" status of the section
+above. No new memory evidence in this pass — everything below is wiring the
+W1 find into the profile schema and `src/training.rs`; the store, the guard
+value, and the write recipe are exactly the write-verified ones above.
+
+`enforcement.timer_hold` now has TWO declarative forms
+(`src/profile.rs::TimerHold`, untagged serde enum — the parser picks by
+shape):
+
+- **Legacy `[sec, subsec]` array** (asurabld `[133, 3]`, genesis
+  `[153, 0]`): written to the `round_timer` global and `+1` every in-fight
+  tick, byte-for-byte the pre-W2 behavior. Unchanged — asurabld's training
+  tests are the proof. A port with the array form but no `round_timer`
+  global (sf2ce) still declines the feature softly, as before.
+- **Guarded object form** (MK2 arcade), matching the task-record layout:
+
+  ```json
+  "timer_hold": {
+    "guard":  { "global": "timer_task_code", "size": 4, "equals": "0x0106B820" },
+    "writes": [ { "global": "timer_task_tens", "value": 9 },
+                { "global": "timer_task_ones", "value": 9 } ]
+  }
+  ```
+
+  New globals in `mk2.profile.json`: `timer_task_code 0xD632`,
+  `timer_task_tens 0xD636`, `timer_task_ones 0xD63A` (the countdown task
+  record's code-pointer word and digit cells, from the section above).
+
+Semantics, as implemented in `src/training.rs::tick_with`:
+
+- The tick writes **every in-fight frame** while the training gate is open
+  (cheap; the recipe above tolerates any cadence up to ~260 frames).
+- **The guard is honored on every write pass**: read `size` bytes at
+  `guard.global`, endian-fix per the port's `memory.endianness`, compare to
+  `equals`. Match → write each `writes` entry as a u8. Mismatch → **skip
+  silently** (no log line): the slot belongs to another task right now
+  (menu/countdown screens host a different task with pointer `0x0106B840`
+  in the same slot — the hazard the section above documents).
+- Byte order, confirmed against the evidence above: the exposed region is
+  little-endian and `DebugState::read_addr` composes ascending bytes LE, so
+  `equals: "0x0106B820"` matches the raw bytes `20 B8 06 01` at `0xD632`
+  with no swap.
+- u8 writes of 9 suffice (the section above verified u16): the digit cells
+  are u32s that never exceed 9, so bytes 1–3 are already zero and stay
+  untouched.
+- Load-validation (`GameProfile::load`): every global named by the guarded
+  form must exist in `memory.globals`, `guard.size` must be 1/2/4, and
+  `writes` must be non-empty — a typo fails the LOAD loudly instead of
+  silently declining the feature (the legacy form keeps its soft
+  lookup-by-convention decline).
+
+`features_of` now reports timer hold available for MK2 — the 🎯 panel's
+"Not mapped" line loses "timer hold" (remaining: credits top-up, position
+reset, finish round). Tests: guarded parse + name/size validation, guard
+match writes both digits and re-pins next frame, guard mismatch (`0x0106B840`
+staged) leaves the digits untouched with zero log lines, and the legacy pair
+still lands on `round_timer`/+1.
+
+Caveat carried forward unchanged from the section above: 1P-vs-CPU rounds
+are UNVERIFIED for the recipe (all write evidence is the 2-human m-v-r rig),
+and whether the slot can land elsewhere under different heap load is open —
+the guard is the mitigation, not a proof.
+
+## Disproven-globals cleanup (2026-09-01, W2)
+
+The profile still shipped globals this doc had DISPROVEN for their implied
+purpose. A profile global is a machine-readable claim other tools may bind
+by name; the evidence stays HERE, the claims left the JSON. Removed from
+`mk2.profile.json` `memory.globals`:
+
+| global | why removed | consumer audit result |
+|---|---|---|
+| `p1_x 0x6CBA` / `p2_x 0x6CFC` | object-pool slots, not positions; not run-to-run stable | `src/training.rs resolve()`'s `p1_x`/`p2_x` fallback is unreachable for MK2 — `x` is `via: "object_ptr"`, which wins first. `src/record.rs` never read them (its `opp_right` falls back to "left fighter is P1" for mk2, per its own doc). The only remaining references were inert test writes (two in `training.rs`, one in `record.rs`) — deleted. `src/profile.rs`'s `mk2_ships_x_and_y_as_object_ptr_fields` test flipped from asserting retention to asserting removal. |
+| `p1_screen_x 0x3E40` | derived, read-only mirror | zero consumers anywhere (src/, shadow_train/, Lua, panels). |
+| `p1_facing 0xBE81` | read a constant 2 through a live crossover — disproven for facing (was only ever LIKELY) | zero consumers. Facing/`opp_right` comes from pointer-resolved x. |
+| `hit_counter 0xD3FE` | P1-victim-only — not the global contact signal its name claims | was in `record_globals` (a per-frame recorded column). Nothing downstream consumed the column: `dataset.py`'s hitstun features read the HUD pair via `hitstun_sources`, the contact trigger is struct `health` `direction:"decrease"`, and the framelab explicitly refuses it. Removed from `record_globals` too — see behavior change below. |
+
+Kept, with a new `_GLOBALS_NOTE` in the profile making their status
+self-describing: `timer_tens`/`timer_ones` (the DRAWN digits),
+`timer_master`, `timer_frames` — derived/inert per "The round timer,
+closed", read observables only, never enforcement targets.
+
+**Named behavior change (the one this cleanup makes):** new mk2-arcade
+recordings no longer carry the `hit_counter` globals column
+(`record_globals` entry removed). Old recordings with the column still load
+— readers index columns by name and ignore extras. Recorder/training
+behavior is otherwise byte-identical: the HUD pair stays recorded, the gate
+globals stay recorded, and no MK2 feature resolution path changes (x was
+already pointer-resolved).
+
+**`HITSTUN_RECENT_FRAMES: 20` re-grounded.** The hit-counter table row's
+claim that the `0xD3FE` reset window "retroactively justifies" the constant
+is WITHDRAWN (struck at the table row itself): that counter is
+P1-victim-only, so its window generalizes exactly as badly as the counter
+itself did. The constant is retained by measurement — but the measurement
+is **asurabld's**: `dataset.py::_recent_change_mask`'s run-length evidence
+(combo increments 7–25 frames apart vs hundreds-to-thousands of quiet
+frames between combos, a bimodal gap distribution that 20 splits cleanly).
+For MK2, 20 is a transplanted default pending a per-game measurement — "a
+default correct for two subjects is not a law".

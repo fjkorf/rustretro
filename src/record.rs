@@ -1262,15 +1262,14 @@ mod tests {
         assert_eq!(v["block1"]["health"], 100);
         let gkeys: Vec<&str> = v["globals"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
         // Set membership (Value maps sort): gate globals + record_globals.
-        assert_eq!(
-            gkeys,
-            vec!["hit_counter", "p1_health_hud", "p2_health_hud", "round_over", "screen_state"]
-        );
+        // `hit_counter` left both in the W2 cleanup (P1-victim-only, nothing
+        // downstream consumed the column — mk2.profile.json _STATUS).
+        assert_eq!(gkeys, vec!["p1_health_hud", "p2_health_hud", "round_over", "screen_state"]);
         // Serialized order is gate order (word-read screen_state, round_over)
-        // then record_globals order (the hitstun-source HUD pair, hit_counter).
+        // then record_globals order (the hitstun-source HUD pair).
         assert!(text.contains(
             "\"globals\":{\"screen_state\":0,\"round_over\":0,\
-             \"p1_health_hud\":0,\"p2_health_hud\":0,\"hit_counter\":0}"
+             \"p1_health_hud\":0,\"p2_health_hud\":0}"
         ));
         assert!(text.contains("\"block1\":{\"char_id\":7,\"health\":100,\"action_counter\":0}"));
         assert_eq!(v["controllable"], true);
@@ -1452,16 +1451,12 @@ mod tests {
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
         assert!(ds.write_addr((p.block1() + coff) as usize, 1, 9));
         assert!(ds.write_addr((p.block2() + coff) as usize, 1, 9));
-        // These raw globals are DISPROVEN as a position source (task B-prof,
-        // docs/frames.md §5) and no fighter field references them anymore,
-        // so this recorder's `opp_right` has no x to read for mk2 and falls
-        // back to its "left fighter is P1" default (`record.rs`'s
-        // `opp_right` doc) — which happens to match the facing this test
-        // wants (block1 left/facing right, block2 right/facing left)
-        // WITHOUT these writes doing anything. Left in place as evidence
-        // that they are inert, not load-bearing, for this recorder version.
-        assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
-        assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
+        // No x staged: the raw p1_x/p2_x globals are DISPROVEN as a position
+        // source (task B-prof, docs/frames.md §5) and were REMOVED in the W2
+        // cleanup, so this recorder's `opp_right` has no x to read for mk2
+        // and falls back to its "left fighter is P1" default (`record.rs`'s
+        // `opp_right` doc) — which matches the facing this test wants
+        // (block1 left/facing right, block2 right/facing left).
         assert!(crate::gate::eval_gate(&ds, &p));
 
         let path = tmp("shadow_rec_specials");

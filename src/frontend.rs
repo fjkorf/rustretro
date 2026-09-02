@@ -38,6 +38,31 @@ pub struct Frontend {
     save_dir: PathBuf,
     /// ROM file stem used to name slot save-state files.
     rom_stem: Option<String>,
+    /// Cumulative per-subsystem `try_lock` skip counters (see
+    /// [`crate::debug::LockSkips`]). They live HERE, not on `DebugState`,
+    /// because at the moment of a skip the `debug_state` mutex is exactly the
+    /// lock that was contended — incrementing a `DebugState` field would
+    /// require the lock we just failed to take. Plain `u64`s (no atomics)
+    /// suffice: `run_frame` only ever runs on the emulation thread, which is
+    /// the sole writer. Published into `DebugState::lock_skips` every frame
+    /// under `run_frame`'s end-of-frame hard lock (the `step_generation`
+    /// acquisition, which runs unconditionally), so MCP/panel readers see
+    /// them at most one frame stale.
+    lock_skips: crate::debug::LockSkips,
+    /// Snapshot of `lock_skips` as of the last rate-limited stderr report —
+    /// the baseline `maybe_report_lock_skips` diffs against.
+    lock_skips_reported: crate::debug::LockSkips,
+    /// When the last rate-limited stderr report was printed.
+    lock_skips_last_report: std::time::Instant,
+    /// Whether an input-slot playback was ACTIVELY consuming frames
+    /// (`PlaybackSlot::started && !done`) as of the end of the PREVIOUS
+    /// frame, cached under that frame's hard lock. Consulted when a
+    /// `training::tick` skip happens (the lock is unreadable right then);
+    /// one frame stale, which is conservative-correct — a playback can only
+    /// START via `playback::tick` inside the very `training::tick` that was
+    /// skipped, so "was playing last frame" can't miss a playback that
+    /// began this frame.
+    playback_active_hint: bool,
 }
 
 /// Resolve the on-disk path of save-state slot `slot` (1..=9) for a ROM:
@@ -108,6 +133,10 @@ impl Frontend {
             shadow_info_dirty: false,
             save_dir: save_dir.clone(),
             rom_stem: rom_stem.clone(),
+            lock_skips: crate::debug::LockSkips::default(),
+            lock_skips_reported: crate::debug::LockSkips::default(),
+            lock_skips_last_report: std::time::Instant::now(),
+            playback_active_hint: false,
         };
 
         // Store sidecar path in debug state and try to load existing data
@@ -694,7 +723,17 @@ impl Frontend {
                 Ok(ds) if is_obj => profile.object_ptr_field(block, "x", |addr, size| {
                     endian_fix(ds.read_addr(addr as usize, size as usize).unwrap_or(0), size, little)
                 }),
-                Ok(ds) => fixed.and_then(|(a, s)| ds.read_addr(a as usize, s as usize)).map(|v| v as i64),
+                // Endian-fixed to match training.rs's `rd16`/`read_via_x`
+                // fixed-address path: `read_addr` assembles bytes little-
+                // endian, so a big-endian guest's (68k) 2-byte x read raw
+                // would be byte-swapped — deltas across a 256 boundary then
+                // come out huge and wrong-signed, corrupting the burst
+                // judgement. The object_ptr arm above already fixes this via
+                // its reader closure.
+                Ok(ds) => fixed.and_then(|(a, s)| {
+                    ds.read_addr(a as usize, s as usize)
+                        .map(|v| endian_fix(v, s, little) as i64)
+                }),
                 Err(_) => None,
             };
             samples.push((going_right, sample));
@@ -1440,10 +1479,15 @@ impl Frontend {
         if self.frame_count % 60 == 0 {
             let pins = crate::profile::current().resolved_pins();
             if !pins.is_empty() {
-                if let Ok(mut ds) = self.debug_state.try_lock() {
-                    for (addr, value) in pins {
-                        let _ = ds.write_addr(addr as usize, 1, value as u32);
+                match self.debug_state.try_lock() {
+                    Ok(mut ds) => {
+                        for (addr, value) in pins {
+                            let _ = ds.write_addr(addr as usize, 1, value as u32);
+                        }
                     }
+                    // Contended: this second's pin rewrite is LOST (next
+                    // attempt is ~60 frames away) — count it (see LockSkips).
+                    Err(_) => self.lock_skips.pins += 1,
                 }
             }
         }
@@ -1451,16 +1495,32 @@ impl Frontend {
         // --- Training mode (--training): enforce sandbox + drive the dummy.
         // After the snapshot refresh so reads see this frame; its bus writes
         // drain next frame.
-        if let Ok(mut ds) = self.debug_state.try_lock() {
-            crate::training::tick(&mut ds, self.frame_count);
+        //
+        // A contended try_lock here SKIPS training::tick — and playback::tick
+        // inside it — for this real emulated frame. That is a determinism
+        // hazard (playback.rs's replay argument assumes one tick per real
+        // frame), so it is COUNTED, not silent; the counters are published
+        // and rate-limit-reported at the end of this frame (see LockSkips).
+        match self.debug_state.try_lock() {
+            Ok(mut ds) => crate::training::tick(&mut ds, self.frame_count),
+            Err(_) => {
+                self.lock_skips.training += 1;
+                if self.playback_active_hint {
+                    // Worst case: an input-slot playback was actively
+                    // consuming frames — its recorded stream just slipped a
+                    // frame relative to emulation. Tracked distinctly.
+                    self.lock_skips.training_during_playback += 1;
+                }
+            }
         }
 
         // --- Shadow bot (--shadow): decide every P frames while the fight
         // gate is open and inject the sampled intent on port 1. Runs AFTER
         // training::tick so its injection wins over a non-Free dummy preset.
         if let Some(sh) = self.shadow.as_mut() {
-            if let Ok(mut ds) = self.debug_state.try_lock() {
-                sh.tick(&mut ds, self.frame_count);
+            match self.debug_state.try_lock() {
+                Ok(mut ds) => sh.tick(&mut ds, self.frame_count),
+                Err(_) => self.lock_skips.shadow += 1,
             }
         }
 
@@ -1468,6 +1528,9 @@ impl Frontend {
         self.maybe_capture_bookmark();
 
         // --- Save regions sidecar if requested ---
+        // (These two flag checks also use try_lock, but a contended frame is
+        // harmless here: the flag stays set in DebugState and the save just
+        // happens a frame later — nothing is lost, so no skip counter.)
         let needs_save = self.debug_state.try_lock()
             .map(|mut ds| { let v = ds.save_regions; ds.save_regions = false; v })
             .unwrap_or(false);
@@ -1519,11 +1582,42 @@ impl Frontend {
         // sleep-8ms settle with an actual completion signal).
         {
             let mut ds = self.debug_state.lock().unwrap();
+            // Publish the try_lock skip counters (owned by Frontend — see
+            // `lock_skips`'s field doc) under this guaranteed, every-frame
+            // acquisition so MCP/panel readers can observe them; and cache
+            // whether an input-slot playback is actively consuming frames,
+            // for next frame's "skip during playback" classification (the
+            // lock is by definition unreadable at skip time).
+            ds.lock_skips = self.lock_skips;
+            self.playback_active_hint = ds
+                .playback_slot
+                .as_ref()
+                .map_or(false, |p| p.started && !p.done);
             ds.step_generation = ds.step_generation.wrapping_add(1);
             ds.frame_cv.notify_all();
         }
 
+        // Rate-limited stderr surfacing of any skips counted above (after
+        // the lock is released — eprintln needs no lock).
+        self.maybe_report_lock_skips();
+
         Ok(self.callback_context.video_real > 0)
+    }
+
+    /// Print the rate-limited `[lock-skip]` stderr report when warranted (see
+    /// [`lock_skip_should_report`] for the policy and
+    /// [`lock_skip_report`] for the format), then advance the baseline. The
+    /// decision and formatting are pure functions so they're unit-testable;
+    /// this wrapper only owns the clock and the baseline bookkeeping.
+    fn maybe_report_lock_skips(&mut self) {
+        let delta = self.lock_skips.delta_since(&self.lock_skips_reported);
+        let elapsed = self.lock_skips_last_report.elapsed().as_secs_f64();
+        if !lock_skip_should_report(&delta, elapsed) {
+            return;
+        }
+        eprintln!("{}", lock_skip_report(&delta, &self.lock_skips, self.frame_count));
+        self.lock_skips_reported = self.lock_skips;
+        self.lock_skips_last_report = std::time::Instant::now();
     }
 
     /// Borrow the current framebuffer: (data, width, height, pitch, pixel_format).
@@ -2132,6 +2226,59 @@ fn x_is_readable(profile: &crate::profile::GameProfile, block: u8) -> bool {
     profile.field_is_object_ptr("x") || profile.field_addr(block, "x").is_some()
 }
 
+/// Ordinary lock-skip reports are throttled to one per this many seconds.
+const LOCK_SKIP_REPORT_SECS: f64 = 5.0;
+/// Skips that landed during an ACTIVE input-slot playback (replay
+/// determinism broken) report faster — still rate-limited, but at most one
+/// per second, so a sustained contention storm during playback can't spam.
+const LOCK_SKIP_PLAYBACK_REPORT_SECS: f64 = 1.0;
+
+/// Whether a `[lock-skip]` stderr report should be printed now, given the
+/// skips accumulated since the last report (`delta`) and the seconds elapsed
+/// since it. Pure so the rate-limit policy is unit-testable without a clock:
+/// nothing new → never; something new → after [`LOCK_SKIP_REPORT_SECS`];
+/// a playback-determinism-breaking skip → after the shorter
+/// [`LOCK_SKIP_PLAYBACK_REPORT_SECS`].
+fn lock_skip_should_report(delta: &crate::debug::LockSkips, elapsed_secs: f64) -> bool {
+    if delta.training_during_playback > 0 {
+        return elapsed_secs >= LOCK_SKIP_PLAYBACK_REPORT_SECS;
+    }
+    delta.any() && elapsed_secs >= LOCK_SKIP_REPORT_SECS
+}
+
+/// Format the `[lock-skip]` report line: only the subsystems that actually
+/// skipped since the last report appear (`+delta (total cumulative)` each),
+/// and a skip during ACTIVE input-slot playback gets its own loud clause —
+/// that is the case that breaks replay determinism outright. Pure for
+/// testability; [`Frontend::maybe_report_lock_skips`] prints it.
+fn lock_skip_report(
+    delta: &crate::debug::LockSkips,
+    total: &crate::debug::LockSkips,
+    frame: u64,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if delta.training > 0 {
+        parts.push(format!("training +{} ({} total)", delta.training, total.training));
+    }
+    if delta.shadow > 0 {
+        parts.push(format!("shadow +{} ({} total)", delta.shadow, total.shadow));
+    }
+    if delta.pins > 0 {
+        parts.push(format!("pins +{} ({} total)", delta.pins, total.pins));
+    }
+    let mut line = format!(
+        "[lock-skip] frame {frame}: subsystem tick(s) skipped — debug_state try_lock contended: {}",
+        parts.join(", ")
+    );
+    if delta.training_during_playback > 0 {
+        line.push_str(&format!(
+            "; WARNING: {} training skip(s) during ACTIVE input-slot playback ({} total) — that playback's replay determinism is broken",
+            delta.training_during_playback, total.training_during_playback
+        ));
+    }
+    line
+}
+
 /// Endian-correct a raw multi-byte read of `size` bytes (1/2/4) for the
 /// `via: "object_ptr"` live-read path (docs/frames.md §5) — the pointer word
 /// is 4 bytes, the resolved field 1 or 2. Mirrors `training.rs`'s and
@@ -2464,12 +2611,107 @@ mod sha1_tests {
 }
 
 #[cfg(test)]
+mod lock_skip_tests {
+    use super::{
+        lock_skip_report, lock_skip_should_report, LOCK_SKIP_PLAYBACK_REPORT_SECS,
+        LOCK_SKIP_REPORT_SECS,
+    };
+    use crate::debug::LockSkips;
+
+    #[test]
+    fn delta_since_is_per_field_and_saturating() {
+        let total = LockSkips { training: 5, shadow: 3, pins: 2, training_during_playback: 1 };
+        let base = LockSkips { training: 4, shadow: 3, pins: 0, training_during_playback: 0 };
+        assert_eq!(
+            total.delta_since(&base),
+            LockSkips { training: 1, shadow: 0, pins: 2, training_during_playback: 1 }
+        );
+        // A foreign/greater baseline never underflows (saturating).
+        assert_eq!(base.delta_since(&total), LockSkips::default());
+    }
+
+    #[test]
+    fn any_is_false_only_when_all_subsystem_counters_are_zero() {
+        assert!(!LockSkips::default().any());
+        assert!(LockSkips { training: 1, ..Default::default() }.any());
+        assert!(LockSkips { shadow: 1, ..Default::default() }.any());
+        assert!(LockSkips { pins: 1, ..Default::default() }.any());
+    }
+
+    #[test]
+    fn should_report_never_fires_with_nothing_new() {
+        // No new skips → silent forever, no matter how much time passed.
+        assert!(!lock_skip_should_report(&LockSkips::default(), 1e9));
+    }
+
+    #[test]
+    fn should_report_throttles_ordinary_skips_to_the_long_interval() {
+        let d = LockSkips { training: 2, shadow: 1, ..Default::default() };
+        assert!(!lock_skip_should_report(&d, LOCK_SKIP_REPORT_SECS - 0.1));
+        assert!(lock_skip_should_report(&d, LOCK_SKIP_REPORT_SECS));
+    }
+
+    #[test]
+    fn should_report_fires_faster_for_playback_breaking_skips_but_still_throttled() {
+        let d = LockSkips { training: 1, training_during_playback: 1, ..Default::default() };
+        assert!(!lock_skip_should_report(&d, LOCK_SKIP_PLAYBACK_REPORT_SECS - 0.1));
+        assert!(lock_skip_should_report(&d, LOCK_SKIP_PLAYBACK_REPORT_SECS));
+        // …well before the ordinary interval.
+        assert!(LOCK_SKIP_PLAYBACK_REPORT_SECS < LOCK_SKIP_REPORT_SECS);
+    }
+
+    #[test]
+    fn report_lists_only_subsystems_that_skipped_with_delta_and_total() {
+        let delta = LockSkips { training: 2, pins: 1, ..Default::default() };
+        let total = LockSkips { training: 7, shadow: 4, pins: 1, training_during_playback: 0 };
+        let line = lock_skip_report(&delta, &total, 1234);
+        assert!(line.contains("[lock-skip] frame 1234"));
+        assert!(line.contains("training +2 (7 total)"));
+        assert!(line.contains("pins +1 (1 total)"));
+        // Shadow didn't skip in THIS window — its stale total must not appear.
+        assert!(!line.contains("shadow"));
+        assert!(!line.contains("WARNING"));
+    }
+
+    #[test]
+    fn report_calls_out_the_playback_determinism_break_distinctly() {
+        let delta = LockSkips { training: 1, training_during_playback: 1, ..Default::default() };
+        let total = delta;
+        let line = lock_skip_report(&delta, &total, 60);
+        assert!(line.contains("WARNING"));
+        assert!(line.contains("ACTIVE input-slot playback"));
+        assert!(line.contains("replay determinism is broken"));
+    }
+}
+
+#[cfg(test)]
 mod arena_sidecar_tests {
     use super::{
-        is_arena_path, judge_burst_motion_differential, liveness_precheck, load_arena_meta, x_is_readable,
-        ArenaMeta, InputsLive,
+        endian_fix, is_arena_path, judge_burst_motion_differential, liveness_precheck,
+        load_arena_meta, x_is_readable, ArenaMeta, InputsLive,
     };
     use std::path::Path;
+
+    /// `run_liveness_window`'s fixed-address x sample must decode exactly
+    /// like training.rs's `rd16` (read_via_x's Fixed arm): `read_addr`
+    /// assembles bytes little-endian, so a big-endian guest (68k — asurabld,
+    /// the fixed-x case) needs the swap. Without it, a real +1 step across a
+    /// 256 boundary (0x00FF→0x0100) reads as a huge wrong-signed delta
+    /// (0xFF00→0x0001 = −65279) and corrupts the burst judgement.
+    #[test]
+    fn fixed_x_sample_endian_fix_matches_rd16_semantics() {
+        // Big-endian guest, 2-byte field: swap.
+        assert_eq!(endian_fix(0x0001, 2, false), 0x0100);
+        assert_eq!(endian_fix(0xFF00, 2, false), 0x00FF);
+        // The boundary step decodes monotonically once fixed.
+        assert_eq!(
+            endian_fix(0x0001, 2, false) as i64 - endian_fix(0xFF00, 2, false) as i64,
+            1
+        );
+        // Little-endian guests and single bytes pass through untouched.
+        assert_eq!(endian_fix(0x1234, 2, true), 0x1234);
+        assert_eq!(endian_fix(0x7F, 1, false), 0x7F);
+    }
 
     #[test]
     fn arena_meta_serializes_with_the_expected_shape() {

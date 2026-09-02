@@ -429,10 +429,53 @@ pub enum GateCond {
 pub struct Enforcement {
     pub health_max: u8,
     pub refill_below: u8,
-    /// [seconds byte, subseconds byte] written to round_timer/+1 to hold it.
-    pub timer_hold: [u8; 2],
+    pub timer_hold: TimerHold,
     pub credits_target: u8,
     pub credits_min: u8,
+}
+
+/// How training holds the round timer — two declarative forms, because two
+/// real layouts exist (docs/game-profiles.md):
+///
+/// - **Adjacent** (legacy, asurabld/genesis shape): `[seconds byte,
+///   subseconds byte]` written to the `round_timer` global and `+1` every
+///   tick. Kept verbatim — asurabld's training tests are the proof.
+/// - **Guarded** (MK2-arcade shape, mk2.md "The round timer, closed"): the
+///   authoritative store is a task-record SLOT that hosts DIFFERENT tasks on
+///   menu screens, so every write is gated on a guard word first: write the
+///   `writes` list (u8 each) only while the u32/u16/u8 at `guard.global`
+///   equals `guard.equals`; on mismatch skip silently (the slot belongs to
+///   someone else right now). The guard value is compared after the same
+///   guest-endianness fix every profile read gets — MK2's exposed region is
+///   little-endian, so `equals: "0x0106B820"` matches the raw LE bytes
+///   `20 B8 06 01` at 0xD632.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TimerHold {
+    /// Legacy: [seconds byte, subseconds byte] → `round_timer`/+1.
+    Adjacent([u8; 2]),
+    /// Guard-checked multi-write (task-record slots, MK2 arcade).
+    Guarded {
+        guard: TimerGuard,
+        writes: Vec<TimerWrite>,
+    },
+}
+
+/// The guard of a [`TimerHold::Guarded`]: only write while the `size`-byte
+/// value at `global` equals `equals` (guest endianness).
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TimerGuard {
+    pub global: String,
+    /// Read width in bytes: 1, 2, or 4 (validated at load).
+    pub size: u8,
+    pub equals: HexAddr,
+}
+
+/// One byte written while a [`TimerHold::Guarded`]'s guard matches.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TimerWrite {
+    pub global: String,
+    pub value: u8,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1088,6 +1131,31 @@ impl GameProfile {
         for rg in &port.memory.record_globals {
             if !port.memory.globals.contains_key(&rg.name) {
                 return Err(format!("record_globals names unknown global '{}'", rg.name));
+            }
+        }
+
+        // Validate a guarded timer_hold: every named global must exist (a
+        // typo must fail the load, not silently decline the feature — the
+        // legacy Adjacent form keeps its lookup-by-convention `round_timer`
+        // soft-decline unchanged), and the guard width must be readable.
+        if let TimerHold::Guarded { guard, writes } = &port.enforcement.timer_hold {
+            if !matches!(guard.size, 1 | 2 | 4) {
+                return Err(format!(
+                    "enforcement.timer_hold guard size {} is not 1/2/4",
+                    guard.size
+                ));
+            }
+            if writes.is_empty() {
+                return Err("enforcement.timer_hold guarded form has no writes".into());
+            }
+            for name in std::iter::once(guard.global.as_str())
+                .chain(writes.iter().map(|w| w.global.as_str()))
+            {
+                if !port.memory.globals.contains_key(name) {
+                    return Err(format!(
+                        "enforcement.timer_hold names unknown global '{name}'"
+                    ));
+                }
             }
         }
 
@@ -1799,7 +1867,7 @@ mod tests {
             assert!(p.port.attack_chords.contains_key(class), "{class} chord missing");
         }
         assert_eq!(p.port.enforcement.health_max, 0xEF);
-        assert_eq!(p.port.enforcement.timer_hold, [0x85, 0x03]);
+        assert_eq!(p.port.enforcement.timer_hold, TimerHold::Adjacent([0x85, 0x03]));
         assert_eq!(p.calibration("GROUND_Y"), Some(216.0));
     }
 
@@ -2051,6 +2119,55 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("record_globals names unknown global"));
+    }
+
+    /// The guarded timer_hold form (mk2.md "The round timer, closed"):
+    /// parses into `TimerHold::Guarded`, and load-validation rejects a name
+    /// that isn't a declared global — a typo must fail loudly, never decline
+    /// the feature silently.
+    #[test]
+    fn timer_hold_guarded_parses_and_validates_names() {
+        let tmpbase = make_test_dir("timer_hold_guarded");
+        let game_dir = tmpbase.join("guarded");
+        fs::create_dir(&game_dir).unwrap();
+        let family_json = r#"{"family":"guarded","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let mk = |timer_hold: &str| {
+            format!(
+                r#"{{"family":"guarded","port":"test","core":{{"library_name":"","provenance_game":"guarded","provenance_core":"test"}},"memory":{{"blocks":{{"block1":"0x0","block2":"0x0","stride":"0x0"}},"fighter_fields":[],"globals":{{"task_code":"0xD632","task_tens":"0xD636","task_ones":"0xD63A"}}}},"gate":[],"enforcement":{{"health_max":255,"refill_below":1,"timer_hold":{timer_hold},"credits_target":0,"credits_min":0}},"calibration":{{}},"attack_chords":{{}}}}"#
+            )
+        };
+        let good = r#"{"guard":{"global":"task_code","size":4,"equals":"0x0106B820"},"writes":[{"global":"task_tens","value":9},{"global":"task_ones","value":9}]}"#;
+        fs::write(game_dir.join("guarded.profile.json"), mk(good)).unwrap();
+        let p = GameProfile::load(&game_dir).unwrap();
+        match &p.port.enforcement.timer_hold {
+            TimerHold::Guarded { guard, writes } => {
+                assert_eq!(guard.global, "task_code");
+                assert_eq!(guard.size, 4);
+                assert_eq!(guard.equals, HexAddr(0x0106_B820));
+                assert_eq!(
+                    writes,
+                    &vec![
+                        TimerWrite { global: "task_tens".into(), value: 9 },
+                        TimerWrite { global: "task_ones".into(), value: 9 },
+                    ]
+                );
+            }
+            other => panic!("expected the guarded form, got {other:?}"),
+        }
+
+        // A write naming an undeclared global fails the LOAD.
+        let bad = r#"{"guard":{"global":"task_code","size":4,"equals":"0x0106B820"},"writes":[{"global":"task_typo","value":9}]}"#;
+        fs::write(game_dir.join("guarded.profile.json"), mk(bad)).unwrap();
+        let err = GameProfile::load(&game_dir).unwrap_err();
+        assert!(err.contains("timer_hold names unknown global 'task_typo'"), "{err}");
+
+        // An unreadable guard width fails the LOAD.
+        let bad_size = r#"{"guard":{"global":"task_code","size":3,"equals":"0x0106B820"},"writes":[{"global":"task_tens","value":9}]}"#;
+        fs::write(game_dir.join("guarded.profile.json"), mk(bad_size)).unwrap();
+        let err = GameProfile::load(&game_dir).unwrap_err();
+        assert!(err.contains("guard size 3"), "{err}");
     }
 
     #[test]
@@ -2510,7 +2627,9 @@ mod tests {
     }
 
     /// mk2's shipped profile: `x` is pointer-resolved, `y` too (signed), and
-    /// `p1_x`/`p2_x` are disproven-but-retained globals no field references.
+    /// the DISPROVEN raw globals are gone (W2 cleanup): evidence lives in
+    /// mk2.md, and a profile global is a machine-readable claim other tools
+    /// may bind — history is not a reason to keep one.
     #[test]
     fn mk2_ships_x_and_y_as_object_ptr_fields() {
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
@@ -2518,10 +2637,12 @@ mod tests {
         assert!(p.field_is_object_ptr("y"));
         assert_eq!(p.field_addr(1, "x"), None, "no fixed address for a pointer-resolved field");
         assert_eq!(p.field_off("y"), None);
-        // The disproven raw globals are still declared (evidence / other
-        // tools) but no fighter field references them anymore.
-        assert!(p.global("p1_x").is_some());
-        assert!(p.global("p2_x").is_some());
+        // The disproven globals (object-pool-slot "positions", the constant
+        // facing byte, the P1-victim-only hit_counter) are REMOVED, so no
+        // consumer can quietly re-adopt them by name.
+        for gone in ["p1_x", "p2_x", "p1_screen_x", "p1_facing", "hit_counter"] {
+            assert!(p.global(gone).is_none(), "disproven global '{gone}' must stay removed");
+        }
         assert!(p.port.memory.blocks.object_ptr.is_some());
         let obj_ptr = p.port.memory.blocks.object_ptr.as_ref().unwrap();
         assert_eq!(obj_ptr.off.0, -0xC);

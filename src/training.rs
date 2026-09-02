@@ -7,7 +7,13 @@
 //! the dummy while its unmapped enforcements (timer hold, credits, position
 //! reset) decline individually:
 //! - **credits topped up** so Start always works (`credits` global),
-//! - **round timer held** — no timeouts (`round_timer` global),
+//! - **round timer held** — no timeouts. Two profile forms
+//!   ([`crate::profile::TimerHold`]): the legacy `[sec, subsec]` pair
+//!   written to `round_timer`/+1 (asurabld, genesis), and the guarded
+//!   multi-write for task-record timer slots (MK2 arcade's 0xD630 countdown
+//!   task, mk2.md "The round timer, closed") — every write there is gated on
+//!   the slot's code-pointer word matching first, because menu screens host
+//!   DIFFERENT tasks in the same slot,
 //! - **health refill**: below the threshold every mapped health byte is
 //!   rewritten to max — fighter-block health/health2 plus any per-player HUD
 //!   accumulator globals (`p1_health_hud`/`p2_health_hud`; MK2 damages all
@@ -153,10 +159,23 @@ struct Reset {
 /// as plain locals rather than a cached/static struct so the profile stays
 /// hot-swappable-in-theory and the hot path stays simple (small `Vec`/`BTreeMap`
 /// lookups on a handful of fields, once per emulated frame — cheap).
+/// The resolved timer-hold enforcement (profile `enforcement.timer_hold`,
+/// [`crate::profile::TimerHold`]) with every global name already turned into
+/// an address.
+enum TimerEnf {
+    /// Legacy: `hold[0]` → `addr`, `hold[1]` → `addr + 1`, every tick.
+    Adjacent { addr: u32, hold: [u8; 2] },
+    /// Guard-checked (task-record slots): write each `(addr, value)` u8 only
+    /// while the `size`-byte guard read equals `equals` — the tick honors the
+    /// guard EVERY time it writes, because the slot hosts different tasks on
+    /// menu screens (mk2.md); a mismatch skips silently.
+    Guarded { guard_addr: u32, guard_size: u8, equals: u32, writes: Vec<(u32, u8)> },
+}
+
 struct Resolved {
     little: bool,
     refill: Option<Refill>,
-    timer: Option<(u32, [u8; 2])>,
+    timer: Option<TimerEnf>,
     credits: Option<(u32, u8, u8)>,
     reset: Option<Reset>,
     finish: Option<u32>,
@@ -384,7 +403,26 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
     Some(Resolved {
         little: p.port.memory.endianness == "little",
         refill,
-        timer: g("round_timer").map(|a| (a, e.timer_hold)),
+        timer: match &e.timer_hold {
+            // Legacy pair: keyed on the conventional `round_timer` global —
+            // unmapped (MK2 pre-W2, sf2ce) declines the feature softly.
+            crate::profile::TimerHold::Adjacent(hold) => {
+                g("round_timer").map(|addr| TimerEnf::Adjacent { addr, hold: *hold })
+            }
+            // Guarded form: names were load-validated, so resolution here
+            // cannot silently miss — but stay total anyway.
+            crate::profile::TimerHold::Guarded { guard, writes } => (|| {
+                Some(TimerEnf::Guarded {
+                    guard_addr: g(&guard.global)?,
+                    guard_size: guard.size,
+                    equals: guard.equals.0,
+                    writes: writes
+                        .iter()
+                        .map(|w| Some((g(&w.global)?, w.value)))
+                        .collect::<Option<Vec<_>>>()?,
+                })
+            })(),
+        },
         credits: g("credits").map(|a| (a, e.credits_target, e.credits_min)),
         reset,
         finish: g("round_state"),
@@ -842,10 +880,31 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
         return;
     }
     ds.training.punish_gate_grace = 0;
-    // Hold the round clock.
-    if let Some((addr, hold)) = r.timer {
-        wr8(ds, addr, hold[0]);
-        wr8(ds, addr + 1, hold[1]);
+    // Hold the round clock — every frame while the gate is open (cheap; the
+    // MK2 recipe tolerates any cadence up to ~260 frames, mk2.md).
+    match &r.timer {
+        Some(TimerEnf::Adjacent { addr, hold }) => {
+            wr8(ds, *addr, hold[0]);
+            wr8(ds, *addr + 1, hold[1]);
+        }
+        Some(TimerEnf::Guarded { guard_addr, guard_size, equals, writes }) => {
+            // The guard is checked on EVERY write pass: the timer slot is a
+            // task record that hosts DIFFERENT tasks on menu screens (the
+            // countdown-screen task shares the address with a different code
+            // pointer — mk2.md "The round timer, closed"). Mismatch = the
+            // slot is not ours right now; skip silently, no log spam.
+            let cur = endian_fix(
+                ds.read_addr(*guard_addr as usize, *guard_size as usize).unwrap_or(0),
+                *guard_size,
+                r.little,
+            );
+            if cur == *equals {
+                for (addr, value) in writes {
+                    wr8(ds, *addr, *value);
+                }
+            }
+        }
+        None => {}
     }
     // Health refill: let damage show, never let anyone die. Every mapped
     // accumulator for the refilled fighter is rewritten (MK2's HUD pair
@@ -1276,19 +1335,22 @@ mod tests {
     #[test]
     fn mk2_degrades_per_feature() {
         // MK2's map is partial by honesty (mk2.md): gate + health + world X/Y
-        // exist (X/Y now pointer-resolved, docs/frames.md §5); timer store,
-        // credits (CMOS), and round_state don't. `positions` (round-start
-        // teleport coordinates) is also unmapped, so position_reset stays
-        // declined regardless of x/y being resolvable.
+        // exist (X/Y pointer-resolved, docs/frames.md §5), and since W2 the
+        // timer store does too (the guarded 0xD630 task-record form — the
+        // panel's "Not mapped" line loses "timer hold"); credits (CMOS) and
+        // round_state still don't. `positions` (round-start teleport
+        // coordinates) is also unmapped, so position_reset stays declined
+        // regardless of x/y being resolvable.
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
         let f = features_of(&p).expect("mk2 must be training-available (has a gate)");
         assert!(f.refill, "health field + HUD pair are mapped");
         assert!(f.block_dummy, "MK is button-block: the Block chord is mapped");
         assert!(f.block_punish, "contact_signal (struct health, decrease-only) is mapped");
-        assert!(!f.timer_hold && !f.credits && !f.position_reset && !f.finish_round);
+        assert!(f.timer_hold, "the guarded timer_hold form resolves (mk2.md 0xD630)");
+        assert!(!f.credits && !f.position_reset && !f.finish_round);
         assert_eq!(
             f.missing(),
-            vec!["timer hold", "credits top-up", "position reset", "finish round"]
+            vec!["credits top-up", "position reset", "finish round"]
         );
         // And the refill spec includes all four MK2 health bytes.
         let r = resolve(&p).unwrap();
@@ -1302,6 +1364,87 @@ mod tests {
         };
         let held: Vec<usize> = chord.iter().enumerate().filter(|(_, on)| **on).map(|(i, _)| i).collect();
         assert_eq!(held, vec![10], "Block = RETRO L");
+    }
+
+    /// The MK2 arcade countdown-task guard address/value/digit cells, from
+    /// mk2.md "The round timer, closed" — via the profile, never hardcoded
+    /// into the tick (these are only here so the test can STAGE the slot).
+    fn mk2_timer_addrs(p: &GameProfile) -> (usize, usize, usize) {
+        (
+            p.global("timer_task_code").unwrap() as usize,
+            p.global("timer_task_tens").unwrap() as usize,
+            p.global("timer_task_ones").unwrap() as usize,
+        )
+    }
+    const MK2_COUNTDOWN_TASK: u32 = 0x0106_B820;
+
+    /// MK2 in a bus window with an open gate and a staged countdown-task
+    /// slot at 0xD630 (guard word + digit cells).
+    fn mk2_timer_scene() -> (GameProfile, DebugState) {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-timer-test".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 161));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 161));
+        assert!(crate::gate::eval_gate(&ds, &p), "gate must be open");
+        ds.training.enabled = true;
+        (p, ds)
+    }
+
+    /// Guard MATCH: the tick writes 9 into BOTH digit cells (u8 writes — the
+    /// cells are u32s whose value never exceeds 9, so the high bytes are
+    /// already zero and stay untouched).
+    #[test]
+    fn mk2_timer_hold_writes_digits_while_the_countdown_task_owns_the_slot() {
+        let (p, mut ds) = mk2_timer_scene();
+        let (code, tens, ones) = mk2_timer_addrs(&p);
+        assert!(ds.write_addr(code, 4, MK2_COUNTDOWN_TASK));
+        assert!(ds.write_addr(tens, 4, 3));
+        assert!(ds.write_addr(ones, 4, 7));
+        tick_with(&mut ds, 1, &p);
+        assert_eq!(ds.read_addr(tens, 4), Some(9), "tens pinned to 9");
+        assert_eq!(ds.read_addr(ones, 4), Some(9), "ones pinned to 9");
+        // And every frame while the gate stays open (the sag-absorbing
+        // cadence: the recipe needs ≤~260 frames, we give it 1).
+        assert!(ds.write_addr(ones, 4, 8)); // a tick decremented it
+        tick_with(&mut ds, 2, &p);
+        assert_eq!(ds.read_addr(ones, 4), Some(9), "re-pinned next frame");
+    }
+
+    /// Guard MISMATCH (the countdown-screen task, pointer 0x0106B840, hosts
+    /// the same slot on menu screens — mk2.md): the write is skipped
+    /// SILENTLY and the digit cells keep their values.
+    #[test]
+    fn mk2_timer_hold_skips_silently_when_another_task_owns_the_slot() {
+        let (p, mut ds) = mk2_timer_scene();
+        let (code, tens, ones) = mk2_timer_addrs(&p);
+        assert!(ds.write_addr(code, 4, 0x0106_B840));
+        assert!(ds.write_addr(tens, 4, 3));
+        assert!(ds.write_addr(ones, 4, 7));
+        let logs_before = ds.event_log.len();
+        tick_with(&mut ds, 1, &p);
+        assert_eq!(ds.read_addr(tens, 4), Some(3), "guard mismatch: no write");
+        assert_eq!(ds.read_addr(ones, 4), Some(7), "guard mismatch: no write");
+        assert_eq!(ds.event_log.len(), logs_before, "skip is silent — no log spam");
+    }
+
+    /// The legacy Adjacent form is untouched by the guarded form's arrival:
+    /// asurabld's tick still writes `timer_hold[0]`/`[1]` to
+    /// `round_timer`/+1 unconditionally while in-fight.
+    #[test]
+    fn asurabld_legacy_timer_hold_still_writes_round_timer_pair() {
+        let (p, mut ds) = asurabld_scene();
+        let timer = p.global("round_timer").unwrap() as usize;
+        tick_with(&mut ds, 1, &p);
+        assert_eq!(ds.read_addr(timer, 1), Some(0x85), "seconds byte held (BCD 85)");
+        assert_eq!(ds.read_addr(timer + 1, 1), Some(0x03), "subseconds byte held");
     }
 
     #[test]
@@ -1724,8 +1867,8 @@ mod tests {
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
-        assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
-        assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
+        // No x staged: mk2's x is pointer-resolved (the DISPROVEN p1_x/p2_x
+        // globals are removed), and the button guard doesn't need geometry.
         ds.training.enabled = true;
         ds.training.dummy = DummyMode::BlockPunish;
         ds.training.punish_pool = vec![(crate::macros::PunishOption::Attack("HP".into()), 1)];
@@ -2125,8 +2268,8 @@ mod tests {
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
-        assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
-        assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
+        // No x staged: mk2's x is pointer-resolved (the DISPROVEN p1_x/p2_x
+        // globals are removed) and the button-block dummy needs no geometry.
         assert!(crate::gate::eval_gate(&ds, &p), "gate must be open for this test");
 
         ds.training.enabled = true;

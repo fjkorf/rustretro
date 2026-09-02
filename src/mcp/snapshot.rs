@@ -11,7 +11,7 @@
 
 use serde::Serialize;
 
-use crate::debug::{DebugState, MemoryRegion};
+use crate::debug::{DebugState, LockSkips, MemoryRegion};
 
 /// One memory-region summary line: metadata only, never the bytes.
 #[derive(Serialize, Clone)]
@@ -76,6 +76,13 @@ pub struct AiSnapshot {
     pub counts: SnapshotCounts,
     /// The shared navigation cursor's current address, if any.
     pub nav_address: Option<u32>,
+    /// Cumulative counts of per-frame subsystem ticks (training / shadow /
+    /// pins) `run_frame` skipped because its `debug_state` try_lock was
+    /// contended — the determinism-observability counters (see
+    /// [`crate::debug::LockSkips`]; `training_during_playback > 0` means an
+    /// input-slot playback's replay determinism was broken). All zero on a
+    /// healthy session; refreshed every frame, at most one frame stale.
+    pub lock_skips: LockSkips,
 }
 
 impl AiSnapshot {
@@ -127,6 +134,7 @@ impl AiSnapshot {
                 heatmap_entries: ds.pc_heatmap.len(),
             },
             nav_address: ds.nav.current_address,
+            lock_skips: ds.lock_skips,
         }
     }
 }
@@ -922,6 +930,31 @@ mod tests {
         // And it actually serializes to JSON without panicking.
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"frame_count\":1234"));
+    }
+
+    /// The try_lock skip counters (`DebugState::lock_skips`, mirrored from
+    /// `Frontend` each frame) must project into the snapshot verbatim and
+    /// serialize with their field names — this is the read-only surface an
+    /// agent polls to check nothing was silently skipped under contention.
+    #[test]
+    fn snapshot_projects_lock_skip_counters() {
+        let mut ds = DebugState::new();
+        // Default state: all zero (healthy session).
+        let snap = AiSnapshot::from_debug_state(&ds);
+        assert_eq!(snap.lock_skips, LockSkips::default());
+
+        ds.lock_skips = LockSkips { training: 3, shadow: 2, pins: 1, training_during_playback: 1 };
+        let snap = AiSnapshot::from_debug_state(&ds);
+        assert_eq!(snap.lock_skips.training, 3);
+        assert_eq!(snap.lock_skips.shadow, 2);
+        assert_eq!(snap.lock_skips.pins, 1);
+        assert_eq!(snap.lock_skips.training_during_playback, 1);
+
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["lock_skips"]["training"], 3);
+        assert_eq!(json["lock_skips"]["shadow"], 2);
+        assert_eq!(json["lock_skips"]["pins"], 1);
+        assert_eq!(json["lock_skips"]["training_during_playback"], 1);
     }
 
     #[test]

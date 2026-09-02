@@ -16,6 +16,17 @@ architecture for game #2 (sf2ce) and beyond (MK2 arcade/Genesis).
   list, enforcement values, stage/opponent selector, feature calibration,
   attack-class → button-chord table, per-core button-name table.
 
+  `enforcement.timer_hold` accepts two forms (authoritative rustdoc:
+  `src/profile.rs::TimerHold`): the legacy `[u8, u8]` array (written to the
+  `round_timer` global and `+1` each in-fight frame), or a guarded object —
+  `{ "guard": { "global", "size" (1|2|4), "equals" (hex) }, "writes":
+  [ { "global", "value" (u8) }, ... ] }` — for timer stores living in
+  task-record slots that host DIFFERENT tasks per screen: writes land only
+  while the guard word matches (guest endianness), skipped silently
+  otherwise. Guarded-form global names are load-validated; the reference
+  instance is MK2 arcade's `0xD630` countdown task (mk2.md "The round
+  timer, closed").
+
 Loaded once at startup: `--game library/<game>` (default `library/asurabld`)
 → `profile::init(dir)`; consumers call `profile::current()`. The Python side
 (`shadow_train.profile`) reads the SAME files. Model `meta.json` carries
