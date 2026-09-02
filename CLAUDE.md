@@ -149,6 +149,24 @@ in `shadow/train/shadow_train/dataset.py`).
 - WRAM snapshot via bus window costs ~10 ms; snapshot-diff + pause/step is
   the effective RE discovery method (see asurabld.md for the session log).
 
+## Project skills — the manuals
+
+`CLAUDE.md` is the map; `.claude/skills/` holds the manuals. Invoke by name:
+
+| skill | for |
+|---|---|
+| `/re-probe` | live memory-RE session: launch, phase discipline, snapshot-diff, write-tests, menu macros, transport quirks |
+| `/frame-lab-run` | measuring frame data: the act-again probe, its preconditions, the laws, and the refusal rules |
+| `/encode-moves` | auditing a character's special-move inputs live — both readings, negative controls, disproven readings recorded |
+| `/fit-ghost` | the record → fit → fight loop |
+| `/port-game` | bringing a new game or port up |
+| `/wrap-session` | session-end discipline |
+
+Skills carry PROTOCOL, never a game's numbers — facts live in
+`library/<family>/<port>.md` and the profile JSON. Overclaiming in a skill is
+worse than in a commit: a skill is standing guidance for sessions that cannot
+check it.
+
 ## The frame lab — measured frame data
 
 `docs/frames.md` is the NORMATIVE contract for measured frame data (startup /
@@ -186,6 +204,23 @@ settings now persist to `rustretro_training_v1.json` (cwd, gitignored).
   found it.
 - **Absent is not zero.** One schema change from "synthesized 0" to "absent"
   exposed five consumers that had all been reporting success on frozen data.
+  A cap that renders identically to a measurement is the most dangerous kind:
+  a whiff glyph hid an entire move twice.
+- **A second RIG, not a second observable.** Cross-method agreement buys
+  precision, never truth — three wrong numbers survived because two
+  observables agreed, sharing a flawed subtraction, a stale input frame, and
+  incompatible units. The only number ever CONFIRMED rather than corrected
+  was hitstop, when an unrelated input-timing rig reproduced it exactly.
+  Before believing a result, name the control you did not run.
+- **A default correct for two subjects is not a law.** Every scaling bug in
+  this project has been a default nobody wrote as a decision — a contact
+  horizon, a stance lead-in, a liveness window. Measure them per subject.
+- **A cross-game FACT is the same error as a cross-game address.** An
+  asurabld finding went into an agent brief as an MK2 fact; the agent checked
+  the evidence doc and refused it. This law applies to prompts, not just code.
+- **A test that fails because the work succeeded is a liability.** Three
+  pinned-count assertions broke as measurement progressed; each teaches "edit
+  the number until it passes". Assert invariants, not snapshots.
 
 ## Gotchas
 
