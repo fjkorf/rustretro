@@ -76,7 +76,7 @@
     "size": 1
    }
   ],
-  "_GLOBALS_NOTE": "timer_tens/timer_ones are the DRAWN digits and timer_master/timer_frames are derived/inert (all four write-revert) — read observables only, never enforcement targets; the authoritative store is the 0xD630 countdown TASK RECORD (timer_task_* below, mk2.md 'The round timer, closed'). W2 cleanup 2026-09-01 removed the DISPROVEN globals p1_x/p2_x (object-pool slots, not positions), p1_screen_x (derived), p1_facing (read a constant 2 through a live crossover), and hit_counter (P1-victim-only, also dropped from record_globals) — evidence stays in mk2.md; a declared global is a claim tools may bind, so disproven ones do not get to keep their names here.",
+  "_GLOBALS_NOTE": "timer_tens/timer_ones are the DRAWN digits and timer_master/timer_frames are derived/inert (all four write-revert) — read observables only, never enforcement targets. timer_tens/timer_ones ARE load-bearing as the enforcement.timer_hold eq_global cross-check: the countdown TASK RECORD is found by structural signature each frame (mk2.md 'The round timer, closed'), and its tens/ones cells must equal these drawn digits for a match. W2b cleanup 2026-09-02 REMOVED the fixed-address globals timer_task_code/tens/ones (0xD632/0xD636/0xD63A): a live 1P diagnostic proved the task record physically relocates every fight (base 0xD630 on the 2-human capture rig, but 0xDC42/0xE254 in two 1P fights; the code pointer also varies 0x0106B8xx/0x0106E8xx/0x01071940), so no fixed address or guard value exists — the Guarded form they backed is replaced by the Located form below. W2 cleanup 2026-09-01 removed the DISPROVEN globals p1_x/p2_x (object-pool slots, not positions), p1_screen_x (derived), p1_facing (read a constant 2 through a live crossover), and hit_counter (P1-victim-only, also dropped from record_globals) — evidence stays in mk2.md; a declared global is a claim tools may bind, so disproven ones do not get to keep their names here.",
   "globals": {
    "round_over": "0xC360",
    "screen_state": "0xC37E",
@@ -85,9 +85,6 @@
    "timer_ones": "0xBD76",
    "timer_master": "0xBC20",
    "timer_frames": "0xD396",
-   "timer_task_code": "0xD632",
-   "timer_task_tens": "0xD636",
-   "timer_task_ones": "0xD63A",
    "p1_health_hud": "0xBCA0",
    "p2_health_hud": "0xBC88",
    "credits_hud_ascii": "0x1704D"
@@ -181,22 +178,44 @@
   }
  ],
  "enforcement": {
-  "_TIMER_HOLD_NOTE": "Guarded form (mk2.md 'The round timer, closed', 2026-09-01): the authoritative timer is the countdown TASK RECORD at 0xD630 — digit-split tens/ones u32s (values 0-9). The slot hosts DIFFERENT tasks on menu screens (countdown screen: code pointer 0x0106B840), so every write is gated on the task's code-pointer u32 at 0xD632 equalling 0x0106B820 (compared after the guest-endianness fix; this region is little-endian, raw bytes 20 B8 06 01) — mismatch skips silently. u8 writes of 9 suffice: the cells never exceed 9, so the high bytes are already zero. Written every in-fight frame; write-verified live at far sparser cadences (any cadence <= ~260 frames absorbs the ~33-frame tick sag).",
+  "_TIMER_HOLD_NOTE": "Located form (mk2.md 'The round timer, closed', W2b 2026-09-02): the authoritative timer is a countdown TASK RECORD whose STRUCTURE is invariant but whose BASE ADDRESS RELOCATES every fight — a live 1P diagnostic measured base 0xD630 on the 2-human capture rig, 0xDC42 and 0xE254 in two separate 1P fights, and the code-pointer word varying 0x0106B8xx / 0x0106E8xx / 0x01071940. So the W2 Guarded form (fixed guard 0xD632==0x0106B820, fixed writes 0xD636/0xD63A) CANNOT work and is replaced. The record layout: [round# u16 @+0][code u32 @+2][tens u32 @+6][ones u32 @+0xA][0x0000000B u32 @+0xE]; tens/ones hold a single digit 0-9 equal to the drawn digits at timer_tens(0xBD74)/timer_ones(0xBD76). Every in-fight frame the tick scans [0xC000,0xF000) (step 2, records are u16-aligned) for the first base R where u32@(R+0xE)==0x0000000B, u32@(R+2) in [0x01060000,0x01080000), u8@(R+6)==drawn tens, u8@(R+0xA)==drawn ones (all endian-fixed; this region is little-endian). On a fresh 1P fight this returned EXACTLY ONE hit, and the 2-human 0xD630 record satisfies the same signature (one locator covers both modes). Then u8 9 -> (R+6) and (R+0xA) (the cells never exceed 9, so u8 writes leave the high bytes zero). Zero matches (menu/transition) skip silently. LIVE-VALIDATION of the write recipe against a fresh 1P fight is the orchestrator's separate step.",
   "health_max": 161,
   "refill_below": 120,
   "timer_hold": {
-   "guard": {
-    "global": "timer_task_code",
-    "size": 4,
-    "equals": "0x0106B820"
-   },
+   "scan": [
+    "0xC000",
+    "0xF000"
+   ],
+   "record": [
+    {
+     "offset": "0xE",
+     "size": 4,
+     "equals": "0x0000000B"
+    },
+    {
+     "offset": "0x2",
+     "size": 4,
+     "min": "0x01060000",
+     "max": "0x01080000"
+    },
+    {
+     "offset": "0x6",
+     "size": 1,
+     "eq_global": "timer_tens"
+    },
+    {
+     "offset": "0xA",
+     "size": 1,
+     "eq_global": "timer_ones"
+    }
+   ],
    "writes": [
     {
-     "global": "timer_task_tens",
+     "offset": "0x6",
      "value": 9
     },
     {
-     "global": "timer_task_ones",
+     "offset": "0xA",
      "value": 9
     }
    ]

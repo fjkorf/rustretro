@@ -251,7 +251,7 @@ Known imperfections, stated honestly:
 |---|---|
 | health refill | **WORKS** via `write_memory` — write 161 to all four health bytes (`0xC05E`, `0xC1D8`, `0xBCA0`, `0xBC88`). Verified live: bar refills, fight continues. Must be a periodic rewrite (freeze is a no-op on this core, see gotchas). |
 | health_max | **161** (`0xA1`) — fill target observed at round start, MAME cheat's fill value, and the write-verified full-bar value. |
-| timer hold | ~~**NOT functional** — no authoritative store found (above).~~ **Store found 2026-09-01** (the `0xD630` countdown task record, write-verified both directions — see "The round timer, closed" below); **wired 2026-09-01 (W2)** — the guarded `enforcement.timer_hold` form; see "timer_hold wired functional" below. |
+| timer hold | ~~**NOT functional** — no authoritative store found (above).~~ **Store found 2026-09-01** (the `0xD630` countdown task record, write-verified both directions — see "The round timer, closed" below); **functional 2026-09-02 (W2b)** — the guarded form was disproven for 1P (the record relocates); the shipped mechanism is the structural `Located` locator, LIVE-VERIFIED in 1P and 2-human. See "The countdown record RELOCATES" below. |
 | credits top-up | **NOT possible via memory** — credits live in T-Unit CMOS (`0x01400000` bit range, handler-mapped), which is OUTSIDE the exposed region. Two coin presses produced exactly two byte deltas in work RAM: the ASCII HUD digit and a transient counter (`0x5E0C`, disproven — dropped 161→24 on a screen change). Coin-up works fine through input (`select`), which is how a training harness should do it. |
 
 ## Disproven / dead ends (don't re-chase these)
@@ -6625,7 +6625,14 @@ screenshots are a phase oracle ONLY after at least one post-load frame.
 Status: the store is KNOWN and write-verified; `timer_hold` enforcement
 LANDED 2026-09-01 (W2) — see "timer_hold wired functional" below.
 
-## timer_hold wired functional: the guarded enforcement form (2026-09-01, W2)
+> **⚠ The "guarded" form below was DISPROVEN for 1P play and REPLACED — see
+> "The countdown record RELOCATES" (W2b, 2026-09-02) further down.** It worked
+> only on the 2-human capture rig because that rig happens to park the record
+> at a fixed `0xD630`; in 1P arcade the record moves every fight and the fixed
+> guard never matches. The section is kept for the evidence trail; the SHIPPED
+> mechanism is the structural locator in the W2b section.
+
+## timer_hold wired functional: the guarded enforcement form (2026-09-01, W2) — SUPERSEDED
 
 Closes the "enforcement WIRING is queued (wave 2)" status of the section
 above. No new memory evidence in this pass — everything below is wiring the
@@ -6727,3 +6734,66 @@ is **asurabld's**: `dataset.py::_recent_change_mask`'s run-length evidence
 frames between combos, a bimodal gap distribution that 20 splits cleanly).
 For MK2, 20 is a transplanted default pending a per-game measurement — "a
 default correct for two subjects is not a law".
+
+## The countdown record RELOCATES: the structural locator (W2b, 2026-09-02)
+
+The W2 `Guarded` form above (fixed guard `u32 @ 0xD632 == 0x0106B820`, fixed
+writes `9 → 0xD636/0xD63A`, record based at `0xD630`) was DISPROVEN by a live
+1P-arcade diagnostic and REPLACED. All W2 write-evidence came from ONE rig —
+the 2-human `m-v-r` match — where the record happens to sit at a stable base.
+
+**The record is not at a fixed address.** Its base and its code-pointer word
+both move fight to fight:
+
+| rig / fight         | record base | code-pointer word |
+|---------------------|-------------|-------------------|
+| 2-human capture rig | `0xD630`    | `0x0106B8xx`      |
+| 1P fight A          | `0xDC42`    | `0x0106E8xx`      |
+| 1P fight B          | `0xE254`    | `0x01071940`      |
+
+So there is no fixed write address and no fixed guard value; `Guarded` had
+exactly one user (MK2 arcade) and is removed outright.
+
+**The invariant is STRUCTURE, not address:**
+
+```
+[round#  u16 @ +0x0]
+[code    u32 @ +0x2]    task code pointer, in [0x01060000, 0x01080000)
+[tens    u32 @ +0x6]    single digit 0-9, == drawn tens (timer_tens 0xBD74)
+[ones    u32 @ +0xA]    single digit 0-9, == drawn ones (timer_ones 0xBD76)
+[0x0000000B u32 @ +0xE] constant sentinel
+```
+
+The drawn digits at the fixed globals are re-derived FROM this record every
+tick, which makes them a usable cross-check to disambiguate the true record
+from decoys.
+
+**The shipped locator** (`enforcement.timer_hold` = the new `Located` form,
+`src/profile.rs::TimerHold` / `src/training.rs::locate_timer_record`,
+docs/game-profiles.md): each in-fight frame, read `[0xC000, 0xF000)` once into
+a buffer and scan step-2 for the first base `R` where `u32@(R+0xE)==0x0B`,
+`u32@(R+2) ∈ [0x01060000,0x01080000)`, and `u8@(R+6)`/`u8@(R+0xA)` each equal
+the drawn tens/ones and are 0-9; then write `9 → R+6`, `9 → R+0xA`. Zero
+matches (menu/transition) skip silently; the in-fight training gate scopes
+when it runs. The `0xD632/0xD636/0xD63A` fixed globals are removed;
+`timer_tens`/`timer_ones` are retained and now load-bearing as the `eq_global`
+cross-check.
+
+**LIVE-VERIFIED end to end (2026-09-02, port 4031, `--training`), all with a
+training-off count-down control from the identical anchor:**
+
+- **1P arcade HOLD — PASS.** Liu Kang vs Jax CPU, liveness-verified: training
+  OFF counts down 98→94, training ON holds at 98. Located base **`0xD396`**
+  (≠ the old fixed `0xD630`), proven the live record by its `+0xA` tracking the
+  drawn ones during the off-countdown.
+- **Relocation robustness — PASS.** A second fresh 1P fight (Reptile vs Raiden)
+  relocated the record to base **`0xEB00`**; ON still holds, OFF counts down,
+  no code change. Three distinct bases (`0xD630`/`0xD396`/`0xEB00`) handled by
+  one unchanged locator.
+- **No-false-pin — PASS.** On attract/intro (gate closed) the strict signature
+  matched zero records; drawn digits sat at 88 and were not forced to 9.
+- **2-human regression — PASS.** `m-v-r.state`: record at `0xD630`, ON holds,
+  OFF counts down. One locator covers both modes.
+
+Not re-tested: boss/endurance rounds, 2P-arcade if its path differs, whether
+the record can ever land outside `[0xC000, 0xF000)`.

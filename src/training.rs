@@ -9,11 +9,11 @@
 //! - **credits topped up** so Start always works (`credits` global),
 //! - **round timer held** — no timeouts. Two profile forms
 //!   ([`crate::profile::TimerHold`]): the legacy `[sec, subsec]` pair
-//!   written to `round_timer`/+1 (asurabld, genesis), and the guarded
-//!   multi-write for task-record timer slots (MK2 arcade's 0xD630 countdown
-//!   task, mk2.md "The round timer, closed") — every write there is gated on
-//!   the slot's code-pointer word matching first, because menu screens host
-//!   DIFFERENT tasks in the same slot,
+//!   written to `round_timer`/+1 (asurabld, genesis), and the Located
+//!   structural-locator form for a relocating task-record timer store (MK2
+//!   arcade's countdown task, mk2.md "The round timer, closed") — the record
+//!   moves every fight, so each in-fight frame it is found by scanning for a
+//!   base matching a structural signature, then the digit cells are written,
 //! - **health refill**: below the threshold every mapped health byte is
 //!   rewritten to max — fighter-block health/health2 plus any per-player HUD
 //!   accumulator globals (`p1_health_hud`/`p2_health_hud`; MK2 damages all
@@ -165,11 +165,37 @@ struct Reset {
 enum TimerEnf {
     /// Legacy: `hold[0]` → `addr`, `hold[1]` → `addr + 1`, every tick.
     Adjacent { addr: u32, hold: [u8; 2] },
-    /// Guard-checked (task-record slots): write each `(addr, value)` u8 only
-    /// while the `size`-byte guard read equals `equals` — the tick honors the
-    /// guard EVERY time it writes, because the slot hosts different tasks on
-    /// menu screens (mk2.md); a mismatch skips silently.
-    Guarded { guard_addr: u32, guard_size: u8, equals: u32, writes: Vec<(u32, u8)> },
+    /// Structural-locator (relocating task-record, MK2 arcade): every in-fight
+    /// frame, scan `[scan_start, scan_end)` (step 2) for the first base `R`
+    /// satisfying every `preds` predicate, then write each `(offset, value)`
+    /// u8 at `R + offset`. The record moves each fight, so there is no fixed
+    /// address to write (mk2.md "The round timer, closed"); zero matches skip
+    /// silently.
+    Located {
+        scan_start: u32,
+        scan_end: u32,
+        preds: Vec<LocPred>,
+        writes: Vec<(u32, u8)>,
+    },
+}
+
+/// One resolved [`TimerEnf::Located`] predicate: read `size` bytes at
+/// `R + offset` (endian-fixed) and test against `kind`. Every global name has
+/// already been turned into an address here.
+struct LocPred {
+    offset: u32,
+    size: u8,
+    kind: LocKind,
+}
+
+enum LocKind {
+    /// Value equals this constant.
+    Equals(u32),
+    /// Value in `[min, max)` — inclusive min, EXCLUSIVE max.
+    Range { min: u32, max: u32 },
+    /// Value equals `size` bytes read (endian-fixed) at this resolved global
+    /// address — the drawn-digit cross-check that makes the match unique.
+    EqGlobal(u32),
 }
 
 struct Resolved {
@@ -409,17 +435,29 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
             crate::profile::TimerHold::Adjacent(hold) => {
                 g("round_timer").map(|addr| TimerEnf::Adjacent { addr, hold: *hold })
             }
-            // Guarded form: names were load-validated, so resolution here
-            // cannot silently miss — but stay total anyway.
-            crate::profile::TimerHold::Guarded { guard, writes } => (|| {
-                Some(TimerEnf::Guarded {
-                    guard_addr: g(&guard.global)?,
-                    guard_size: guard.size,
-                    equals: guard.equals.0,
-                    writes: writes
-                        .iter()
-                        .map(|w| Some((g(&w.global)?, w.value)))
-                        .collect::<Option<Vec<_>>>()?,
+            // Located form: eq_global names were load-validated, so resolution
+            // here cannot silently miss — but stay total anyway.
+            crate::profile::TimerHold::Located { scan, record, writes } => (|| {
+                let preds = record
+                    .iter()
+                    .map(|pr| {
+                        let kind = if let Some(eq) = pr.equals {
+                            LocKind::Equals(eq.0)
+                        } else if let (Some(mn), Some(mx)) = (pr.min, pr.max) {
+                            LocKind::Range { min: mn.0, max: mx.0 }
+                        } else if let Some(name) = &pr.eq_global {
+                            LocKind::EqGlobal(g(name)?)
+                        } else {
+                            return None;
+                        };
+                        Some(LocPred { offset: pr.offset.0, size: pr.size, kind })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(TimerEnf::Located {
+                    scan_start: scan[0].0,
+                    scan_end: scan[1].0,
+                    preds,
+                    writes: writes.iter().map(|w| (w.offset.0, w.value)).collect(),
                 })
             })(),
         },
@@ -466,6 +504,119 @@ fn endian_fix(v: u32, size: u8, little: bool) -> u32 {
         4 => v.swap_bytes(),
         _ => v,
     }
+}
+
+/// Read the guest window `[start, start+len)` once into a flat buffer (mirrors
+/// src/hunt.rs region sampling): 4-byte `read_addr` chunks reassembled as raw
+/// guest bytes. A hole (unbacked descriptor / boundary straddle where
+/// `read_addr` returns None) fills 0 — a 0 can never match the record's
+/// 0x0000000B sentinel, so a hole is a non-match, not a false hit. Buffering
+/// avoids re-walking `memory_regions` up to four times per scan candidate.
+fn read_window(ds: &DebugState, start: u32, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    let mut i = 0;
+    while i < len {
+        // read_addr returns bytes LE-packed (addr = least-significant), so
+        // byte at start+i+k is (v >> 8k) & 0xFF.
+        let v = ds.read_addr((start as usize) + i, 4).unwrap_or(0);
+        let n = 4.min(len - i);
+        for k in 0..n {
+            buf[i + k] = ((v >> (8 * k)) & 0xFF) as u8;
+        }
+        i += 4;
+    }
+    buf
+}
+
+/// Assemble the `size`-byte value of a candidate record at base `r`, from the
+/// window buffer (`buf` starts at guest address `start`). `None` if the field
+/// runs past the buffer (candidate too near the scan end). Endianness is fixed
+/// by the caller via [`endian_fix`].
+fn window_value(buf: &[u8], start: u32, r: u32, offset: u32, size: u8) -> Option<u32> {
+    let idx = (r - start) as usize + offset as usize;
+    let size = size as usize;
+    if idx + size > buf.len() {
+        return None;
+    }
+    let mut v = 0u32;
+    for k in 0..size {
+        v |= (buf[idx + k] as u32) << (8 * k);
+    }
+    Some(v)
+}
+
+/// Does candidate base `r` satisfy every [`LocPred`]? Short-circuits on the
+/// first failing predicate (the cheap `+0xE == 0x0000000B` sentinel is meant
+/// to lead, so almost every candidate dies on read one).
+fn timer_preds_match(
+    ds: &DebugState,
+    buf: &[u8],
+    start: u32,
+    little: bool,
+    r: u32,
+    preds: &[LocPred],
+) -> bool {
+    preds.iter().all(|pr| {
+        let Some(raw) = window_value(buf, start, r, pr.offset, pr.size) else {
+            return false;
+        };
+        let val = endian_fix(raw, pr.size, little);
+        match &pr.kind {
+            LocKind::Equals(c) => val == *c,
+            LocKind::Range { min, max } => val >= *min && val < *max,
+            LocKind::EqGlobal(addr) => {
+                let g = endian_fix(
+                    ds.read_addr(*addr as usize, pr.size as usize).unwrap_or(0),
+                    pr.size,
+                    little,
+                );
+                val == g
+            }
+        }
+    })
+}
+
+/// Scan `[start, end)` for the FIRST base R matching every predicate. Records
+/// are u16-aligned (round# is a u16 at `R+0`), so the scan STEPS BY 2. Reads
+/// the whole window once (see [`read_window`]) and matches in-memory. Returns
+/// None (skip silently) on zero matches; the signature is meant to be unique,
+/// so more than one match is noted via a single lifetime eprintln (it signals
+/// the signature needs tightening) but still writes the first.
+fn locate_timer_record(
+    ds: &DebugState,
+    little: bool,
+    start: u32,
+    end: u32,
+    preds: &[LocPred],
+) -> Option<u32> {
+    if end <= start {
+        return None;
+    }
+    let buf = read_window(ds, start, (end - start) as usize);
+    let mut found: Option<u32> = None;
+    let mut count = 0u32;
+    let mut r = start;
+    while r < end {
+        if timer_preds_match(ds, &buf, start, little, r, preds) {
+            count += 1;
+            if found.is_none() {
+                found = Some(r);
+            }
+        }
+        r = r.wrapping_add(2);
+    }
+    if count > 1 {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "timer_hold locator: {count} records matched the signature at once \
+                 (writing the first, {:#x}) — the signature may need tightening",
+                found.unwrap_or(start)
+            );
+        }
+    }
+    found
 }
 
 /// Live-read a pointer-resolved fighter field (`x`/`y`, docs/frames.md §5)
@@ -887,20 +1038,18 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
             wr8(ds, *addr, hold[0]);
             wr8(ds, *addr + 1, hold[1]);
         }
-        Some(TimerEnf::Guarded { guard_addr, guard_size, equals, writes }) => {
-            // The guard is checked on EVERY write pass: the timer slot is a
-            // task record that hosts DIFFERENT tasks on menu screens (the
-            // countdown-screen task shares the address with a different code
-            // pointer — mk2.md "The round timer, closed"). Mismatch = the
-            // slot is not ours right now; skip silently, no log spam.
-            let cur = endian_fix(
-                ds.read_addr(*guard_addr as usize, *guard_size as usize).unwrap_or(0),
-                *guard_size,
-                r.little,
-            );
-            if cur == *equals {
-                for (addr, value) in writes {
-                    wr8(ds, *addr, *value);
+        Some(TimerEnf::Located { scan_start, scan_end, preds, writes }) => {
+            // The countdown task record RELOCATES every fight (mk2.md "The
+            // round timer, closed": base 0xD630 on the 2-human rig it was
+            // captured from, but 0xDC42 / 0xE254 in two separate 1P fights),
+            // so no fixed address works — find it by structural signature this
+            // frame, then write the digit cells at that base. Zero matches
+            // (menu/transition) skip silently.
+            if let Some(base) =
+                locate_timer_record(ds, r.little, *scan_start, *scan_end, preds)
+            {
+                for (off, value) in writes {
+                    wr8(ds, base.wrapping_add(*off), *value);
                 }
             }
         }
@@ -1336,8 +1485,9 @@ mod tests {
     fn mk2_degrades_per_feature() {
         // MK2's map is partial by honesty (mk2.md): gate + health + world X/Y
         // exist (X/Y pointer-resolved, docs/frames.md §5), and since W2 the
-        // timer store does too (the guarded 0xD630 task-record form — the
-        // panel's "Not mapped" line loses "timer hold"); credits (CMOS) and
+        // timer store does too (W2b: the Located structural-locator form,
+        // replacing the broken fixed-address Guarded form — the panel's "Not
+        // mapped" line loses "timer hold"); credits (CMOS) and
         // round_state still don't. `positions` (round-start teleport
         // coordinates) is also unmapped, so position_reset stays declined
         // regardless of x/y being resolvable.
@@ -1346,7 +1496,7 @@ mod tests {
         assert!(f.refill, "health field + HUD pair are mapped");
         assert!(f.block_dummy, "MK is button-block: the Block chord is mapped");
         assert!(f.block_punish, "contact_signal (struct health, decrease-only) is mapped");
-        assert!(f.timer_hold, "the guarded timer_hold form resolves (mk2.md 0xD630)");
+        assert!(f.timer_hold, "the Located timer_hold form resolves (mk2.md 'The round timer, closed')");
         assert!(!f.credits && !f.position_reset && !f.finish_round);
         assert_eq!(
             f.missing(),
@@ -1366,20 +1516,14 @@ mod tests {
         assert_eq!(held, vec![10], "Block = RETRO L");
     }
 
-    /// The MK2 arcade countdown-task guard address/value/digit cells, from
-    /// mk2.md "The round timer, closed" — via the profile, never hardcoded
-    /// into the tick (these are only here so the test can STAGE the slot).
-    fn mk2_timer_addrs(p: &GameProfile) -> (usize, usize, usize) {
-        (
-            p.global("timer_task_code").unwrap() as usize,
-            p.global("timer_task_tens").unwrap() as usize,
-            p.global("timer_task_ones").unwrap() as usize,
-        )
-    }
-    const MK2_COUNTDOWN_TASK: u32 = 0x0106_B820;
+    /// A base the diagnostic actually observed the 1P countdown record at
+    /// (mk2.md "The round timer, closed"): NOT the 2-human 0xD630, proving the
+    /// locator finds the record by signature at a relocated address. Even, and
+    /// inside the [0xC000,0xF000) scan window.
+    const MK2_1P_TIMER_BASE: u32 = 0xDC42;
 
-    /// MK2 in a bus window with an open gate and a staged countdown-task
-    /// slot at 0xD630 (guard word + digit cells).
+    /// MK2 in a bus window with an open gate. The countdown record is NOT
+    /// staged here — each test stages it (or a near-miss) itself.
     fn mk2_timer_scene() -> (GameProfile, DebugState) {
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
         let mut ds = DebugState::new();
@@ -1398,44 +1542,98 @@ mod tests {
         (p, ds)
     }
 
-    /// Guard MATCH: the tick writes 9 into BOTH digit cells (u8 writes — the
-    /// cells are u32s whose value never exceeds 9, so the high bytes are
-    /// already zero and stay untouched).
-    #[test]
-    fn mk2_timer_hold_writes_digits_while_the_countdown_task_owns_the_slot() {
-        let (p, mut ds) = mk2_timer_scene();
-        let (code, tens, ones) = mk2_timer_addrs(&p);
-        assert!(ds.write_addr(code, 4, MK2_COUNTDOWN_TASK));
-        assert!(ds.write_addr(tens, 4, 3));
-        assert!(ds.write_addr(ones, 4, 7));
-        tick_with(&mut ds, 1, &p);
-        assert_eq!(ds.read_addr(tens, 4), Some(9), "tens pinned to 9");
-        assert_eq!(ds.read_addr(ones, 4), Some(9), "ones pinned to 9");
-        // And every frame while the gate stays open (the sag-absorbing
-        // cadence: the recipe needs ≤~260 frames, we give it 1).
-        assert!(ds.write_addr(ones, 4, 8)); // a tick decremented it
-        tick_with(&mut ds, 2, &p);
-        assert_eq!(ds.read_addr(ones, 4), Some(9), "re-pinned next frame");
+    /// Stamp a Located-signature-matching countdown record at `base`, with
+    /// digit cells `tens`/`ones`, and set the drawn-digit globals to match
+    /// (the eq_global cross-check). `code` lands the in-range code pointer.
+    fn stage_timer_record(ds: &mut DebugState, p: &GameProfile, base: u32, tens: u8, ones: u8) {
+        let tt = p.global("timer_tens").unwrap() as usize;
+        let to = p.global("timer_ones").unwrap() as usize;
+        assert!(ds.write_addr(tt, 1, tens as u32));
+        assert!(ds.write_addr(to, 1, ones as u32));
+        assert!(ds.write_addr((base + 0xE) as usize, 4, 0x0000_000B)); // sentinel
+        assert!(ds.write_addr((base + 0x2) as usize, 4, 0x0106_E800)); // code, in range
+        assert!(ds.write_addr((base + 0x6) as usize, 1, tens as u32));
+        assert!(ds.write_addr((base + 0xA) as usize, 1, ones as u32));
     }
 
-    /// Guard MISMATCH (the countdown-screen task, pointer 0x0106B840, hosts
-    /// the same slot on menu screens — mk2.md): the write is skipped
-    /// SILENTLY and the digit cells keep their values.
+    /// LOCATE + WRITE: the tick finds the record at a RELOCATED base by
+    /// signature and writes 9 into both digit cells (u8 writes — the cells are
+    /// u32s whose value never exceeds 9, so the high bytes stay zero).
     #[test]
-    fn mk2_timer_hold_skips_silently_when_another_task_owns_the_slot() {
+    fn mk2_timer_hold_locates_relocated_record_and_writes_digits() {
         let (p, mut ds) = mk2_timer_scene();
-        let (code, tens, ones) = mk2_timer_addrs(&p);
-        assert!(ds.write_addr(code, 4, 0x0106_B840));
-        assert!(ds.write_addr(tens, 4, 3));
-        assert!(ds.write_addr(ones, 4, 7));
+        let base = MK2_1P_TIMER_BASE;
+        stage_timer_record(&mut ds, &p, base, 3, 7);
+        tick_with(&mut ds, 1, &p);
+        assert_eq!(ds.read_addr((base + 0x6) as usize, 4), Some(9), "tens pinned to 9");
+        assert_eq!(ds.read_addr((base + 0xA) as usize, 4), Some(9), "ones pinned to 9");
+        // Every frame while the gate stays open (the sag-absorbing cadence:
+        // the recipe needs ≤~260 frames, we give it 1). The game re-derives
+        // the drawn globals FROM the record, so after the first tick pinned
+        // the cells to 9/9 the drawn tens is also 9; then a countdown tick
+        // decrements the ones cell (and its drawn global) to 8. Stage that
+        // consistent state, then the second tick must re-pin ones to 9.
+        assert!(ds.write_addr(p.global("timer_tens").unwrap() as usize, 1, 9));
+        assert!(ds.write_addr(p.global("timer_ones").unwrap() as usize, 1, 8));
+        assert!(ds.write_addr((base + 0xA) as usize, 1, 8));
+        tick_with(&mut ds, 2, &p);
+        assert_eq!(ds.read_addr((base + 0xA) as usize, 4), Some(9), "re-pinned next frame");
+    }
+
+    /// The locator must reject NEAR-MISSES and find the true record: two decoy
+    /// records sit at LOWER addresses (so a naive first-hit would take them) —
+    /// one with the wrong +0xE sentinel, one whose digit cells disagree with
+    /// the drawn-digit globals — and only the real record at the higher
+    /// relocated base gets the 9/9 write.
+    #[test]
+    fn mk2_timer_hold_rejects_near_misses_and_finds_the_true_record() {
+        let (p, mut ds) = mk2_timer_scene();
+        let real = MK2_1P_TIMER_BASE; // 0xDC42
+        // Drawn globals say tens=4, ones=2.
+        stage_timer_record(&mut ds, &p, real, 4, 2);
+
+        // Decoy A @ 0xC800 (< real): valid code+digits but WRONG sentinel.
+        let decoy_sentinel = 0xC800u32;
+        assert!(ds.write_addr((decoy_sentinel + 0xE) as usize, 4, 0x0000_000C));
+        assert!(ds.write_addr((decoy_sentinel + 0x2) as usize, 4, 0x0106_E800));
+        assert!(ds.write_addr((decoy_sentinel + 0x6) as usize, 1, 4));
+        assert!(ds.write_addr((decoy_sentinel + 0xA) as usize, 1, 2));
+
+        // Decoy B @ 0xCE00 (< real): valid sentinel+code but digit cells (5/9)
+        // DISAGREE with the drawn globals (4/2) — the eq_global cross-check
+        // must reject it.
+        let decoy_digits = 0xCE00u32;
+        assert!(ds.write_addr((decoy_digits + 0xE) as usize, 4, 0x0000_000B));
+        assert!(ds.write_addr((decoy_digits + 0x2) as usize, 4, 0x0106_E800));
+        assert!(ds.write_addr((decoy_digits + 0x6) as usize, 1, 5));
+        assert!(ds.write_addr((decoy_digits + 0xA) as usize, 1, 9));
+
+        tick_with(&mut ds, 1, &p);
+
+        // The real record won: both digit cells forced to 9.
+        assert_eq!(ds.read_addr((real + 0x6) as usize, 4), Some(9), "real tens → 9");
+        assert_eq!(ds.read_addr((real + 0xA) as usize, 4), Some(9), "real ones → 9");
+        // Neither decoy was touched.
+        assert_eq!(ds.read_addr((decoy_sentinel + 0x6) as usize, 4), Some(4), "wrong-sentinel decoy untouched");
+        assert_eq!(ds.read_addr((decoy_digits + 0x6) as usize, 4), Some(5), "wrong-digits decoy untouched");
+    }
+
+    /// A menu/transition-shaped region — no record matches the signature — the
+    /// tick writes NOTHING (locate returns None, skip silently).
+    #[test]
+    fn mk2_timer_hold_writes_nothing_when_no_record_matches() {
+        let (p, mut ds) = mk2_timer_scene();
+        // A lone marker where a digit cell would be, but no valid record
+        // around it (sentinel +0xE stays 0).
+        let marker = MK2_1P_TIMER_BASE;
+        assert!(ds.write_addr((marker + 0x6) as usize, 1, 0x22));
         let logs_before = ds.event_log.len();
         tick_with(&mut ds, 1, &p);
-        assert_eq!(ds.read_addr(tens, 4), Some(3), "guard mismatch: no write");
-        assert_eq!(ds.read_addr(ones, 4), Some(7), "guard mismatch: no write");
-        assert_eq!(ds.event_log.len(), logs_before, "skip is silent — no log spam");
+        assert_eq!(ds.read_addr((marker + 0x6) as usize, 1), Some(0x22), "no match → cell untouched");
+        assert_eq!(ds.event_log.len(), logs_before, "no-match is silent — no log spam");
     }
 
-    /// The legacy Adjacent form is untouched by the guarded form's arrival:
+    /// The legacy Adjacent form is untouched by the Located form's arrival:
     /// asurabld's tick still writes `timer_hold[0]`/`[1]` to
     /// `round_timer`/+1 unconditionally while in-fight.
     #[test]
