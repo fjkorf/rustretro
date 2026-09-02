@@ -7,7 +7,13 @@
 //! the dummy while its unmapped enforcements (timer hold, credits, position
 //! reset) decline individually:
 //! - **credits topped up** so Start always works (`credits` global),
-//! - **round timer held** — no timeouts (`round_timer` global),
+//! - **round timer held** — no timeouts. Two profile forms
+//!   ([`crate::profile::TimerHold`]): the legacy `[sec, subsec]` pair
+//!   written to `round_timer`/+1 (asurabld, genesis), and the Located
+//!   structural-locator form for a relocating task-record timer store (MK2
+//!   arcade's countdown task, mk2.md "The round timer, closed") — the record
+//!   moves every fight, so each in-fight frame it is found by scanning for a
+//!   base matching a structural signature, then the digit cells are written,
 //! - **health refill**: below the threshold every mapped health byte is
 //!   rewritten to max — fighter-block health/health2 plus any per-player HUD
 //!   accumulator globals (`p1_health_hud`/`p2_health_hud`; MK2 damages all
@@ -153,20 +159,64 @@ struct Reset {
 /// as plain locals rather than a cached/static struct so the profile stays
 /// hot-swappable-in-theory and the hot path stays simple (small `Vec`/`BTreeMap`
 /// lookups on a handful of fields, once per emulated frame — cheap).
+/// The resolved timer-hold enforcement (profile `enforcement.timer_hold`,
+/// [`crate::profile::TimerHold`]) with every global name already turned into
+/// an address.
+enum TimerEnf {
+    /// Legacy: `hold[0]` → `addr`, `hold[1]` → `addr + 1`, every tick.
+    Adjacent { addr: u32, hold: [u8; 2] },
+    /// Structural-locator (relocating task-record, MK2 arcade): every in-fight
+    /// frame, scan `[scan_start, scan_end)` (step 2) for the first base `R`
+    /// satisfying every `preds` predicate, then write each `(offset, value)`
+    /// u8 at `R + offset`. The record moves each fight, so there is no fixed
+    /// address to write (mk2.md "The round timer, closed"); zero matches skip
+    /// silently.
+    Located {
+        scan_start: u32,
+        scan_end: u32,
+        preds: Vec<LocPred>,
+        writes: Vec<(u32, u8)>,
+    },
+}
+
+/// One resolved [`TimerEnf::Located`] predicate: read `size` bytes at
+/// `R + offset` (endian-fixed) and test against `kind`. Every global name has
+/// already been turned into an address here.
+struct LocPred {
+    offset: u32,
+    size: u8,
+    kind: LocKind,
+}
+
+enum LocKind {
+    /// Value equals this constant.
+    Equals(u32),
+    /// Value in `[min, max)` — inclusive min, EXCLUSIVE max.
+    Range { min: u32, max: u32 },
+    /// Value equals `size` bytes read (endian-fixed) at this resolved global
+    /// address — the drawn-digit cross-check that makes the match unique.
+    EqGlobal(u32),
+}
+
 struct Resolved {
     little: bool,
     refill: Option<Refill>,
-    timer: Option<(u32, [u8; 2])>,
+    timer: Option<TimerEnf>,
     credits: Option<(u32, u8, u8)>,
     reset: Option<Reset>,
     finish: Option<u32>,
     x_pair: Option<XSource>,
     /// The family's guard POLICY (MACRO_ACTIONS §9.1) — how the dummy blocks.
     guard: Guard,
-    /// The BlockPunish trigger source (MACRO_ACTIONS §6): per-block hitstun
-    /// globals where mapped (asurabld), else the port's global contact signal
-    /// (MK2 arcade's hit_counter). None → the mode degrades to plain Block.
+    /// The BlockPunish trigger source (MACRO_ACTIONS §6): the port's
+    /// `contact_signal` where declared (MK2 arcade: struct `health`,
+    /// decrease-only), else the per-block `hitstun_sources` globals
+    /// (asurabld's combo counters). None → the mode degrades to plain Block.
     contact: Option<Contact>,
+    /// `contact_signal.direction == "decrease"`: only a DROP in the signal
+    /// counts as contact (see `poll_contact`). Always false for the
+    /// `hitstun_sources` fallback (any-change back-compat).
+    contact_decrease: bool,
     /// Cooldown window: the signal must be quiet this long to re-arm.
     hitstun_window: u64,
 }
@@ -343,20 +393,32 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
     };
 
     // `contact_signal` FIRST: it is the purpose-built "was struck" signal.
-    // hitstun_sources is a health delta — blind to zero-chip blocked hits
-    // (the user-reported "punishes some hits but not others") and disturbed
-    // by refill writes — so it is only the fallback.
+    // MK2 arcade declares struct `health` (block+0x0E, decrease-only): it
+    // steps by the whole damage in ONE frame, on hit AND on block — blocked
+    // normals always chip on this port (3/6/8, mk2.md), so a health-valued
+    // signal DOES see blocked contact here. (The old comment's "blind to
+    // zero-chip blocked hits" concern was about asurabld-style zero-chip
+    // ports and the RETRACTED action_counter story — mk2.md.)
+    // hitstun_sources is the fallback: on MK2 that pair is the DRAWN HUD
+    // value, which animates 1 unit/frame and smears one hit into ~11 edges.
+    let mut contact_decrease = false;
     let contact = p
         .port
         .contact_signal
         .as_ref()
-        .and_then(|cs| match (&cs.field, &cs.global) {
-            (Some(f), _) => Some(Contact::PerBlock(
-                p.field_addr(1, f)?.0,
-                p.field_addr(2, f)?.0,
-            )),
-            (None, Some(gl)) => g(gl).map(Contact::Global),
-            _ => None,
+        .and_then(|cs| {
+            let c = match (&cs.field, &cs.global) {
+                (Some(f), _) => Some(Contact::PerBlock(
+                    p.field_addr(1, f)?.0,
+                    p.field_addr(2, f)?.0,
+                )),
+                (None, Some(gl)) => g(gl).map(Contact::Global),
+                _ => None,
+            };
+            if c.is_some() {
+                contact_decrease = cs.direction.as_deref() == Some("decrease");
+            }
+            c
         })
         .or_else(|| {
             p.port.hitstun_sources.as_ref().and_then(|hs| {
@@ -367,13 +429,45 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
     Some(Resolved {
         little: p.port.memory.endianness == "little",
         refill,
-        timer: g("round_timer").map(|a| (a, e.timer_hold)),
+        timer: match &e.timer_hold {
+            // Legacy pair: keyed on the conventional `round_timer` global —
+            // unmapped (MK2 pre-W2, sf2ce) declines the feature softly.
+            crate::profile::TimerHold::Adjacent(hold) => {
+                g("round_timer").map(|addr| TimerEnf::Adjacent { addr, hold: *hold })
+            }
+            // Located form: eq_global names were load-validated, so resolution
+            // here cannot silently miss — but stay total anyway.
+            crate::profile::TimerHold::Located { scan, record, writes } => (|| {
+                let preds = record
+                    .iter()
+                    .map(|pr| {
+                        let kind = if let Some(eq) = pr.equals {
+                            LocKind::Equals(eq.0)
+                        } else if let (Some(mn), Some(mx)) = (pr.min, pr.max) {
+                            LocKind::Range { min: mn.0, max: mx.0 }
+                        } else if let Some(name) = &pr.eq_global {
+                            LocKind::EqGlobal(g(name)?)
+                        } else {
+                            return None;
+                        };
+                        Some(LocPred { offset: pr.offset.0, size: pr.size, kind })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(TimerEnf::Located {
+                    scan_start: scan[0].0,
+                    scan_end: scan[1].0,
+                    preds,
+                    writes: writes.iter().map(|w| (w.offset.0, w.value)).collect(),
+                })
+            })(),
+        },
         credits: g("credits").map(|a| (a, e.credits_target, e.credits_min)),
         reset,
         finish: g("round_state"),
         x_pair,
         guard,
         contact,
+        contact_decrease,
         hitstun_window: p.calibration("HITSTUN_RECENT_FRAMES").unwrap_or(20.0) as u64,
     })
 }
@@ -410,6 +504,119 @@ fn endian_fix(v: u32, size: u8, little: bool) -> u32 {
         4 => v.swap_bytes(),
         _ => v,
     }
+}
+
+/// Read the guest window `[start, start+len)` once into a flat buffer (mirrors
+/// src/hunt.rs region sampling): 4-byte `read_addr` chunks reassembled as raw
+/// guest bytes. A hole (unbacked descriptor / boundary straddle where
+/// `read_addr` returns None) fills 0 — a 0 can never match the record's
+/// 0x0000000B sentinel, so a hole is a non-match, not a false hit. Buffering
+/// avoids re-walking `memory_regions` up to four times per scan candidate.
+fn read_window(ds: &DebugState, start: u32, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    let mut i = 0;
+    while i < len {
+        // read_addr returns bytes LE-packed (addr = least-significant), so
+        // byte at start+i+k is (v >> 8k) & 0xFF.
+        let v = ds.read_addr((start as usize) + i, 4).unwrap_or(0);
+        let n = 4.min(len - i);
+        for k in 0..n {
+            buf[i + k] = ((v >> (8 * k)) & 0xFF) as u8;
+        }
+        i += 4;
+    }
+    buf
+}
+
+/// Assemble the `size`-byte value of a candidate record at base `r`, from the
+/// window buffer (`buf` starts at guest address `start`). `None` if the field
+/// runs past the buffer (candidate too near the scan end). Endianness is fixed
+/// by the caller via [`endian_fix`].
+fn window_value(buf: &[u8], start: u32, r: u32, offset: u32, size: u8) -> Option<u32> {
+    let idx = (r - start) as usize + offset as usize;
+    let size = size as usize;
+    if idx + size > buf.len() {
+        return None;
+    }
+    let mut v = 0u32;
+    for k in 0..size {
+        v |= (buf[idx + k] as u32) << (8 * k);
+    }
+    Some(v)
+}
+
+/// Does candidate base `r` satisfy every [`LocPred`]? Short-circuits on the
+/// first failing predicate (the cheap `+0xE == 0x0000000B` sentinel is meant
+/// to lead, so almost every candidate dies on read one).
+fn timer_preds_match(
+    ds: &DebugState,
+    buf: &[u8],
+    start: u32,
+    little: bool,
+    r: u32,
+    preds: &[LocPred],
+) -> bool {
+    preds.iter().all(|pr| {
+        let Some(raw) = window_value(buf, start, r, pr.offset, pr.size) else {
+            return false;
+        };
+        let val = endian_fix(raw, pr.size, little);
+        match &pr.kind {
+            LocKind::Equals(c) => val == *c,
+            LocKind::Range { min, max } => val >= *min && val < *max,
+            LocKind::EqGlobal(addr) => {
+                let g = endian_fix(
+                    ds.read_addr(*addr as usize, pr.size as usize).unwrap_or(0),
+                    pr.size,
+                    little,
+                );
+                val == g
+            }
+        }
+    })
+}
+
+/// Scan `[start, end)` for the FIRST base R matching every predicate. Records
+/// are u16-aligned (round# is a u16 at `R+0`), so the scan STEPS BY 2. Reads
+/// the whole window once (see [`read_window`]) and matches in-memory. Returns
+/// None (skip silently) on zero matches; the signature is meant to be unique,
+/// so more than one match is noted via a single lifetime eprintln (it signals
+/// the signature needs tightening) but still writes the first.
+fn locate_timer_record(
+    ds: &DebugState,
+    little: bool,
+    start: u32,
+    end: u32,
+    preds: &[LocPred],
+) -> Option<u32> {
+    if end <= start {
+        return None;
+    }
+    let buf = read_window(ds, start, (end - start) as usize);
+    let mut found: Option<u32> = None;
+    let mut count = 0u32;
+    let mut r = start;
+    while r < end {
+        if timer_preds_match(ds, &buf, start, little, r, preds) {
+            count += 1;
+            if found.is_none() {
+                found = Some(r);
+            }
+        }
+        r = r.wrapping_add(2);
+    }
+    if count > 1 {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "timer_hold locator: {count} records matched the signature at once \
+                 (writing the first, {:#x}) — the signature may need tightening",
+                found.unwrap_or(start)
+            );
+        }
+    }
+    found
 }
 
 /// Live-read a pointer-resolved fighter field (`x`/`y`, docs/frames.md §5)
@@ -492,7 +699,20 @@ fn poll_contact(ds: &mut DebugState, r: &Resolved, frame: u64) -> (bool, u8) {
         }
     };
     let cur = rd8(ds, addr);
-    let changed = ds.training.punish_prev_signal.is_some_and(|prev| prev != cur);
+    // `direction: "decrease"` (contact_signal): only a DROP counts as
+    // contact. This is what makes a health-valued signal (MK2's struct
+    // health) immune to both INCREASE hazards by one sign check — the
+    // round-intro ramp (+2/frame under the banner-gate leak) and the
+    // training refill writing health back to max. Increases also don't
+    // stamp the quiet-window bookkeeping, so a refill can't hold the
+    // cooldown open. ACCEPTED LOSS: the hit that drives health below the
+    // refill threshold is overwritten back to max by refill before the next
+    // poll, so ~one real trigger per refill cycle is lost — the inverse of
+    // the previously documented "one spurious punish per refill", and
+    // harmless (the dummy blocks that one instead of punishing).
+    let changed = ds.training.punish_prev_signal.is_some_and(|prev| {
+        if r.contact_decrease { cur < prev } else { prev != cur }
+    });
     ds.training.punish_prev_signal = Some(cur);
     if changed {
         ds.training.punish_last_change = frame;
@@ -630,6 +850,10 @@ fn release_punish_exec(ds: &mut DebugState, reason: &str, frame: u64) {
     let Some(mut ex) = ds.training.punish_exec.take() else { return };
     let bits = ex.abort();
     ds.training.punish_wait = 0;
+    // The abort already injects neutral below; the hold-off EXTENDS that
+    // neutral (the guard chord must not snap back next frame — the same
+    // block-cancel hazard as the normal-completion path).
+    ds.training.punish_holdoff_until = frame + PUNISH_HOLDOFF;
     if !crate::playback::active_on_port(ds, 1) {
         for (i, on) in bits.iter().enumerate() {
             ds.injected_input2[i] = if *on { 2 } else { 0 };
@@ -782,7 +1006,14 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
                     bits = ex.next(opp_right);
                 }
                 if bits.is_none() {
+                    // Macro COMPLETED under a gate closure (hit-freeze —
+                    // MK2 zeroes its in-fight word at the contact frame):
+                    // same post-punish hold-off as the in-gate completion
+                    // path, and an explicit neutral injection so the last
+                    // chord frame can't outlive the macro.
                     ds.training.punish_exec = None;
+                    ds.training.punish_holdoff_until = frame + PUNISH_HOLDOFF;
+                    bits = Some([false; 12]);
                 }
             }
             // Playback wins (task A2 §4): if an input-slot playback is
@@ -800,10 +1031,29 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
         return;
     }
     ds.training.punish_gate_grace = 0;
-    // Hold the round clock.
-    if let Some((addr, hold)) = r.timer {
-        wr8(ds, addr, hold[0]);
-        wr8(ds, addr + 1, hold[1]);
+    // Hold the round clock — every frame while the gate is open (cheap; the
+    // MK2 recipe tolerates any cadence up to ~260 frames, mk2.md).
+    match &r.timer {
+        Some(TimerEnf::Adjacent { addr, hold }) => {
+            wr8(ds, *addr, hold[0]);
+            wr8(ds, *addr + 1, hold[1]);
+        }
+        Some(TimerEnf::Located { scan_start, scan_end, preds, writes }) => {
+            // The countdown task record RELOCATES every fight (mk2.md "The
+            // round timer, closed": base 0xD630 on the 2-human rig it was
+            // captured from, but 0xDC42 / 0xE254 in two separate 1P fights),
+            // so no fixed address works — find it by structural signature this
+            // frame, then write the digit cells at that base. Zero matches
+            // (menu/transition) skip silently.
+            if let Some(base) =
+                locate_timer_record(ds, r.little, *scan_start, *scan_end, preds)
+            {
+                for (off, value) in writes {
+                    wr8(ds, base.wrapping_add(*off), *value);
+                }
+            }
+        }
+        None => {}
     }
     // Health refill: let damage show, never let anyone die. Every mapped
     // accumulator for the refilled fighter is rewritten (MK2's HUD pair
@@ -945,22 +1195,49 @@ fn resolve_reversal_delay(timing: crate::debug::ReversalTiming, seed: u64) -> u6
     }
 }
 
-/// Neutral frames at the tail of the delay: a still-held guard bleeds into
-/// the macro's chord (MK's held Block eats attack buttons — live-observed:
-/// the slide fires from a clean simultaneous press, not from Block-held +
-/// buttons added), so everything is released before the first step.
-const PUNISH_RELEASE: u64 = 4;
+/// Neutral frames between releasing the guard and the macro's first press.
+/// This is the load-bearing constant of the whole punish: MK2's block-stance
+/// input-eat OUTLIVES the Block release by ~8 frames (live-measured
+/// 2026-09-01, port 4030: release-gap 7 fails at every guard-hold length
+/// tried, 8 succeeds at all of them; ~10 needed after very short holds), so
+/// the old value of 4 pressed inside the latch and the punish was EATEN on
+/// 10/10 measured cycles — the user-reported "the punish never happens".
+/// 12 = the measured boundary's worst case (10) plus margin. Evidence:
+/// w1-blockcancel-evidence.md (wave-1 probe; to be merged into mk2.md).
+const PUNISH_RELEASE: u64 = 12;
+
+/// Post-punish neutral hold-off: after a punish macro COMPLETES (or aborts),
+/// the dummy injects NEUTRAL — never the guard chord — for this many frames.
+/// Originally shipped at 48 on the hypothesis that a re-held Block
+/// block-cancels the attack's startup; the wave-1 live probe REFUTED that
+/// (2026-09-01, port 4030): Block re-held at every frame from press+1 to
+/// press+12 left contact frame and damage byte-identical to baseline — a
+/// started move cannot be guard-canceled on this port. The real hazard was
+/// the PRE-press gap ([`PUNISH_RELEASE`], see its doc). What remains for
+/// the hold-off is only the input-fold edge (a chord needs ≥2 clean frames,
+/// MACRO_ACTIONS §11, and a kick chorded with a same-frame Block fold is
+/// eaten), so 2 frames of neutral after the macro's last press is enough.
+const PUNISH_HOLDOFF: u64 = 2;
+
+/// Quiet frames required to re-arm the trigger after a punish. With the
+/// `contact_signal` struct-health source the signal genuinely moves for a
+/// SINGLE frame per contact (the whole damage lands in one step — the frame
+/// lab's verified anchor), so 8 is pure margin over the write itself; it
+/// also keeps one punish per multi-hit contact burst (hit-freeze re-writes,
+/// double_kick's two hits 11–16f apart trigger at most once while the
+/// scheduled punish is already in flight). The HISTORY that picked 8: the
+/// old HUD fallback smeared one hit into ~11 one-unit edges, so quiet only
+/// began ~11 frames after contact and 8 sat on top of that; with the
+/// one-frame signal the effective cooldown is shorter but still one-per-
+/// string in practice (an in-flight punish ignores further triggers). The
+/// value before that reused HITSTUN_RECENT_FRAMES (20 — the hitstun FEATURE
+/// window, a different concept) and made back-to-back pressure feel
+/// unresponsive.
+const PUNISH_REARM_FRAMES: u64 = 8;
 
 /// Frames an in-flight punish (delay + macro) may keep running while the
 /// gate is closed (MK2 zeroes its in-fight word from the contact frame
 /// onward) before it is dropped as a real round end.
-/// Quiet frames required to re-arm the trigger after a punish. The contact
-/// signal (a health delta) moves for a SINGLE frame per hit, so this only has
-/// to outlast the write itself; the old value reused HITSTUN_RECENT_FRAMES
-/// (20 — the hitstun FEATURE window, a different concept) and made
-/// back-to-back pressure feel unresponsive.
-const PUNISH_REARM_FRAMES: u64 = 8;
-
 const PUNISH_GATE_GRACE: u64 = 60;
 
 /// One BlockPunish frame: guard by policy; on each TRIGGER sample the weighted
@@ -1028,14 +1305,28 @@ fn block_punish(
                 }
             }
             if done {
+                // Completion starts the post-punish hold-off: the old code
+                // fell through to `out.unwrap_or(guard_bits)` HERE, re-
+                // holding Block one frame after the attack press — which
+                // block-cancels the just-pressed attack (the user-reported
+                // "the HP comes out while still blocking and the punish
+                // never happens").
                 ds.training.punish_exec = None;
+                ds.training.punish_holdoff_until = frame + PUNISH_HOLDOFF;
             }
         }
     }
 
     if ds.training.punish_exec.is_none() {
         let mode = ds.training.guard_mode;
-        ds.training.punish_phase = if frame < ds.training.punish_hold_until {
+        ds.training.punish_phase = if frame < ds.training.punish_holdoff_until {
+            // Deliberate neutral (see PUNISH_HOLDOFF) — the panel must say
+            // so rather than look broken while the dummy stands still.
+            format!(
+                "recovering — holdoff {}f",
+                ds.training.punish_holdoff_until - frame
+            )
+        } else if frame < ds.training.punish_hold_until {
             // ContinueBlock: keep guarding (reactively, where that is the
             // policy) and decline to punish until the hold expires.
             if on_commit {
@@ -1124,6 +1415,12 @@ fn block_punish(
             None => {} // empty/zero-weight pool: just keep guarding
         }
     }
+    // Post-punish hold-off: with no macro output this frame, NEUTRAL wins
+    // over the guard fallback until the stamp expires — never over `out`
+    // itself (a newly scheduled macro's own steps are untouched).
+    if out.is_none() && frame < ds.training.punish_holdoff_until {
+        return [false; 12];
+    }
     out.unwrap_or(guard_bits)
 }
 
@@ -1187,19 +1484,23 @@ mod tests {
     #[test]
     fn mk2_degrades_per_feature() {
         // MK2's map is partial by honesty (mk2.md): gate + health + world X/Y
-        // exist (X/Y now pointer-resolved, docs/frames.md §5); timer store,
-        // credits (CMOS), and round_state don't. `positions` (round-start
-        // teleport coordinates) is also unmapped, so position_reset stays
-        // declined regardless of x/y being resolvable.
+        // exist (X/Y pointer-resolved, docs/frames.md §5), and since W2 the
+        // timer store does too (W2b: the Located structural-locator form,
+        // replacing the broken fixed-address Guarded form — the panel's "Not
+        // mapped" line loses "timer hold"); credits (CMOS) and
+        // round_state still don't. `positions` (round-start teleport
+        // coordinates) is also unmapped, so position_reset stays declined
+        // regardless of x/y being resolvable.
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
         let f = features_of(&p).expect("mk2 must be training-available (has a gate)");
         assert!(f.refill, "health field + HUD pair are mapped");
         assert!(f.block_dummy, "MK is button-block: the Block chord is mapped");
-        assert!(f.block_punish, "hitstun_sources (HUD health pair) is mapped");
-        assert!(!f.timer_hold && !f.credits && !f.position_reset && !f.finish_round);
+        assert!(f.block_punish, "contact_signal (struct health, decrease-only) is mapped");
+        assert!(f.timer_hold, "the Located timer_hold form resolves (mk2.md 'The round timer, closed')");
+        assert!(!f.credits && !f.position_reset && !f.finish_round);
         assert_eq!(
             f.missing(),
-            vec!["timer hold", "credits top-up", "position reset", "finish round"]
+            vec!["credits top-up", "position reset", "finish round"]
         );
         // And the refill spec includes all four MK2 health bytes.
         let r = resolve(&p).unwrap();
@@ -1213,6 +1514,135 @@ mod tests {
         };
         let held: Vec<usize> = chord.iter().enumerate().filter(|(_, on)| **on).map(|(i, _)| i).collect();
         assert_eq!(held, vec![10], "Block = RETRO L");
+    }
+
+    /// A base the diagnostic actually observed the 1P countdown record at
+    /// (mk2.md "The round timer, closed"): NOT the 2-human 0xD630, proving the
+    /// locator finds the record by signature at a relocated address. Even, and
+    /// inside the [0xC000,0xF000) scan window.
+    const MK2_1P_TIMER_BASE: u32 = 0xDC42;
+
+    /// MK2 in a bus window with an open gate. The countdown record is NOT
+    /// staged here — each test stages it (or a near-miss) itself.
+    fn mk2_timer_scene() -> (GameProfile, DebugState) {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-timer-test".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 161));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 161));
+        assert!(crate::gate::eval_gate(&ds, &p), "gate must be open");
+        ds.training.enabled = true;
+        (p, ds)
+    }
+
+    /// Stamp a Located-signature-matching countdown record at `base`, with
+    /// digit cells `tens`/`ones`, and set the drawn-digit globals to match
+    /// (the eq_global cross-check). `code` lands the in-range code pointer.
+    fn stage_timer_record(ds: &mut DebugState, p: &GameProfile, base: u32, tens: u8, ones: u8) {
+        let tt = p.global("timer_tens").unwrap() as usize;
+        let to = p.global("timer_ones").unwrap() as usize;
+        assert!(ds.write_addr(tt, 1, tens as u32));
+        assert!(ds.write_addr(to, 1, ones as u32));
+        assert!(ds.write_addr((base + 0xE) as usize, 4, 0x0000_000B)); // sentinel
+        assert!(ds.write_addr((base + 0x2) as usize, 4, 0x0106_E800)); // code, in range
+        assert!(ds.write_addr((base + 0x6) as usize, 1, tens as u32));
+        assert!(ds.write_addr((base + 0xA) as usize, 1, ones as u32));
+    }
+
+    /// LOCATE + WRITE: the tick finds the record at a RELOCATED base by
+    /// signature and writes 9 into both digit cells (u8 writes — the cells are
+    /// u32s whose value never exceeds 9, so the high bytes stay zero).
+    #[test]
+    fn mk2_timer_hold_locates_relocated_record_and_writes_digits() {
+        let (p, mut ds) = mk2_timer_scene();
+        let base = MK2_1P_TIMER_BASE;
+        stage_timer_record(&mut ds, &p, base, 3, 7);
+        tick_with(&mut ds, 1, &p);
+        assert_eq!(ds.read_addr((base + 0x6) as usize, 4), Some(9), "tens pinned to 9");
+        assert_eq!(ds.read_addr((base + 0xA) as usize, 4), Some(9), "ones pinned to 9");
+        // Every frame while the gate stays open (the sag-absorbing cadence:
+        // the recipe needs ≤~260 frames, we give it 1). The game re-derives
+        // the drawn globals FROM the record, so after the first tick pinned
+        // the cells to 9/9 the drawn tens is also 9; then a countdown tick
+        // decrements the ones cell (and its drawn global) to 8. Stage that
+        // consistent state, then the second tick must re-pin ones to 9.
+        assert!(ds.write_addr(p.global("timer_tens").unwrap() as usize, 1, 9));
+        assert!(ds.write_addr(p.global("timer_ones").unwrap() as usize, 1, 8));
+        assert!(ds.write_addr((base + 0xA) as usize, 1, 8));
+        tick_with(&mut ds, 2, &p);
+        assert_eq!(ds.read_addr((base + 0xA) as usize, 4), Some(9), "re-pinned next frame");
+    }
+
+    /// The locator must reject NEAR-MISSES and find the true record: two decoy
+    /// records sit at LOWER addresses (so a naive first-hit would take them) —
+    /// one with the wrong +0xE sentinel, one whose digit cells disagree with
+    /// the drawn-digit globals — and only the real record at the higher
+    /// relocated base gets the 9/9 write.
+    #[test]
+    fn mk2_timer_hold_rejects_near_misses_and_finds_the_true_record() {
+        let (p, mut ds) = mk2_timer_scene();
+        let real = MK2_1P_TIMER_BASE; // 0xDC42
+        // Drawn globals say tens=4, ones=2.
+        stage_timer_record(&mut ds, &p, real, 4, 2);
+
+        // Decoy A @ 0xC800 (< real): valid code+digits but WRONG sentinel.
+        let decoy_sentinel = 0xC800u32;
+        assert!(ds.write_addr((decoy_sentinel + 0xE) as usize, 4, 0x0000_000C));
+        assert!(ds.write_addr((decoy_sentinel + 0x2) as usize, 4, 0x0106_E800));
+        assert!(ds.write_addr((decoy_sentinel + 0x6) as usize, 1, 4));
+        assert!(ds.write_addr((decoy_sentinel + 0xA) as usize, 1, 2));
+
+        // Decoy B @ 0xCE00 (< real): valid sentinel+code but digit cells (5/9)
+        // DISAGREE with the drawn globals (4/2) — the eq_global cross-check
+        // must reject it.
+        let decoy_digits = 0xCE00u32;
+        assert!(ds.write_addr((decoy_digits + 0xE) as usize, 4, 0x0000_000B));
+        assert!(ds.write_addr((decoy_digits + 0x2) as usize, 4, 0x0106_E800));
+        assert!(ds.write_addr((decoy_digits + 0x6) as usize, 1, 5));
+        assert!(ds.write_addr((decoy_digits + 0xA) as usize, 1, 9));
+
+        tick_with(&mut ds, 1, &p);
+
+        // The real record won: both digit cells forced to 9.
+        assert_eq!(ds.read_addr((real + 0x6) as usize, 4), Some(9), "real tens → 9");
+        assert_eq!(ds.read_addr((real + 0xA) as usize, 4), Some(9), "real ones → 9");
+        // Neither decoy was touched.
+        assert_eq!(ds.read_addr((decoy_sentinel + 0x6) as usize, 4), Some(4), "wrong-sentinel decoy untouched");
+        assert_eq!(ds.read_addr((decoy_digits + 0x6) as usize, 4), Some(5), "wrong-digits decoy untouched");
+    }
+
+    /// A menu/transition-shaped region — no record matches the signature — the
+    /// tick writes NOTHING (locate returns None, skip silently).
+    #[test]
+    fn mk2_timer_hold_writes_nothing_when_no_record_matches() {
+        let (p, mut ds) = mk2_timer_scene();
+        // A lone marker where a digit cell would be, but no valid record
+        // around it (sentinel +0xE stays 0).
+        let marker = MK2_1P_TIMER_BASE;
+        assert!(ds.write_addr((marker + 0x6) as usize, 1, 0x22));
+        let logs_before = ds.event_log.len();
+        tick_with(&mut ds, 1, &p);
+        assert_eq!(ds.read_addr((marker + 0x6) as usize, 1), Some(0x22), "no match → cell untouched");
+        assert_eq!(ds.event_log.len(), logs_before, "no-match is silent — no log spam");
+    }
+
+    /// The legacy Adjacent form is untouched by the Located form's arrival:
+    /// asurabld's tick still writes `timer_hold[0]`/`[1]` to
+    /// `round_timer`/+1 unconditionally while in-fight.
+    #[test]
+    fn asurabld_legacy_timer_hold_still_writes_round_timer_pair() {
+        let (p, mut ds) = asurabld_scene();
+        let timer = p.global("round_timer").unwrap() as usize;
+        tick_with(&mut ds, 1, &p);
+        assert_eq!(ds.read_addr(timer, 1), Some(0x85), "seconds byte held (BCD 85)");
+        assert_eq!(ds.read_addr(timer + 1, 1), Some(0x03), "subseconds byte held");
     }
 
     #[test]
@@ -1239,9 +1669,10 @@ mod tests {
     }
 
     /// The full §6 loop against the mk2 profile: arm on quiet, trigger on a
-    /// hit_counter change while guarding, play the char-aware slide through
-    /// MacroExec on the dummy port, return to the guard chord, and stay in
-    /// cooldown until the signal goes quiet again.
+    /// struct-health DECREASE while guarding, play the char-aware slide
+    /// through MacroExec on the dummy port, stand deliberately neutral for
+    /// the post-punish hold-off, then return to the guard chord — and treat
+    /// an INCREASE (refill / round-intro shaped) as no contact at all.
     #[test]
     fn block_punish_fires_the_slide_on_contact_then_cools_down() {
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
@@ -1254,8 +1685,9 @@ mod tests {
             flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
         }));
         // Open mk2's gate and stage the matchup: dummy (higher X → block2)
-        // is Reptile; its contact signal is the block2 hitstun source
-        // (p2_health_hud — the HUD accumulator that moves when P2 is struck).
+        // is Reptile; its contact signal is block2's own struct `health`
+        // (contact_signal field=health, direction=decrease — the frame-lab
+        // anchor that steps by the whole damage in one frame).
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
@@ -1265,12 +1697,10 @@ mod tests {
         // block1 at x=100 (left), block2/dummy (Reptile) at x=200 (right).
         stage_object_ptr(&mut ds, p.block1(), 0, 0x7000, 100);
         stage_object_ptr(&mut ds, p.block2(), 9, 0x7100, 200);
-        // The dummy is block2 (larger x); mk2 ships no contact_signal, so
-        // the trigger falls back to hitstun_sources — block2's HUD health.
-        // (A blocking MK2 fighter's struct is otherwise frozen and blocked
-        // contact always chips, so the health delta IS the contact event —
-        // see mk2.md's contact-signal investigation.)
-        let sig = p.global("p2_health_hud").unwrap() as usize;
+        // The dummy is block2 (larger x); the trigger is block2's struct
+        // health. (Blocked contact always chips on this port — 3/6/8 — so
+        // the struct-health delta sees blocked hits too; mk2.md.)
+        let sig = (p.block2() + hoff) as usize;
         assert!(crate::gate::eval_gate(&ds, &p));
 
         ds.training.enabled = true;
@@ -1287,9 +1717,10 @@ mod tests {
         assert_eq!(ds.injected_input2[10], 2, "guarding while armed");
         assert_eq!(ds.injected_input2[8], 0);
 
-        // Contact: the signal moves while the dummy guards → punish is
-        // SCHEDULED (guard held through hit-freeze + blockstun first).
-        assert!(ds.write_addr(sig, 1, 1));
+        // Contact: a blocked-HP chip (90 → 84, whole damage in one frame)
+        // while the dummy guards → punish is SCHEDULED (guard held through
+        // hit-freeze + blockstun first).
+        assert!(ds.write_addr(sig, 1, 84));
         tick_with(&mut ds, 26, &p);
         assert!(ds.training.punish_exec.is_some(), "punish scheduled");
         assert_eq!(ds.training.punish_wait, PUNISH_DELAY);
@@ -1328,16 +1759,44 @@ mod tests {
         assert!(ds.training.punish_exec.is_none(), "macro finished under grace");
         f += 9;
 
-        // Gate reopens: the guard chord returns.
+        // Gate reopens DURING the post-punish hold-off: the guard chord must
+        // NOT snap back (re-held Block block-cancels the just-pressed chord
+        // — the bug PUNISH_HOLDOFF fixes); the dummy stands deliberately
+        // neutral and the phase says so.
         assert!(ds.write_addr(scr, 2, 0));
         tick_with(&mut ds, f, &p);
-        assert_eq!(ds.injected_input2[10], 2, "back to guarding");
+        assert_eq!(ds.injected_input2[10], 0, "no guard during the post-punish hold-off");
+        assert!(
+            ds.training.punish_phase.starts_with("recovering — holdoff"),
+            "deliberate neutral must explain itself: {}",
+            ds.training.punish_phase
+        );
+
+        // The hold-off expires → the guard chord returns.
+        let end = ds.training.punish_holdoff_until;
+        while f < end {
+            f += 1;
+            tick_with(&mut ds, f, &p);
+        }
+        assert_eq!(ds.injected_input2[10], 2, "guard returns after the hold-off");
         assert_eq!(ds.injected_input2[8], 0);
 
-        // Another change inside the quiet window must NOT re-trigger.
-        assert!(ds.write_addr(sig, 1, 2));
-        tick_with(&mut ds, f + 1, &p);
-        assert_eq!(ds.injected_input2[10], 2, "cooldown holds the guard");
+        // An INCREASE (training refill / round-intro ramp shaped) is NOT
+        // contact: no trigger, and it must not stamp the quiet window (the
+        // trigger stays armed).
+        assert!(ds.training.punish_armed, "long quiet re-armed the trigger");
+        assert!(ds.write_addr(sig, 1, 161));
+        f += 1;
+        tick_with(&mut ds, f, &p);
+        assert!(ds.training.punish_exec.is_none(), "an increase must never trigger");
+        assert!(ds.training.punish_armed, "an increase must not reset the quiet window");
+        assert_eq!(ds.injected_input2[10], 2, "still guarding");
+
+        // A fresh DECREASE re-triggers — the loop is repeatable.
+        assert!(ds.write_addr(sig, 1, 155));
+        f += 1;
+        tick_with(&mut ds, f, &p);
+        assert!(ds.training.punish_exec.is_some(), "a decrease re-triggers once re-armed");
         assert!(!ds.training.punish_armed);
     }
 
@@ -1606,8 +2065,8 @@ mod tests {
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
-        assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
-        assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
+        // No x staged: mk2's x is pointer-resolved (the DISPROVEN p1_x/p2_x
+        // globals are removed), and the button guard doesn't need geometry.
         ds.training.enabled = true;
         ds.training.dummy = DummyMode::BlockPunish;
         ds.training.punish_pool = vec![(crate::macros::PunishOption::Attack("HP".into()), 1)];
@@ -1615,10 +2074,75 @@ mod tests {
             tick_with(&mut ds, f, &p);
         }
         assert_eq!(ds.training.punish_phase, "guarding — ARMED");
-        let sig = p.global("p2_health_hud").unwrap() as usize;
-        assert!(ds.write_addr(sig, 1, 1));
+        // Contact = the dummy's (block2's) struct health DECREASING.
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 84));
         tick_with(&mut ds, 21, &p);
         assert_eq!(ds.training.punish_phase, "punishing: HP");
+    }
+
+    /// The post-punish hold-off, in-gate (the user-reported bug's exact
+    /// shape): the frame the punish macro completes, the dummy must inject
+    /// NEUTRAL — not fall back to the guard chord, which one frame after a
+    /// 3-frame attack press block-cancels the attack ("the HP comes out
+    /// while the character is still blocking and the punish never happens").
+    /// Neutral holds for PUNISH_HOLDOFF frames with an honest phase string,
+    /// then the guard chord returns.
+    #[test]
+    fn punish_completion_holds_off_the_guard_chord() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-holdoff-test".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        assert!(crate::gate::eval_gate(&ds, &p));
+        ds.training.enabled = true;
+        ds.training.dummy = DummyMode::BlockPunish;
+        ds.training.punish_pool = vec![(crate::macros::PunishOption::Attack("HP".into()), 1)];
+
+        for f in 1..=20 {
+            tick_with(&mut ds, f, &p);
+        }
+        assert!(ds.training.punish_armed);
+        assert_eq!(ds.injected_input2[10], 2, "guarding while armed");
+
+        // Chip contact triggers; ride the delay + release tail + 3-frame
+        // HP press to completion.
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 84));
+        let mut f = 21;
+        tick_with(&mut ds, f, &p);
+        assert!(ds.training.punish_exec.is_some(), "punish scheduled");
+        while ds.training.punish_exec.is_some() {
+            f += 1;
+            tick_with(&mut ds, f, &p);
+        }
+        // `f` is the completion tick: the old code re-injected guard_bits
+        // HERE (out.unwrap_or) — the regression under test.
+        assert_eq!(
+            ds.injected_input2[10], 0,
+            "guard must NOT snap back on the completion frame"
+        );
+        assert!(
+            ds.training.punish_phase.starts_with("recovering — holdoff"),
+            "the deliberate neutral must explain itself: {}",
+            ds.training.punish_phase
+        );
+        let end = ds.training.punish_holdoff_until;
+        assert_eq!(end, f + PUNISH_HOLDOFF, "hold-off stamped at completion");
+        while f + 1 < end {
+            f += 1;
+            tick_with(&mut ds, f, &p);
+            assert_eq!(ds.injected_input2[10], 0, "neutral through the hold-off (frame {f})");
+        }
+        f += 1;
+        tick_with(&mut ds, f, &p); // f == end: the stamp has expired
+        assert_eq!(ds.injected_input2[10], 2, "guard returns after the hold-off");
     }
 
     // ── §10.1 abort paths: a held chord must never survive a macro ending
@@ -1942,8 +2466,8 @@ mod tests {
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
-        assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
-        assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
+        // No x staged: mk2's x is pointer-resolved (the DISPROVEN p1_x/p2_x
+        // globals are removed) and the button-block dummy needs no geometry.
         assert!(crate::gate::eval_gate(&ds, &p), "gate must be open for this test");
 
         ds.training.enabled = true;

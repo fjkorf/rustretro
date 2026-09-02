@@ -137,10 +137,23 @@ enum ContactSrc {
     Globals(usize, usize),
 }
 
-fn resolve_contact_src(p: &GameProfile, fields1: &[Slot], globals: &[Slot]) -> Option<ContactSrc> {
+/// Returns the resolved source plus its `direction: "decrease"` flag (only a
+/// DROP in the signal is a contact event). On MK2 arcade the source is struct
+/// `health` with decrease-only — without the sign check the round-intro ramp
+/// (+2/frame under the banner-gate leak) and the training refill's write back
+/// to max would each read as a stream of bogus "contact" events in the
+/// string/juggle sidecar stats. The `hitstun_sources` fallback never carries
+/// a direction (any-change back-compat — asurabld's combo counters INCREASE).
+fn resolve_contact_src(p: &GameProfile, fields1: &[Slot], globals: &[Slot]) -> Option<(ContactSrc, bool)> {
     if let Some(cs) = &p.port.contact_signal {
+        let decrease = cs.direction.as_deref() == Some("decrease");
         match (&cs.field, &cs.global) {
-            (Some(f), _) => return fields1.iter().position(|s| &s.name == f).map(ContactSrc::Field),
+            (Some(f), _) => {
+                return fields1
+                    .iter()
+                    .position(|s| &s.name == f)
+                    .map(|i| (ContactSrc::Field(i), decrease));
+            }
             (None, Some(_)) => return None, // shared counter: defender-ambiguous
             (None, None) => {} // unreachable post-validation; fall through
         }
@@ -149,7 +162,7 @@ fn resolve_contact_src(p: &GameProfile, fields1: &[Slot], globals: &[Slot]) -> O
     let find = |name: &str| globals.iter().position(|s| s.name == name);
     let i1 = find(hs.get("block1")?)?;
     let i2 = find(hs.get("block2")?)?;
-    Some(ContactSrc::Globals(i1, i2))
+    Some((ContactSrc::Globals(i1, i2), false))
 }
 
 /// One in-progress "string" for one defender (MACRO_ACTIONS §8.1): the
@@ -342,6 +355,9 @@ pub struct FrameRecorder {
     /// `contact_signal` nor `hitstun_sources` is usable (unmapped port, or a
     /// defender-ambiguous shared counter) — string/juggle stats stay absent.
     contact_src: Option<ContactSrc>,
+    /// `contact_signal.direction == "decrease"`: only a drop in the signal
+    /// counts as a contact event (see `resolve_contact_src`'s doc).
+    contact_decrease: bool,
     /// Index into `fields1`/`fields2` of `health` (damage-delta classification)
     /// and `y` (juggle flag); `ground_y` is the profile's calibration for the
     /// off-ground margin. `y_idx`/`ground_y` both `Some` = juggle flag emitted.
@@ -493,7 +509,10 @@ impl FrameRecorder {
         let health_idx = field_idx("health");
         let y_idx = field_idx("y");
         let ground_y = profile.calibration("GROUND_Y");
-        let contact_src = resolve_contact_src(profile, &fields1, &globals);
+        let (contact_src, contact_decrease) = match resolve_contact_src(profile, &fields1, &globals) {
+            Some((src, dec)) => (Some(src), dec),
+            None => (None, false),
+        };
         let hitstun_window = profile.calibration("HITSTUN_RECENT_FRAMES").unwrap_or(20.0) as u64;
 
         // Compile every special the profile encodes (family∩port, all
@@ -610,6 +629,7 @@ impl FrameRecorder {
             matchers,
             round_specials: std::collections::BTreeMap::new(),
             contact_src,
+            contact_decrease,
             health_idx,
             y_idx,
             ground_y,
@@ -808,7 +828,12 @@ impl FrameRecorder {
                 for side in 0..2 {
                     let val = cur_vals[side];
                     if let Some(prev) = self.prev_contact[side] {
-                        if val != prev {
+                        // Decrease-only sources (MK2's struct health): an
+                        // increase (round-intro ramp, training refill) is
+                        // NOT contact — same sign check as the trainer's
+                        // `poll_contact`.
+                        let event = if self.contact_decrease { val < prev } else { val != prev };
+                        if event {
                             // Contact event fires this frame for `side`'s
                             // defender. Link into the current string only if
                             // the previous event (if any) was recent enough
@@ -1237,15 +1262,14 @@ mod tests {
         assert_eq!(v["block1"]["health"], 100);
         let gkeys: Vec<&str> = v["globals"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
         // Set membership (Value maps sort): gate globals + record_globals.
-        assert_eq!(
-            gkeys,
-            vec!["hit_counter", "p1_health_hud", "p2_health_hud", "round_over", "screen_state"]
-        );
+        // `hit_counter` left both in the W2 cleanup (P1-victim-only, nothing
+        // downstream consumed the column — mk2.profile.json _STATUS).
+        assert_eq!(gkeys, vec!["p1_health_hud", "p2_health_hud", "round_over", "screen_state"]);
         // Serialized order is gate order (word-read screen_state, round_over)
-        // then record_globals order (the hitstun-source HUD pair, hit_counter).
+        // then record_globals order (the hitstun-source HUD pair).
         assert!(text.contains(
             "\"globals\":{\"screen_state\":0,\"round_over\":0,\
-             \"p1_health_hud\":0,\"p2_health_hud\":0,\"hit_counter\":0}"
+             \"p1_health_hud\":0,\"p2_health_hud\":0}"
         ));
         assert!(text.contains("\"block1\":{\"char_id\":7,\"health\":100,\"action_counter\":0}"));
         assert_eq!(v["controllable"], true);
@@ -1427,16 +1451,12 @@ mod tests {
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
         assert!(ds.write_addr((p.block1() + coff) as usize, 1, 9));
         assert!(ds.write_addr((p.block2() + coff) as usize, 1, 9));
-        // These raw globals are DISPROVEN as a position source (task B-prof,
-        // docs/frames.md §5) and no fighter field references them anymore,
-        // so this recorder's `opp_right` has no x to read for mk2 and falls
-        // back to its "left fighter is P1" default (`record.rs`'s
-        // `opp_right` doc) — which happens to match the facing this test
-        // wants (block1 left/facing right, block2 right/facing left)
-        // WITHOUT these writes doing anything. Left in place as evidence
-        // that they are inert, not load-bearing, for this recorder version.
-        assert!(ds.write_addr(p.global("p1_x").unwrap() as usize, 2, 100));
-        assert!(ds.write_addr(p.global("p2_x").unwrap() as usize, 2, 200));
+        // No x staged: the raw p1_x/p2_x globals are DISPROVEN as a position
+        // source (task B-prof, docs/frames.md §5) and were REMOVED in the W2
+        // cleanup, so this recorder's `opp_right` has no x to read for mk2
+        // and falls back to its "left fighter is P1" default (`record.rs`'s
+        // `opp_right` doc) — which matches the facing this test wants
+        // (block1 left/facing right, block2 right/facing left).
         assert!(crate::gate::eval_gate(&ds, &p));
 
         let path = tmp("shadow_rec_specials");
@@ -1648,36 +1668,41 @@ mod tests {
     /// MACRO_ACTIONS §8 item 2: a contact event with NO health change on the
     /// defender classifies as `no_damage`, never asserted as "blocked" — it
     /// still opens/holds a string, and a string with zero hits counts as a
-    /// block string. Exercises the mk2-shaped profile (hitstun_sources over
-    /// the HUD health-accumulator globals, distinct from the `health`
-    /// fighter field used for the damage delta).
+    /// block string. Exercises the asurabld shape (hitstun_sources over the
+    /// combo counters, distinct from the `health` fighter field used for the
+    /// damage delta). This USED to run on mk2's HUD-pair fallback; mk2 now
+    /// ships `contact_signal` field=health direction=decrease, whose every
+    /// event carries damage by construction (blocked contact always chips
+    /// there) — see the mk2-specific test below.
     #[test]
     fn v3_zero_damage_contact_classifies_as_no_damage() {
-        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let p = crate::profile::init_for_tests();
         let mut ds = DebugState::new();
         assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
-            name: "wram-mk2-nodamage".into(),
-            addr: 0x0,
-            len: 0x10000,
+            name: "wram-asura-nodamage".into(),
+            addr: 0x400000,
+            len: 0x7000,
             interval: 1,
             flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
         }));
         let hoff = p.field_off("health").unwrap().0;
-        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
-        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90)); // unchanged all test
-        let p2_hud = p.global("p2_health_hud").unwrap() as usize;
-        assert!(crate::gate::eval_gate(&ds, &p));
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 200));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 200)); // unchanged all test
+        assert!(ds.write_addr(p.global("round_timer").unwrap() as usize, 1, 0x90));
+        let combo_b2 = p.global("combo_on_b2").unwrap() as usize;
+        assert!(crate::gate::eval_gate(&ds, p));
 
         let path = tmp("shadow_rec_no_damage");
         {
-            let mut rec = FrameRecorder::create(&path, &p, "mk2", "fbneo", None).unwrap();
+            let mut rec = FrameRecorder::create(&path, p, "test", "test", None).unwrap();
             rec.record(&ds, 0, 0); // baseline
-            // The contact signal fires (HUD counter changes) but the
-            // fighter's own `health` field never moves — no_damage.
-            assert!(ds.write_addr(p2_hud, 1, 1));
+            // The contact signal fires (combo counter changes) but the
+            // fighter's own `health` field never moves — no_damage
+            // (asurabld blocks deal zero chip).
+            assert!(ds.write_addr(combo_b2, 1, 1));
             rec.record(&ds, 0, 0);
             // Close the round.
-            assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 0)); // out of range -> gate closes
+            assert!(ds.write_addr(p.global("round_timer").unwrap() as usize, 1, 0xFF));
             rec.record(&ds, 0, 0);
             rec.finish();
         }
@@ -1686,7 +1711,60 @@ mod tests {
         assert_eq!(r["strings"]["count"], 1);
         assert_eq!(r["strings"]["longest_hits"], 0, "no damage-dealing events: {r}");
         assert_eq!(r["strings"]["block_strings"], 1, "an all-no_damage string is a block string");
-        assert!(r["strings"]["juggle_hits"].is_null(), "mk2 arcade maps no y — flag stays absent");
+        assert_eq!(r["strings"]["juggle_hits"], 0, "y IS mapped here — flag present, no juggles");
+        cleanup(&path);
+    }
+
+    /// mk2's shipped contact source is struct `health` with
+    /// `direction: "decrease"`: a DECREASE is a contact event (and always
+    /// carries damage — blocked contact chips on this port), while an
+    /// INCREASE (round-intro ramp, training refill) fires NOTHING. The
+    /// increase is separated from the decrease by more than the hitstun
+    /// window, so a wrongly-fired increase event would show up as a second
+    /// (block) string — the aggregates below prove it never fired.
+    #[test]
+    fn v3_mk2_contact_fires_on_struct_health_decrease_only() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-mk2-decrease".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        let h2 = (p.block2() + hoff) as usize;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr(h2, 1, 90));
+        assert!(crate::gate::eval_gate(&ds, &p));
+
+        let path = tmp("shadow_rec_mk2_decrease");
+        {
+            let mut rec = FrameRecorder::create(&path, &p, "mk2", "fbneo", None).unwrap();
+            rec.record(&ds, 0, 0); // baseline
+            // INCREASE (refill-shaped, 90 → 96): must NOT be a contact event.
+            assert!(ds.write_addr(h2, 1, 96));
+            rec.record(&ds, 0, 0);
+            // Quiet gap longer than the hitstun window (20): if the increase
+            // HAD fired, its string would finalize separately here.
+            for _ in 0..25 {
+                rec.record(&ds, 0, 0);
+            }
+            // DECREASE (blocked-HP chip, 96 → 90): one Hit event, damage 6.
+            assert!(ds.write_addr(h2, 1, 90));
+            rec.record(&ds, 0, 0);
+            // Close the round.
+            assert!(ds.write_addr(h2, 1, 0)); // out of range -> gate closes
+            rec.record(&ds, 0, 0);
+            rec.finish();
+        }
+        let rounds = std::fs::read_to_string(path.with_extension("rounds.jsonl")).unwrap();
+        let r: serde_json::Value = serde_json::from_str(rounds.lines().next().unwrap()).unwrap();
+        assert_eq!(r["strings"]["count"], 1, "only the decrease is an event: {r}");
+        assert_eq!(r["strings"]["longest_hits"], 1);
+        assert_eq!(r["strings"]["longest_damage"], 6, "the chip amount, whole in one frame");
+        assert_eq!(r["strings"]["block_strings"], 0, "chip carries damage -> not a block string");
         cleanup(&path);
     }
 

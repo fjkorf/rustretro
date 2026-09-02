@@ -45,6 +45,15 @@ plays them back; both read the same profile data.
 }
 ```
 
+> **The example above is the PRE-correction draft, kept for schema shape
+> only** (annotated 2026-09-01). Both entries were corrected by live audit:
+> the arcade `slide` chord is `{dirs:["back"], press:["LK","LP","Block"],
+> frames:8}` (Reference data below — without Block the chord resolves to a
+> normal, and a 1-frame chord fires nothing, §11), and `acid_spit`'s trigger
+> is a BARE `HP` step — `F · F · HP` — because a direction chorded with its
+> trigger on the same frame does not register (§11; the `F,F+HP` shape shown
+> here is retracted, see the Reference-data correction below).
+
 - A macro is an ordered list of steps. Each step: optional `dirs` (held
   directions, SEMANTIC space: `back`/`forward`/`up`/`down` — side-resolved at
   match/execute time), optional `press` (attack-CLASS names from
@@ -76,6 +85,19 @@ plays them back; both read the same profile data.
 - `acid_spit` (F,F,HP) and `force_ball` (B,B,HP+LP) are CANDIDATES: encode
   them, live-verify with the executor (projectile appears / hit_counter fires
   at range), and DROP any that fail verification rather than shipping guesses.
+
+  > **Since resolved (2026-08-30 audit; correction recorded 2026-09-01).**
+  > `force_ball` is VERIFIED as `B · B+HP+LP` — the chorded back is the
+  > second tap of the motion, not a held-direction chord (§11). `acid_spit`'s
+  > first "verification" (h1 −24 via the punish executor) was **RETRACTED**:
+  > the trial ran at point blank and 24 is exactly Reptile's *close HP
+  > normal*; the chorded `F · F+HP` form produces no special at all (0
+  > damage, 16/16 configurations). The shipped encoding is `F` · `F` · `HP`
+  > — bare trigger tap (§11; evidence in mk2.md "Special-move encodings,
+  > live-audited"). And "hit_counter fires at range" was never a valid
+  > verification signal either — `0xD3FE` is P1-victim-only (§6's own
+  > amendment); verify a projectile by damage at a gap where every normal
+  > provably whiffs.
 
 ## 3. Recorder annotation (RECORDER_V3 v3-additive)
 
@@ -122,7 +144,17 @@ label space ships in models).
   0xD3FE is P1-victim-only (never fires for hits ON P2) — DROPPED as the
   arcade trigger; arcade uses `hitstun_sources` = the per-player HUD damage
   pair (caveat: training refill rewrites those bytes — one spurious punish
-  per refill, absorbed by the cooldown). Genesis has NO verified contact
+  per refill, absorbed by the cooldown). **Superseded in turn (2026-09-01):
+  the arcade trigger is now the shipped `contact_signal {"field": "health",
+  "direction": "decrease"}` — STRUCT health `block+0x0E`, which steps by the
+  whole damage in one frame (the HUD pair is a DRAWN value that smears one
+  hit into ~11 edges), with `direction: "decrease"` making the trigger
+  immune to both known increase hazards (the round-intro health ramp and the
+  training refill — closing the spurious-punish caveat above, inverted into
+  ~one LOST trigger per refill cycle). Blocked normals chip 3/6/8 on this
+  port, so a health-delta trigger sees blocked contact. `hitstun_sources`
+  stays as the fallback. Evidence: mk2.md "Contact signal shipped"
+  (2026-09-01).** Genesis has NO verified contact
   signal (honest negative — VFX-cluster candidate false-fires on movement);
   BlockPunish greys there until one lands. No signal mapped → BlockPunish is offered greyed with a hint
   (per-feature degradation, house pattern).
@@ -163,13 +195,31 @@ label space ships in models).
 State-free tracking, per the review's findings (no state word needed):
 
 1. **String segmentation stats** in the rounds sidecar: contact events come
-   from the port's contact signal (arcade `hit_counter` — its own ~20-frame
+   from the port's contact signal ~~(arcade `hit_counter` — its own ~20-frame
    reset window IS the game's linking judgment: consecutive increments
-   without reset = one string; genesis analog pending A-RE). Each event
-   classified hit-vs-block by defender health delta (MK2: blocked normals
-   do 0, blocked specials chip). Per round: string count, longest string
+   without reset = one string; genesis analog pending A-RE)~~. Each event
+   classified hit-vs-block ~~by defender health delta (MK2: blocked normals
+   do 0, blocked specials chip)~~. Per round: string count, longest string
    (hits + damage), block-string count. Feeds report/coverage as drill
    inputs ("juggle conversion after launcher: 2/9").
+
+   > **CORRECTED 2026-09-01 — both struck clauses were written against
+   > evidence the docs had already retracted when this section was drafted.**
+   > (a) Arcade `hit_counter` 0xD3FE is P1-victim-only (§6's own amendment)
+   > and must never source string events. The arcade contact source is the
+   > per-victim health signal — now the shipped
+   > `contact_signal {"field": "health", "direction": "decrease"}` on STRUCT
+   > health `block+0x0E` (§6 above; mk2.md "Contact signal shipped",
+   > 2026-09-01) — with the ~20-frame quiet window
+   > (`HITSTUN_RECENT_FRAMES`) supplying the linking judgment instead of the
+   > counter's reset. The genesis analog is still an honest negative (§6).
+   > (b) "MK2: blocked normals do 0" is measured FALSE: blocked normals CHIP
+   > on arcade struct health — 3/6/8, exactly a quarter of the damage
+   > (docs/frames.md §4.1's chip note; mk2.md's ladder tables) — so
+   > hit-vs-block cannot be classified by a zero health delta at all: zero
+   > damage means WHIFF, not block (frames.md §2.6). Classify hit-vs-block
+   > from the rig's own guard state where the rig drives the defender, else
+   > from the chip-vs-full damage signature.
 2. **Juggle context flag**: genesis = defender y off ground at contact;
    arcade = the `+0xC` latch (0xFFFC ~366ms, fires on launcher hits) —
    VERIFY the latch holds through the juggle and clears on landing before

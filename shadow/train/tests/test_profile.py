@@ -675,6 +675,31 @@ class MacroActionsSchemaTest(unittest.TestCase):
             )
             self.assertEqual(prof.contact_signal, {"global": "hit_counter"})
 
+    def test_contact_signal_direction_decrease_carried_through(self):
+        # Optional `direction: "decrease"` (mk2 arcade ships it on struct
+        # `health`) must survive normalization -- only a DROP counts as
+        # contact on the Rust side (refill/round-intro INCREASE immunity).
+        with tempfile.TemporaryDirectory() as d:
+            prof = self._write(
+                Path(d),
+                globals_map={"hit_counter": "0x1000"},
+                contact_signal={"global": "hit_counter", "direction": "decrease"},
+            )
+            self.assertEqual(
+                prof.contact_signal,
+                {"global": "hit_counter", "direction": "decrease"},
+            )
+
+    def test_contact_signal_bad_direction_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(profile.ProfileError) as ctx:
+                self._write(
+                    Path(d),
+                    globals_map={"hit_counter": "0x1000"},
+                    contact_signal={"global": "hit_counter", "direction": "increase"},
+                )
+            self.assertIn("direction", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -165,16 +165,30 @@ pub struct PortBlock {
 /// The contact-signal declaration: something whose CHANGE means "this
 /// fighter was struck (hit OR blocked)". Exactly one source:
 /// - `field`: a per-fighter field name, resolved per block — PREFERRED,
-///   because it is per-victim by construction and (MK2's `action_counter`)
-///   fires on zero-chip blocked contact, which a health delta cannot see.
+///   because it is per-victim by construction. MK2 arcade ships struct
+///   `health` (block+0x0E): it steps by the whole damage in ONE frame, on
+///   hit AND on block — blocked normals always chip on this port (3/6/8,
+///   mk2.md "Hitstun / blockstun observables") — unlike the drawn HUD pair,
+///   which animates 1 unit/frame and smears one hit into ~11 edges. (The
+///   earlier `action_counter` contact claim was RETRACTED — mk2.md.)
 /// - `global`: one address shared by both fighters (weaker: usually
 ///   victim-asymmetric, as MK2's hit_counter turned out to be).
+///
+/// `direction` (optional) restricts which changes COUNT as contact:
+/// - `"decrease"`: only a drop in the value is contact. This is what makes a
+///   health-valued signal immune to the two INCREASE hazards — the round-
+///   intro ramp (+2/frame under the banner-gate leak) and the training
+///   refill's write back to max — by one sign check.
+/// - absent: any change counts (back-compat; asurabld's combo counters
+///   INCREASE on hits, so decrease-only must never be a global rule).
 #[derive(Deserialize, Debug, Clone)]
 pub struct ContactSignal {
     #[serde(default)]
     pub field: Option<String>,
     #[serde(default)]
     pub global: Option<String>,
+    #[serde(default)]
+    pub direction: Option<String>,
 }
 
 /// One macro step (MACRO_ACTIONS §2/§10): held SEMANTIC directions, attack
@@ -415,10 +429,79 @@ pub enum GateCond {
 pub struct Enforcement {
     pub health_max: u8,
     pub refill_below: u8,
-    /// [seconds byte, subseconds byte] written to round_timer/+1 to hold it.
-    pub timer_hold: [u8; 2],
+    pub timer_hold: TimerHold,
     pub credits_target: u8,
     pub credits_min: u8,
+}
+
+/// How training holds the round timer — two declarative forms, because two
+/// real layouts exist (docs/game-profiles.md):
+///
+/// - **Adjacent** (legacy, asurabld/genesis shape): `[seconds byte,
+///   subseconds byte]` written to the `round_timer` global and `+1` every
+///   tick. Kept verbatim — asurabld's training tests are the proof.
+/// - **Located** (MK2-arcade shape, mk2.md "The round timer, closed"): the
+///   authoritative store is a countdown TASK RECORD that physically RELOCATES
+///   every fight (base 0xD630 on the 2-human rig it was first captured from,
+///   but 0xDC42 / 0xE254 in two separate 1P fights, and the code-pointer word
+///   varies too), so no fixed address or fixed guard value exists. The
+///   record's STRUCTURE is invariant, so it is found each in-fight frame by
+///   scanning `[scan[0], scan[1])` (step 2 — records are u16-aligned) for the
+///   first base R that satisfies every `record` predicate, then applying each
+///   `writes` entry (a u8 at `R + offset`). Each predicate is `offset` +
+///   `size` (1|2|4) + exactly one of: `equals` (hex constant), `min`+`max`
+///   (inclusive-min, EXCLUSIVE-max range), or `eq_global` (equal to `size`
+///   bytes read at that global's address — the drawn-digit cross-check that
+///   makes the match unique). All multi-byte reads get the same
+///   guest-endianness fix every profile read gets (MK2's region is
+///   little-endian). Zero matches → skip silently (menu/transition). The
+///   reference instance is MK2 arcade (mk2.md).
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TimerHold {
+    /// Legacy: [seconds byte, subseconds byte] → `round_timer`/+1.
+    Adjacent([u8; 2]),
+    /// Structural-locator multi-write (relocating task-record, MK2 arcade).
+    Located {
+        /// `[start, end)` guest-address scan window (end exclusive).
+        scan: [HexAddr; 2],
+        /// Signature predicates every matching record base must satisfy.
+        record: Vec<TimerPredicate>,
+        /// u8 writes applied to the first matching base, relative to it.
+        writes: Vec<TimerWrite>,
+    },
+}
+
+/// One structural predicate on a candidate record base `R`
+/// ([`TimerHold::Located`]). Reads `size` bytes at `R + offset` (endian-fixed)
+/// and tests them against EXACTLY ONE of `equals` / (`min`+`max`) /
+/// `eq_global` — validated at load.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TimerPredicate {
+    /// Byte offset of the field relative to the candidate base `R`.
+    pub offset: HexAddr,
+    /// Read width in bytes: 1, 2, or 4 (validated at load).
+    pub size: u8,
+    /// Equal to this constant (endian-fixed).
+    #[serde(default)]
+    pub equals: Option<HexAddr>,
+    /// Inclusive lower bound of a range (pairs with `max`).
+    #[serde(default)]
+    pub min: Option<HexAddr>,
+    /// EXCLUSIVE upper bound of a range (pairs with `min`).
+    #[serde(default)]
+    pub max: Option<HexAddr>,
+    /// Equal to `size` bytes read at this named global's address (endian-fixed).
+    #[serde(default)]
+    pub eq_global: Option<String>,
+}
+
+/// One u8 written at `base + offset` for the first matching
+/// [`TimerHold::Located`] record.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TimerWrite {
+    pub offset: HexAddr,
+    pub value: u8,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1077,6 +1160,56 @@ impl GameProfile {
             }
         }
 
+        // Validate a Located timer_hold: the scan window must be non-empty,
+        // there must be at least one write, and every predicate must have a
+        // readable width and EXACTLY ONE predicate kind. Every `eq_global`
+        // must name a declared global (a typo fails the load, not silently
+        // declines the feature — the legacy Adjacent form keeps its
+        // lookup-by-convention `round_timer` soft-decline unchanged).
+        if let TimerHold::Located { scan, record, writes } = &port.enforcement.timer_hold {
+            if scan[0].0 >= scan[1].0 {
+                return Err(format!(
+                    "enforcement.timer_hold scan start {:#x} is not < end {:#x}",
+                    scan[0].0, scan[1].0
+                ));
+            }
+            if writes.is_empty() {
+                return Err("enforcement.timer_hold located form has no writes".into());
+            }
+            for pr in record {
+                if !matches!(pr.size, 1 | 2 | 4) {
+                    return Err(format!(
+                        "enforcement.timer_hold predicate size {} is not 1/2/4",
+                        pr.size
+                    ));
+                }
+                // A range needs BOTH bounds; count kinds as equals / range /
+                // eq_global and require exactly one.
+                if pr.min.is_some() != pr.max.is_some() {
+                    return Err(format!(
+                        "enforcement.timer_hold range predicate at offset {:#x} needs both min and max",
+                        pr.offset.0
+                    ));
+                }
+                let kinds = pr.equals.is_some() as u8
+                    + (pr.min.is_some() && pr.max.is_some()) as u8
+                    + pr.eq_global.is_some() as u8;
+                if kinds != 1 {
+                    return Err(format!(
+                        "enforcement.timer_hold predicate at offset {:#x} must have exactly one of equals / min+max / eq_global",
+                        pr.offset.0
+                    ));
+                }
+                if let Some(name) = &pr.eq_global {
+                    if !port.memory.globals.contains_key(name) {
+                        return Err(format!(
+                            "enforcement.timer_hold names unknown global '{name}'"
+                        ));
+                    }
+                }
+            }
+        }
+
         // Validate hitstun_sources names appear in the recorded-globals union.
         if let Some(hs) = &port.hitstun_sources {
             let recorded_names: Vec<&str> = port.gate
@@ -1267,6 +1400,13 @@ impl GameProfile {
                     if !port.memory.globals.contains_key(gl) {
                         return Err(format!("contact_signal names unknown global '{gl}'"));
                     }
+                }
+            }
+            if let Some(d) = &cs.direction {
+                if d != "decrease" {
+                    return Err(format!(
+                        "contact_signal.direction must be \"decrease\" or absent (got '{d}')"
+                    ));
                 }
             }
         }
@@ -1778,7 +1918,7 @@ mod tests {
             assert!(p.port.attack_chords.contains_key(class), "{class} chord missing");
         }
         assert_eq!(p.port.enforcement.health_max, 0xEF);
-        assert_eq!(p.port.enforcement.timer_hold, [0x85, 0x03]);
+        assert_eq!(p.port.enforcement.timer_hold, TimerHold::Adjacent([0x85, 0x03]));
         assert_eq!(p.calibration("GROUND_Y"), Some(216.0));
     }
 
@@ -2032,6 +2172,86 @@ mod tests {
         assert!(err.contains("record_globals names unknown global"));
     }
 
+    /// The Located timer_hold form (mk2.md "The round timer, closed"): parses
+    /// into `TimerHold::Located`, and load-validation rejects each malformed
+    /// shape loudly (bad size, two predicate kinds, unknown eq_global global,
+    /// empty writes, empty scan) rather than silently declining the feature.
+    #[test]
+    fn timer_hold_located_parses_and_validates() {
+        let tmpbase = make_test_dir("timer_hold_located");
+        let game_dir = tmpbase.join("located");
+        fs::create_dir(&game_dir).unwrap();
+        let family_json = r#"{"family":"located","roster":[],"move_classes":[],"attack_classes":[]}"#;
+        fs::write(game_dir.join("family.json"), family_json).unwrap();
+
+        let mk = |timer_hold: &str| {
+            format!(
+                r#"{{"family":"located","port":"test","core":{{"library_name":"","provenance_game":"located","provenance_core":"test"}},"memory":{{"blocks":{{"block1":"0x0","block2":"0x0","stride":"0x0"}},"fighter_fields":[],"globals":{{"timer_tens":"0xBD74","timer_ones":"0xBD76"}}}},"gate":[],"enforcement":{{"health_max":255,"refill_below":1,"timer_hold":{timer_hold},"credits_target":0,"credits_min":0}},"calibration":{{}},"attack_chords":{{}}}}"#
+            )
+        };
+        let good = r#"{"scan":["0xC000","0xF000"],"record":[{"offset":"0xE","size":4,"equals":"0x0000000B"},{"offset":"0x2","size":4,"min":"0x01060000","max":"0x01080000"},{"offset":"0x6","size":1,"eq_global":"timer_tens"},{"offset":"0xA","size":1,"eq_global":"timer_ones"}],"writes":[{"offset":"0x6","value":9},{"offset":"0xA","value":9}]}"#;
+        fs::write(game_dir.join("located.profile.json"), mk(good)).unwrap();
+        let p = GameProfile::load(&game_dir).unwrap();
+        match &p.port.enforcement.timer_hold {
+            TimerHold::Located { scan, record, writes } => {
+                assert_eq!(*scan, [HexAddr(0xC000), HexAddr(0xF000)]);
+                assert_eq!(record.len(), 4);
+                assert_eq!(record[0].offset, HexAddr(0xE));
+                assert_eq!(record[0].equals, Some(HexAddr(0xB)));
+                assert_eq!(record[1].min, Some(HexAddr(0x0106_0000)));
+                assert_eq!(record[1].max, Some(HexAddr(0x0108_0000)));
+                assert_eq!(record[2].eq_global.as_deref(), Some("timer_tens"));
+                assert_eq!(
+                    writes,
+                    &vec![
+                        TimerWrite { offset: HexAddr(0x6), value: 9 },
+                        TimerWrite { offset: HexAddr(0xA), value: 9 },
+                    ]
+                );
+            }
+            other => panic!("expected the Located form, got {other:?}"),
+        }
+
+        // Reusable rejection helper: write the profile, expect a load error
+        // whose message contains `needle`.
+        let reject = |timer_hold: &str, needle: &str| {
+            fs::write(game_dir.join("located.profile.json"), mk(timer_hold)).unwrap();
+            let err = GameProfile::load(&game_dir).unwrap_err();
+            assert!(err.contains(needle), "expected {needle:?} in: {err}");
+        };
+
+        // Bad predicate size (3 is not 1/2/4).
+        reject(
+            r#"{"scan":["0xC000","0xF000"],"record":[{"offset":"0xE","size":3,"equals":"0x0000000B"}],"writes":[{"offset":"0x6","value":9}]}"#,
+            "predicate size 3",
+        );
+        // Two predicate kinds on one entry (equals AND min+max).
+        reject(
+            r#"{"scan":["0xC000","0xF000"],"record":[{"offset":"0xE","size":4,"equals":"0x0000000B","min":"0x0","max":"0x1"}],"writes":[{"offset":"0x6","value":9}]}"#,
+            "exactly one of",
+        );
+        // eq_global naming an undeclared global.
+        reject(
+            r#"{"scan":["0xC000","0xF000"],"record":[{"offset":"0x6","size":1,"eq_global":"timer_typo"}],"writes":[{"offset":"0x6","value":9}]}"#,
+            "names unknown global 'timer_typo'",
+        );
+        // Empty writes.
+        reject(
+            r#"{"scan":["0xC000","0xF000"],"record":[{"offset":"0xE","size":4,"equals":"0x0000000B"}],"writes":[]}"#,
+            "has no writes",
+        );
+        // Empty / inverted scan window (start not < end).
+        reject(
+            r#"{"scan":["0xF000","0xC000"],"record":[{"offset":"0xE","size":4,"equals":"0x0000000B"}],"writes":[{"offset":"0x6","value":9}]}"#,
+            "is not < end",
+        );
+        // A range predicate missing its upper bound.
+        reject(
+            r#"{"scan":["0xC000","0xF000"],"record":[{"offset":"0x2","size":4,"min":"0x0"}],"writes":[{"offset":"0x6","value":9}]}"#,
+            "needs both min and max",
+        );
+    }
+
     #[test]
     fn hitstun_sources_valid() {
         // hitstun_sources with valid recorded globals
@@ -2114,11 +2334,18 @@ mod tests {
         for (name, steps) in p.all_specials() {
             assert!(!steps.is_empty(), "{name} compiled to no steps");
         }
-        // The arcade contact signal is the per-fighter `action_counter`
-        // FIELD (quiet while guarding, fires on blocked contact even at zero
-        // chip — live-verified). hitstun_sources stays as the health-delta
-        // fallback and as the hitstun FEATURE source.
-        assert!(p.port.contact_signal.is_none(), "mk2 uses the hitstun_sources fallback");
+        // The arcade contact signal is struct `health` (block+0x0E), the
+        // frame lab's verified contact anchor: it steps by the whole damage
+        // in ONE frame, on hit (161→150) AND on block (161→158 — blocked
+        // normals chip 3/6/8 on this port, mk2.md). direction:"decrease"
+        // makes it immune to the two INCREASE hazards (round-intro ramp,
+        // training refill). hitstun_sources (the DRAWN HUD pair, 1 unit/
+        // frame smear) stays as the fallback and the hitstun FEATURE source.
+        // (An earlier `action_counter` contact claim was RETRACTED — mk2.md.)
+        let cs = p.port.contact_signal.as_ref().expect("mk2 ships a contact_signal");
+        assert_eq!(cs.field.as_deref(), Some("health"));
+        assert!(cs.global.is_none());
+        assert_eq!(cs.direction.as_deref(), Some("decrease"));
         let hs = p.port.hitstun_sources.as_ref().unwrap();
         assert_eq!(hs.get("block1").map(String::as_str), Some("p1_health_hud"));
         assert_eq!(hs.get("block2").map(String::as_str), Some("p2_health_hud"));
@@ -2482,7 +2709,9 @@ mod tests {
     }
 
     /// mk2's shipped profile: `x` is pointer-resolved, `y` too (signed), and
-    /// `p1_x`/`p2_x` are disproven-but-retained globals no field references.
+    /// the DISPROVEN raw globals are gone (W2 cleanup): evidence lives in
+    /// mk2.md, and a profile global is a machine-readable claim other tools
+    /// may bind — history is not a reason to keep one.
     #[test]
     fn mk2_ships_x_and_y_as_object_ptr_fields() {
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
@@ -2490,10 +2719,12 @@ mod tests {
         assert!(p.field_is_object_ptr("y"));
         assert_eq!(p.field_addr(1, "x"), None, "no fixed address for a pointer-resolved field");
         assert_eq!(p.field_off("y"), None);
-        // The disproven raw globals are still declared (evidence / other
-        // tools) but no fighter field references them anymore.
-        assert!(p.global("p1_x").is_some());
-        assert!(p.global("p2_x").is_some());
+        // The disproven globals (object-pool-slot "positions", the constant
+        // facing byte, the P1-victim-only hit_counter) are REMOVED, so no
+        // consumer can quietly re-adopt them by name.
+        for gone in ["p1_x", "p2_x", "p1_screen_x", "p1_facing", "hit_counter"] {
+            assert!(p.global(gone).is_none(), "disproven global '{gone}' must stay removed");
+        }
         assert!(p.port.memory.blocks.object_ptr.is_some());
         let obj_ptr = p.port.memory.blocks.object_ptr.as_ref().unwrap();
         assert_eq!(obj_ptr.off.0, -0xC);

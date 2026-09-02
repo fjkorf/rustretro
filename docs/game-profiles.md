@@ -16,6 +16,25 @@ architecture for game #2 (sf2ce) and beyond (MK2 arcade/Genesis).
   list, enforcement values, stage/opponent selector, feature calibration,
   attack-class → button-chord table, per-core button-name table.
 
+  `enforcement.timer_hold` accepts two forms (authoritative rustdoc:
+  `src/profile.rs::TimerHold`): the legacy `Adjacent` `[u8, u8]` array
+  (written to the `round_timer` global and `+1` each in-fight frame), or a
+  `Located` object — `{ "scan": [start, end] (hex, end exclusive), "record":
+  [ { "offset" (hex), "size" (1|2|4), <one predicate> }, ... ], "writes":
+  [ { "offset" (hex), "value" (u8) }, ... ] }` — for a timer store whose
+  record physically RELOCATES between fights (no fixed address exists). Each
+  in-fight frame the scan window is swept (step 2, records are u16-aligned)
+  for the first base `R` satisfying every `record` predicate, then each
+  `writes` entry lands a u8 at `R + offset`; zero matches skip silently. A
+  predicate carries EXACTLY ONE of: `equals` (hex constant), `min`+`max`
+  (inclusive-min, EXCLUSIVE-max range), or `eq_global` (equal to `size` bytes
+  read at that global's address — a drawn-value cross-check that makes the
+  match unique). All multi-byte reads get the guest-endianness fix. `scan`,
+  predicate sizes/kinds, `eq_global` global names, and non-empty `writes` are
+  load-validated; the reference instance is MK2 arcade's countdown task, found
+  by signature because its base moves every fight (mk2.md "The round timer,
+  closed").
+
 Loaded once at startup: `--game library/<game>` (default `library/asurabld`)
 → `profile::init(dir)`; consumers call `profile::current()`. The Python side
 (`shadow_train.profile`) reads the SAME files. Model `meta.json` carries

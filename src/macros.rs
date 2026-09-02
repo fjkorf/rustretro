@@ -544,13 +544,19 @@ mod tests {
     /// the tests must not read library/mk2/genesis.profile.json (edited
     /// concurrently); the cross-port point only needs the two chord tables.
     fn test_profile(tag: &str, chords: &str) -> GameProfile {
+        // pid + nanos alone COLLIDED once under the parallel test runner
+        // (two same-tag fixtures in one timestamp tick racing the same dir,
+        // one loading while the other rewrote it) — the per-process counter
+        // makes every call's dir unique by construction.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let base = std::env::temp_dir().join("rustretro_tests").join(format!(
-            "macros_{tag}_{}_{}",
+            "macros_{tag}_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(

@@ -562,6 +562,17 @@ pub struct TrainingConfig {
     pub punish_armed: bool,
     /// ContinueBlock outcome: keep guarding (and don't re-trigger) until here.
     pub punish_hold_until: u64,
+    /// Post-punish neutral hold-off (`training::PUNISH_HOLDOFF`): until this
+    /// frame the dummy injects NEUTRAL instead of falling back to the guard
+    /// chord, so a just-pressed punish attack cannot be block-cancelled by
+    /// the guard snapping back one frame later. A frame STAMP deliberately —
+    /// it survives across frames and across gate closures (frames keep
+    /// counting while the gate is closed, which is the point: wall-frame
+    /// recovery, not a counter someone forgets to tick). Stamped at macro
+    /// completion (both the in-gate and gate-closed completion paths) and by
+    /// `release_punish_exec`, so aborts extend their neutral instead of
+    /// letting guard snap back next frame.
+    pub punish_holdoff_until: u64,
     /// Consecutive gate-closed frames survived by the in-flight punish macro
     /// (hit-freeze grace — see `training::PUNISH_GATE_GRACE`).
     pub punish_gate_grace: u64,
@@ -872,6 +883,58 @@ pub struct PlaybackSlot {
     /// the first observation only seeds the baseline, it can never itself be
     /// "the start", so arming mid-round correctly waits for the NEXT round).
     pub gate_baseline: Option<bool>,
+}
+
+/// Cumulative counts of per-frame subsystem ticks `run_frame` SKIPPED because
+/// its `debug_state.try_lock()` was contended (GUI/MCP thread holding the
+/// lock). A contended `try_lock` silently drops that subsystem for that frame
+/// — which undermines the determinism claims layered on top (playback.rs
+/// assumes `training::tick` runs once per REAL emulated frame; the frame lab
+/// certifies determinism on top of that) — so the skips are counted and made
+/// observable rather than left invisible.
+///
+/// The counters themselves are OWNED by `Frontend` (plain `u64`s on the emu
+/// thread — see `Frontend::lock_skips` for why they cannot live here at
+/// increment time: at the moment of a skip THIS struct's lock is exactly what
+/// was contended). This mirror is refreshed every frame under `run_frame`'s
+/// end-of-frame hard lock (the same acquisition that bumps
+/// `step_generation`), so readers — the MCP `AiSnapshot` projection, panels —
+/// see values at most one frame stale.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LockSkips {
+    /// `training::tick` (which hosts `playback::tick`) skipped — replay/
+    /// dummy/enforcement logic missed a real emulated frame.
+    pub training: u64,
+    /// `ShadowRunner::tick` skipped — the shadow bot missed a decision frame.
+    pub shadow: u64,
+    /// A once-per-second profile-pins rewrite skipped (that second's pin
+    /// write is lost entirely; the next attempt is ~60 frames later).
+    pub pins: u64,
+    /// Subset of `training`: skips that landed while an input-slot playback
+    /// was actively consuming frames (`PlaybackSlot::started && !done`) —
+    /// the worst case, because the recorded input stream slips one frame
+    /// relative to emulation and that playback's replay determinism is gone.
+    pub training_during_playback: u64,
+}
+
+impl LockSkips {
+    /// Any skip recorded at all.
+    pub fn any(&self) -> bool {
+        self.training > 0 || self.shadow > 0 || self.pins > 0
+    }
+
+    /// Per-field difference vs an earlier snapshot of the same counters
+    /// (saturating, so a stale/foreign baseline can never underflow).
+    pub fn delta_since(&self, baseline: &LockSkips) -> LockSkips {
+        LockSkips {
+            training: self.training.saturating_sub(baseline.training),
+            shadow: self.shadow.saturating_sub(baseline.shadow),
+            pins: self.pins.saturating_sub(baseline.pins),
+            training_during_playback: self
+                .training_during_playback
+                .saturating_sub(baseline.training_during_playback),
+        }
+    }
 }
 
 pub struct DebugState {
@@ -1197,6 +1260,12 @@ pub struct DebugState {
     pub playback_slot: Option<PlaybackSlot>,
     pub playback_note: Option<String>,
 
+    // --- try_lock skip observability ---
+    /// Mirror of `Frontend::lock_skips` (see [`LockSkips`]) — refreshed every
+    /// frame under `run_frame`'s end-of-frame hard lock; at most one frame
+    /// stale for readers. Cumulative since app start.
+    pub lock_skips: LockSkips,
+
     // --- Input descriptors (core-provided per-game button names) ---
     /// `input_descriptors[port][retro_id]` = the core's label for that button
     /// in THIS game (RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS), e.g. FBNeo's
@@ -1315,6 +1384,7 @@ impl DebugState {
             recording_note: None,
             playback_slot: None,
             playback_note: None,
+            lock_skips: LockSkips::default(),
             keymap_lines: Vec::new(),
             input_descriptors: Default::default(),
         }
