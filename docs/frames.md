@@ -181,6 +181,14 @@ not measurement failures.
    (blocked contact chips −3/−6, so "zero damage" means WHIFF, not block —
    mk2.md "Hitstun / blockstun observables"). Rows record the rig's guard
    state; the inferred value, where computed, is a separate column.
+7. **A frame is the NATIVE refresh, and MK2 arcade's is not 60 Hz.** T-Unit
+   runs at 54.71 Hz (`retro_get_system_av_info`), so one logic frame here is
+   ~18.3 ms, not 16.7. Frame COUNTS are exact and portable; wall-clock
+   equivalents are not — an external guide written against a 60 fps
+   assumption differs from this table by ~9% in seconds before any
+   convention mismatch (rule 1, rule 3) is even considered. Reconcile
+   against external tables in frames, never in seconds; rule 4's wall-clock
+   ban is what makes that possible.
 
 ## 3. Preconditions — every one of these is a precondition, not a nicety
 
@@ -970,3 +978,16 @@ the same protocol reproduces the same systematic error perfectly.
    sidecar field records whether the fighter was at rest.
 7. **Travel is a STEP function of gap, not a ramp** — interpolating a
    projectile's advantage between measured rungs invents numbers.
+8. **§1/§1.1 describe only the airborne VICTIM; the airborne ATTACKER needs
+   its own clause** (added 2026-09-01 — the half of the neutral-jump run's
+   proposed amendment that §10's REFUTED entry does not carry). An airborne
+   attacker's side of the advantage is LANDING-relative, not
+   contact-relative, so a jumping normal's advantage is dominated by its
+   REMAINING AIRTIME at contact and is a CURVE over contact height rather
+   than a scalar — measured on Reptile's neutral jump HP: +6 → +10 on hit
+   and −2 → +3 on block across one arc, with the move unchanged
+   (mk2.md "Reptile's neutral jump punch"). Stored rows are keyed by arc
+   frame (`variant: throw@<J>/h<height>`) for exactly this reason, and a
+   renderer that prints one number for a jumping normal is printing the
+   midpoint of a curve. Until §1 gains the clause, this entry is the
+   contract's statement of it.

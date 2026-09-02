@@ -188,7 +188,7 @@ All in the `0xC33x-0xC3Ax` cluster (bit `0x1061Axx-0x1061Dxx`), plus timer:
 | `0xBCA0` / `0xBC88` | p1/p2 HUD health | see Fighter data above. |
 | `0x1704D` | credits HUD digit (ASCII) | `'1'`→`'2'`→`'3'` byte-exact with the drawn CREDITS counter across coin presses. Display cell, read-only use. |
 
-### The round timer — partially open
+### The round timer — partially open (since CLOSED, 2026-09-01 — see below)
 
 The visible countdown's *authoritative* store was not pinned down: digits
 (`0xBD74/76`), master (`0xBC20`), and the frame counter (`0xD396`) were each
@@ -196,8 +196,13 @@ write-tested and each reverts/decouples; a fourth store (or a
 tick-event chain) regenerates the digits. No byte anywhere in work RAM holds
 the display value as one number (exhaustive sequence search over the
 snapshot series, binary and BCD). Consequences:
-- `timer_hold` enforcement is **not functional** — the profile carries a
-  placeholder and this caveat.
+- ~~`timer_hold` enforcement is **not functional** — the profile carries a
+  placeholder and this caveat.~~ **Resolved 2026-09-01**: the fourth store
+  was found and write-verified in both directions — a round-countdown TASK
+  RECORD at `0xD630` (tens `0xD636`, ones `0xD63A`, guarded by the code
+  pointer at `0xD632`); the single-byte search missed it because the value
+  is digit-SPLIT across two u32s. See "The round timer, closed" below.
+  Enforcement WIRING is still queued (wave 2); the recipe is now known.
 - The timer digits are still perfectly good *reads* for overlays/features.
 
 ## The controllable gate
@@ -228,6 +233,13 @@ Known imperfections, stated honestly:
 - **Timeout draws untested**: if a round times out with both healths > 0,
   gate correctness depends on `round_over` going nonzero at TIME UP —
   plausible (it fires on every KO-decided round end) but not observed.
+  **Since measured (2026-09-01), and it SPLITS.** Unequal healths at TIME UP:
+  `round_over` → 1 (~80 frames after the digits render 00, "X WINS", both
+  healths > 0) — the gate closes as hoped. EQUAL healths: `round_over`
+  **never leaves 0** — straight to GAME OVER, whose screen reads
+  scr=0 / ro=0 / healths 161/161, so all three gate conditions are TRUE on a
+  non-fight screen. A real leak on the timeout-draw path; see "The round
+  timer, closed" below.
 - **Attract gameplay demos**: only a fatality demo was captured (healths
   read 0 there → gate false). If MK2's rotation includes a full HUD demo
   fight, the gate may be true during it; recordings filter demo rounds by
@@ -239,7 +251,7 @@ Known imperfections, stated honestly:
 |---|---|
 | health refill | **WORKS** via `write_memory` — write 161 to all four health bytes (`0xC05E`, `0xC1D8`, `0xBCA0`, `0xBC88`). Verified live: bar refills, fight continues. Must be a periodic rewrite (freeze is a no-op on this core, see gotchas). |
 | health_max | **161** (`0xA1`) — fill target observed at round start, MAME cheat's fill value, and the write-verified full-bar value. |
-| timer hold | **NOT functional** — no authoritative store found (above). |
+| timer hold | ~~**NOT functional** — no authoritative store found (above).~~ **Store found 2026-09-01** (the `0xD630` countdown task record, write-verified both directions — see "The round timer, closed" below); enforcement wiring queued (wave 2). |
 | credits top-up | **NOT possible via memory** — credits live in T-Unit CMOS (`0x01400000` bit range, handler-mapped), which is OUTSIDE the exposed region. Two coin presses produced exactly two byte deltas in work RAM: the ASCII HUD digit and a transient counter (`0x5E0C`, disproven — dropped 161→24 on a screen change). Coin-up works fine through input (`select`), which is how a training harness should do it. |
 
 ## Disproven / dead ends (don't re-chase these)
@@ -272,6 +284,8 @@ via core descriptors). Coin=`select`, Start=`start`, both live-verified.
 
 1. **Player Y** — the one missing fighter field (jump features blind).
 2. **Authoritative round timer** — needed for `timer_hold`; reads work.
+   *(Found 2026-09-01: the `0xD630` countdown task record — see "The round
+   timer, closed" below.)*
 3. `src/training.rs` `resolve()` requires `health2`/`x`/`y` fields and
    `round_timer`/`round_state`/`credits`/`abort`/`match_end` globals to arm
    at all — MK2's map can't satisfy that contract yet (x lives at a
@@ -651,6 +665,15 @@ Rig note: `shadow/arenas/mk2/reptile-vs-reptile.state` is 1P-vs-CPU, so
 injected dummy input CANNOT drive P2 there — BlockPunish end-to-end
 testing requires a 2-human match (controller 2 joins).
 
+**Arena restore hazard (found 2026-09-01):** `b-v-r.state`, `r-v-r.state`
+and `gap-30.state` all restore INPUT-DEAD on a FRESH emulator instance —
+RAM verifies (char ids, healths) but the machine comes up on a non-fight
+countdown screen and held directions move nothing. Only `m-v-r.state` has
+been verified to restore live cross-session. Details and the verification
+recipe in "The round timer, closed" below; do not trust a committed arena's
+`inputs_live` sidecar across a process boundary without a fresh
+differential walk test.
+
 ## CORRECTION: the contact signal is the health delta after all (2026-08-28)
 
 The section above over-claimed from a rig where the defender was struck
@@ -683,6 +706,13 @@ during which the dummy is not guarding).** Not a signal bug.
 useful data (action transitions, incl. the attacker's swings and whiffs)
 and costs nothing. The `contact_signal` schema keeps its per-fighter
 `field` variant for games that do have a true contact counter.
+
+**Update 2026-09-01: `contact_signal` is back in the arcade profile, in a
+new form** — `{"field": "health", "direction": "decrease"}`, anchored on
+STRUCT health `block+0x0E` rather than the drawn HUD pair. The health-delta
+conclusion above stands; what changed is WHICH health bytes and a sign
+check. See "Contact signal shipped: struct health, decrease-only" below.
+`hitstun_sources` remains the fallback and the hitstun-FEATURE source.
 
 ## Gate revision 3: bits 1 AND 2 TOGETHER mark a menu — word_masked_not_all (2026-08-28)
 
@@ -1081,6 +1111,17 @@ region. No profile JSON was modified.
 
 ### Proposed profile change (NOT applied — orchestrator's call)
 
+> **ADOPTED (annotated 2026-09-01).** The `object_ptr` declaration and the
+> pointer-relative `x`/`y` fighter fields shipped in `mk2.profile.json`
+> essentially as proposed below — the frame lab's `pointer_x` observable,
+> the pixel-gap ladders and the `via: "object_ptr"` absent-never-0
+> resolution all run on them, and `docs/frames.md` §10's first two stated
+> limitations are marked CLOSED because of it. `p1_x`/`p2_x`/`p1_screen_x`
+> (and the unverified `p1_facing` lead) remain in the profile's `globals`
+> ONLY as legacy/disproven entries, pending a wave-2 cleanup — nothing may
+> use them for position or liveness. The block is kept below as written, as
+> the record of what was proposed and why.
+
 `mk2.profile.json` currently sources `x` from the globals `p1_x 0x6CBA` /
 `p2_x 0x6CFC`, which this session shows are wrong on most runs. The proposal
 needs one new schema concept — a *pointer-relative* fighter field:
@@ -1372,10 +1413,13 @@ block recovery is simply longer than its light-hit reaction.
   process and N=16 on the other, real boundary at 20). That is either the
   known one-frame-early-hold transport flake or a genuine T…F…T predicate;
   either way §4.3 says a first_true read off it is not a boundary. No row.
-- **Jumping normals: not attempted.** The act-again probe's observable is a
+- ~~**Jumping normals: not attempted.** The act-again probe's observable is a
   WALK, and an airborne MK2 fighter cannot walk, so the probe cannot answer
-  "is this fighter actionable" mid-jump. Measuring jump-ins needs a different
-  observable (§1.1 also gives airborne hits no advantage number).
+  "is this fighter actionable" mid-jump; measuring jump-ins needs a different
+  observable.~~ **Superseded** — see "Reptile's neutral jump punch" below,
+  which measures one with the existing observables (the probe is DEFERRED to
+  landing, not blind) and says what the number means. Unmeasured *for this
+  run* is a scope statement, not a limitation of the method.
 - **Reptile's specials**: out of this task's scope (Invisibility needs a DSL
   extension).
 - **`hitstop`, `active`, `recovery`, `total`, `wakeup_window`,
@@ -1552,10 +1596,11 @@ measured — that part survives.
 gap-invariance far HK and far LK show — more evidence that the protocol is
 measuring the move rather than the arena.
 
-**Jumping normals are still out**, for the unchanged reason: the act-again
-observable is a WALK and an airborne MK2 fighter cannot walk, so the probe
-cannot answer "is this fighter actionable" mid-jump. Nothing about the speed
-work changes that; it needs a different observable.
+~~**Jumping normals are still out**, for the unchanged reason: the act-again
+observable is a WALK and an airborne MK2 fighter cannot walk — it needs a
+different observable.~~ **Superseded** — see "Reptile's neutral jump punch"
+below: the probe is DEFERRED to landing, not blind, and no new observable
+was needed.
 
 ### Cost
 
@@ -2121,8 +2166,11 @@ Two things fall out, and the second is a caveat on the whole table.
   measured as damage + unblockability, nothing more.
 - **`on_hit` for cHP at any rung**: the uppercut launches, and a knockdown
   has a wakeup window rather than a hit advantage.
-- **Jumping normals**: still out, for the unchanged reason — the act-again
-  observable is a WALK and an airborne fighter cannot walk.
+- ~~**Jumping normals**: still out, for the unchanged reason — the act-again
+  observable is a WALK and an airborne fighter cannot walk.~~ **Superseded**
+  — see "Reptile's neutral jump punch" below, which measures one and says
+  what the number means. Not measured *for this character*, a scope
+  statement, not a limitation of the method.
 - **Her specials**: another task's scope (and `mk2.md`'s special-move audit
   already records why the roll and the teleport break any gap-keyed
   protocol).
@@ -2206,29 +2254,36 @@ what was ASKED, not in what was measured, and it is the one place
    profile stores one (`framelab.spacing.collision_floor_px: 62`). It is
    per-MATCHUP: 61 px here. `ladder.py` now takes `--faf-at-px`, and without
    it this run would have stored `first_active_frame` nowhere and said
-   nothing about why.
+   nothing about why. *(applied — frames.md §4.4 "'point-blank' is a measured
+   value per matchup" and §5 "The collision floor is PER-MATCHUP".)*
 2. **§5's ladder recipe ("reset to a known position, walk K frames") omits
    that the liveness check itself walks both fighters.** The shipped Reptile
    K=0 rung is 180 px from a 192 px base for exactly that reason. Either
    re-load after the check (what `reload_after_liveness` does) or stop
-   calling the base gap "K=0".
+   calling the base gap "K=0". *(applied — frames.md §5's "The liveness probe
+   WALKS both fighters" hazard.)*
 3. **§5 says to record the achieved gap and does not say it can OSCILLATE.**
    Within the collision floor the gap swings 60–66 px frame to frame while a
    direction is held. A rung saved on an arbitrary frame is reproducible but
-   not meaningful; settle it.
+   not meaningful; settle it. *(applied — frames.md §5's "The gap OSCILLATES
+   inside the floor" hazard.)*
 4. **§8.3's punish test cannot be run as written.** Release the guard on the
    counter frame and no counter ever comes out; the acceptance criterion
-   would be met vacuously by declaring everything safe.
+   would be met vacuously by declaring everything safe. *(applied —
+   frames.md §8.3's "Protocol correction".)*
 5. **§1's `punishable` predicate is missing a clock.** It compares advantage
    against the opponent's fastest `first_active_frame` and range, both of
    which this lab measures — but the defender being able to GUARD is what
    actually decides it, and guard returns before the walk this lab probes
    (bound: ≥7 frames earlier for Mileena after cHK). Until there is a guard
    observable, "−20 on block" is an upper bound on punishability, not a
-   verdict.
+   verdict. *(applied — frames.md §1's third clause and the GUARD line in the
+   `punishable` predicate.)*
 6. **§12's second item (two rows per cell, one per observable) is still
    open**, and this run is more evidence for collapsing them: 94 more sweeps,
-   zero disagreements, now across two characters.
+   zero disagreements, now across two characters. *(applied — frames.md §12's
+   second item records the evidence, and the Rust loader now collapses
+   field-by-field, naming any disagreement.)*
 
 ## Mileena's three specials — and the three assumptions each one breaks (2026-08-31, task M5)
 
@@ -3378,8 +3433,11 @@ Four things fall out.
   a wakeup window rather than a hit advantage.
 - **`wakeup_window`**: not measured for any Baraka move, including the two that
   knock down (cHP and the LP throw). The column stays NULL.
-- **Jumping normals**: still out — the act-again observable is a WALK and an
-  airborne fighter cannot walk.
+- ~~**Jumping normals**: still out — the act-again observable is a WALK and an
+  airborne fighter cannot walk.~~ **Superseded** — see "Reptile's neutral
+  jump punch" below, which measures one and says what the number means. Not
+  measured *for this character*, a scope statement, not a limitation of the
+  method.
 - **His specials** (Blade Fury, Blade Swipe, Blade Spin): another task's scope.
 - **`hitstop`, `active`, `recovery`, `total`**: still NULL in every row. None
   is a by-product of this protocol.
@@ -3482,7 +3540,9 @@ a silent cap in the tooling.
    makes the lab refuse such an arena. A liveness probe whose leg is shorter
    than the walk it probes is measuring the wrong thing; the leg must exceed
    the character's commitment (14 frames is the measured threshold here, 20 was
-   used).
+   used). *(applied — frames.md §3's precondition 4 carries the per-character
+   walk-window rule with Baraka's numbers, and §5's momentum paragraph carries
+   the discontinuous settled curve.)*
 2. **`DEFAULT_ANCHOR_FRAMES = 48` is a silent cap, and it hid a whole move.**
    With `quiet_frames = 20` the reachable contact window is 28 frames, and MK2's
    throws are outside it: Baraka's contacts at f40, Reptile's at f48. The
@@ -3493,7 +3553,9 @@ a silent cap in the tooling.
    CLIs now take an explicit `--anchor-frames` (default unchanged, so earlier
    rows stay comparable), and the operator rule is: a `—` at the collision
    floor is the least likely place for a genuine whiff, so widen the window
-   before believing it.
+   before believing it. *(applied — frames.md §7's "violated by a DEFAULT"
+   bullet names this cap, the throw, and the re-scan debt; the debt itself
+   was paid by the 90-frame re-scan below.)*
 
 Everything else was MECHANICAL, and that is the more important half of the
 answer. The four corrections Mileena's run produced all held without
@@ -3618,9 +3680,27 @@ had asked for them.
 
 Asking for them ran into a **second silent cap of exactly the §7 shape, one
 layer down from the horizon.** At the shipped `stance_frames = 6`, *every*
-crouching normal on the Reptile ladder — including `cHP` and `cLK`, which are
-IN the shipped table — reported `—` at every rung. Swept, three trials per
-value, fully deterministic:
+crouching normal on the Reptile ladder — including `cHP` (in the shipped
+table, at its 62 px rung only) and `cLK` (measured at both rungs in the
+re-measure above, but never written to the store, so absent from the shipped
+table) — reported `—` at every rung.
+
+> **CORRECTED 2026-09-01.** The sentence above originally read "including
+> `cHP` and `cLK`, which are IN the shipped table" — wrong for cLK and
+> imprecise for cHP, verified by an exhaustive store↔export audit: all 186
+> store rows match the committed `arcade.frames.json` field-for-field
+> (CLEAN, zero mismatches, across all five commits that ever touched the
+> export), reptile cLK has NEVER had a store row under any move/variant key
+> (its @62/@72 numbers exist only as prose in the re-measure section above),
+> and reptile cHP is store-backed at 62 px only — exactly as that section's
+> own "(stored only at the 62 px rung, §4.4)" already said. The store's one
+> id gap (71–82) is a Mileena-era §7 deletion, hours before Reptile's second
+> write batch; it cannot be the cLK rows. **Queued follow-up:** if the
+> measured cLK @62/@72 and cHP @72 cells are to ship, they must be
+> re-measured through the store's normal provenance path and re-exported —
+> never hand-added to the JSON.
+
+Swept, three trials per value, fully deterministic:
 
 | held `down` frames before the button | Reptile rungs (`gap-45`, `gap-60`) | Mileena rungs (`m-gap-39`, `m-gap-45`) |
 |---|---|---|
@@ -4752,7 +4832,8 @@ command-line argument.
    reports `first_true = 0` — a plausible number that means "free exactly at
    contact" and is silently five frames late. §7's cap rule is stated only
    for the UPPER edge of the search; this is the same failure at the lower
-   edge and the contract does not name it.
+   edge and the contract does not name it. *(applied — frames.md §13 item 3
+   names the lower-edge cap with this exact case.)*
 2. **§4.2's blocked-direction hazard is stated as a static property of a
    direction, and it has a dynamic form.** A direction can be usable at N,
    unusable at N+40 because a scripted push happens to match walking speed,
@@ -4763,7 +4844,7 @@ command-line argument.
    Separately, a fighter being separated from an overlap is genuinely NOT
    actionable, so the act-again predicate is not always monotone, and §4.3's
    "that is a one-frame-early hold or an unsound observable" is not
-   exhaustive.
+   exhaustive. *(applied — frames.md §13 item 4.)*
 3. **§8.4 classifies `total` and `recovery` as ANCHOR-based fields requiring
    exact cross-observable agreement, and a whiff-anchored `total` is not
    one.** It is `origin + first_true + window`, a ONE-SIDED manifest carrying
@@ -4775,6 +4856,9 @@ command-line argument.
    lives only here. The same argument applies to the `total`/`recovery`
    columns the active-frames spike left in a scratch database; both are
    whiff-anchored manifests, so promoting them will hit this first.
+   *(applied — frames.md §8.4 was corrected 2026-09-01: `total`/`recovery`
+   are ONE-SIDED unconditionally, §13 item 1 CLOSED records it, and the Rust
+   collapse rule moved them.)*
 4. **The store has no column for a cell whose only result is a refusal or a
    recovery.** `invisibility` is fully measured — no damage, no advantage,
    recovery 40 — and produces no storable row at all: `on_hit`/`on_block`/
@@ -4782,13 +4866,16 @@ command-line argument.
    3, and there is no reason/evidence column (§12's first item) to say why.
    A reader of the exported table cannot distinguish "invisibility was
    measured and has no advantage" from "nobody has measured invisibility".
+   *(applied as a tracked gap — frames.md §13 item 2; still open in the
+   schema.)*
 5. **A move's SIGNATURE is not gap-invariant, and §4.3 implies it is.** "A
    move must be identified by its measured signature" is right, but a
    signature calibrated at one rung can refuse the same move at another: the
    slide travels 112 px from 182 px away and 62 px from 107 px away, because
    it stops when it connects. Distance-dependent signature fields need a
    floor chosen against what they must DISCRIMINATE, not against what the
-   move does at the rung where it was first seen.
+   move does at the rung where it was first seen. *(applied — frames.md §13
+   item 5.)*
 6. **§5's ladder recipe needs a settle requirement, not just a settle
    warning.** §5 says "a rung saved mid-walk samples the oscillation; settle
    before saving" as advice about pixel gaps. The stronger consequence is
@@ -4797,7 +4884,8 @@ command-line argument.
    what comes out instead is a NORMAL that the frame lab will happily
    measure under the special's name. An arena sidecar should record whether
    the fighter was at rest, and the lab should refuse or compensate; there is
-   no field for it.
+   no field for it. *(applied as a tracked gap — frames.md §13 item 6; the
+   sidecar field itself is still missing.)*
 
 ## Reproduce
 
@@ -5172,6 +5260,9 @@ add the limitation that actually remains:
 >   owns the timing), and **jumps with horizontal movement** re-introduce the
 >   gap-key discontinuity §5 describes and have not been measured.
 
+*(applied — frames.md §10 now carries this REFUTED entry, with the three
+gates and the measured swing.)*
+
 **And add to §1's archetypes / §4.3's conventions:**
 
 > An AIRBORNE attacker's side of the advantage is landing-relative, not
@@ -5183,6 +5274,9 @@ add the limitation that actually remains:
 > the stored rows are keyed by the arc frame and carry the measured contact
 > height for that reason.
 
+*(applied 2026-09-01 as frames.md §13 item 8 — §1 itself still describes
+only the airborne victim, and §13 records this clause until it does.)*
+
 **`library/mk2/mk2.md`** — the three "Jumping normals: still out" bullets
 (Reptile normals, the kit re-run, and Baraka's "What was NOT measured") should
 each be replaced by a pointer to this section rather than edited in place, so
@@ -5193,6 +5287,9 @@ the retraction is visible where the claim was made:
 >   jump punch", which measures one and says what the number means. Not
 >   measured *for this character/kit*, which is a scope statement, not a
 >   limitation of the method.
+
+*(done 2026-09-01 — and there were FOUR sites, not three: Mileena's run
+carried the same bullet. All four now point here.)*
 
 ### Reproduction — a cold-started second process, 8/8 cells exact
 
@@ -5511,6 +5608,11 @@ the `pointer_x` startup.
 ---
 
 ## 8. Consequences for `docs/frames.md` §1 (NOT applied — out of scope)
+
+*(Since applied — frames.md §1's fourth clause now carries exactly these
+corrections: the kick-lead table, "out of a kick there is no cancel, only a
+link", the unchanged-startup finding and the +12 hitstop shift, with its own
+"OVERSTATED when first written" note. Annotated 2026-09-01.)*
 
 The FOURTH clause is right that cancelling exists and right that the published
 "Just Frame on the frame of contact" description is wrong. Three of its
@@ -6262,6 +6364,13 @@ the observation that the walk-based actionability number is an over-estimate of
 commitment for anyone holding a special-move input — which is a docs/frames.md
 §1 amendment (a fourth item after "walk", "guard returns earlier"), not a
 column. Neither change was made here; both are out of this job's file scope.
+*(Since applied in corrected form — frames.md §1's fourth clause carries the
+cancel rule as amended by the kick-lead run above: punch leads cancel, kick
+leads only link, and the over-estimate is scoped to a fighter holding a
+PUNCH-cancellable special's input. The `normal_followup_floor` column idea
+was NOT adopted — the clause records a button-class rule instead of a
+per-move column, which is what this section itself argued for. Annotated
+2026-09-01.)*
 
 **Confidence: medium-high.** The signal is enormous (an 18-frame margin, delay
 identically 0 across ~120 trials, two specials agreeing on the same trigger
@@ -6308,3 +6417,203 @@ Field-by-field collapse with a named `disagreements` list was built so a
 cross-observable disagreement could not be silently resolved; it also
 happens to detect **rows keyed too coarsely**, which nothing else in the
 pipeline checks.
+
+## Contact signal shipped: struct health, decrease-only (2026-09-01, W1 dummy fix)
+
+`library/mk2/mk2.profile.json` now ships
+
+```json
+"contact_signal": { "field": "health", "direction": "decrease" }
+```
+
+and the `_STATUS` sentence "contact_signal therefore NOT shipped; the
+per-victim signal is hitstun_sources" (written 2026-08-28, before the frame
+lab existed) was amended in the same edit. `hitstun_sources`
+(`p1_health_hud`/`p2_health_hud`) is retained unchanged as the fallback and
+as the hitstun-FEATURE source.
+
+**Why the trigger moved off the HUD pair.** The BlockPunish dummy's trigger
+fell back to `hitstun_sources` = the HUD health pair (`0xBCA0`/`0xBC88`) — a
+DRAWN value that animates toward its target at 1 unit/frame, smearing one
+hit into ~11 one-unit edges (the "never anchor on a DRAWN value" measurement
+law). The lab's verified contact anchor is STRUCT health (`block+0x0E`, u8),
+which steps by the whole damage in ONE frame — 161→150 on a clean hit,
+161→158 blocked ("Hitstun / blockstun observables" above) — and blocked
+normals always chip on this port (3/6/8, the ladder tables; docs/frames.md
+§4.1), which is what retracts the old "a health delta is blind to blocked
+contact" objection FOR THIS PORT. It remains true for zero-chip games like
+asurabld, whose contact source is its combo counters and which declares no
+`contact_signal` — absent `direction` keeps the old any-change semantics,
+and the full suite verified asurabld's behavior unchanged. Nothing in this
+change relies on the retracted `action_counter`-as-contact claim.
+
+**Why `direction: "decrease"`** (a new optional schema key): both known
+hazards on this signal are INCREASES — the round-intro ramp (+2/frame during
+the ROUND-N banner, above, while the gate leaks open) and the training
+refill writing health back up to 161 (the old "one spurious BlockPunish
+trigger per refill" caveat, closed by this). One sign check is immune to
+both. The accepted loss is the caveat inverted: the hit that drives health
+below the refill threshold is overwritten back to max before the next poll,
+so ~one REAL trigger per refill cycle is LOST — the dummy blocks that one
+instead of punishing. Same class, now harmless; documented in
+`src/training.rs poll_contact` and the profile's `_STATUS`.
+
+Consumers carrying the key: profile validation (`src/profile.rs`), the
+trainer (`src/training.rs poll_contact`), the recorder (`src/record.rs` —
+its string/juggle sidecar stats now also read struct health, decrease-only),
+and the Python mirror (`shadow_train/profile.py`). The trainer half of the
+same bug report (the punish that never comes out) is a separate finding —
+the block-stance input-eat latch, next section — whose measured constants
+are what finally shipped.
+
+## Block vs a normal in progress — the block-stance input-eat latch (2026-09-01, W1)
+
+Rig: headless FBNeo on MCP **4030** (never 4025), arena
+`shadow/arenas/mk2/gap-60.state` (Reptile mirror, 62 px floor, liveness
+verified differentially at session start, identity-checked per load),
+`LabSession` transport — `hold_buttons`/`release_buttons` only, fold
+confirmed on every change, atomic pause-after loads. The dummy reproduction
+ran at `--pace 1` because a frame-stepped MCP session makes the training
+dummy **inert by construction** (its per-frame injection drains on host-loop
+folds between `step` calls — any stepped dummy measurement is void).
+Caveat: measured on a mid-flight uncommitted tree (the `contact_signal`
+change above landed mid-session); re-verify if anything disagrees after the
+wave lands.
+
+**A normal already in progress is NEVER canceled by re-holding Block.**
+Close HP (contact f8, 24 dmg) and close HK (f11, 16 dmg): Block re-held at
+every frame from press+1 through press+12 left contact frame and damage
+byte-identical to baseline, every trial (3–4/3–4 at boundaries, baselines
+reproducing the committed frames-table rows exactly).
+
+**The only Block interaction is at INPUT time, and it is per-button:**
+
+- **HK pressed on the same frame Block folds → nothing comes out** (0/4 at
+  the press frame; press+1 succeeds 3/3 — a one-frame boundary).
+- **HP and LK are immune even to that**: simultaneous Block+HP and Block+LK
+  both produce the full normal. So the same-frame eat is HK-specific on this
+  kit, not kick-class — a per-button finding; do not generalize.
+- **Block held BEFORE the press eats HP and HK both**, and — the
+  load-bearing number — **the eat persists ~8 frames AFTER Block is
+  released** (the block-stance latch; the one short hold measured, 8 frames,
+  needed 10). Manual bracket across hold lengths 8–100: release-gap 7 fails
+  / 8 succeeds for every hold ≥15; the latch is a property of the
+  release-to-press gap, not of elapsed time. Pose evidence: the "eaten" press shows the
+  block-stance sprite, identical to Block alone — nothing starts and nothing
+  is canceled; the input is eaten. Consistent with frames.md §3.1's
+  guarded-defender calibration (release-Block probe latency 10 vs neutral 1
+  — the stance outliving the button by ~9, measured there by walk, here by
+  attack-eating).
+- `action_counter` (+0xC0) is RETRACTED once more as an attack-started
+  witness: it read 160→192 at f5 in every arm including the eaten ones, and
+  stayed flat for Block alone — it fires on the attack-class INPUT, not on
+  an attack starting. No conclusion may rest on it.
+
+**The BlockPunish dummy's failure, classified: 10/10 EATEN.** At real
+cadence, every cycle: dummy blocks (chip −6), logs `punish: HP`, releases
+guard, presses HP exactly `PUNISH_RELEASE = 4` frames later — inside the
+latch — and the punish deals damage 0/10. Not WHIFFED (gap held 62 px, the
+proven cHP range; the identical timeline with an 8-frame release gap hits
+for 24) and not CANCELED-BY-BLOCK (nothing was in progress, and the Block
+re-hold came ~51 frames after the press). This also explains the user's
+"punishes some hits but not others": pool entries whose macro spends frames
+on direction steps before the trigger press (acid_spit's press lands ≈
+release+10) clear the latch, and the slide's chord *contains* Block so the
+eat rule does not apply to it — the outcome depends on which pool entry is
+sampled.
+
+**Shipped constants (orchestrator, same day, `src/training.rs`, tests
+green):** `PUNISH_RELEASE` 4 → **12** (boundary worst case 10 for short
+holds, plus margin) and `PUNISH_HOLDOFF` 48 → **2** (per Question A a
+re-held Block ≥1 frame after the press cancels nothing; 48 cost the dummy
+~0.9 s standing unguarded for no benefit).
+
+Named rather than silently fixed: a first pass reported long holds (bf≥73)
+failing at every release gap — the trial window was capped at 80 frames, so
+those runs never pressed the button at all; the cap rendered exactly like a
+measurement (the §7 trap). Not measured, named: the act-again arm of the
+cancel question (refused — differencing across probe shapes without a
+calibration pass, §4.3), close LP (it is the throw, a different outcome
+class), other characters/gaps/pools.
+
+## The round timer, closed: the countdown task record at 0xD630 (2026-09-01, W1)
+
+Resolves "The round timer — partially open" above. Rig: headless, MCP
+**4031**, `--pace 0`, all advancement via paused synchronous `run_frames`
+(verified exact); arena `shadow/arenas/mk2/m-v-r.state` (Mileena vs Reptile,
+2-HUMAN); every trial a fresh `load_state(pause_after=True)` + verify
+(char ids 5/9, healths 161/161).
+
+**VERDICT: the authoritative store is a round-countdown TASK RECORD at
+`0xD630`** — write-verified in BOTH directions, each twice. Layout
+(little-endian, observed mid-round and again on a fresh round 2):
+
+```
+0xD630  u16  round number? (1 in round 1, 2 in round 2)
+0xD632  u32  0x0106B820 — TMS34010 bit-address code pointer: THE GUARD
+0xD636  u32  tens digit (0-9)
+0xD63A  u32  ones digit (0-9)
+0xD63E  u32  0x0B constant (not probed)
+0xD642  u32  varies (unknown)
+```
+
+A tick task decrements the ones (borrowing from tens) every ~32.8 frames and
+re-derives the drawn digits `0xBD74/76` AND `0xBC20` from the pair; when it
+reads 0/0 the next tick fires the round-end path. **This is why the old
+exhaustive single-byte sequence search missed it: the value is digit-SPLIT
+across two u32s — no byte ever holds "93".** The other three stores are
+derived/inert, each pinned one at a time with baseline-exact timeouts:
+`0xD396` keeps counting from a written value and nothing reads it; `0xBC20`
+is re-derived per tick; the drawn digits are display cells visibly
+overwritten back every tick. Write evidence for authority: pinning 9/9 (or
+even the ones digit alone) holds the round alive past 4200 frames, twice,
+with the display sitting at "98"; a one-shot write of tens=0/ones=1 forces
+TIME UP at the next tick (≤ ~33 frames), twice. Found by the in-app signal
+hunt over `0xB000..0xE000` + the fighter structs (6 event marks, 6 mid-tick
+controls, 6 surviving candidates); the remaining ~2.35 MB was NOT searched —
+unnecessary once write-verified.
+
+**It is a task-record SLOT, not a static global.** After a real KO, round
+2's countdown task reappeared at the same address with the same code
+pointer, digits tracking the HUD tick-for-tick; on the b-v-r countdown
+screen the same slot holds a DIFFERENT task (pointer `0x0106B840`) and
+pinning it does nothing there. **The timer_hold recipe therefore guards
+first**: write only if `u32 @0xD632 == 0x0106B820`; then write 9 to both
+digit cells (u16 writes suffice — the high halves are zero) at any cadence
+up to ~260 frames (sag: one decrement per ~33-frame tick; need
+V > ceil(cadence/33)). Force TIME UP: tens=0/ones=1 once (0/0 direct
+untested; 0/1 is the verified recipe). Whether the slot can land elsewhere
+under different heap load is open — the guard is the mitigation. 1P-vs-CPU
+rounds are UNVERIFIED (no committed 1P arena restores live on a fresh
+instance — the hazard below). `0xD630`'s tick-phase byte, `0xD63E` and the
+noisy `0xD900` were observed, not write-tested.
+
+**`round_over` (0xC360) at round end, 2-human — all new observations:**
+
+| ending | round_over |
+|---|---|
+| timeout, unequal health (161 vs 113) | **1**, ~80 frames after the digits render 00; "MILEENA WINS", both healths > 0 — the timeout-decided observation the gate section wanted |
+| KO | **1** (the doc's earlier 2/3 came from 1P play) |
+| timeout, EQUAL health (draw) | **never leaves 0** — straight to GAME OVER, no FINISH HIM, no tally |
+
+**NEW GATE LEAK (timeout-draw path):** the GAME OVER screen after an
+equal-health timeout reads `screen_state`=0, `round_over`=0, healths still
+161/161 — the controllable gate is TRUE on a non-fight screen. Also beware
+reading the gate fields after any transition: attract screens leak
+scr=0/ro=0-or-1 with stale healths (a 30-frame-sampled run "found" ro=1 that
+was really attract garbage 2400 frames later). Screenshots are the phase
+oracle.
+
+**Arena restore hazard (cross-session):** `b-v-r.state`, `r-v-r.state` and
+`gap-30.state` all restore INPUT-DEAD on a FRESH emulator instance — RAM
+verifies (cids, healths) but the machine comes up on a non-fight countdown
+screen and held directions move nothing (world-X globals read 215/233, not
+the meta's 469/661). Only `m-v-r.state` restored live cross-session (walk
+test x 1130→1170 under held right; an HP press dealt 24; `screen_state`→276,
+the documented 2-human first-contact value). The b-v-r meta claims live
+inputs; the discrepancy is unexplained and worth its own session. One
+baseline run on b-v-r was caught by screenshots and discarded.
+
+Status: the store is KNOWN and write-verified; `timer_hold` enforcement
+WIRING is queued (wave 2) — the profile still carries the placeholder until
+it lands.

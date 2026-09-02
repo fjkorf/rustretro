@@ -154,6 +154,10 @@ impl FramelabPanel {
         egui::ScrollArea::horizontal().id_salt("framelab_table_scroll").show(ui, |ui| {
             egui::Grid::new("framelab_grid").spacing([8.0, 4.0]).striped(true).show(ui, |ui| {
                 ui.label(egui::RichText::new("move \\ gap (walk-frames)").small());
+                ui.label(egui::RichText::new("Startup (FAF)").strong()).on_hover_text(
+                    "1-indexed frame on which contact can first occur (docs/frames.md §2.1) \
+                     — measured at the minimum-gap row only (§4.4).",
+                );
                 for g in &gaps {
                     ui.label(egui::RichText::new(format!("{g}f")).strong());
                 }
@@ -161,6 +165,8 @@ impl FramelabPanel {
                 for mv in &moves {
                     let mv: &str = mv;
                     ui.label(egui::RichText::new(mv).strong());
+                    ui.label(egui::RichText::new(startup_faf_text(table, ch, mv)).monospace())
+                        .on_hover_text("FAF is measured at the minimum-gap row only (docs/frames.md §4.4).");
                     for g in &gaps {
                         let g: i64 = *g;
                         let cell = table.cell(ch, mv, Some(g));
@@ -192,7 +198,9 @@ impl FramelabPanel {
             egui::RichText::new(
                 "on-hit/on-block · — = unmeasured, · = never measured, KD = knockdown (no \
                  on-hit number — measure the wakeup window instead), amber = sparse \
-                 (sample_n < 2), red = observables DISAGREED (docs/frames.md §12).",
+                 (sample_n < 2), red = observables DISAGREED (docs/frames.md §12). \
+                 Startup (FAF) = 1-indexed frame on which contact can first occur, \
+                 measured at the minimum-gap row only (§2.1, §4.4).",
             )
             .small()
             .color(egui::Color32::DARK_GRAY),
@@ -439,6 +447,26 @@ impl FramelabPanel {
     }
 }
 
+/// The move's collapsed `first_active_frame` for the Startup (FAF) column.
+/// FAF is deliberately stored only on the minimum-gap (collision-floor) row
+/// and NULL elsewhere (docs/frames.md §4.4), so at most one distinct value
+/// exists per move — `—` for none measured (matching the panel's other
+/// absent measurements, never 0), and `⚠` if the contract is violated by
+/// disagreeing values across rows (flagged, not resolved).
+fn startup_faf_text(table: &FrameTable, ch: &str, mv: &str) -> String {
+    let values: BTreeSet<i64> = table
+        .cells_for_char(ch)
+        .into_iter()
+        .filter(|c| c.move_name == mv)
+        .filter_map(|c| c.measurement.first_active_frame)
+        .collect();
+    match values.len() {
+        0 => "—".to_string(),
+        1 => values.iter().next().unwrap().to_string(),
+        _ => "⚠".to_string(),
+    }
+}
+
 fn gap_label(gap: Option<i64>) -> String {
     match gap {
         Some(g) => format!("{g}f gap"),
@@ -667,6 +695,24 @@ mod tests {
         let (text, color) = cell_style(Some(disagreed));
         assert!(text.contains('⚠'), "{text}");
         assert_eq!(color, egui::Color32::from_rgb(220, 90, 90));
+    }
+
+    /// The Startup (FAF) column: a measured move shows its collapsed
+    /// `first_active_frame`; a move with no FAF anywhere renders `—` exactly
+    /// like the panel's other absent measurements (never 0); disagreeing
+    /// values across rows — a §4.4 contract violation — render `⚠`, never a
+    /// silently picked winner.
+    #[test]
+    fn startup_faf_text_renders_value_dash_and_disagreement() {
+        let mut table = synthetic_table();
+        assert_eq!(startup_faf_text(&table, "reptile", "HK"), "11");
+        assert_eq!(startup_faf_text(&table, "mileena", "roll"), "—");
+
+        let mut clash = table.cell("reptile", "HK", Some(60)).unwrap().clone();
+        clash.gap_walk_frames = Some(45);
+        clash.measurement.first_active_frame = Some(9);
+        table.cells.push(clash);
+        assert_eq!(startup_faf_text(&table, "reptile", "HK"), "⚠");
     }
 
     /// A one-sided field's collapsed value must never render as a bare,

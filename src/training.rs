@@ -163,10 +163,15 @@ struct Resolved {
     x_pair: Option<XSource>,
     /// The family's guard POLICY (MACRO_ACTIONS §9.1) — how the dummy blocks.
     guard: Guard,
-    /// The BlockPunish trigger source (MACRO_ACTIONS §6): per-block hitstun
-    /// globals where mapped (asurabld), else the port's global contact signal
-    /// (MK2 arcade's hit_counter). None → the mode degrades to plain Block.
+    /// The BlockPunish trigger source (MACRO_ACTIONS §6): the port's
+    /// `contact_signal` where declared (MK2 arcade: struct `health`,
+    /// decrease-only), else the per-block `hitstun_sources` globals
+    /// (asurabld's combo counters). None → the mode degrades to plain Block.
     contact: Option<Contact>,
+    /// `contact_signal.direction == "decrease"`: only a DROP in the signal
+    /// counts as contact (see `poll_contact`). Always false for the
+    /// `hitstun_sources` fallback (any-change back-compat).
+    contact_decrease: bool,
     /// Cooldown window: the signal must be quiet this long to re-arm.
     hitstun_window: u64,
 }
@@ -343,20 +348,32 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
     };
 
     // `contact_signal` FIRST: it is the purpose-built "was struck" signal.
-    // hitstun_sources is a health delta — blind to zero-chip blocked hits
-    // (the user-reported "punishes some hits but not others") and disturbed
-    // by refill writes — so it is only the fallback.
+    // MK2 arcade declares struct `health` (block+0x0E, decrease-only): it
+    // steps by the whole damage in ONE frame, on hit AND on block — blocked
+    // normals always chip on this port (3/6/8, mk2.md), so a health-valued
+    // signal DOES see blocked contact here. (The old comment's "blind to
+    // zero-chip blocked hits" concern was about asurabld-style zero-chip
+    // ports and the RETRACTED action_counter story — mk2.md.)
+    // hitstun_sources is the fallback: on MK2 that pair is the DRAWN HUD
+    // value, which animates 1 unit/frame and smears one hit into ~11 edges.
+    let mut contact_decrease = false;
     let contact = p
         .port
         .contact_signal
         .as_ref()
-        .and_then(|cs| match (&cs.field, &cs.global) {
-            (Some(f), _) => Some(Contact::PerBlock(
-                p.field_addr(1, f)?.0,
-                p.field_addr(2, f)?.0,
-            )),
-            (None, Some(gl)) => g(gl).map(Contact::Global),
-            _ => None,
+        .and_then(|cs| {
+            let c = match (&cs.field, &cs.global) {
+                (Some(f), _) => Some(Contact::PerBlock(
+                    p.field_addr(1, f)?.0,
+                    p.field_addr(2, f)?.0,
+                )),
+                (None, Some(gl)) => g(gl).map(Contact::Global),
+                _ => None,
+            };
+            if c.is_some() {
+                contact_decrease = cs.direction.as_deref() == Some("decrease");
+            }
+            c
         })
         .or_else(|| {
             p.port.hitstun_sources.as_ref().and_then(|hs| {
@@ -374,6 +391,7 @@ fn resolve(p: &GameProfile) -> Option<Resolved> {
         x_pair,
         guard,
         contact,
+        contact_decrease,
         hitstun_window: p.calibration("HITSTUN_RECENT_FRAMES").unwrap_or(20.0) as u64,
     })
 }
@@ -492,7 +510,20 @@ fn poll_contact(ds: &mut DebugState, r: &Resolved, frame: u64) -> (bool, u8) {
         }
     };
     let cur = rd8(ds, addr);
-    let changed = ds.training.punish_prev_signal.is_some_and(|prev| prev != cur);
+    // `direction: "decrease"` (contact_signal): only a DROP counts as
+    // contact. This is what makes a health-valued signal (MK2's struct
+    // health) immune to both INCREASE hazards by one sign check — the
+    // round-intro ramp (+2/frame under the banner-gate leak) and the
+    // training refill writing health back to max. Increases also don't
+    // stamp the quiet-window bookkeeping, so a refill can't hold the
+    // cooldown open. ACCEPTED LOSS: the hit that drives health below the
+    // refill threshold is overwritten back to max by refill before the next
+    // poll, so ~one real trigger per refill cycle is lost — the inverse of
+    // the previously documented "one spurious punish per refill", and
+    // harmless (the dummy blocks that one instead of punishing).
+    let changed = ds.training.punish_prev_signal.is_some_and(|prev| {
+        if r.contact_decrease { cur < prev } else { prev != cur }
+    });
     ds.training.punish_prev_signal = Some(cur);
     if changed {
         ds.training.punish_last_change = frame;
@@ -630,6 +661,10 @@ fn release_punish_exec(ds: &mut DebugState, reason: &str, frame: u64) {
     let Some(mut ex) = ds.training.punish_exec.take() else { return };
     let bits = ex.abort();
     ds.training.punish_wait = 0;
+    // The abort already injects neutral below; the hold-off EXTENDS that
+    // neutral (the guard chord must not snap back next frame — the same
+    // block-cancel hazard as the normal-completion path).
+    ds.training.punish_holdoff_until = frame + PUNISH_HOLDOFF;
     if !crate::playback::active_on_port(ds, 1) {
         for (i, on) in bits.iter().enumerate() {
             ds.injected_input2[i] = if *on { 2 } else { 0 };
@@ -782,7 +817,14 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
                     bits = ex.next(opp_right);
                 }
                 if bits.is_none() {
+                    // Macro COMPLETED under a gate closure (hit-freeze —
+                    // MK2 zeroes its in-fight word at the contact frame):
+                    // same post-punish hold-off as the in-gate completion
+                    // path, and an explicit neutral injection so the last
+                    // chord frame can't outlive the macro.
                     ds.training.punish_exec = None;
+                    ds.training.punish_holdoff_until = frame + PUNISH_HOLDOFF;
+                    bits = Some([false; 12]);
                 }
             }
             // Playback wins (task A2 §4): if an input-slot playback is
@@ -945,22 +987,49 @@ fn resolve_reversal_delay(timing: crate::debug::ReversalTiming, seed: u64) -> u6
     }
 }
 
-/// Neutral frames at the tail of the delay: a still-held guard bleeds into
-/// the macro's chord (MK's held Block eats attack buttons — live-observed:
-/// the slide fires from a clean simultaneous press, not from Block-held +
-/// buttons added), so everything is released before the first step.
-const PUNISH_RELEASE: u64 = 4;
+/// Neutral frames between releasing the guard and the macro's first press.
+/// This is the load-bearing constant of the whole punish: MK2's block-stance
+/// input-eat OUTLIVES the Block release by ~8 frames (live-measured
+/// 2026-09-01, port 4030: release-gap 7 fails at every guard-hold length
+/// tried, 8 succeeds at all of them; ~10 needed after very short holds), so
+/// the old value of 4 pressed inside the latch and the punish was EATEN on
+/// 10/10 measured cycles — the user-reported "the punish never happens".
+/// 12 = the measured boundary's worst case (10) plus margin. Evidence:
+/// w1-blockcancel-evidence.md (wave-1 probe; to be merged into mk2.md).
+const PUNISH_RELEASE: u64 = 12;
+
+/// Post-punish neutral hold-off: after a punish macro COMPLETES (or aborts),
+/// the dummy injects NEUTRAL — never the guard chord — for this many frames.
+/// Originally shipped at 48 on the hypothesis that a re-held Block
+/// block-cancels the attack's startup; the wave-1 live probe REFUTED that
+/// (2026-09-01, port 4030): Block re-held at every frame from press+1 to
+/// press+12 left contact frame and damage byte-identical to baseline — a
+/// started move cannot be guard-canceled on this port. The real hazard was
+/// the PRE-press gap ([`PUNISH_RELEASE`], see its doc). What remains for
+/// the hold-off is only the input-fold edge (a chord needs ≥2 clean frames,
+/// MACRO_ACTIONS §11, and a kick chorded with a same-frame Block fold is
+/// eaten), so 2 frames of neutral after the macro's last press is enough.
+const PUNISH_HOLDOFF: u64 = 2;
+
+/// Quiet frames required to re-arm the trigger after a punish. With the
+/// `contact_signal` struct-health source the signal genuinely moves for a
+/// SINGLE frame per contact (the whole damage lands in one step — the frame
+/// lab's verified anchor), so 8 is pure margin over the write itself; it
+/// also keeps one punish per multi-hit contact burst (hit-freeze re-writes,
+/// double_kick's two hits 11–16f apart trigger at most once while the
+/// scheduled punish is already in flight). The HISTORY that picked 8: the
+/// old HUD fallback smeared one hit into ~11 one-unit edges, so quiet only
+/// began ~11 frames after contact and 8 sat on top of that; with the
+/// one-frame signal the effective cooldown is shorter but still one-per-
+/// string in practice (an in-flight punish ignores further triggers). The
+/// value before that reused HITSTUN_RECENT_FRAMES (20 — the hitstun FEATURE
+/// window, a different concept) and made back-to-back pressure feel
+/// unresponsive.
+const PUNISH_REARM_FRAMES: u64 = 8;
 
 /// Frames an in-flight punish (delay + macro) may keep running while the
 /// gate is closed (MK2 zeroes its in-fight word from the contact frame
 /// onward) before it is dropped as a real round end.
-/// Quiet frames required to re-arm the trigger after a punish. The contact
-/// signal (a health delta) moves for a SINGLE frame per hit, so this only has
-/// to outlast the write itself; the old value reused HITSTUN_RECENT_FRAMES
-/// (20 — the hitstun FEATURE window, a different concept) and made
-/// back-to-back pressure feel unresponsive.
-const PUNISH_REARM_FRAMES: u64 = 8;
-
 const PUNISH_GATE_GRACE: u64 = 60;
 
 /// One BlockPunish frame: guard by policy; on each TRIGGER sample the weighted
@@ -1028,14 +1097,28 @@ fn block_punish(
                 }
             }
             if done {
+                // Completion starts the post-punish hold-off: the old code
+                // fell through to `out.unwrap_or(guard_bits)` HERE, re-
+                // holding Block one frame after the attack press — which
+                // block-cancels the just-pressed attack (the user-reported
+                // "the HP comes out while still blocking and the punish
+                // never happens").
                 ds.training.punish_exec = None;
+                ds.training.punish_holdoff_until = frame + PUNISH_HOLDOFF;
             }
         }
     }
 
     if ds.training.punish_exec.is_none() {
         let mode = ds.training.guard_mode;
-        ds.training.punish_phase = if frame < ds.training.punish_hold_until {
+        ds.training.punish_phase = if frame < ds.training.punish_holdoff_until {
+            // Deliberate neutral (see PUNISH_HOLDOFF) — the panel must say
+            // so rather than look broken while the dummy stands still.
+            format!(
+                "recovering — holdoff {}f",
+                ds.training.punish_holdoff_until - frame
+            )
+        } else if frame < ds.training.punish_hold_until {
             // ContinueBlock: keep guarding (reactively, where that is the
             // policy) and decline to punish until the hold expires.
             if on_commit {
@@ -1124,6 +1207,12 @@ fn block_punish(
             None => {} // empty/zero-weight pool: just keep guarding
         }
     }
+    // Post-punish hold-off: with no macro output this frame, NEUTRAL wins
+    // over the guard fallback until the stamp expires — never over `out`
+    // itself (a newly scheduled macro's own steps are untouched).
+    if out.is_none() && frame < ds.training.punish_holdoff_until {
+        return [false; 12];
+    }
     out.unwrap_or(guard_bits)
 }
 
@@ -1195,7 +1284,7 @@ mod tests {
         let f = features_of(&p).expect("mk2 must be training-available (has a gate)");
         assert!(f.refill, "health field + HUD pair are mapped");
         assert!(f.block_dummy, "MK is button-block: the Block chord is mapped");
-        assert!(f.block_punish, "hitstun_sources (HUD health pair) is mapped");
+        assert!(f.block_punish, "contact_signal (struct health, decrease-only) is mapped");
         assert!(!f.timer_hold && !f.credits && !f.position_reset && !f.finish_round);
         assert_eq!(
             f.missing(),
@@ -1239,9 +1328,10 @@ mod tests {
     }
 
     /// The full §6 loop against the mk2 profile: arm on quiet, trigger on a
-    /// hit_counter change while guarding, play the char-aware slide through
-    /// MacroExec on the dummy port, return to the guard chord, and stay in
-    /// cooldown until the signal goes quiet again.
+    /// struct-health DECREASE while guarding, play the char-aware slide
+    /// through MacroExec on the dummy port, stand deliberately neutral for
+    /// the post-punish hold-off, then return to the guard chord — and treat
+    /// an INCREASE (refill / round-intro shaped) as no contact at all.
     #[test]
     fn block_punish_fires_the_slide_on_contact_then_cools_down() {
         let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
@@ -1254,8 +1344,9 @@ mod tests {
             flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
         }));
         // Open mk2's gate and stage the matchup: dummy (higher X → block2)
-        // is Reptile; its contact signal is the block2 hitstun source
-        // (p2_health_hud — the HUD accumulator that moves when P2 is struck).
+        // is Reptile; its contact signal is block2's own struct `health`
+        // (contact_signal field=health, direction=decrease — the frame-lab
+        // anchor that steps by the whole damage in one frame).
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
@@ -1265,12 +1356,10 @@ mod tests {
         // block1 at x=100 (left), block2/dummy (Reptile) at x=200 (right).
         stage_object_ptr(&mut ds, p.block1(), 0, 0x7000, 100);
         stage_object_ptr(&mut ds, p.block2(), 9, 0x7100, 200);
-        // The dummy is block2 (larger x); mk2 ships no contact_signal, so
-        // the trigger falls back to hitstun_sources — block2's HUD health.
-        // (A blocking MK2 fighter's struct is otherwise frozen and blocked
-        // contact always chips, so the health delta IS the contact event —
-        // see mk2.md's contact-signal investigation.)
-        let sig = p.global("p2_health_hud").unwrap() as usize;
+        // The dummy is block2 (larger x); the trigger is block2's struct
+        // health. (Blocked contact always chips on this port — 3/6/8 — so
+        // the struct-health delta sees blocked hits too; mk2.md.)
+        let sig = (p.block2() + hoff) as usize;
         assert!(crate::gate::eval_gate(&ds, &p));
 
         ds.training.enabled = true;
@@ -1287,9 +1376,10 @@ mod tests {
         assert_eq!(ds.injected_input2[10], 2, "guarding while armed");
         assert_eq!(ds.injected_input2[8], 0);
 
-        // Contact: the signal moves while the dummy guards → punish is
-        // SCHEDULED (guard held through hit-freeze + blockstun first).
-        assert!(ds.write_addr(sig, 1, 1));
+        // Contact: a blocked-HP chip (90 → 84, whole damage in one frame)
+        // while the dummy guards → punish is SCHEDULED (guard held through
+        // hit-freeze + blockstun first).
+        assert!(ds.write_addr(sig, 1, 84));
         tick_with(&mut ds, 26, &p);
         assert!(ds.training.punish_exec.is_some(), "punish scheduled");
         assert_eq!(ds.training.punish_wait, PUNISH_DELAY);
@@ -1328,16 +1418,44 @@ mod tests {
         assert!(ds.training.punish_exec.is_none(), "macro finished under grace");
         f += 9;
 
-        // Gate reopens: the guard chord returns.
+        // Gate reopens DURING the post-punish hold-off: the guard chord must
+        // NOT snap back (re-held Block block-cancels the just-pressed chord
+        // — the bug PUNISH_HOLDOFF fixes); the dummy stands deliberately
+        // neutral and the phase says so.
         assert!(ds.write_addr(scr, 2, 0));
         tick_with(&mut ds, f, &p);
-        assert_eq!(ds.injected_input2[10], 2, "back to guarding");
+        assert_eq!(ds.injected_input2[10], 0, "no guard during the post-punish hold-off");
+        assert!(
+            ds.training.punish_phase.starts_with("recovering — holdoff"),
+            "deliberate neutral must explain itself: {}",
+            ds.training.punish_phase
+        );
+
+        // The hold-off expires → the guard chord returns.
+        let end = ds.training.punish_holdoff_until;
+        while f < end {
+            f += 1;
+            tick_with(&mut ds, f, &p);
+        }
+        assert_eq!(ds.injected_input2[10], 2, "guard returns after the hold-off");
         assert_eq!(ds.injected_input2[8], 0);
 
-        // Another change inside the quiet window must NOT re-trigger.
-        assert!(ds.write_addr(sig, 1, 2));
-        tick_with(&mut ds, f + 1, &p);
-        assert_eq!(ds.injected_input2[10], 2, "cooldown holds the guard");
+        // An INCREASE (training refill / round-intro ramp shaped) is NOT
+        // contact: no trigger, and it must not stamp the quiet window (the
+        // trigger stays armed).
+        assert!(ds.training.punish_armed, "long quiet re-armed the trigger");
+        assert!(ds.write_addr(sig, 1, 161));
+        f += 1;
+        tick_with(&mut ds, f, &p);
+        assert!(ds.training.punish_exec.is_none(), "an increase must never trigger");
+        assert!(ds.training.punish_armed, "an increase must not reset the quiet window");
+        assert_eq!(ds.injected_input2[10], 2, "still guarding");
+
+        // A fresh DECREASE re-triggers — the loop is repeatable.
+        assert!(ds.write_addr(sig, 1, 155));
+        f += 1;
+        tick_with(&mut ds, f, &p);
+        assert!(ds.training.punish_exec.is_some(), "a decrease re-triggers once re-armed");
         assert!(!ds.training.punish_armed);
     }
 
@@ -1615,10 +1733,75 @@ mod tests {
             tick_with(&mut ds, f, &p);
         }
         assert_eq!(ds.training.punish_phase, "guarding — ARMED");
-        let sig = p.global("p2_health_hud").unwrap() as usize;
-        assert!(ds.write_addr(sig, 1, 1));
+        // Contact = the dummy's (block2's) struct health DECREASING.
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 84));
         tick_with(&mut ds, 21, &p);
         assert_eq!(ds.training.punish_phase, "punishing: HP");
+    }
+
+    /// The post-punish hold-off, in-gate (the user-reported bug's exact
+    /// shape): the frame the punish macro completes, the dummy must inject
+    /// NEUTRAL — not fall back to the guard chord, which one frame after a
+    /// 3-frame attack press block-cancels the attack ("the HP comes out
+    /// while the character is still blocking and the punish never happens").
+    /// Neutral holds for PUNISH_HOLDOFF frames with an honest phase string,
+    /// then the guard chord returns.
+    #[test]
+    fn punish_completion_holds_off_the_guard_chord() {
+        let p = GameProfile::load(Path::new("library/mk2")).expect("mk2 profile loads");
+        let mut ds = DebugState::new();
+        assert!(ds.install_bus_window(crate::debug::BusWindowCfg {
+            name: "wram-holdoff-test".into(),
+            addr: 0x0,
+            len: 0x10000,
+            interval: 1,
+            flags: crate::libretro::RETRO_MEMDESC_SYSTEM_RAM,
+        }));
+        let hoff = p.field_off("health").unwrap().0;
+        assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        assert!(crate::gate::eval_gate(&ds, &p));
+        ds.training.enabled = true;
+        ds.training.dummy = DummyMode::BlockPunish;
+        ds.training.punish_pool = vec![(crate::macros::PunishOption::Attack("HP".into()), 1)];
+
+        for f in 1..=20 {
+            tick_with(&mut ds, f, &p);
+        }
+        assert!(ds.training.punish_armed);
+        assert_eq!(ds.injected_input2[10], 2, "guarding while armed");
+
+        // Chip contact triggers; ride the delay + release tail + 3-frame
+        // HP press to completion.
+        assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 84));
+        let mut f = 21;
+        tick_with(&mut ds, f, &p);
+        assert!(ds.training.punish_exec.is_some(), "punish scheduled");
+        while ds.training.punish_exec.is_some() {
+            f += 1;
+            tick_with(&mut ds, f, &p);
+        }
+        // `f` is the completion tick: the old code re-injected guard_bits
+        // HERE (out.unwrap_or) — the regression under test.
+        assert_eq!(
+            ds.injected_input2[10], 0,
+            "guard must NOT snap back on the completion frame"
+        );
+        assert!(
+            ds.training.punish_phase.starts_with("recovering — holdoff"),
+            "the deliberate neutral must explain itself: {}",
+            ds.training.punish_phase
+        );
+        let end = ds.training.punish_holdoff_until;
+        assert_eq!(end, f + PUNISH_HOLDOFF, "hold-off stamped at completion");
+        while f + 1 < end {
+            f += 1;
+            tick_with(&mut ds, f, &p);
+            assert_eq!(ds.injected_input2[10], 0, "neutral through the hold-off (frame {f})");
+        }
+        f += 1;
+        tick_with(&mut ds, f, &p); // f == end: the stamp has expired
+        assert_eq!(ds.injected_input2[10], 2, "guard returns after the hold-off");
     }
 
     // ── §10.1 abort paths: a held chord must never survive a macro ending

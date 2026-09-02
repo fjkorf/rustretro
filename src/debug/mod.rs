@@ -562,6 +562,17 @@ pub struct TrainingConfig {
     pub punish_armed: bool,
     /// ContinueBlock outcome: keep guarding (and don't re-trigger) until here.
     pub punish_hold_until: u64,
+    /// Post-punish neutral hold-off (`training::PUNISH_HOLDOFF`): until this
+    /// frame the dummy injects NEUTRAL instead of falling back to the guard
+    /// chord, so a just-pressed punish attack cannot be block-cancelled by
+    /// the guard snapping back one frame later. A frame STAMP deliberately —
+    /// it survives across frames and across gate closures (frames keep
+    /// counting while the gate is closed, which is the point: wall-frame
+    /// recovery, not a counter someone forgets to tick). Stamped at macro
+    /// completion (both the in-gate and gate-closed completion paths) and by
+    /// `release_punish_exec`, so aborts extend their neutral instead of
+    /// letting guard snap back next frame.
+    pub punish_holdoff_until: u64,
     /// Consecutive gate-closed frames survived by the in-flight punish macro
     /// (hit-freeze grace — see `training::PUNISH_GATE_GRACE`).
     pub punish_gate_grace: u64,

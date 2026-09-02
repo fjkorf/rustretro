@@ -165,16 +165,30 @@ pub struct PortBlock {
 /// The contact-signal declaration: something whose CHANGE means "this
 /// fighter was struck (hit OR blocked)". Exactly one source:
 /// - `field`: a per-fighter field name, resolved per block — PREFERRED,
-///   because it is per-victim by construction and (MK2's `action_counter`)
-///   fires on zero-chip blocked contact, which a health delta cannot see.
+///   because it is per-victim by construction. MK2 arcade ships struct
+///   `health` (block+0x0E): it steps by the whole damage in ONE frame, on
+///   hit AND on block — blocked normals always chip on this port (3/6/8,
+///   mk2.md "Hitstun / blockstun observables") — unlike the drawn HUD pair,
+///   which animates 1 unit/frame and smears one hit into ~11 edges. (The
+///   earlier `action_counter` contact claim was RETRACTED — mk2.md.)
 /// - `global`: one address shared by both fighters (weaker: usually
 ///   victim-asymmetric, as MK2's hit_counter turned out to be).
+///
+/// `direction` (optional) restricts which changes COUNT as contact:
+/// - `"decrease"`: only a drop in the value is contact. This is what makes a
+///   health-valued signal immune to the two INCREASE hazards — the round-
+///   intro ramp (+2/frame under the banner-gate leak) and the training
+///   refill's write back to max — by one sign check.
+/// - absent: any change counts (back-compat; asurabld's combo counters
+///   INCREASE on hits, so decrease-only must never be a global rule).
 #[derive(Deserialize, Debug, Clone)]
 pub struct ContactSignal {
     #[serde(default)]
     pub field: Option<String>,
     #[serde(default)]
     pub global: Option<String>,
+    #[serde(default)]
+    pub direction: Option<String>,
 }
 
 /// One macro step (MACRO_ACTIONS §2/§10): held SEMANTIC directions, attack
@@ -1269,6 +1283,13 @@ impl GameProfile {
                     }
                 }
             }
+            if let Some(d) = &cs.direction {
+                if d != "decrease" {
+                    return Err(format!(
+                        "contact_signal.direction must be \"decrease\" or absent (got '{d}')"
+                    ));
+                }
+            }
         }
         let frames = load_frame_table(&fam_dir, &port.port)?;
 
@@ -2114,11 +2135,18 @@ mod tests {
         for (name, steps) in p.all_specials() {
             assert!(!steps.is_empty(), "{name} compiled to no steps");
         }
-        // The arcade contact signal is the per-fighter `action_counter`
-        // FIELD (quiet while guarding, fires on blocked contact even at zero
-        // chip — live-verified). hitstun_sources stays as the health-delta
-        // fallback and as the hitstun FEATURE source.
-        assert!(p.port.contact_signal.is_none(), "mk2 uses the hitstun_sources fallback");
+        // The arcade contact signal is struct `health` (block+0x0E), the
+        // frame lab's verified contact anchor: it steps by the whole damage
+        // in ONE frame, on hit (161→150) AND on block (161→158 — blocked
+        // normals chip 3/6/8 on this port, mk2.md). direction:"decrease"
+        // makes it immune to the two INCREASE hazards (round-intro ramp,
+        // training refill). hitstun_sources (the DRAWN HUD pair, 1 unit/
+        // frame smear) stays as the fallback and the hitstun FEATURE source.
+        // (An earlier `action_counter` contact claim was RETRACTED — mk2.md.)
+        let cs = p.port.contact_signal.as_ref().expect("mk2 ships a contact_signal");
+        assert_eq!(cs.field.as_deref(), Some("health"));
+        assert!(cs.global.is_none());
+        assert_eq!(cs.direction.as_deref(), Some("decrease"));
         let hs = p.port.hitstun_sources.as_ref().unwrap();
         assert_eq!(hs.get("block1").map(String::as_str), Some("p1_health_hud"));
         assert_eq!(hs.get("block2").map(String::as_str), Some("p2_health_hud"));

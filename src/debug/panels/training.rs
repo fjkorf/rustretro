@@ -355,7 +355,9 @@ impl TrainingPanel {
                          commitment (block-punish AND whiff-punish)."
                     } else {
                         "ARMED = the next blocked contact punishes. cooling = waiting for \
-                         the contact signal to go quiet. A whiffed attack never registers \
+                         the contact signal to go quiet. recovering = deliberate neutral \
+                         right after a punish, so the returning guard can't block-cancel \
+                         the just-pressed attack. A whiffed attack never registers \
                          as contact, so the dummy correctly stays armed."
                     });
                 }

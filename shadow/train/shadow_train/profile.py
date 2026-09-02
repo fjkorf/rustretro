@@ -111,7 +111,7 @@ class GameProfile:
     # exact meaning -- this is what keeps asurabld's label space untouched).
     moves: dict = field(default_factory=dict)                # family.json §1: char name -> [{"name","tags"}, ...]
     special_inputs: dict = field(default_factory=dict)       # port §2: char name -> move name -> [step, ...]
-    contact_signal: Optional[dict] = None                    # port §6: {"field"|"global": name}
+    contact_signal: Optional[dict] = None                    # port §6: {"field"|"global": name, optional "direction": "decrease"}
 
     _char_by_id: dict = field(default_factory=dict, repr=False)
 
@@ -466,22 +466,34 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
             compiled_moves[move_name] = compiled_steps
         special_inputs[char_name] = compiled_moves
 
-    # MACRO_ACTIONS.md §6: contact_signal fallback for BlockPunish's trigger
-    # when hitstun_sources is absent. This is Rust-only data today (no
-    # Python consumer -- src/training.rs reads it, not dataset.py), so
-    # unlike hitstun_sources (load-bearing for THIS loader's own hitstun
-    # bucketing, hence the stricter "must be in recorded_globals" check)
-    # this only validates the name is a real global, not that it's already
-    # wired into record_globals -- that keeps the Python mirror from hard-
-    # failing every mk2 profile load while record_globals catches up on the
-    # Rust side (see the final report's contract-ambiguity note).
-    # Two sources, exactly one: `field` (per-fighter, PREFERRED -- MK2's
-    # action_counter fires on zero-chip blocked contact, which a health
-    # delta cannot see) or `global` (shared, usually victim-asymmetric).
+    # MACRO_ACTIONS.md §6: contact_signal, the PREFERRED BlockPunish trigger
+    # source (hitstun_sources is the fallback). This is Rust-only data today
+    # (no Python consumer -- src/training.rs and src/record.rs read it, not
+    # dataset.py), so unlike hitstun_sources (load-bearing for THIS loader's
+    # own hitstun bucketing, hence the stricter "must be in recorded_globals"
+    # check) this only validates the names, not recording wiring.
+    # Two sources, exactly one: `field` (per-fighter, PREFERRED -- per-victim
+    # by construction; mk2 arcade ships struct `health`, which steps by the
+    # whole damage in ONE frame on hit AND on block -- blocked normals always
+    # chip 3/6/8 on that port (mk2.md), so a health-valued signal DOES see
+    # blocked contact there; the old "a health delta is blind to blocked
+    # contact" note here described the RETRACTED action_counter story) or
+    # `global` (shared, usually victim-asymmetric).
+    # Optional `direction: "decrease"`: only a DROP in the value counts as
+    # contact -- what makes a health-valued signal immune to the two
+    # INCREASE hazards (round-intro ramp, training refill) by one sign
+    # check. Absent = any change counts (back-compat: asurabld's fallback
+    # combo counters INCREASE on hits, so decrease-only is per-profile data,
+    # never a global rule).
     contact_signal = port_raw.get("contact_signal")
     if contact_signal:
         sig_field = contact_signal.get("field")
         sig_global = contact_signal.get("global")
+        direction = contact_signal.get("direction")
+        if direction not in (None, "decrease"):
+            raise ProfileError(
+                f"contact_signal.direction must be 'decrease' or absent (got {direction!r})"
+            )
         if sig_field and sig_global:
             raise ProfileError("contact_signal: pick field OR global, not both")
         if sig_field:
@@ -494,6 +506,8 @@ def load(game_dir: Optional[Union[str, Path]] = None) -> GameProfile:
             contact_signal = {"global": sig_global}
         else:
             raise ProfileError("contact_signal needs 'field' or 'global'")
+        if direction:
+            contact_signal["direction"] = direction
     else:
         contact_signal = None
 
