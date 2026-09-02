@@ -577,6 +577,73 @@ def _macro_override_events(rows: list[dict], p1b: str, oppb: str,
     return out
 
 
+def decision_scalars(view, feats, me: dict, opp: dict, hist_masks: list[int],
+                     *, me_hitstun: bool = False, opp_hitstun: bool = False):
+    """THE single source of truth for one decision's scalar feature dict and
+    facing sign (SPEC §1a). `_decisions_for_round` calls this, and so does the
+    segment engine (`segments/features.py`) — so the scalar values have ONE
+    implementation, never a second that could drift (the matcher-unification
+    discipline; a byte-identical G1 refit guards it). `me`/`opp` are the
+    already-resolved fighter dicts, `hist_masks` the demonstrator's own input
+    masks over the preceding decision window; `me_hitstun`/`opp_hitstun` are
+    the already-resolved active-hitstun booleans (they need whole-round
+    context the caller owns). Returns (scal, s, fwd_bit, back_bit)."""
+    fs = set(feats)
+    cal = view.calibration
+    X_SCALE_ = cal["X_SCALE"]
+    if "facing" in view.field_names:
+        s = 1 if me["facing"] == 1 else -1
+    else:
+        # §4.2 facing fallback: s = sign(opp.x - me.x). With this s,
+        # s*(opp.x-me.x) == |opp.x-me.x|, so dist_x is |Δx| exactly as the
+        # contract note says, and fwd/back holds become position-relative.
+        s = 1 if (opp["x"] - me["x"]) >= 0 else -1
+    fwd_bit = BIT_RIGHT if s > 0 else BIT_LEFT
+    back_bit = BIT_LEFT if s > 0 else BIT_RIGHT
+    n = max(1, len(hist_masks))
+    scal = {
+        "dist_x": s * (opp["x"] - me["x"]) / X_SCALE_,
+        "me_fwd_hold": sum(m >> fwd_bit & 1 for m in hist_masks) / n,
+        "me_back_hold": sum(m >> back_bit & 1 for m in hist_masks) / n,
+        "facing_sign": float(s),
+    }
+    if "dy" in fs:
+        GROUND_Y_, Y_SCALE_ = cal["GROUND_Y"], cal["Y_SCALE"]
+        scal["dy"] = (opp["y"] - me["y"]) / Y_SCALE_
+        scal["me_airborne"] = 1.0 if GROUND_Y_ - me["y"] > 4 else 0.0
+        scal["me_height"] = max(0, GROUND_Y_ - me["y"]) / Y_SCALE_
+        scal["opp_airborne"] = 1.0 if GROUND_Y_ - opp["y"] > 4 else 0.0
+        scal["opp_height"] = max(0, GROUND_Y_ - opp["y"]) / Y_SCALE_
+    if "me_anim" in fs:
+        ANIM_SCALE_ = cal["ANIM_SCALE"]
+        scal["me_anim"] = me["anim"] / ANIM_SCALE_
+        scal["opp_anim"] = opp["anim"] / ANIM_SCALE_
+    if "me_timer" in fs:
+        TIMER_SCALE_ = cal["TIMER_SCALE"]
+        scal["me_timer"] = me["timer"] / TIMER_SCALE_
+        scal["opp_timer"] = opp["timer"] / TIMER_SCALE_
+    if "me_health" in fs:
+        HEALTH_MAX_ = cal["HEALTH_MAX"]
+        scal["me_health"] = me["health"] / HEALTH_MAX_
+        scal["opp_health"] = opp["health"] / HEALTH_MAX_
+        scal["health_lead"] = (me["health"] - opp["health"]) / HEALTH_MAX_
+    if "me_meter" in fs:
+        scal["me_meter"] = me["meter"] / max(1, me["meter_max"])
+        scal["opp_meter"] = opp["meter"] / max(1, opp["meter_max"])
+    if "me_hitstun" in fs:
+        # me_hitstun: self-feature, current (§4 — "you know your own hands");
+        # opp_hitstun: opponent-sourced, resolved STALE by the caller.
+        scal["me_hitstun"] = 1.0 if me_hitstun else 0.0
+        scal["opp_hitstun"] = 1.0 if opp_hitstun else 0.0
+    if "me_corner" in fs:
+        CORNER_PX_, SCREEN_W_ = cal["CORNER_PX"], cal["SCREEN_W"]
+        scal["me_corner"] = (
+            1.0 if me["x"] <= CORNER_PX_ or me["x"] >= SCREEN_W_ - CORNER_PX_
+            else 0.0
+        )
+    return scal, s, fwd_bit, back_bit
+
+
 def _decisions_for_round(round_key: tuple, rows: list[dict],
                           view: _RecordingView | None = None,
                           feats: list[str] | None = None,
@@ -606,17 +673,12 @@ def _decisions_for_round(round_key: tuple, rows: list[dict],
 
     p1b = "block1" if rows[0]["p1_block"] == 1 else "block2"
     oppb = "block2" if p1b == "block1" else "block1"
-    has_facing = "facing" in view.field_names
-    have_action = "action" in view.field_names
-    have_xy = "dy" in fs
-    have_anim = "me_anim" in fs
-    have_timer = "me_timer" in fs
-    have_health = "me_health" in fs
-    have_meter = "me_meter" in fs
-    have_hitstun = "me_hitstun" in fs
-    have_corner = "me_corner" in fs
-    cal = view.calibration
-    X_SCALE_ = cal["X_SCALE"]
+    has_facing = "facing" in view.field_names   # macro side-resolution below
+    have_action = "action" in view.field_names   # Decision.me_action/opp_action
+    have_hitstun = "me_hitstun" in fs            # gates the mask computation
+    # Every other scalar's availability is decided inside decision_scalars
+    # (the ONE feature implementation), keyed off `feats` — no second copy of
+    # the have_* flags to keep in sync.
 
     # active-hitstun masks (task 2) -- "recently changed", not "nonzero"
     if have_hitstun:
@@ -659,60 +721,14 @@ def _decisions_for_round(round_key: tuple, rows: list[dict],
             if drop_stats is not None:
                 drop_stats["dropped"] = drop_stats.get("dropped", 0) + 1
             continue
-        if has_facing:
-            s = 1 if me["facing"] == 1 else -1
-        else:
-            # §4.2 facing fallback: s = sign(opp.x - me.x). With this s,
-            # s*(opp.x-me.x) == |opp.x-me.x|, so dist_x below is |Δx| exactly
-            # as the contract note says, and fwd/back holds become
-            # position-relative for free.
-            s = 1 if (opp["x"] - me["x"]) >= 0 else -1
         # me-holds from own mask history (§1a #4/#5)
         hist = [rows[j]["p1_input"] for j in range(max(0, i - P), i)]
-        fwd_bit = BIT_RIGHT if s > 0 else BIT_LEFT
-        back_bit = BIT_LEFT if s > 0 else BIT_RIGHT
-        n = max(1, len(hist))
-        scal = {
-            "dist_x": s * (opp["x"] - me["x"]) / X_SCALE_,
-            "me_fwd_hold": sum(m >> fwd_bit & 1 for m in hist) / n,
-            "me_back_hold": sum(m >> back_bit & 1 for m in hist) / n,
-            "facing_sign": float(s),
-        }
-        if have_xy:
-            GROUND_Y_, Y_SCALE_ = cal["GROUND_Y"], cal["Y_SCALE"]
-            scal["dy"] = (opp["y"] - me["y"]) / Y_SCALE_
-            scal["me_airborne"] = 1.0 if GROUND_Y_ - me["y"] > 4 else 0.0
-            scal["me_height"] = max(0, GROUND_Y_ - me["y"]) / Y_SCALE_
-            scal["opp_airborne"] = 1.0 if GROUND_Y_ - opp["y"] > 4 else 0.0
-            scal["opp_height"] = max(0, GROUND_Y_ - opp["y"]) / Y_SCALE_
-        if have_anim:
-            ANIM_SCALE_ = cal["ANIM_SCALE"]
-            scal["me_anim"] = me["anim"] / ANIM_SCALE_
-            scal["opp_anim"] = opp["anim"] / ANIM_SCALE_
-        if have_timer:
-            TIMER_SCALE_ = cal["TIMER_SCALE"]
-            scal["me_timer"] = me["timer"] / TIMER_SCALE_
-            scal["opp_timer"] = opp["timer"] / TIMER_SCALE_
-        if have_health:
-            HEALTH_MAX_ = cal["HEALTH_MAX"]
-            scal["me_health"] = me["health"] / HEALTH_MAX_
-            scal["opp_health"] = opp["health"] / HEALTH_MAX_
-            scal["health_lead"] = (me["health"] - opp["health"]) / HEALTH_MAX_
-        if have_meter:
-            scal["me_meter"] = me["meter"] / max(1, me["meter_max"])
-            scal["opp_meter"] = opp["meter"] / max(1, opp["meter_max"])
-        if have_hitstun:
-            # me_hitstun: self-feature, stays current (§4 -- "you know your
-            # own hands"); opp_hitstun: opponent-sourced, so it's read STALE
-            # like the rest of the opp_* block (§4 humanness rule, §1a #21).
-            scal["me_hitstun"] = 1.0 if me_active[i] else 0.0
-            scal["opp_hitstun"] = 1.0 if opp_active[max(0, i - STALE)] else 0.0
-        if have_corner:
-            CORNER_PX_, SCREEN_W_ = cal["CORNER_PX"], cal["SCREEN_W"]
-            scal["me_corner"] = (
-                1.0 if me["x"] <= CORNER_PX_ or me["x"] >= SCREEN_W_ - CORNER_PX_
-                else 0.0
-            )
+        # THE single feature implementation (decision_scalars) — shared with
+        # the segment engine so there is never a second copy to drift.
+        mh = bool(me_active[i]) if have_hitstun else False
+        oh = bool(opp_active[max(0, i - STALE)]) if have_hitstun else False
+        scal, s, fwd_bit, back_bit = decision_scalars(
+            view, feats, me, opp, hist, me_hitstun=mh, opp_hitstun=oh)
         # label = what the user held over the NEXT decision window (§4)
         window_masks = [rows[j]["p1_input"] for j in range(i, min(len(rows), i + P))]
         move, attack = _window_label(window_masks, s)
