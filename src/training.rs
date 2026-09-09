@@ -699,17 +699,7 @@ fn poll_contact(ds: &mut DebugState, r: &Resolved, frame: u64) -> (bool, u8) {
         }
     };
     let cur = rd8(ds, addr);
-    // `direction: "decrease"` (contact_signal): only a DROP counts as
-    // contact. This is what makes a health-valued signal (MK2's struct
-    // health) immune to both INCREASE hazards by one sign check — the
-    // round-intro ramp (+2/frame under the banner-gate leak) and the
-    // training refill writing health back to max. Increases also don't
-    // stamp the quiet-window bookkeeping, so a refill can't hold the
-    // cooldown open. ACCEPTED LOSS: the hit that drives health below the
-    // refill threshold is overwritten back to max by refill before the next
-    // poll, so ~one real trigger per refill cycle is lost — the inverse of
-    // the previously documented "one spurious punish per refill", and
-    // harmless (the dummy blocks that one instead of punishing).
+    // (moved to CHANGELOG.md — loom F-03)
     let changed = ds.training.punish_prev_signal.is_some_and(|prev| {
         if r.contact_decrease { cur < prev } else { prev != cur }
     });

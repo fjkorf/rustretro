@@ -123,7 +123,17 @@
    ],
    "id": "F-03",
    "verdict": "relocate",
-   "dest": "CHANGELOG.md"
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-03)",
+    "stripped_text": "`direction: \"decrease\"` (contact_signal): only a DROP counts as\ncontact. This is what makes a health-valued signal (MK2's struct\nhealth) immune to both INCREASE hazards by one sign check \u2014 the\nround-intro ramp (+2/frame under the banner-gate leak) and the\ntraining refill writing health back to max. Increases also don't\nstamp the quiet-window bookkeeping, so a refill can't hold the\ncooldown open. ACCEPTED LOSS: the hit that drives health below the\nrefill threshold is overwritten back to max by refill before the next\npoll, so ~one real trigger per refill cycle is lost \u2014 the inverse of\nthe previously documented \"one spurious punish per refill\", and\nharmless (the dummy blocks that one instead of punishing).",
+    "moved_sha256": "46dd9c9c17cd",
+    "src_lines_before": 2519,
+    "src_lines_after": 2509
+   },
+   "change_id": "trkkzppn"
   },
   {
    "file": "src/training.rs",
