@@ -61,7 +61,11 @@ supported experiment, not an accident).
    6 attacks; trainer and runner size from the class lists (meta.json is
    authoritative for a loaded model; the profile for new fits).
 4. **Chords are data.** intent→mask compiles from `attack_chords` (button
-   names → RETRO bits) on both Rust and Python sides.
+   names → RETRO bits) on both Rust and Python sides. The vocabulary is also
+   what `--calibrate`/F11 prompt and render — a non-fighting game still
+   names its pad buttons here (`{"A": ["a"], "B": ["b"]}`) or they are
+   uncalibratable. Family-level `select_label` (default `"Coin"`) names the
+   RETRO Select bit for display: console families set e.g. `"Select"`.
 5. **`library/<game>/<game>.md` remains the literate evidence document**
    (how each value was verified); the profile is its machine-readable
    extract. asurabld.md's tables are the reference example.

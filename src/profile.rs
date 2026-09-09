@@ -40,6 +40,12 @@ pub struct Family {
     pub roster: Vec<RosterEntry>,
     pub move_classes: Vec<String>,
     pub attack_classes: Vec<String>,
+    /// Display name for the RETRO `Select` bit in the action vocabulary
+    /// (arcade families call it "Coin"; console families keep their pad's
+    /// own name, e.g. NES "Select"). Defaults to "Coin" so every existing
+    /// family.json is untouched.
+    #[serde(default = "d_select_label")]
+    pub select_label: String,
     #[serde(default)]
     pub block: BlockStyle,
     /// Family-level move vocabulary (shadow/MACRO_ACTIONS.md §1), keyed by
@@ -226,6 +232,10 @@ pub struct StepSpec {
 }
 fn d_step_frames() -> u8 {
     3
+}
+
+fn d_select_label() -> String {
+    "Coin".to_string()
 }
 
 /// One pinned RAM value: a named global asserted to `value` for the session.
@@ -1806,6 +1816,32 @@ mod tests {
         let _ = fs::remove_dir_all(&path); // Clean up if it exists
         fs::create_dir_all(&path).ok();
         path
+    }
+
+    #[test]
+    fn shipped_tcsurfdesign_scaffold_loads_with_nes_shape() {
+        let p = GameProfile::load(Path::new("library/tcsurfdesign")).expect("scaffold loads");
+        assert_eq!(p.family.family, "tcsurfdesign");
+        assert_eq!(p.port.port, "nes");
+        // The two schema defaults a console port must override, and the
+        // select-bit label that keeps F11/--calibrate from saying "Coin".
+        assert_eq!(p.port.memory.cpu, "6502");
+        assert_eq!(p.port.memory.endianness, "little");
+        assert_eq!(p.family.select_label, "Select");
+        // The wizard can only prompt profile-named actions: A and B must be
+        // in the vocabulary or they are uncalibratable (not a fighting-game
+        // borrowing — an input-naming necessity).
+        assert!(p.family.attack_classes.contains(&"A".to_string()));
+        assert!(p.port.attack_chords.contains_key("A"));
+        assert!(p.port.attack_chords.contains_key("B"));
+        // T0 honesty: no gate knowledge yet.
+        assert!(p.port.gate.is_empty());
+    }
+
+    #[test]
+    fn select_label_defaults_to_coin_for_existing_families() {
+        let p = init_for_tests();
+        assert_eq!(p.family.select_label, "Coin");
     }
 
     #[test]

@@ -579,7 +579,7 @@ pub fn action_rows(
         single_covered[b.idx()] = true;
     }
     rows.push(ActionRow { name: "Start".into(), bits: vec![Start], source: ActionSource::Profile });
-    rows.push(ActionRow { name: "Coin".into(), bits: vec![Select], source: ActionSource::Profile });
+    rows.push(ActionRow { name: p.family.select_label.clone(), bits: vec![Select], source: ActionSource::Profile });
     single_covered[Start.idx()] = true;
     single_covered[Select.idx()] = true;
 
