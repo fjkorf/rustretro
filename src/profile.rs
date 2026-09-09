@@ -1834,8 +1834,30 @@ mod tests {
         assert!(p.family.attack_classes.contains(&"A".to_string()));
         assert!(p.port.attack_chords.contains_key("A"));
         assert!(p.port.attack_chords.contains_key("B"));
-        // T0 honesty: no gate knowledge yet.
-        assert!(p.port.gate.is_empty());
+        // T1: the gate is real (validated across 9 landmarks in
+        // tcsurfdesign.md) and both its globals resolve.
+        assert!(!p.port.gate.is_empty());
+        assert!(p.global("gameplay_gate").is_some());
+        assert!(p.global("gate_inverse").is_some());
+    }
+
+    /// Every tcsurfdesign global must sit inside NES CPU RAM ($0000-$07FF).
+    /// The engine's read path (lua_engine::read1, gate's rd8/rd16) folds an
+    /// out-of-map read into 0 — a global declared outside the mapped 2KB
+    /// would render a plausible, permanently-wrong 0 indistinguishable from
+    /// a real value. This bound is the one mechanical defense.
+    #[test]
+    fn tcsurfdesign_globals_stay_inside_nes_cpu_ram() {
+        let p = GameProfile::load(Path::new("library/tcsurfdesign")).expect("scaffold loads");
+        assert!(!p.port.memory.globals.is_empty(), "T1 profile should carry globals");
+        for (name, addr) in &p.port.memory.globals {
+            assert!(
+                addr.0 < 0x800,
+                "global {name} = {:#x} is outside NES CPU RAM 0x0-0x7FF — \
+                 the engine would silently read 0 there",
+                addr.0
+            );
+        }
     }
 
     #[test]

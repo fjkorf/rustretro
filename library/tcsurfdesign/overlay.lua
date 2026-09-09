@@ -29,25 +29,28 @@ CONFIG = {
     input    = true,
     mode     = true,
     camera   = true,
-    gate     = false,   -- off: may be vacuously wrong until the profile gains a gate
+    gate     = true,    -- real gate since T1 ($47/$58, 9-landmark validated)
     physics_derived_ground = false, -- judgment-call ground marker (needs GROUND_Y calibration)
   },
   -- The ONE place game-specific read shape lives. Keys must be byte-identical
   -- to the profile's memory.globals names (game.addr is an exact string
-  -- lookup). Widths/signs come from the evidence doc; "s8" is sign-extended
-  -- here (the engine has no read_s8 binding).
+  -- lookup); names/widths come from tcsurfdesign.md's confirmed-globals
+  -- table. "s8" is sign-extended here (the engine has no read_s8 binding).
+  -- Fields with no confirmed global yet (velocity, state, ground, camera)
+  -- stay listed and render "--" until the evidence doc confirms them.
   fields = {
-    player_x     = { reader = "u8",     label = "X" },
-    player_y     = { reader = "u8",     label = "Y" },
-    player_vx    = { reader = "s8",     label = "VX" },
-    player_vy    = { reader = "s8",     label = "VY" },
-    player_state = { reader = "u8",     label = "ST" },
-    on_ground    = { reader = "u8",     label = "GND" },
-    game_mode    = { reader = "u8",     label = "MODE" },
-    camera_x     = { reader = "u16_le", label = "CAMX" },
-    input_p1     = { reader = "u8",     label = "IN" },
+    player_x_screen = { reader = "u8", label = "X" },
+    player_y_screen = { reader = "u8", label = "Y" },
+    player_vx    = { reader = "s8",  label = "VX" },   -- TO-VERIFY: not yet found
+    player_vy    = { reader = "s8",  label = "VY" },   -- TO-VERIFY: not yet found
+    player_state = { reader = "u8",  label = "ST" },   -- TO-VERIFY: $400-$405 are render outputs, not state
+    on_ground    = { reader = "u8",  label = "GND" },  -- TO-VERIFY: not yet found
+    mode_index   = { reader = "u8",  label = "MODE" },
+    camera_x     = { reader = "u8",  label = "CAMX" }, -- TO-VERIFY: $2D/$612 are auto-scroll, Target 4 decides
+    pad_latch_p1 = { reader = "u8",  label = "IN" },
   },
-  mode_names = {},   -- populated as the evidence doc confirms values, e.g. [0]="TITLE"
+  -- mode_index values, live-verified (tcsurfdesign.md menu/flow map)
+  mode_names = { [0] = "STREET SKATE", [1] = "BIG WAVE", [2] = "WOOD+WATER" },
   layout = {
     pos_panel  = { x = 2, y = 2 },
     mode_panel = { x = 196, y = 2 },
@@ -123,12 +126,12 @@ end
 
 local function draw_position()
   local L = CONFIG.layout.pos_panel
-  draw_panel(L.x, L.y, 52, { line("player_x"), line("player_y"), line("player_state") })
+  draw_panel(L.x, L.y, 52, { line("player_x_screen"), line("player_y_screen"), line("player_state") })
 end
 
 local function draw_physics()
   local vx, vy = read_field("player_vx"), read_field("player_vy")
-  local px, py = read_field("player_x"), read_field("player_y")
+  local px, py = read_field("player_x_screen"), read_field("player_y_screen")
   local L = CONFIG.layout.pos_panel
   draw_panel(L.x, L.y + 30, 52, { line("player_vx"), line("player_vy"), line("on_ground") })
   -- Velocity vector, world-anchored: only when position AND velocity are both
@@ -166,14 +169,24 @@ local function draw_input()
     parts[#parts + 1] = on and ch or "."
   end
   local txt = "P1 " .. table.concat(parts)
-  local refl = read_field("input_p1")
-  if refl ~= nil then txt = txt .. string.format("  ram:%02X", refl) end
+  -- Reflected row: the game's own $4016 latch. Its bit order is the GAME's
+  -- (R=01 L=02 D=04 U=08 St=10 Se=20 B=40 A=80 — tcsurfdesign.md), NOT the
+  -- RetroPad mask above; decode it independently rather than remapping.
+  local refl = read_field("pad_latch_p1")
+  if refl ~= nil then
+    local GB = { {8,"U"},{4,"D"},{2,"L"},{1,"R"},{0x20,"s"},{0x10,"S"},{0x40,"B"},{0x80,"A"} }
+    local g = {}
+    for _, b in ipairs(GB) do
+      g[#g + 1] = (math.floor(refl / b[1]) % 2 == 1 and refl >= b[1]) and b[2] or "."
+    end
+    txt = txt .. " ram " .. table.concat(g)
+  end
   gui.text(2, CONFIG.layout.input_y, txt, CONFIG.colors.ok)
 end
 
 local function draw_mode()
   local L = CONFIG.layout.mode_panel
-  local v = read_field("game_mode")
+  local v = read_field("mode_index")
   local txt, col
   if v == nil then
     txt, col = "MODE --", CONFIG.colors.dim

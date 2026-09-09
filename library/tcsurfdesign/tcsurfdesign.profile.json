@@ -1,5 +1,5 @@
 {
-  "_STATUS": "T0 boot scaffold (Step B1, 2026-09-09). memory.blocks/fighter_fields/globals are ALL PLACEHOLDERS (0x0 / empty): no live RAM address is known yet, mirroring src/profile.rs's own minimum-boot fixture, not a real memory map. This is a SINGLE-ACTOR game — blocks.block2/stride will remain stubs even after RE (the schema mandates them); player fields land in memory.globals, not fighter_fields, so Lua reads them via game.addr(). gate is intentionally EMPTY: training and the recorder refuse to run against it, and gate::eval_gate reads an empty gate as CLOSED (not vacuously open) — the honest T0 state, replaced by real conditions after the RE step. enforcement/calibration carry dummy schema-satisfying values only (unmeasured). memory.cpu='6502' overrides the schema default 'm68k' so the Sek 68k register capture can never treat this as a 68k game; endianness='little' overrides the default 'big' (NES). core.provenance_core is the Step-B2 measured decision; see tcsurfdesign.md's Core capability section.",
+  "_STATUS": "T1 (2026-09-09): globals + gate transcribed from the RE session in tcsurfdesign.md's 'Work RAM' section — every entry there carries its write-test/regression evidence; nothing here is guessed. SINGLE-ACTOR game: blocks.block2/stride are permanent stubs (schema mandates them); player fields live in memory.globals so Lua reads them via game.addr(), NOT fighter_fields. Gate = byte_nonzero(gameplay_gate $47) + byte_zero(gate_inverse $58), validated across 9 landmarks (all 3 modes, A- and B-entry; pause/game-over screens not yet visited — see the doc's TO-VERIFY). All globals must stay inside NES CPU RAM $0000-$07FF: the engine folds out-of-map reads into 0, and a profile test asserts this bound. enforcement/calibration remain dummy values (unmeasured). cpu='6502' and endianness='little' override the arcade schema defaults. Core: fceumm (measured decision, see tcsurfdesign.md Core capability).",
   "family": "tcsurfdesign",
   "port": "nes",
   "core": {
@@ -16,9 +16,20 @@
     "endianness": "little",
     "blocks": { "block1": "0x0", "block2": "0x0", "stride": "0x0" },
     "fighter_fields": [],
-    "globals": {}
+    "globals": {
+      "gameplay_gate": "0x47",
+      "gate_inverse": "0x58",
+      "mode_index": "0x5A",
+      "player_x_screen": "0x478",
+      "player_y_screen": "0x48C",
+      "pad_latch_p1": "0x703",
+      "frame_oracle": "0x33"
+    }
   },
-  "gate": [],
+  "gate": [
+    { "kind": "byte_nonzero", "global": "gameplay_gate" },
+    { "kind": "byte_zero", "global": "gate_inverse" }
+  ],
   "enforcement": {
     "health_max": 255,
     "refill_below": 1,
