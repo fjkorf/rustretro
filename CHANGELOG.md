@@ -26,3 +26,15 @@ The dummy occupies fighter block 2: it is injected on controller port 1,
 and port 1 drives block 2 (asurabld.md verified this live; MK2's `p2_*`
 globals are the same pairing). Deriving it from live X instead — as this
 used to — mis-attributes the dummy the moment the fighters cross up.
+
+## Relocated from src/record.rs:1686-1694 (loom lint F-07, ratified 2026-09-09)
+
+MACRO_ACTIONS §8 item 2: a contact event with NO health change on the
+defender classifies as `no_damage`, never asserted as "blocked" — it
+still opens/holds a string, and a string with zero hits counts as a
+block string. Exercises the asurabld shape (hitstun_sources over the
+combo counters, distinct from the `health` fighter field used for the
+damage delta). This USED to run on mk2's HUD-pair fallback; mk2 now
+ships `contact_signal` field=health direction=decrease, whose every
+event carries damage by construction (blocked contact always chips
+there) — see the mk2-specific test below.

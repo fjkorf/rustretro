@@ -1683,15 +1683,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// MACRO_ACTIONS §8 item 2: a contact event with NO health change on the
-    /// defender classifies as `no_damage`, never asserted as "blocked" — it
-    /// still opens/holds a string, and a string with zero hits counts as a
-    /// block string. Exercises the asurabld shape (hitstun_sources over the
-    /// combo counters, distinct from the `health` fighter field used for the
-    /// damage delta). This USED to run on mk2's HUD-pair fallback; mk2 now
-    /// ships `contact_signal` field=health direction=decrease, whose every
-    /// event carries damage by construction (blocked contact always chips
-    /// there) — see the mk2-specific test below.
+    // (moved to CHANGELOG.md — loom F-07)
     #[test]
     fn v3_zero_damage_contact_classifies_as_no_damage() {
         let p = crate::profile::init_for_tests();

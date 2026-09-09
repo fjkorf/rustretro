@@ -262,7 +262,17 @@
    ],
    "id": "F-07",
    "verdict": "relocate",
-   "dest": "CHANGELOG.md"
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-07)",
+    "stripped_text": "MACRO_ACTIONS \u00a78 item 2: a contact event with NO health change on the\ndefender classifies as `no_damage`, never asserted as \"blocked\" \u2014 it\nstill opens/holds a string, and a string with zero hits counts as a\nblock string. Exercises the asurabld shape (hitstun_sources over the\ncombo counters, distinct from the `health` fighter field used for the\ndamage delta). This USED to run on mk2's HUD-pair fallback; mk2 now\nships `contact_signal` field=health direction=decrease, whose every\nevent carries damage by construction (blocked contact always chips\nthere) \u2014 see the mk2-specific test below.",
+    "moved_sha256": "cb3abf9b6786",
+    "src_lines_before": 1872,
+    "src_lines_after": 1864
+   },
+   "change_id": "zusmvxrr"
   },
   {
    "file": "src/training.rs",
