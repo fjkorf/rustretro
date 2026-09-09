@@ -283,9 +283,16 @@ impl MemoryRegion {
         if emu_addr < self.addr_start || emu_addr > self.addr_end {
             return None;
         }
-        // Formula from libretro spec:
-        // host_addr = ptr + offset + (emu_addr & ~disconnect) - start
-        Some(self.ptr + self.offset + ((emu_addr & !self.disconnect) - self.addr_start))
+        // libretro address translation: the `disconnect` bits are stripped
+        // from BOTH the address and the region start before the offset into
+        // `ptr` is computed. Masking only the address (the old bug) underflowed
+        // on fceumm's NES PPU descriptors (NTARAM/PALRAM/OAM), whose start
+        // carries the 0x80000000 PPU-space bit that `disconnect` removes — so
+        // they read back as unbacked "virtual descriptors". For CPU RAM and
+        // arcade bus windows `disconnect` is 0, so both forms are identical.
+        let masked_addr = emu_addr & !self.disconnect;
+        let masked_start = self.addr_start & !self.disconnect;
+        Some(self.ptr + self.offset + (masked_addr - masked_start))
     }
 
     /// Validate that `len` bytes can be safely read at `emu_addr` from this
@@ -1875,6 +1882,28 @@ mod tests {
         // A descriptor with a non-null but bogus pointer and zero size -> rejected.
         let bogus = region("Bogus", 0x6000, 0, 0xdeadbeef);
         assert!(bogus.safe_host_ptr(0x6000, 1).is_none());
+    }
+
+    #[test]
+    fn disconnect_mask_translates_ppu_space_descriptor() {
+        // fceumm's NES PPU descriptors expose e.g. NTARAM at guest 0x80002000
+        // with select=disconnect=0x80000000 (the PPU-space bit) and a REAL
+        // backing pointer. The disconnect bit must be stripped from both the
+        // address and the region start, or the offset underflows and the
+        // region reads as unbacked. This backs the H1 fix.
+        let buf = [10u8, 20, 30, 40, 50, 60, 70, 80];
+        let p = buf.as_ptr() as usize;
+        let mut r = region("NTARAM", 0x80002000, buf.len(), p);
+        r.select = 0x80000000;
+        r.disconnect = 0x80000000;
+        // First byte of the region maps to ptr+0.
+        assert_eq!(r.host_ptr_for_addr(0x80002000), Some(p));
+        assert_eq!(unsafe { *r.safe_host_ptr(0x80002000, 1).unwrap() }, 10);
+        // An address partway in maps by its low bits, disconnect bit ignored.
+        assert_eq!(unsafe { *r.safe_host_ptr(0x80002003, 1).unwrap() }, 40);
+        // Last byte stays in-bounds; one past the end is rejected.
+        assert!(r.safe_host_ptr(0x80002000 + buf.len() - 1, 1).is_some());
+        assert!(r.safe_host_ptr(0x80002000 + buf.len(), 1).is_none());
     }
 
     #[test]
