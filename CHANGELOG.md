@@ -19,3 +19,10 @@ refill threshold is overwritten back to max by refill before the next
 poll, so ~one real trigger per refill cycle is lost — the inverse of
 the previously documented "one spurious punish per refill", and
 harmless (the dummy blocks that one instead of punishing).
+
+## Relocated from src/training.rs:46-49 (loom lint F-11, ratified 2026-09-09)
+
+The dummy occupies fighter block 2: it is injected on controller port 1,
+and port 1 drives block 2 (asurabld.md verified this live; MK2's `p2_*`
+globals are the same pairing). Deriving it from live X instead — as this
+used to — mis-attributes the dummy the moment the fighters cross up.

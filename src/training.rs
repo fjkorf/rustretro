@@ -43,10 +43,7 @@ use crate::profile::GameProfile;
 const BIT_LEFT: usize = 6;
 const BIT_RIGHT: usize = 7;
 
-/// The dummy occupies fighter block 2: it is injected on controller port 1,
-/// and port 1 drives block 2 (asurabld.md verified this live; MK2's `p2_*`
-/// globals are the same pairing). Deriving it from live X instead — as this
-/// used to — mis-attributes the dummy the moment the fighters cross up.
+// (moved to CHANGELOG.md — loom F-11)
 const DUMMY_BLOCK: u8 = 2;
 
 /// Frames the reactive guard keeps holding away after the commitment signal

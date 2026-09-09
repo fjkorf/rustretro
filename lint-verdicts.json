@@ -383,7 +383,17 @@
    ],
    "id": "F-11",
    "verdict": "relocate",
-   "dest": "CHANGELOG.md"
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-11)",
+    "stripped_text": "The dummy occupies fighter block 2: it is injected on controller port 1,\nand port 1 drives block 2 (asurabld.md verified this live; MK2's `p2_*`\nglobals are the same pairing). Deriving it from live X instead \u2014 as this\nused to \u2014 mis-attributes the dummy the moment the fighters cross up.",
+    "moved_sha256": "958e2df1c49f",
+    "src_lines_before": 2509,
+    "src_lines_after": 2506
+   },
+   "change_id": "lomlxyor"
   },
   {
    "file": "src/debug/panels/controls.rs",
