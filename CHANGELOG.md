@@ -55,3 +55,10 @@ read it) so a silent dummy explains itself instead of looking broken
 — an abort is exactly the case that USED to freeze on a stale
 "punishing: slide" while the gate was closed (misdiagnosed live);
 this field must say "aborted" instead (MACRO_ACTIONS §10.1).
+
+## Relocated from src/debug/panels/training.rs:395-398 (loom lint F-10, ratified 2026-09-09)
+
+Reversal timing (MK-style "Block Attack: Fast / Delay / Late", plus an
+explicit-frames power-user knob) — WHEN the scheduled BlockPunish
+macro starts relative to its trigger. `training::PUNISH_DELAY` used to
+be a single hardcoded constant; this is that same knob, now a setting.

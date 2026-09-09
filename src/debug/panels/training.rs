@@ -392,10 +392,7 @@ impl TrainingPanel {
         self.autosave_settings(state);
     }
 
-    /// Reversal timing (MK-style "Block Attack: Fast / Delay / Late", plus an
-    /// explicit-frames power-user knob) — WHEN the scheduled BlockPunish
-    /// macro starts relative to its trigger. `training::PUNISH_DELAY` used to
-    /// be a single hardcoded constant; this is that same knob, now a setting.
+    // (moved to CHANGELOG.md — loom F-10)
     fn reversal_section(&mut self, ui: &mut egui::Ui, state: &mut DebugState) {
         use crate::debug::ReversalTiming;
         ui.horizontal(|ui| {

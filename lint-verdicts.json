@@ -375,7 +375,17 @@
    ],
    "id": "F-10",
    "verdict": "relocate",
-   "dest": "CHANGELOG.md"
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-10)",
+    "stripped_text": "Reversal timing (MK-style \"Block Attack: Fast / Delay / Late\", plus an\nexplicit-frames power-user knob) \u2014 WHEN the scheduled BlockPunish\nmacro starts relative to its trigger. `training::PUNISH_DELAY` used to\nbe a single hardcoded constant; this is that same knob, now a setting.",
+    "moved_sha256": "bb4cd97907d3",
+    "src_lines_before": 1167,
+    "src_lines_after": 1164
+   },
+   "change_id": "tlkknqmz"
   },
   {
    "file": "src/training.rs",
