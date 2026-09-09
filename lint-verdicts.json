@@ -1,0 +1,553 @@
+{
+ "provenance": {
+  "path": ".",
+  "root": ".",
+  "excludes": [
+   "target/*",
+   "node_modules/*",
+   ".git/*",
+   "vendor/*",
+   "*.min.js",
+   ".venv/*",
+   "*/.venv/*",
+   "*/site-packages/*",
+   "fbneo/*",
+   "shadow/*",
+   "library/*"
+  ]
+ },
+ "stats": {
+  "files": 54,
+  "comment_lines": 7513,
+  "blocks": 2726,
+  "flagged": 15
+ },
+ "destinations": {
+  "DEBUGGING/notes doc": "DEBUGGING.md",
+  "explanation doc": "ARCHITECTURE.md"
+ },
+ "findings": [
+  {
+   "file": "src/profile.rs",
+   "lines": [
+    577,
+    666
+   ],
+   "class": "dated-log",
+   "n_lines": 90,
+   "fingerprints": [
+    "contrast",
+    "iso-date",
+    "measurement-log"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 586,
+     "text": "// The export currently carries TWO ROWS PER (char, move, variant, gap) cell,"
+    },
+    {
+     "fingerprint": "iso-date",
+     "line": 601,
+     "text": "// time 2026-09-01):"
+    },
+    {
+     "fingerprint": "measurement-log",
+     "line": 599,
+     "text": "// THE ROW WAS MEASURED, specifically whether the value carries a probe"
+    }
+   ],
+   "id": "F-01",
+   "verdict": "relocate",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "DEBUGGING.md",
+    "pointer": "// (moved to DEBUGGING.md \u2014 loom F-01)",
+    "stripped_text": "\u2500\u2500 frame lab data (docs/frames.md) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n`library/<family>/<port>.frames.json` is a MEASUREMENTS STORE (\u00a76), not a\nprofile constant \u2014 exported by the Python harness\n(`shadow_train.framelab`), never authored or edited by Rust. It is\nentirely optional: a game with no export simply has `GameProfile.frames ==\nNone`, silently (no warning, \u00a77's \"no silent caps\" is about a run that\nSKIPPED something, not about a port that never ran the lab at all).\n\nThe export currently carries TWO ROWS PER (char, move, variant, gap) cell,\none per observable (`docs/frames.md` \u00a712) \u2014 on MK2 arcade always\n`struct_velocity` and `pointer_x`. The two have agreed on every sweep\nacross two independent full runs (52 sweeps in the second alone), so the\nchosen rule is: COLLAPSE agreeing observables into one row. A field where\nthe observables DISAGREE is the exceptional case (surfaced rather than\nsilently resolved \u2014 the collapsed value for that field is left `None` and\nthe field's name is recorded in `FrameCell::disagreements`, while each\nobservable's own raw value survives unedited in `FrameCell::observations`\nfor audit) \u2014 EXCEPT that \"agree\" means something different depending on\nwhat kind of quantity the field is (`docs/frames.md` \u00a78.4, corrected):\n\nThe class is NOT a property of a field's name \u2014 it is a property of HOW\nTHE ROW WAS MEASURED, specifically whether the value carries a probe\nmanifest's manifestation margin (`docs/frames.md` \u00a78.4, corrected a second\ntime 2026-09-01):\n\n- **Difference quantities** (`on_hit`, `on_block` \u2014 a manifest frame minus\n  another manifest frame, both from the SAME observable) have their\n  observable's own margin cancel out of the subtraction. Two observables\n  must therefore agree EXACTLY. `hitstop` is also a difference quantity \u2014\n  connecting manifest minus whiffing manifest \u2014 for the same reason, and\n  for the same reason stays exact even though it is a duration.\n- **Anchor-based quantities** are bracketed by two reads of the SAME\n  anchor signal (\u00a74.1), never a behavioural probe, so neither endpoint\n  carries a manifestation margin. `first_active_frame` (the contact signal\n  relative to a fixed, software-controlled input frame) and `active` (the\n  first and last contact-signal reads across a gap sweep) are both this\n  shape. Held to exact agreement, like a difference quantity, but for a\n  different reason (no margin ever entered the number, rather than two\n  margins entering and cancelling).\n- **One-sided quantities** carry a raw single-sided probe manifest's own\n  manifestation margin `m` directly: `value = A_rel + m`, and \u2014 because\n  \u00a73.1 calibrates the OBSERVABLE, not the move \u2014 the very same `m` is\n  baked into that observable's `input_latency_frames = l + m` (`l` the\n  shared injection latency). So `value \u2212 input_latency_frames = A_rel \u2212 l`\n  is invariant across observables measuring the same truth, independent of\n  each one's own `m`. Two sound observables' raw values will therefore\n  differ by exactly the difference in their `input_latency_frames` \u2014 NOT\n  by zero. Mileena's roll: `wakeup_window` 77 (`struct_velocity`,\n  latency 1) vs 78 (`pointer_x`, latency 2) is this agreement, not a\n  disagreement (77 \u2212 1 == 78 \u2212 2 == 76). A one-sided field that does NOT\n  satisfy this invariant is a REAL disagreement and is still flagged.\n  `wakeup_window` (an anchor-to-actionable-manifest read for a knockdown)\n  was the first field recognised as this shape. `total` and `recovery`\n  are the SAME shape: under the only measurement protocol this project has\n  (\u00a74, the act-again probe), \"recovered\" has no anchor signal of its own \u2014\n  it is read the identical way `wakeup_window` is, from a fixed anchor to\n  the actionable-again probe manifest, so it carries exactly one margin\n  too. This was misclassified as anchor-based in the first cut of this\n  rule (`docs/frames.md` \u00a713 item 1): it cost nothing to notice on a\n  contact-anchored move, because nothing has measured `total`/`recovery`\n  there yet, but it blocked every WHIFF-anchored one outright \u2014 Reptile's\n  invisibility has no contact to anchor on, so its `total` can ONLY come\n  from the act-again probe, and reads 40 (`struct_velocity`, latency 1) /\n  41 (`pointer_x`, latency 2) \u2014 agreement under this rule (40\u22121 == 41\u22122),\n  disagreement under the old exact-match rule. Reclassifying is not\n  loosening the check: it is applying the SAME rule already proven correct\n  for `wakeup_window` to a field that is measured exactly the same way.\n\nThis is a true statement about the CURRENT protocol, not a permanent fact\nabout these field names \u2014 if a future observable can read \"recovery ended\"\ndirectly off an anchor signal (no probe involved), that measurement would\nbe anchor-based instead. The schema has no way to say which shape a given\nrow is; today it is inferred from the field name because every row this\nproject has produced follows the current protocol. The correct fix is a\nper-row column recording how the duration was bounded (e.g. `anchor_kind:\n\"dual_anchor\" | \"anchor_to_probe\"`) so collapsing reads that off the row\ninstead of assuming it from the field's name \u2014 proposed in\n`docs/frames.md` \u00a712, not implemented here: nothing in this project's\nscope (`shadow_train.framelab`, which would populate it) can be touched\nfrom `src/profile.rs`, and a column nothing ever writes is not a real fix.\n\nA one-sided field's collapsed value is the raw reading of whichever\nobservable in the cell has the SMALLEST `input_latency_frames` \u2014 by the\nprobe's own construction (`shadow_train.framelab.probe`) that observable's\nmargin `m` is zero, so its raw number already equals `A_rel` with nothing\nto correct. `FrameCell::one_sided_reference` records, per such field, which\nobservable's frame of reference the collapsed number is in \u2014 a bare \"77\"\nmeans different things in different rows, and that ambiguity is exactly\nwhat this map exists to close off.",
+    "moved_sha256": "746ebf2a742b",
+    "src_lines_before": 3117,
+    "src_lines_after": 3028
+   },
+   "change_id": "qxvwwluy"
+  },
+  {
+   "file": "src/training.rs",
+   "lines": [
+    1,
+    37
+   ],
+   "class": "history",
+   "n_lines": 37,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 27,
+     "text": "//!   **finish round now** (F4, needs `round_state`) one-shots."
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 11,
+     "text": "//!   ([`crate::profile::TimerHold`]): the legacy `[sec, subsec]` pair"
+    }
+   ],
+   "id": "F-02",
+   "verdict": "keep"
+  },
+  {
+   "file": "src/training.rs",
+   "lines": [
+    702,
+    712
+   ],
+   "class": "history",
+   "n_lines": 11,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 712,
+     "text": "// harmless (the dummy blocks that one instead of punishing)."
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 711,
+     "text": "// the previously documented \"one spurious punish per refill\", and"
+    }
+   ],
+   "id": "F-03",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-03)",
+    "stripped_text": "`direction: \"decrease\"` (contact_signal): only a DROP counts as\ncontact. This is what makes a health-valued signal (MK2's struct\nhealth) immune to both INCREASE hazards by one sign check \u2014 the\nround-intro ramp (+2/frame under the banner-gate leak) and the\ntraining refill writing health back to max. Increases also don't\nstamp the quiet-window bookkeeping, so a refill can't hold the\ncooldown open. ACCEPTED LOSS: the hit that drives health below the\nrefill threshold is overwritten back to max by refill before the next\npoll, so ~one real trigger per refill cycle is lost \u2014 the inverse of\nthe previously documented \"one spurious punish per refill\", and\nharmless (the dummy blocks that one instead of punishing).",
+    "moved_sha256": "46dd9c9c17cd",
+    "src_lines_before": 2519,
+    "src_lines_after": 2509
+   },
+   "change_id": "trkkzppn"
+  },
+  {
+   "file": "src/training.rs",
+   "lines": [
+    1209,
+    1219
+   ],
+   "class": "dated-log",
+   "n_lines": 11,
+   "fingerprints": [
+    "iso-date",
+    "measurement-log"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "iso-date",
+     "line": 1213,
+     "text": "/// (2026-09-01, port 4030): Block re-held at every frame from press+1 to"
+    },
+    {
+     "fingerprint": "measurement-log",
+     "line": 1213,
+     "text": "/// (2026-09-01, port 4030): Block re-held at every frame from press+1 to"
+    }
+   ],
+   "id": "F-04",
+   "verdict": "relocate",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "DEBUGGING.md",
+    "pointer": "// (moved to DEBUGGING.md \u2014 loom F-04)",
+    "stripped_text": "Post-punish neutral hold-off: after a punish macro COMPLETES (or aborts),\nthe dummy injects NEUTRAL \u2014 never the guard chord \u2014 for this many frames.\nOriginally shipped at 48 on the hypothesis that a re-held Block\nblock-cancels the attack's startup; the wave-1 live probe REFUTED that\n(2026-09-01, port 4030): Block re-held at every frame from press+1 to\npress+12 left contact frame and damage byte-identical to baseline \u2014 a\nstarted move cannot be guard-canceled on this port. The real hazard was\nthe PRE-press gap ([`PUNISH_RELEASE`], see its doc). What remains for\nthe hold-off is only the input-fold edge (a chord needs \u22652 clean frames,\nMACRO_ACTIONS \u00a711, and a kick chorded with a same-frame Block fold is\neaten), so 2 frames of neutral after the macro's last press is enough.",
+    "moved_sha256": "903e7d8a9f29",
+    "src_lines_before": 2546,
+    "src_lines_after": 2536
+   },
+   "change_id": "trxsuxtu"
+  },
+  {
+   "file": "src/shadow_runner.rs",
+   "lines": [
+    2321,
+    2330
+   ],
+   "class": "history",
+   "n_lines": 10,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 2328,
+     "text": "/// to asurabld by other tests in this binary) \u2014 `RunnerAddrs` now owns"
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 2323,
+     "text": "/// the parts irrelevant to this test) \u2014 used to prove [`read_fighter`]"
+    }
+   ],
+   "id": "F-05",
+   "verdict": "keep"
+  },
+  {
+   "file": "src/training.rs",
+   "lines": [
+    1151,
+    1160
+   ],
+   "class": "dated-log",
+   "n_lines": 10,
+   "fingerprints": [
+    "iso-date",
+    "measurement-log"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "iso-date",
+     "line": 1154,
+     "text": "/// (live-observed on MK2 arcade, 2026-08-28). This is"
+    },
+    {
+     "fingerprint": "measurement-log",
+     "line": 1154,
+     "text": "/// (live-observed on MK2 arcade, 2026-08-28). This is"
+    }
+   ],
+   "id": "F-06",
+   "verdict": "relocate",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "DEBUGGING.md",
+    "pointer": "// (moved to DEBUGGING.md \u2014 loom F-06)",
+    "stripped_text": "Frames between the contact trigger and the macro's first input: the\ndummy keeps guarding through hit-freeze + its own blockstun, then\npunishes \u2014 inputs played into the freeze are eaten by the game\n(live-observed on MK2 arcade, 2026-08-28). This is\n[`crate::debug::ReversalTiming`]'s DEFAULT (`Explicit(PUNISH_DELAY)`) \u2014\nunchanged behaviour on a fresh install: 26 \u2248 hit-freeze (~10) + jab\nblockstun (~14) + slack \u2014 a chord played at +16 was still eaten while a\nmotion whose chord lands at +21 came out \u2014 live-calibrated on MK2 arcade\n2026-08-28. See [`PUNISH_DELAY_FAST`]/[`PUNISH_DELAY_LATE`] for\n`ReversalTiming::Fast`/`Late`.",
+    "moved_sha256": "3eb8cff8e862",
+    "src_lines_before": 2528,
+    "src_lines_after": 2519
+   },
+   "change_id": "nwlukyuy"
+  },
+  {
+   "file": "src/record.rs",
+   "lines": [
+    1686,
+    1694
+   ],
+   "class": "history",
+   "n_lines": 9,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 1691,
+     "text": "/// damage delta). This USED to run on mk2's HUD-pair fallback; mk2 now"
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 1691,
+     "text": "/// damage delta). This USED to run on mk2's HUD-pair fallback; mk2 now"
+    }
+   ],
+   "id": "F-07",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-07)",
+    "stripped_text": "MACRO_ACTIONS \u00a78 item 2: a contact event with NO health change on the\ndefender classifies as `no_damage`, never asserted as \"blocked\" \u2014 it\nstill opens/holds a string, and a string with zero hits counts as a\nblock string. Exercises the asurabld shape (hitstun_sources over the\ncombo counters, distinct from the `health` fighter field used for the\ndamage delta). This USED to run on mk2's HUD-pair fallback; mk2 now\nships `contact_signal` field=health direction=decrease, whose every\nevent carries damage by construction (blocked contact always chips\nthere) \u2014 see the mk2-specific test below.",
+    "moved_sha256": "cb3abf9b6786",
+    "src_lines_before": 1872,
+    "src_lines_after": 1864
+   },
+   "change_id": "zusmvxrr"
+  },
+  {
+   "file": "src/training.rs",
+   "lines": [
+    1198,
+    1206
+   ],
+   "class": "dated-log",
+   "n_lines": 9,
+   "fingerprints": [
+    "iso-date",
+    "measurement-log"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "iso-date",
+     "line": 1201,
+     "text": "/// 2026-09-01, port 4030: release-gap 7 fails at every guard-hold length"
+    },
+    {
+     "fingerprint": "measurement-log",
+     "line": 1200,
+     "text": "/// input-eat OUTLIVES the Block release by ~8 frames (live-measured"
+    }
+   ],
+   "id": "F-08",
+   "verdict": "relocate",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "DEBUGGING.md",
+    "pointer": "// (moved to DEBUGGING.md \u2014 loom F-08)",
+    "stripped_text": "Neutral frames between releasing the guard and the macro's first press.\nThis is the load-bearing constant of the whole punish: MK2's block-stance\ninput-eat OUTLIVES the Block release by ~8 frames (live-measured\n2026-09-01, port 4030: release-gap 7 fails at every guard-hold length\ntried, 8 succeeds at all of them; ~10 needed after very short holds), so\nthe old value of 4 pressed inside the latch and the punish was EATEN on\n10/10 measured cycles \u2014 the user-reported \"the punish never happens\".\n12 = the measured boundary's worst case (10) plus margin. Evidence:\nw1-blockcancel-evidence.md (wave-1 probe; to be merged into mk2.md).",
+    "moved_sha256": "711c52150955",
+    "src_lines_before": 2536,
+    "src_lines_after": 2528
+   },
+   "change_id": "wrplsqsw"
+  },
+  {
+   "file": "src/debug/mod.rs",
+   "lines": [
+    582,
+    589
+   ],
+   "class": "history",
+   "n_lines": 8,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 586,
+     "text": "/// read it) so a silent dummy explains itself instead of looking broken"
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 587,
+     "text": "/// \u2014 an abort is exactly the case that USED to freeze on a stale"
+    }
+   ],
+   "id": "F-09",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-09)",
+    "stripped_text": "Human-readable BlockPunish phase, refreshed every frame the mode\nruns: \"guarding \u2014 armed\" / \"cooling (Nf)\" / \"punishing: slide\" /\n\"aborted \u2014 <reason>\" / \"unavailable \u2026\". The ONE place this is\ncomputed (panel, Lua `training.punish_state()`, and any overlay all\nread it) so a silent dummy explains itself instead of looking broken\n\u2014 an abort is exactly the case that USED to freeze on a stale\n\"punishing: slide\" while the gate was closed (misdiagnosed live);\nthis field must say \"aborted\" instead (MACRO_ACTIONS \u00a710.1).",
+    "moved_sha256": "4ecc27f703a8",
+    "src_lines_before": 2227,
+    "src_lines_after": 2220
+   },
+   "change_id": "psvpvlpt"
+  },
+  {
+   "file": "src/debug/panels/training.rs",
+   "lines": [
+    395,
+    398
+   ],
+   "class": "history",
+   "n_lines": 4,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 398,
+     "text": "/// be a single hardcoded constant; this is that same knob, now a setting."
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 397,
+     "text": "/// macro starts relative to its trigger. `training::PUNISH_DELAY` used to"
+    }
+   ],
+   "id": "F-10",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-10)",
+    "stripped_text": "Reversal timing (MK-style \"Block Attack: Fast / Delay / Late\", plus an\nexplicit-frames power-user knob) \u2014 WHEN the scheduled BlockPunish\nmacro starts relative to its trigger. `training::PUNISH_DELAY` used to\nbe a single hardcoded constant; this is that same knob, now a setting.",
+    "moved_sha256": "bb4cd97907d3",
+    "src_lines_before": 1167,
+    "src_lines_after": 1164
+   },
+   "change_id": "tlkknqmz"
+  },
+  {
+   "file": "src/training.rs",
+   "lines": [
+    46,
+    49
+   ],
+   "class": "history",
+   "n_lines": 4,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 48,
+     "text": "/// globals are the same pairing). Deriving it from live X instead \u2014 as this"
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 49,
+     "text": "/// used to \u2014 mis-attributes the dummy the moment the fighters cross up."
+    }
+   ],
+   "id": "F-11",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-11)",
+    "stripped_text": "The dummy occupies fighter block 2: it is injected on controller port 1,\nand port 1 drives block 2 (asurabld.md verified this live; MK2's `p2_*`\nglobals are the same pairing). Deriving it from live X instead \u2014 as this\nused to \u2014 mis-attributes the dummy the moment the fighters cross up.",
+    "moved_sha256": "958e2df1c49f",
+    "src_lines_before": 2509,
+    "src_lines_after": 2506
+   },
+   "change_id": "lomlxyor"
+  },
+  {
+   "file": "src/debug/panels/controls.rs",
+   "lines": [
+    194,
+    195
+   ],
+   "class": "history",
+   "n_lines": 2,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 194,
+     "text": "/// Controls that previously emitted this action's chord and were removed"
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 194,
+     "text": "/// Controls that previously emitted this action's chord and were removed"
+    }
+   ],
+   "id": "F-12",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-12)",
+    "stripped_text": "Controls that previously emitted this action's chord and were removed\n(the replace-binding semantics). Does not include `control` itself.",
+    "moved_sha256": "94f7ff1b2a95",
+    "src_lines_before": 859,
+    "src_lines_after": 858
+   },
+   "change_id": "qwzrxrzy"
+  },
+  {
+   "file": "src/profile.rs",
+   "lines": [
+    411,
+    417
+   ],
+   "class": "dated-log",
+   "n_lines": 7,
+   "fingerprints": [
+    "iso-date"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "iso-date",
+     "line": 417,
+     "text": "/// 2026-09-02)."
+    }
+   ],
+   "id": "F-13",
+   "verdict": "keep"
+  },
+  {
+   "file": "src/record.rs",
+   "lines": [
+    1088,
+    1090
+   ],
+   "class": "history",
+   "n_lines": 3,
+   "fingerprints": [
+    "version-delta"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "version-delta",
+     "line": 1089,
+     "text": "// 0, so `health_in_range` fails and the gate must be CLOSED (v1's gate"
+    }
+   ],
+   "id": "F-14",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-14)",
+    "stripped_text": "A bare DebugState has no regions, so all reads return 0: healths are\n0, so `health_in_range` fails and the gate must be CLOSED (v1's gate\nwas true here \u2014 the broken-permissive bug the v2 rewrite fixed).",
+    "moved_sha256": "012491b995a2",
+    "src_lines_before": 1864,
+    "src_lines_after": 1862
+   },
+   "change_id": "zszquoon"
+  },
+  {
+   "file": "src/input_config.rs",
+   "lines": [
+    446,
+    446
+   ],
+   "class": "history",
+   "n_lines": 1,
+   "fingerprints": [
+    "version-delta"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "version-delta",
+     "line": 446,
+     "text": "// v1 files wrote keyboard values as bare buttons; v2 is chord lists."
+    }
+   ],
+   "id": "F-15",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-15)",
+    "stripped_text": "v1 files wrote keyboard values as bare buttons; v2 is chord lists.",
+    "moved_sha256": "1624e4de4e27",
+    "src_lines_before": 624,
+    "src_lines_after": 624
+   },
+   "change_id": "xrznxsrv"
+  }
+ ],
+ "ratified": "2026-09-09"
+}

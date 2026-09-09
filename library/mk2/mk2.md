@@ -6613,6 +6613,33 @@ scr=0/ro=0-or-1 with stale healths (a 30-frame-sampled run "found" ro=1 that
 was really attract garbage 2400 frames later). Screenshots are the phase
 oracle.
 
+**GATE-LEAK DISCRIMINATOR PROBE (2026-09-02, port 4030, differential across
+attract / active fight / hitstop-context / round boundary / the draw ending).**
+Reproduced the leak end-to-end: forced score to 1-1 (freeze one health low per
+round so the timeout awards on health), then a round-3 equal-health timeout
+(both frozen 161) → the match-ending **"MORTAL KOMBAT BATTLE PLAN"** ending
+screen, which reads `screen_state`=**259**, `round_over`=0, `round_num`=3,
+hp 161/161. (259&0x6 = 2 ≠ 6, so the mask leaves the gate OPEN; 259 is a
+legitimate 2-human *fight* value, so `screen_state` cannot separate this
+screen from a fight — confirmed.) Candidate discriminators measured:
+
+| candidate | attract | active fight | draw ending | verdict |
+|---|---|---|---|---|
+| `round_num` 0xC35E | 0 | 1/2/3 | **3** | **DISPROVEN** — nonzero on the ending screen (and stays nonzero through the ROUND-N banner → win/fatality per row above). Refines the "0 outside matches" note: it is NOT 0 on the battle-plan/ending screen. A `byte_nonzero(round_num)` gate would NOT close the leak. |
+| `0xC03E`/`0xC1B8` (block−0x12, per-fighter) | 0/0 | looked 1/1 in gap-0 & b-v-r | 0/0 | **DISPROVEN** — `0xC1B8` read **0 during a live fight** (reptile-vs-reptile arena, P2 at 1 hp, timer actively counting 9→1). A per-fighter flag that is 0 mid-fight would falsely close the gate. Classic "correct for two subjects is not a law". |
+| timer task record located (`locate_timer_record`) | 0 | 1 | 0 | SOUND signal (1 only while a countdown is live; 0 on ending/attract/select, consistent with the no-false-pin note above) BUT **too expensive for the gate**: it reads the whole [0xC000,0xF000) window (~12 KB) per call, and `eval_gate` runs every frame in the recorder/training/shadow hot paths. Disqualified for the gate (fine for the once-per-training-frame timer_hold it already serves). |
+| `0xC336` (global) | 0 | 1 | 0 | SURVIVING cheap candidate — separated active(1) from attract(0) and the ending(0) and held 1 through a full countdown incl. the P2=1-hp live fight. NOT YET ADOPTED: round-INTRO reading unmeasured and no write-test — adopting it now would repeat the `0xC1B8` mistake. Needs a follow-up characterization pass (intro + write-test + more matchups) before it becomes a gate condition. |
+
+**Consequence for wave (a) (segment shadow):** the leak does NOT block
+segmentation. Every leak screen (battle-plan/ending, attract, the brief
+515/512/260 transitions) has `p1_input`=`p2_input`=0, and both the demo
+filter (`dataset.py` `_rounds`, sum p1_input==0) and the segment per-side
+eligibility drop zero-input rounds — the leak frames never become segments.
+The leak remains a real *training-enforcement* bug (refill/timer-hold could
+run on the ending screen) worth a proper fix, but it is independent of the
+segment core. Probe artifacts: `scratchpad/gate-probe/` (matchdraw.log,
+snap_active/snap_leak_*.bin diff, shots/).
+
 **~~Arena restore hazard (cross-session)~~ — REFUTED 2026-09-01** by a
 dedicated re-test (see the corrected note at the reptile-vs-reptile rig
 paragraph above for the full artifact analysis): every state named here

@@ -1,0 +1,43 @@
+{
+ "_NOTE": "Segment-shadow (SEGMENT_SHADOW.md wave a) calibration for MK2 arcade. boundaries.* are in the recording's RAW units (frames; px for x/y — MK2 collision floor is 62px, the far gap rung ~110px). similarity.* operate on the NORMALIZED start_feature vector (dataset.scalar_features_for divides positions by X_SCALE), so weights are roughly scale-free. Every value here is a SEED to be tuned against the §8 replay-classifier validation (segments validate); they are DATA, never code defaults, and the index meta snapshots whatever was used at build. KI weighted categorical/knockdown states far above raw position (SEGMENT_SHADOW §3.1) — reflected below.",
+ "boundaries": {
+  "seg_max": 180,
+  "y_eps": 8,
+  "knockdown_window": 60,
+  "dist_close": 90,
+  "dist_far": 150,
+  "neutral_hold": 8,
+  "start_slack": 6
+ },
+ "similarity": {
+  "select_band": 0.10,
+  "match_floor": 3.0,
+  "stickiness_bias": 1.0,
+  "swap_debounce": 3,
+  "recency_half_life": 10,
+  "boundary_kind_mismatch_penalty": 1.0,
+  "weights": {
+   "dist_x": 1.0,
+   "dy": 0.5,
+   "me_airborne": 3.0,
+   "me_height": 0.5,
+   "me_fwd_hold": 0.5,
+   "me_back_hold": 0.5,
+   "me_anim": 1.0,
+   "me_timer": 0.2,
+   "opp_airborne": 2.0,
+   "opp_height": 0.5,
+   "opp_anim": 1.0,
+   "opp_timer": 0.2,
+   "facing_sign": 2.0,
+   "me_health": 0.5,
+   "opp_health": 0.5,
+   "health_lead": 1.0,
+   "me_meter": 0.3,
+   "opp_meter": 0.3,
+   "me_hitstun": 3.0,
+   "opp_hitstun": 3.0,
+   "me_corner": 2.0
+  }
+ }
+}

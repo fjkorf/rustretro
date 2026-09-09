@@ -76,7 +76,7 @@
     "size": 1
    }
   ],
-  "_GLOBALS_NOTE": "timer_tens/timer_ones are the DRAWN digits and timer_master/timer_frames are derived/inert (all four write-revert) — read observables only, never enforcement targets. timer_tens/timer_ones ARE load-bearing as the enforcement.timer_hold eq_global cross-check: the countdown TASK RECORD is found by structural signature each frame (mk2.md 'The round timer, closed'), and its tens/ones cells must equal these drawn digits for a match. W2b cleanup 2026-09-02 REMOVED the fixed-address globals timer_task_code/tens/ones (0xD632/0xD636/0xD63A): a live 1P diagnostic proved the task record physically relocates every fight (base 0xD630 on the 2-human capture rig, but 0xDC42/0xE254 in two 1P fights; the code pointer also varies 0x0106B8xx/0x0106E8xx/0x01071940), so no fixed address or guard value exists — the Guarded form they backed is replaced by the Located form below. W2 cleanup 2026-09-01 removed the DISPROVEN globals p1_x/p2_x (object-pool slots, not positions), p1_screen_x (derived), p1_facing (read a constant 2 through a live crossover), and hit_counter (P1-victim-only, also dropped from record_globals) — evidence stays in mk2.md; a declared global is a claim tools may bind, so disproven ones do not get to keep their names here.",
+  "_GLOBALS_NOTE": "timer_tens/timer_ones are the DRAWN digits and timer_master/timer_frames are derived/inert (all four write-revert) — read observables only, never enforcement targets. timer_tens/timer_ones ARE load-bearing as the enforcement.timer_hold eq_global cross-check: the countdown TASK RECORD is found by structural signature each frame (mk2.md 'The round timer, closed'), and its tens/ones cells must equal these drawn digits for a match. W2b cleanup 2026-09-02 REMOVED the fixed-address globals timer_task_code/tens/ones (0xD632/0xD636/0xD63A): a live 1P diagnostic proved the task record physically relocates every fight (base 0xD630 on the 2-human capture rig, but 0xDC42/0xE254 in two 1P fights; the code pointer also varies 0x0106B8xx/0x0106E8xx/0x01071940), so no fixed address or guard value exists — the Guarded form they backed is replaced by the Located form below. W2 cleanup 2026-09-01 removed the DISPROVEN globals p1_x/p2_x (object-pool slots, not positions), p1_screen_x (derived), p1_facing (read a constant 2 through a live crossover), and hit_counter (P1-victim-only, also dropped from record_globals) — evidence stays in mk2.md; a declared global is a claim tools may bind, so disproven ones do not get to keep their names here. fight_active (0xC336) is a gate discriminator found by the 2026-09-02 gate-leak probe (mk2.md): 1 across all 26 committed fight arenas incl. a live P2=1-hp fight, 0 on attract AND on the equal-health-timeout GAME OVER / battle-plan ending screen where scr=0/round_over=0/health-in-range all keep the OLD gate open. It is a byte_nonzero gate term (append-only, can only tighten the gate). DISPROVEN alternatives from the same probe: round_num (stays nonzero on the ending screen) and the block-0x12 per-fighter flags 0xC03E/0xC1B8 (0xC1B8 read 0 during a live fight). RESIDUAL: fight_active's exact semantics are empirical, not write-tested; its round-INTRO reading was not measured (intro frames are zero-input, dropped by the demo filter, so any intro flicker cannot poison recordings).",
   "globals": {
    "round_over": "0xC360",
    "screen_state": "0xC37E",
@@ -87,7 +87,8 @@
    "timer_frames": "0xD396",
    "p1_health_hud": "0xBCA0",
    "p2_health_hud": "0xBC88",
-   "credits_hud_ascii": "0x1704D"
+   "credits_hud_ascii": "0x1704D",
+   "fight_active": "0xC336"
   },
   "record_globals": [
    {
@@ -175,6 +176,10 @@
    "kind": "health_in_range",
    "min": 1,
    "max": 161
+  },
+  {
+   "kind": "byte_nonzero",
+   "global": "fight_active"
   }
  ],
  "enforcement": {

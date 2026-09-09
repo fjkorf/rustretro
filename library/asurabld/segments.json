@@ -1,0 +1,43 @@
+{
+ "_NOTE": "Segment-shadow calibration for Asura Blade — UNTUNED SEED. Asura Blade is not the wave-(a) validation target (that is MK2 arcade); these values exist so SegmentsConfig.load resolves for asurabld and so an eventual asurabld segment pass has a starting point. boundaries.* are in asurabld's raw units (frames; world-X px, a different scale than MK2). asurabld HAS a facing byte (SPEC §2 +0x61), so facing_sign is a real observed feature here, and its knockdown/hitstun are decision-sparse. Tune against the §8 replay-classifier validation before trusting any asurabld segment index built from this.",
+ "boundaries": {
+  "seg_max": 180,
+  "y_eps": 8,
+  "knockdown_window": 60,
+  "dist_close": 80,
+  "dist_far": 160,
+  "neutral_hold": 8,
+  "start_slack": 6
+ },
+ "similarity": {
+  "select_band": 0.10,
+  "match_floor": 3.0,
+  "stickiness_bias": 1.0,
+  "swap_debounce": 3,
+  "recency_half_life": 10,
+  "boundary_kind_mismatch_penalty": 1.0,
+  "weights": {
+   "dist_x": 1.0,
+   "dy": 0.5,
+   "me_airborne": 3.0,
+   "me_height": 0.5,
+   "me_fwd_hold": 0.5,
+   "me_back_hold": 0.5,
+   "me_anim": 1.0,
+   "me_timer": 0.2,
+   "opp_airborne": 2.0,
+   "opp_height": 0.5,
+   "opp_anim": 1.0,
+   "opp_timer": 0.2,
+   "facing_sign": 2.0,
+   "me_health": 0.5,
+   "opp_health": 0.5,
+   "health_lead": 1.0,
+   "me_meter": 0.3,
+   "opp_meter": 0.3,
+   "me_hitstun": 3.0,
+   "opp_hitstun": 3.0,
+   "me_corner": 2.0
+  }
+ }
+}

@@ -43,10 +43,7 @@ use crate::profile::GameProfile;
 const BIT_LEFT: usize = 6;
 const BIT_RIGHT: usize = 7;
 
-/// The dummy occupies fighter block 2: it is injected on controller port 1,
-/// and port 1 drives block 2 (asurabld.md verified this live; MK2's `p2_*`
-/// globals are the same pairing). Deriving it from live X instead — as this
-/// used to — mis-attributes the dummy the moment the fighters cross up.
+// (moved to CHANGELOG.md — loom F-11)
 const DUMMY_BLOCK: u8 = 2;
 
 /// Frames the reactive guard keeps holding away after the commitment signal
@@ -699,17 +696,7 @@ fn poll_contact(ds: &mut DebugState, r: &Resolved, frame: u64) -> (bool, u8) {
         }
     };
     let cur = rd8(ds, addr);
-    // `direction: "decrease"` (contact_signal): only a DROP counts as
-    // contact. This is what makes a health-valued signal (MK2's struct
-    // health) immune to both INCREASE hazards by one sign check — the
-    // round-intro ramp (+2/frame under the banner-gate leak) and the
-    // training refill writing health back to max. Increases also don't
-    // stamp the quiet-window bookkeeping, so a refill can't hold the
-    // cooldown open. ACCEPTED LOSS: the hit that drives health below the
-    // refill threshold is overwritten back to max by refill before the next
-    // poll, so ~one real trigger per refill cycle is lost — the inverse of
-    // the previously documented "one spurious punish per refill", and
-    // harmless (the dummy blocks that one instead of punishing).
+    // (moved to CHANGELOG.md — loom F-03)
     let changed = ds.training.punish_prev_signal.is_some_and(|prev| {
         if r.contact_decrease { cur < prev } else { prev != cur }
     });
@@ -1148,16 +1135,7 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
     }
 }
 
-/// Frames between the contact trigger and the macro's first input: the
-/// dummy keeps guarding through hit-freeze + its own blockstun, then
-/// punishes — inputs played into the freeze are eaten by the game
-/// (live-observed on MK2 arcade, 2026-08-28). This is
-/// [`crate::debug::ReversalTiming`]'s DEFAULT (`Explicit(PUNISH_DELAY)`) —
-/// unchanged behaviour on a fresh install: 26 ≈ hit-freeze (~10) + jab
-/// blockstun (~14) + slack — a chord played at +16 was still eaten while a
-/// motion whose chord lands at +21 came out — live-calibrated on MK2 arcade
-/// 2026-08-28. See [`PUNISH_DELAY_FAST`]/[`PUNISH_DELAY_LATE`] for
-/// `ReversalTiming::Fast`/`Late`.
+// (moved to DEBUGGING.md — loom F-06)
 pub const PUNISH_DELAY: u64 = 26;
 
 /// `ReversalTiming::Fast`'s floor: one frame below this (+16 — see
@@ -1195,28 +1173,10 @@ fn resolve_reversal_delay(timing: crate::debug::ReversalTiming, seed: u64) -> u6
     }
 }
 
-/// Neutral frames between releasing the guard and the macro's first press.
-/// This is the load-bearing constant of the whole punish: MK2's block-stance
-/// input-eat OUTLIVES the Block release by ~8 frames (live-measured
-/// 2026-09-01, port 4030: release-gap 7 fails at every guard-hold length
-/// tried, 8 succeeds at all of them; ~10 needed after very short holds), so
-/// the old value of 4 pressed inside the latch and the punish was EATEN on
-/// 10/10 measured cycles — the user-reported "the punish never happens".
-/// 12 = the measured boundary's worst case (10) plus margin. Evidence:
-/// w1-blockcancel-evidence.md (wave-1 probe; to be merged into mk2.md).
+// (moved to DEBUGGING.md — loom F-08)
 const PUNISH_RELEASE: u64 = 12;
 
-/// Post-punish neutral hold-off: after a punish macro COMPLETES (or aborts),
-/// the dummy injects NEUTRAL — never the guard chord — for this many frames.
-/// Originally shipped at 48 on the hypothesis that a re-held Block
-/// block-cancels the attack's startup; the wave-1 live probe REFUTED that
-/// (2026-09-01, port 4030): Block re-held at every frame from press+1 to
-/// press+12 left contact frame and damage byte-identical to baseline — a
-/// started move cannot be guard-canceled on this port. The real hazard was
-/// the PRE-press gap ([`PUNISH_RELEASE`], see its doc). What remains for
-/// the hold-off is only the input-fold edge (a chord needs ≥2 clean frames,
-/// MACRO_ACTIONS §11, and a kick chorded with a same-frame Block fold is
-/// eaten), so 2 frames of neutral after the macro's last press is enough.
+// (moved to DEBUGGING.md — loom F-04)
 const PUNISH_HOLDOFF: u64 = 2;
 
 /// Quiet frames required to re-arm the trigger after a punish. With the
@@ -1522,6 +1482,16 @@ mod tests {
     /// inside the [0xC000,0xF000) scan window.
     const MK2_1P_TIMER_BASE: u32 = 0xDC42;
 
+    /// MK2's gate now also requires `fight_active` (0xC336) != 0 — the
+    /// discriminator that closes the equal-health-timeout GAME-OVER leak
+    /// (mk2.md gate probe 2026-09-02). Stage it so an in-fight mk2 scene opens
+    /// the gate; a no-op for a profile that does not declare the global.
+    fn stage_fight_active(ds: &mut DebugState, p: &GameProfile) {
+        if let Some(a) = p.global("fight_active") {
+            assert!(ds.write_addr(a as usize, 1, 1));
+        }
+    }
+
     /// MK2 in a bus window with an open gate. The countdown record is NOT
     /// staged here — each test stages it (or a near-miss) itself.
     fn mk2_timer_scene() -> (GameProfile, DebugState) {
@@ -1537,6 +1507,7 @@ mod tests {
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 161));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 161));
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p), "gate must be open");
         ds.training.enabled = true;
         (p, ds)
@@ -1701,6 +1672,7 @@ mod tests {
         // health. (Blocked contact always chips on this port — 3/6/8 — so
         // the struct-health delta sees blocked hits too; mk2.md.)
         let sig = (p.block2() + hoff) as usize;
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p));
 
         ds.training.enabled = true;
@@ -2067,6 +2039,7 @@ mod tests {
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
         // No x staged: mk2's x is pointer-resolved (the DISPROVEN p1_x/p2_x
         // globals are removed), and the button guard doesn't need geometry.
+        stage_fight_active(&mut ds, &p);
         ds.training.enabled = true;
         ds.training.dummy = DummyMode::BlockPunish;
         ds.training.punish_pool = vec![(crate::macros::PunishOption::Attack("HP".into()), 1)];
@@ -2101,6 +2074,7 @@ mod tests {
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p));
         ds.training.enabled = true;
         ds.training.dummy = DummyMode::BlockPunish;
@@ -2468,6 +2442,7 @@ mod tests {
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
         // No x staged: mk2's x is pointer-resolved (the DISPROVEN p1_x/p2_x
         // globals are removed) and the button-block dummy needs no geometry.
+        stage_fight_active(&mut ds, &p);
         assert!(crate::gate::eval_gate(&ds, &p), "gate must be open for this test");
 
         ds.training.enabled = true;
@@ -2522,6 +2497,7 @@ mod tests {
         let hoff = p.field_off("health").unwrap().0;
         assert!(ds.write_addr((p.block1() + hoff) as usize, 1, 100));
         assert!(ds.write_addr((p.block2() + hoff) as usize, 1, 90));
+        stage_fight_active(&mut ds, &p);
         ds.training.enabled = true;
         ds.training.dummy = DummyMode::Block;
         tick_with(&mut ds, 1, &p);

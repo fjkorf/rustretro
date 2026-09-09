@@ -579,14 +579,7 @@ pub struct TrainingConfig {
     /// Frames of guarding left before the scheduled punish macro starts
     /// (`training::PUNISH_DELAY` — hit-freeze + blockstun ride-out).
     pub punish_wait: u64,
-    /// Human-readable BlockPunish phase, refreshed every frame the mode
-    /// runs: "guarding — armed" / "cooling (Nf)" / "punishing: slide" /
-    /// "aborted — <reason>" / "unavailable …". The ONE place this is
-    /// computed (panel, Lua `training.punish_state()`, and any overlay all
-    /// read it) so a silent dummy explains itself instead of looking broken
-    /// — an abort is exactly the case that USED to freeze on a stale
-    /// "punishing: slide" while the gate was closed (misdiagnosed live);
-    /// this field must say "aborted" instead (MACRO_ACTIONS §10.1).
+    // (moved to CHANGELOG.md — loom F-09)
     pub punish_phase: String,
     /// `ds.training.dummy` as observed on the PREVIOUS tick — lets
     /// `training::abort_disrupted_punish` detect a mode switch AWAY FROM
