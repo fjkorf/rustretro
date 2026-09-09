@@ -147,11 +147,26 @@ older plans; the VRAM descriptors remain unreadable).
   scroll phase) or the char-id read at the charsel screen before entry.
 - **Round timer** — ZP $0037/$0039/$003E/$0044 all decrement over ~2.5s of play
   (candidates for the min:sec:tenths HUD "TIME"); not individually mapped.
+  **RESOLVED (session #2):** the HUD "TIME" is stored as separate display
+  DIGITS — $0036=seconds-tens, $0037=seconds-ones, $0038=tenths — see the
+  session-#2 Timer entry. $003E/$0044 are lockstep-offset copies (derived);
+  $003F/$0045 hold a constant 59 (round limit, not live); $0039 is noise.
 - **Score / lives** — not located (score display stayed 000000; the 4 LIFE
   hearts not tied to a byte). BCD-vs-binary of score untested.
+  **STILL TO-VERIFY (session #2 tried, failed):** P1 score stayed 000000 the
+  whole session (no score event was scriptable — see below), so no digit-carry
+  test was possible. LIFE hearts stayed 4; poke-tests of every stably-4 byte
+  and of 0x0F-bitmask candidates left the hearts display unchanged. Neither
+  isolated.
 - **Pause/high-score/game-over screens** not visited — the $0047 gate is
   validated only against title/menu/charsel/gameplay; an unmapped screen could
   in principle also read $0047≠0.
+  **PARTIALLY RESOLVED (session #2):** in-game PAUSE was visited — $0047 stays
+  $04 (gate correctly OPEN; you are still in a gameplay session), $0058 goes to
+  $01. Timer-zero was reached and RESETS the round (does NOT end the game;
+  $0047 stays $04, hearts stay 4). Game-over (all lives) and high-score/continue
+  screens still NOT reached — no scriptable crash/lose mechanic found. See the
+  session-#2 Gate entry for the inverse-cross-check revision this forced.
 
 ### Gate-condition draft (closed vocabulary)
 
@@ -175,3 +190,99 @@ family.json): the seven confirmed globals above are ready to transcribe into
 `memory.globals`, and the gate list to `byte_nonzero $0047`. Player fields are
 single-actor GLOBALS ($0478/$048C), not `fighter_fields` — `blocks.block2`/
 `stride` stay stubs.
+
+## Work RAM — RE session #2 (headless, fceumm, port 4028, 2026-09-09)
+
+Second live-RE pass. Scope: velocity bytes (A), state-machine + ground flag
+(B), gate hardening across new states (C), timer/score/lives (D). All work
+was done from a single committed checkpoint reached by menu-macro (title →
+Start → Start → A) into **Street Skate** gameplay ($005A mode 0), saved as a
+scratch state and `load`-ed for every trial (deterministic replay). Frame-
+accurate capture gates on `get_state.frame_count` (NOT $0033 — it ticks during
+pause and falsely gates capture on a paused world); the game needs a brief
+settle after `load_state` before $0004 begins ticking, so trials `wait_live`
+(poll $0004 until it moves) before applying input.
+
+**Method note (paid for twice this session):** `Probe.screenshot()` PAUSES and
+stays paused — a `sleep` after it elapses on a frozen world. Two "static
+timer" false reads came from screenshotting between two memory snapshots. Read
+memory live, or pause ONCE and read bytes + shoot at the same frozen instant.
+
+**Genre correction:** Street Skate is an AUTO-SCROLLER. The skater is
+screen-locked horizontally ($0478 sits at ~128 at cruise) and forward progress
+is the world scroll ($002D et al., the "camera" counters from session #1 — they
+ARE forward progress). Holding RIGHT does nothing extra at cruise (idle==right
+scroll rate); holding LEFT brakes (scroll ~74 vs 86 per 70 frames) and drifts
+$0478 left at exactly −1 px/frame; the skater re-centers at cruise.
+
+### Confirmed globals (write-test or difference-based control)
+
+| name | addr | width | sign | confidence | how confirmed |
+|---|---|---|---|---|---|
+| engine_clock | $0004 | 1 | unsigned | confirmed | Free-running while the world advances; FREEZES at in-game pause. Pause test: Start in gameplay → $0004 5→5 static while $0033 kept ticking (186→205); resume → runs again. The gameplay running/paused oracle (session #1 named it; here it is write-test-grade against the pause state). |
+| action_state | $040A | 1 | enum | confirmed | Current-action register. GROUNDED it is re-derived each frame from input (right=1 left=2 down=3 up=4 B=5 A=6, idle=0 — the session-#1 "decoded input nibble"). AIRBORNE it LATCHES **6** for the whole jump arc INDEPENDENT of input: tap-A jump (A released frame 3, $0703→0) kept $040A=6 through frames 1–42, clearing to 0 exactly on landing (frame 43). So it is the ACTION/STATE byte, not a raw input echo. Poke persists across steps (not re-derived while latched) but does NOT by itself drive physics → state indicator/output. Mirrored at $0568. |
+| ground_air_flag | $0428 | 1 | enum | confirmed | **2 = grounded, 1 = airborne.** Flips at takeoff (frame 1) and landing (frame 43) exactly, INDEPENDENT of input (same tap-A control: A gone by frame 3, flag stayed 1 until landing). Poke persists (not re-derived); poking it alone does not levitate the skater → it is a read-flag the physics/animation consults, not the jump trigger. |
+| time_sec_tens | $0036 | 1 | unsigned | confirmed | HUD "TIME" seconds TENS digit (0–9). Difference-confirmed at 3 screenshot anchors: 0:59:0→5, 0:54:1→5, 0:49:1→**4** (crossed the tens boundary). |
+| time_sec_ones | $0037 | 1 | unsigned | confirmed | Seconds ONES digit. Same 3 anchors: 9, 4, 9. Poking $0036/$0037 lower drove the on-screen countdown and it kept ticking down from the poked value → these display digits are the authoritative countdown (not a rendered copy). |
+| time_tenths | $0038 | 1 | unsigned | confirmed | Tenths digit. Anchors: .0→0, .1→1, .1→1. |
+
+### Derived / disproven (recorded so a future session doesn't re-chase)
+
+- **VELOCITY (VX/VY) — COMPUTED, NOT STORED (TO-VERIFY table/routine in PRG).**
+  No persistent signed velocity byte exists. Vertical: player Y $048C traces a
+  clean gravity parabola (per-frame dY sweeps −3…+3 smoothly) written DIRECTLY
+  to the position; there is no adjacent subpixel byte ($048B/$048D are 0/160
+  constant) and no jump-phase timer that resets to 0 at takeoff (the only
+  monotone bytes across the arc — $002D,$0033,$045A,$067E/F — are the same
+  free-running counters seen at idle). Horizontal: $0478 is screen-locked, and
+  when it does move (left-brake) it steps a fixed −1 px/frame. Conclusion:
+  velocity is applied by an arc/gravity routine (likely a PRG table), not held
+  in RAM. Disprove/confirm by disassembly, not more RAM diffing.
+- **$04C8** — jump-pose animation index, tracks HEIGHT not velocity (7 on
+  ground → 4 at apex → 7 on landing). Derived render output.
+- **$0446 / $0450 / $062F** — flip only at the landing frame (single
+  transition), consistent with a landing-SFX/one-shot, not a clean state flag.
+- **$003E / $0044** — decrement in lockstep with $0037 (constant offsets: $3E =
+  $37+1, $44 = $37+17). Redundant timer copies, derived. **$003F / $0045** hold
+  a constant 59 across the whole countdown = the round time LIMIT, not the live
+  clock. **$0039** is animation noise, not a timer.
+- **$0568** — mirror of $040A (same values every frame). Use $040A.
+
+### Gate hardening (Target C) — new states visited
+
+| landmark | $0047 | $0058 | gate byte_nonzero($47) | classification |
+|---|---|---|---|---|
+| gameplay (running) | $04 | $00 | OPEN | gameplay ✓ |
+| **gameplay PAUSED** (Start in-game) | $04 | $01 | OPEN | gameplay ✓ (correct — still a gameplay session; $0004 frozen) |
+| **timer hit 0:00** | $04 | $00 | OPEN | gameplay ✓ (round RESETS — timer refills, hearts stay 4; NOT game-over) |
+| game-over (all lives) | — | — | — | NOT REACHED this session |
+| high-score / continue | — | — | — | NOT REACHED this session |
+
+**Verdict — primary gate HELD, inverse cross-check needs revision.** The
+primary `byte_nonzero $0047` classified pause and the timer-zero round-reset
+correctly (both are gameplay, both read $04). BUT the optional inverse
+cross-check `byte_zero $0058` FAILS at pause: $0058 is not a pure complement —
+it reads **0 = active gameplay, 1 = paused gameplay, 2 = menu/non-gameplay**.
+Revise the inverse to **`$0058 < 2`** (i.e. gameplay incl. pause) or drop the
+inverse and trust $0047 alone. The gate is still NOT proven exhaustive:
+game-over and high-score screens remain unvisited, so an unmapped screen could
+in principle also read $0047≠0 — carry this forward.
+
+**New behavioral finding:** timing out (TIME → 0:00) in Street Skate does NOT
+cost a life or end the game — it resets the round timer to full with all 4
+hearts intact. Game-over therefore requires losing all hearts, and no
+scriptable crash/lose mechanic was found (holding a direction skates past the
+barrel obstacles without collision; a 20 s idle run never dropped a heart or
+left Y=160). Reaching game-over needs a real crash trigger (specific
+obstacle/enemy/fall) identified first.
+
+### Score / lives (Target D) — NOT isolated (honest negative)
+
+P1 score display stayed **000000** the entire session (no trick/obstacle score
+event could be scripted), so no digit-carry / BCD-vs-binary test was possible.
+The LIFE hearts stayed **4**: every byte that read a stable 4 across a 20 s run
+($009F,$00D0,$030C,$0409,$0477,$0684–$0686,$06A2) and the 0x0F-bitmask
+candidates ($0333,$0603) were poke-tested — none changed the on-screen hearts
+($009F/$00D0/$06A2 re-derived back to 4; the rest held the poke but the hearts
+render was unaffected). Both remain TO-VERIFY; they need a real heart-loss /
+scoring event to anchor a difference-based search.

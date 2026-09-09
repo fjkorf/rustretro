@@ -1,5 +1,5 @@
 {
-  "_STATUS": "T1 (2026-09-09): globals + gate transcribed from the RE session in tcsurfdesign.md's 'Work RAM' section — every entry there carries its write-test/regression evidence; nothing here is guessed. SINGLE-ACTOR game: blocks.block2/stride are permanent stubs (schema mandates them); player fields live in memory.globals so Lua reads them via game.addr(), NOT fighter_fields. Gate = byte_nonzero(gameplay_gate $47) + byte_zero(gate_inverse $58), validated across 9 landmarks (all 3 modes, A- and B-entry; pause/game-over screens not yet visited — see the doc's TO-VERIFY). All globals must stay inside NES CPU RAM $0000-$07FF: the engine folds out-of-map reads into 0, and a profile test asserts this bound. enforcement/calibration remain dummy values (unmeasured). cpu='6502' and endianness='little' override the arcade schema defaults. Core: fceumm (measured decision, see tcsurfdesign.md Core capability).",
+  "_STATUS": "T1 (2026-09-09, two RE sessions): globals + gate transcribed from tcsurfdesign.md's 'Work RAM' sections — every entry carries its write-test/regression evidence; nothing here is guessed. SINGLE-ACTOR game: blocks.block2/stride are permanent stubs (schema mandates them); player fields live in memory.globals so Lua reads them via game.addr(), NOT fighter_fields. Gate = byte_nonzero(gameplay_gate $47) ALONE: session #2 found gate_phase $58 is 0=active/1=paused/2=menu (NOT a pure inverse), and the closed vocabulary has no '<2' predicate, so $47 alone is the honest gate — it held OPEN across in-game pause and timer-zero-reset. Still not proven against game-over/high-score screens (unreached — see doc TO-VERIFY). NOTE session #2 behavior: timing out RESETS the round (no game-over), Street Skate is an auto-scroller (player x screen-locked). Velocity is COMPUTED not stored (no VX/VY byte). All globals stay inside NES CPU RAM $0000-$07FF (a profile test asserts this; the engine folds out-of-map reads to 0). enforcement/calibration remain dummy (unmeasured). cpu='6502'/endianness='little' override arcade defaults. Core: fceumm (see tcsurfdesign.md Core capability).",
   "family": "tcsurfdesign",
   "port": "nes",
   "core": {
@@ -18,17 +18,22 @@
     "fighter_fields": [],
     "globals": {
       "gameplay_gate": "0x47",
-      "gate_inverse": "0x58",
+      "gate_phase": "0x58",
       "mode_index": "0x5A",
       "player_x_screen": "0x478",
       "player_y_screen": "0x48C",
       "pad_latch_p1": "0x703",
-      "frame_oracle": "0x33"
+      "frame_oracle": "0x33",
+      "engine_clock": "0x4",
+      "action_state": "0x40A",
+      "ground_air_flag": "0x428",
+      "time_sec_tens": "0x36",
+      "time_sec_ones": "0x37",
+      "time_tenths": "0x38"
     }
   },
   "gate": [
-    { "kind": "byte_nonzero", "global": "gameplay_gate" },
-    { "kind": "byte_zero", "global": "gate_inverse" }
+    { "kind": "byte_nonzero", "global": "gameplay_gate" }
   ],
   "enforcement": {
     "health_max": 255,

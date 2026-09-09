@@ -1834,11 +1834,13 @@ mod tests {
         assert!(p.family.attack_classes.contains(&"A".to_string()));
         assert!(p.port.attack_chords.contains_key("A"));
         assert!(p.port.attack_chords.contains_key("B"));
-        // T1: the gate is real (validated across 9 landmarks in
-        // tcsurfdesign.md) and both its globals resolve.
+        // T1: the gate is real (validated live across pause + timer-reset)
+        // and its global resolves. Session #2 dropped the $58 inverse cross-
+        // check (it's 0=active/1=paused/2=menu, not a pure complement), so
+        // $47 alone is the gate.
         assert!(!p.port.gate.is_empty());
         assert!(p.global("gameplay_gate").is_some());
-        assert!(p.global("gate_inverse").is_some());
+        assert!(p.global("engine_clock").is_some());
     }
 
     /// Every tcsurfdesign global must sit inside NES CPU RAM ($0000-$07FF).

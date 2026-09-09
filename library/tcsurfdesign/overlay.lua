@@ -25,12 +25,10 @@ end
 CONFIG = {
   sections = {
     position = true,
-    physics  = true,
+    physics  = true,   -- derived velocity + confirmed ground flag
     input    = true,
-    mode     = true,
-    camera   = true,
-    gate     = true,    -- real gate since T1 ($47/$58, 9-landmark validated)
-    physics_derived_ground = false, -- judgment-call ground marker (needs GROUND_Y calibration)
+    mode     = true,   -- mode name + timer
+    gate     = true,   -- real gate since T1 (byte_nonzero $47)
   },
   -- The ONE place game-specific read shape lives. Keys must be byte-identical
   -- to the profile's memory.globals names (game.addr is an exact string
@@ -41,16 +39,21 @@ CONFIG = {
   fields = {
     player_x_screen = { reader = "u8", label = "X" },
     player_y_screen = { reader = "u8", label = "Y" },
-    player_vx    = { reader = "s8",  label = "VX" },   -- TO-VERIFY: not yet found
-    player_vy    = { reader = "s8",  label = "VY" },   -- TO-VERIFY: not yet found
-    player_state = { reader = "u8",  label = "ST" },   -- TO-VERIFY: $400-$405 are render outputs, not state
-    on_ground    = { reader = "u8",  label = "GND" },  -- TO-VERIFY: not yet found
-    mode_index   = { reader = "u8",  label = "MODE" },
-    camera_x     = { reader = "u8",  label = "CAMX" }, -- TO-VERIFY: $2D/$612 are auto-scroll, Target 4 decides
-    pad_latch_p1 = { reader = "u8",  label = "IN" },
+    action_state    = { reader = "u8", label = "ACT" },  -- $40A: 0 idle,1-4 dir,5 B,6 A/air (latches airborne)
+    ground_air_flag = { reader = "u8", label = "GND" },  -- $428: 2=grounded 1=airborne
+    mode_index      = { reader = "u8", label = "MODE" },
+    engine_clock    = { reader = "u8", label = "CLK" },   -- $04: freezes on pause
+    time_sec_tens   = { reader = "u8", label = "T10s" },
+    time_sec_ones   = { reader = "u8", label = "T1s" },
+    time_tenths     = { reader = "u8", label = "T.1" },
+    pad_latch_p1    = { reader = "u8", label = "IN" },
+    -- Velocity is COMPUTED not stored (RE session #2) — no VX/VY byte exists;
+    -- the physics section derives motion from player_x/y frame deltas instead.
   },
   -- mode_index values, live-verified (tcsurfdesign.md menu/flow map)
   mode_names = { [0] = "STREET SKATE", [1] = "BIG WAVE", [2] = "WOOD+WATER" },
+  -- action_state decode (grounded = re-derived from input; airborne latches 6)
+  action_names = { [0]="idle", [1]="right", [2]="left", [3]="down", [4]="up", [5]="B", [6]="A/air" },
   layout = {
     pos_panel  = { x = 2, y = 2 },
     mode_panel = { x = 196, y = 2 },
@@ -126,31 +129,50 @@ end
 
 local function draw_position()
   local L = CONFIG.layout.pos_panel
-  draw_panel(L.x, L.y, 52, { line("player_x_screen"), line("player_y_screen"), line("player_state") })
+  -- action_state decoded via action_names, else raw.
+  local act = read_field("action_state")
+  local act_txt, act_col = "ACT --", CONFIG.colors.dim
+  if act ~= nil then
+    act_txt = "ACT " .. (CONFIG.action_names[act] or tostring(act))
+    act_col = CONFIG.colors.ok
+  end
+  draw_panel(L.x, L.y, 60, {
+    line("player_x_screen"), line("player_y_screen"),
+    { text = act_txt, color = act_col },
+  })
 end
 
+-- Velocity is COMPUTED not stored (no VX/VY byte): DERIVE it from the
+-- per-frame position delta, stored across frames in a global. Labeled
+-- "(derived)" so it never reads as a measured field.
+_PREV_POS = _PREV_POS or {}
+
 local function draw_physics()
-  local vx, vy = read_field("player_vx"), read_field("player_vy")
   local px, py = read_field("player_x_screen"), read_field("player_y_screen")
-  local L = CONFIG.layout.pos_panel
-  draw_panel(L.x, L.y + 30, 52, { line("player_vx"), line("player_vy"), line("on_ground") })
-  -- Velocity vector, world-anchored: only when position AND velocity are both
-  -- present — never anchor a vector on a missing position.
-  if vx and vy and px and py then
-    local s = CONFIG.layout.vector_scale
-    gui.drawLine(px, py, px + vx * s, py + vy * s, CONFIG.colors.vec)
-  end
-  local gnd = read_field("on_ground")
-  if gnd ~= nil and px and py then
-    gui.drawPixel(px, py + 2, gnd ~= 0 and CONFIG.colors.gnd_on or CONFIG.colors.gnd_off)
-  elseif CONFIG.sections.physics_derived_ground and px and py then
-    local gy = game.calibration("GROUND_Y")
-    if gy then
-      -- HOLLOW derived marker: a judgment call, visually distinct from a
-      -- measured ground flag; off by default until GROUND_Y is confirmed.
-      local c = (py >= gy) and CONFIG.colors.derived or CONFIG.colors.dim
-      gui.drawBox(px - 2, py + 1, px + 2, py + 3, 0x00000000, c)
+  local dvx, dvy
+  if px and py then
+    if _PREV_POS.x then
+      -- NES coords wrap in 8 bits; keep the delta small and signed.
+      local function d(a, b) local v = a - b; if v > 127 then v = v - 256 elseif v < -128 then v = v + 256 end; return v end
+      dvx, dvy = d(px, _PREV_POS.x), d(py, _PREV_POS.y)
     end
+    _PREV_POS.x, _PREV_POS.y = px, py
+  end
+  local L = CONFIG.layout.pos_panel
+  draw_panel(L.x, L.y + 38, 60, {
+    { text = "dVX " .. (dvx and dvx or "--") .. " (deriv)", color = dvx and CONFIG.colors.ok or CONFIG.colors.dim },
+    { text = "dVY " .. (dvy and dvy or "--") .. " (deriv)", color = dvy and CONFIG.colors.ok or CONFIG.colors.dim },
+    line("ground_air_flag"),
+  })
+  -- Derived velocity vector, world-anchored (only with a real position).
+  if dvx and dvy and px and py then
+    local s = CONFIG.layout.vector_scale
+    gui.drawLine(px, py, px + dvx * s, py + dvy * s, CONFIG.colors.vec)
+  end
+  -- Ground marker from the confirmed flag: 2=grounded, 1=airborne.
+  local gnd = read_field("ground_air_flag")
+  if gnd ~= nil and px and py then
+    gui.drawPixel(px, py + 2, gnd == 2 and CONFIG.colors.gnd_on or CONFIG.colors.gnd_off)
   end
 end
 
@@ -187,18 +209,23 @@ end
 local function draw_mode()
   local L = CONFIG.layout.mode_panel
   local v = read_field("mode_index")
-  local txt, col
+  local mode_txt, mode_col
   if v == nil then
-    txt, col = "MODE --", CONFIG.colors.dim
+    mode_txt, mode_col = "MODE --", CONFIG.colors.dim
   else
-    txt, col = (CONFIG.mode_names[v] or ("MODE " .. v)), CONFIG.colors.ok
+    mode_txt, mode_col = (CONFIG.mode_names[v] or ("MODE " .. v)), CONFIG.colors.ok
   end
-  draw_panel(L.x, L.y, 58, { { text = txt, color = col } })
-end
-
-local function draw_camera()
-  local L = CONFIG.layout.mode_panel
-  draw_panel(L.x, L.y + 14, 58, { line("camera_x") })
+  -- Timer from the three confirmed digit bytes (tens:ones.tenths of seconds).
+  local t10, t1, tt = read_field("time_sec_tens"), read_field("time_sec_ones"), read_field("time_tenths")
+  local time_txt, time_col = "TIME --", CONFIG.colors.dim
+  if t10 and t1 and tt then
+    time_txt = string.format("TIME %d%d.%d", t10, t1, tt)
+    time_col = CONFIG.colors.ok
+  end
+  draw_panel(L.x, L.y, 58, {
+    { text = mode_txt, color = mode_col },
+    { text = time_txt, color = time_col },
+  })
 end
 
 local function draw_gate()
@@ -213,7 +240,6 @@ event.onframeend(function()
   if CONFIG.sections.physics  then safe_section("physics",  draw_physics)  end
   if CONFIG.sections.input    then safe_section("input",    draw_input)    end
   if CONFIG.sections.mode     then safe_section("mode",     draw_mode)     end
-  if CONFIG.sections.camera   then safe_section("camera",   draw_camera)   end
   if CONFIG.sections.gate     then safe_section("gate",     draw_gate)     end
 end)
 
