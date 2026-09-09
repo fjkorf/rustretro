@@ -150,7 +150,17 @@
     }
    ],
    "id": "F-04",
-   "verdict": "relocate"
+   "verdict": "relocate",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "DEBUGGING.md",
+    "pointer": "// (moved to DEBUGGING.md \u2014 loom F-04)",
+    "stripped_text": "Post-punish neutral hold-off: after a punish macro COMPLETES (or aborts),\nthe dummy injects NEUTRAL \u2014 never the guard chord \u2014 for this many frames.\nOriginally shipped at 48 on the hypothesis that a re-held Block\nblock-cancels the attack's startup; the wave-1 live probe REFUTED that\n(2026-09-01, port 4030): Block re-held at every frame from press+1 to\npress+12 left contact frame and damage byte-identical to baseline \u2014 a\nstarted move cannot be guard-canceled on this port. The real hazard was\nthe PRE-press gap ([`PUNISH_RELEASE`], see its doc). What remains for\nthe hold-off is only the input-fold edge (a chord needs \u22652 clean frames,\nMACRO_ACTIONS \u00a711, and a kick chorded with a same-frame Block fold is\neaten), so 2 frames of neutral after the macro's last press is enough.",
+    "moved_sha256": "903e7d8a9f29",
+    "src_lines_before": 2546,
+    "src_lines_after": 2536
+   },
+   "change_id": "trxsuxtu"
   },
   {
    "file": "src/shadow_runner.rs",

@@ -163,3 +163,17 @@ to correct. `FrameCell::one_sided_reference` records, per such field, which
 observable's frame of reference the collapsed number is in — a bare "77"
 means different things in different rows, and that ambiguity is exactly
 what this map exists to close off.
+
+## Relocated from src/training.rs:1209-1219 (loom lint F-04, ratified 2026-09-09)
+
+Post-punish neutral hold-off: after a punish macro COMPLETES (or aborts),
+the dummy injects NEUTRAL — never the guard chord — for this many frames.
+Originally shipped at 48 on the hypothesis that a re-held Block
+block-cancels the attack's startup; the wave-1 live probe REFUTED that
+(2026-09-01, port 4030): Block re-held at every frame from press+1 to
+press+12 left contact frame and damage byte-identical to baseline — a
+started move cannot be guard-canceled on this port. The real hazard was
+the PRE-press gap ([`PUNISH_RELEASE`], see its doc). What remains for
+the hold-off is only the input-fold edge (a chord needs ≥2 clean frames,
+MACRO_ACTIONS §11, and a kick chorded with a same-frame Block fold is
+eaten), so 2 frames of neutral after the macro's last press is enough.

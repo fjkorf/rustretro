@@ -1206,17 +1206,7 @@ fn resolve_reversal_delay(timing: crate::debug::ReversalTiming, seed: u64) -> u6
 /// w1-blockcancel-evidence.md (wave-1 probe; to be merged into mk2.md).
 const PUNISH_RELEASE: u64 = 12;
 
-/// Post-punish neutral hold-off: after a punish macro COMPLETES (or aborts),
-/// the dummy injects NEUTRAL — never the guard chord — for this many frames.
-/// Originally shipped at 48 on the hypothesis that a re-held Block
-/// block-cancels the attack's startup; the wave-1 live probe REFUTED that
-/// (2026-09-01, port 4030): Block re-held at every frame from press+1 to
-/// press+12 left contact frame and damage byte-identical to baseline — a
-/// started move cannot be guard-canceled on this port. The real hazard was
-/// the PRE-press gap ([`PUNISH_RELEASE`], see its doc). What remains for
-/// the hold-off is only the input-fold edge (a chord needs ≥2 clean frames,
-/// MACRO_ACTIONS §11, and a kick chorded with a same-frame Block fold is
-/// eaten), so 2 frames of neutral after the macro's last press is enough.
+// (moved to DEBUGGING.md — loom F-04)
 const PUNISH_HOLDOFF: u64 = 2;
 
 /// Quiet frames required to re-arm the trigger after a punish. With the
