@@ -35,6 +35,7 @@ use crate::debug::panels::{
     help::HelpPanel,
     hex_dump::HexDump,
     matchup::MatchupPanel,
+    nametable::NametablePanel,
     hunt::HuntPanel,
     framelab::FramelabPanel,
     input_log::InputLogPanel,
@@ -61,6 +62,7 @@ pub enum Tab {
     HexDump,
     TileViewer,
     ChrEditor,
+    Nametables,
     InputMonitor,
     InputLog,
     FrameLog,
@@ -83,11 +85,12 @@ pub enum Tab {
 /// variant missing from a saved sidecar) and the toolbar Panels menu — adding
 /// a variant without extending this list is a compile-time-invisible bug, so
 /// the `default_layout_contains_all_tabs` test cross-checks it.
-pub const ALL_TABS: [Tab; 20] = [
+pub const ALL_TABS: [Tab; 21] = [
     Tab::FrameInspector,
     Tab::HexDump,
     Tab::TileViewer,
     Tab::ChrEditor,
+    Tab::Nametables,
     Tab::InputMonitor,
     Tab::InputLog,
     Tab::FrameLog,
@@ -113,6 +116,7 @@ impl Tab {
             Tab::HexDump => "📋 Hex",
             Tab::TileViewer => "🧩 Tiles",
             Tab::ChrEditor => "🎨 CHR Editor",
+            Tab::Nametables => "🗺 Nametables",
             Tab::InputMonitor => "🕹 Input",
             Tab::InputLog => "📜 Input Log",
             Tab::FrameLog => "🧾 Log",
@@ -142,6 +146,7 @@ pub struct Panels {
     pub input_log_panel: InputLogPanel,
     pub tile_viewer: TileViewer,
     pub chr_editor: ChrEditor,
+    pub nametable_panel: NametablePanel,
     pub frame_log: FrameLog,
     pub triggers: Triggers,
     pub cpu_state: CpuState,
@@ -166,6 +171,7 @@ impl Panels {
             input_log_panel: InputLogPanel::new(),
             tile_viewer: TileViewer::new(),
             chr_editor: ChrEditor::new(),
+            nametable_panel: NametablePanel::new(),
             frame_log: FrameLog::new(),
             triggers: Triggers::new(),
             cpu_state: CpuState::new(),
@@ -210,6 +216,7 @@ impl<'a> egui_dock::TabViewer for DockViewer<'a> {
             Tab::FrameInspector => self.panels.frame_inspector.show(ui, &ctx, self.state),
             Tab::TileViewer => self.panels.tile_viewer.show(ui, &ctx, self.state),
             Tab::ChrEditor => self.panels.chr_editor.show(ui, &ctx, self.state),
+            Tab::Nametables => self.panels.nametable_panel.show(ui, &ctx, self.state),
 
             // shape: &mut self, ui, &Arc<Mutex<DebugState>>
             Tab::HexDump => self.panels.hex_dump.show(ui, self.state),
@@ -324,7 +331,7 @@ impl<'a> egui_dock::TabViewer for DockViewer<'a> {
 /// |  CANVAS (tabbed)           |  LIVE: Watch|CPU|Input|  |
 /// |                            |        Input Log        |
 /// |  Frame|Disasm|Hex|Tiles|   +--------------------------+
-/// |  CHR Editor                |
+/// |  CHR Editor|Nametables     |
 /// |                            |  CONTROL: State|Training |
 /// |                            |           |Audio         |
 /// +----------------------------+--------------------------+
@@ -341,6 +348,7 @@ pub fn default_layout() -> DockState<Tab> {
         Tab::HexDump,
         Tab::TileViewer,
         Tab::ChrEditor,
+        Tab::Nametables,
     ]);
 
     let surface = dock.main_surface_mut();

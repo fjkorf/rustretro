@@ -29,7 +29,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::debug::DebugState;
 use crate::mcp::ines::{chr_span, parse_ines};
 use crate::mcp::snapshot::{
-    decode_2bpp_planar_indices, encode_2bpp_planar_row, gray_ramp_rgba, BYTES_PER_2BPP_TILE,
+    decode_2bpp_planar_indices, encode_2bpp_planar_row, gray_ramp_rgba, nes_master_rgba,
+    read_region_bytes, BYTES_PER_2BPP_TILE,
     TILE_PX,
 };
 
@@ -52,23 +53,37 @@ enum Status {
     Ready,
 }
 
-/// The editor's color source, factored behind [`palette_color`] so a real NES
-/// palette can plug in later without touching any painting code.
+/// The editor's color source, factored behind [`palette_color`] so painting
+/// code never branches on it.
 ///
-/// `Nes(..)` (live PPU palette RAM, `$3F00-$3F1F`) is a known future seam,
-/// deliberately NOT implemented today: no NES core in this tree exposes PPU
-/// palette RAM as a readable memory region (nestopia's memory capability is
-/// "System RAM (fallback)" only, per the live-boot facts in this program's
-/// evidence docs), so there is nothing to read it FROM yet even if the
-/// variant existed.
+/// `Nes([i0..i3])` carries a live 4-color sub-palette: four NES master-palette
+/// indices read from PALRAM (`$3F00-$3F1F`). Since the H1 disconnect-mask fix,
+/// fceumm's PALRAM region reads live, so this is now real, not a placeholder —
+/// but it degrades to grayscale whenever PALRAM is unreadable (non-NES core,
+/// no live core), so nothing fabricates color.
 enum EditorPalette {
     GrayscaleStructureOnly,
+    Nes([u8; 4]),
+}
+
+impl EditorPalette {
+    /// Cheap identity for change-detection (rebuild textures only on change).
+    fn fingerprint(&self) -> [u8; 5] {
+        match self {
+            EditorPalette::GrayscaleStructureOnly => [0, 0, 0, 0, 0],
+            EditorPalette::Nes(s) => [1, s[0], s[1], s[2], s[3]],
+        }
+    }
 }
 
 fn palette_color(index: u8, palette: &EditorPalette) -> egui::Color32 {
     match palette {
         EditorPalette::GrayscaleStructureOnly => {
             let [r, g, b, a] = gray_ramp_rgba(index, 4);
+            egui::Color32::from_rgba_premultiplied(r, g, b, a)
+        }
+        EditorPalette::Nes(sub) => {
+            let [r, g, b, a] = nes_master_rgba(sub[(index & 0x3) as usize]);
             egui::Color32::from_rgba_premultiplied(r, g, b, a)
         }
     }
@@ -155,6 +170,10 @@ pub struct ChrEditor {
     hide_blank: bool,
     zoom: f32,
     palette: EditorPalette,
+    /// When true, recolor from live PALRAM sub-palette `subpalette_group`
+    /// each frame; when false (or PALRAM unreadable) stay grayscale.
+    use_live_palette: bool,
+    subpalette_group: usize,
     /// The palette index the next click paints with.
     draw_index: u8,
 
@@ -188,6 +207,8 @@ impl ChrEditor {
             hide_blank: false,
             zoom: 3.0,
             palette: EditorPalette::GrayscaleStructureOnly,
+            use_live_palette: false,
+            subpalette_group: 0,
             draw_index: 3,
             save_path_input: String::new(),
             save_note: None,
@@ -379,11 +400,42 @@ impl ChrEditor {
         }
     }
 
+    /// Read four NES master-palette indices from live PALRAM sub-palette
+    /// `group` (0-7). PALRAM index 0 of every group is the universal backdrop
+    /// `$3F00` per the PPU rule. Returns None if PALRAM is not a readable
+    /// region (non-NES core, no live core) — the caller then stays grayscale.
+    fn live_subpalette(state: &Arc<Mutex<DebugState>>, group: usize) -> Option<[u8; 4]> {
+        let s = state.lock().ok()?;
+        let region = s.memory_regions.iter().find(|r| r.name == "PALRAM")?.clone();
+        drop(s);
+        let pal = read_region_bytes(&region, 0, 32)?;
+        if pal.len() < 32 {
+            return None;
+        }
+        let base = (group & 0x7) * 4;
+        Some([pal[0], pal[base + 1], pal[base + 2], pal[base + 3]])
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, state: &Arc<Mutex<DebugState>>) {
         let (rom_system, rom_bytes, rom_path) = Self::snapshot_rom(state);
         if rom_path != self.loaded_from {
             self.load(rom_system.as_deref(), rom_bytes, rom_path.clone());
             self.loaded_from = rom_path;
+        }
+
+        // Recompute the color source each frame: live PALRAM if requested and
+        // readable, else grayscale (never a fabricated color). Changing it
+        // invalidates cached tile textures so thumbnails recolor.
+        let want = if self.use_live_palette {
+            Self::live_subpalette(state, self.subpalette_group)
+                .map(EditorPalette::Nes)
+                .unwrap_or(EditorPalette::GrayscaleStructureOnly)
+        } else {
+            EditorPalette::GrayscaleStructureOnly
+        };
+        if want.fingerprint() != self.palette.fingerprint() {
+            self.palette = want;
+            self.tile_textures.iter_mut().for_each(|t| *t = None);
         }
 
         ui.heading("🎨 CHR Editor");
@@ -423,6 +475,27 @@ impl ChrEditor {
             ui.separator();
             ui.label("Zoom:");
             ui.add(egui::Slider::new(&mut self.zoom, 1.0..=8.0).step_by(1.0));
+            ui.separator();
+            ui.checkbox(&mut self.use_live_palette, "Live palette")
+                .on_hover_text(
+                    "Color from live PALRAM instead of grayscale (needs a running NES core). \
+                     Which sub-palette a given tile really uses is a runtime fact — pick the \
+                     group that matches the on-screen sprite.",
+                );
+            if self.use_live_palette {
+                ui.label("Sub:");
+                egui::ComboBox::from_id_source("chr_subpalette")
+                    .selected_text(format!("{}", self.subpalette_group))
+                    .show_ui(ui, |ui| {
+                        for g in 0..8usize {
+                            let tag = if g < 4 { "bg" } else { "spr" };
+                            ui.selectable_value(&mut self.subpalette_group, g, format!("{g} ({tag})"));
+                        }
+                    });
+                if matches!(self.palette, EditorPalette::GrayscaleStructureOnly) {
+                    ui.colored_label(egui::Color32::from_rgb(0xE0, 0xA0, 0x40), "PALRAM unreadable");
+                }
+            }
             ui.separator();
             ui.label(format!(
                 "{} tile(s), {} bank(s)",
