@@ -191,8 +191,7 @@ pub(crate) fn action_is_bound(port: &PortMap, bits: &[RetroButton]) -> bool {
 
 /// Result of a rebind in one map.
 pub(crate) struct RebindOutcome<K> {
-    /// Controls that previously emitted this action's chord and were removed
-    /// (the replace-binding semantics). Does not include `control` itself.
+    // (moved to CHANGELOG.md — loom F-12)
     pub replaced: Vec<K>,
     /// `control`'s previous chord when it was bound to a DIFFERENT action —
     /// the "stolen from" warning payload. `None` if it was unbound or

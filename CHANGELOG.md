@@ -62,3 +62,8 @@ Reversal timing (MK-style "Block Attack: Fast / Delay / Late", plus an
 explicit-frames power-user knob) — WHEN the scheduled BlockPunish
 macro starts relative to its trigger. `training::PUNISH_DELAY` used to
 be a single hardcoded constant; this is that same knob, now a setting.
+
+## Relocated from src/debug/panels/controls.rs:194-195 (loom lint F-12, ratified 2026-09-09)
+
+Controls that previously emitted this action's chord and were removed
+(the replace-binding semantics). Does not include `control` itself.

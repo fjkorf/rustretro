@@ -451,7 +451,17 @@
    ],
    "id": "F-12",
    "verdict": "relocate",
-   "dest": "CHANGELOG.md"
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-12)",
+    "stripped_text": "Controls that previously emitted this action's chord and were removed\n(the replace-binding semantics). Does not include `control` itself.",
+    "moved_sha256": "94f7ff1b2a95",
+    "src_lines_before": 859,
+    "src_lines_after": 858
+   },
+   "change_id": "qwzrxrzy"
   },
   {
    "file": "src/profile.rs",
