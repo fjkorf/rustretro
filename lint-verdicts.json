@@ -1,0 +1,433 @@
+{
+ "provenance": {
+  "path": ".",
+  "root": ".",
+  "excludes": [
+   "target/*",
+   "node_modules/*",
+   ".git/*",
+   "vendor/*",
+   "*.min.js",
+   ".venv/*",
+   "*/.venv/*",
+   "*/site-packages/*",
+   "fbneo/*",
+   "shadow/*",
+   "library/*"
+  ]
+ },
+ "stats": {
+  "files": 54,
+  "comment_lines": 7513,
+  "blocks": 2726,
+  "flagged": 15
+ },
+ "destinations": {
+  "DEBUGGING/notes doc": "DEBUGGING.md",
+  "explanation doc": "ARCHITECTURE.md"
+ },
+ "findings": [
+  {
+   "file": "src/profile.rs",
+   "lines": [
+    577,
+    666
+   ],
+   "class": "dated-log",
+   "n_lines": 90,
+   "fingerprints": [
+    "contrast",
+    "iso-date",
+    "measurement-log"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 586,
+     "text": "// The export currently carries TWO ROWS PER (char, move, variant, gap) cell,"
+    },
+    {
+     "fingerprint": "iso-date",
+     "line": 601,
+     "text": "// time 2026-09-01):"
+    },
+    {
+     "fingerprint": "measurement-log",
+     "line": 599,
+     "text": "// THE ROW WAS MEASURED, specifically whether the value carries a probe"
+    }
+   ],
+   "id": "F-01",
+   "verdict": "relocate"
+  },
+  {
+   "file": "src/training.rs",
+   "lines": [
+    1,
+    37
+   ],
+   "class": "history",
+   "n_lines": 37,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 27,
+     "text": "//!   **finish round now** (F4, needs `round_state`) one-shots."
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 11,
+     "text": "//!   ([`crate::profile::TimerHold`]): the legacy `[sec, subsec]` pair"
+    }
+   ],
+   "id": "F-02",
+   "verdict": "keep"
+  },
+  {
+   "file": "src/training.rs",
+   "lines": [
+    702,
+    712
+   ],
+   "class": "history",
+   "n_lines": 11,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 712,
+     "text": "// harmless (the dummy blocks that one instead of punishing)."
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 711,
+     "text": "// the previously documented \"one spurious punish per refill\", and"
+    }
+   ],
+   "id": "F-03",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md"
+  },
+  {
+   "file": "src/training.rs",
+   "lines": [
+    1209,
+    1219
+   ],
+   "class": "dated-log",
+   "n_lines": 11,
+   "fingerprints": [
+    "iso-date",
+    "measurement-log"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "iso-date",
+     "line": 1213,
+     "text": "/// (2026-09-01, port 4030): Block re-held at every frame from press+1 to"
+    },
+    {
+     "fingerprint": "measurement-log",
+     "line": 1213,
+     "text": "/// (2026-09-01, port 4030): Block re-held at every frame from press+1 to"
+    }
+   ],
+   "id": "F-04",
+   "verdict": "relocate"
+  },
+  {
+   "file": "src/shadow_runner.rs",
+   "lines": [
+    2321,
+    2330
+   ],
+   "class": "history",
+   "n_lines": 10,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 2328,
+     "text": "/// to asurabld by other tests in this binary) \u2014 `RunnerAddrs` now owns"
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 2323,
+     "text": "/// the parts irrelevant to this test) \u2014 used to prove [`read_fighter`]"
+    }
+   ],
+   "id": "F-05",
+   "verdict": "keep"
+  },
+  {
+   "file": "src/training.rs",
+   "lines": [
+    1151,
+    1160
+   ],
+   "class": "dated-log",
+   "n_lines": 10,
+   "fingerprints": [
+    "iso-date",
+    "measurement-log"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "iso-date",
+     "line": 1154,
+     "text": "/// (live-observed on MK2 arcade, 2026-08-28). This is"
+    },
+    {
+     "fingerprint": "measurement-log",
+     "line": 1154,
+     "text": "/// (live-observed on MK2 arcade, 2026-08-28). This is"
+    }
+   ],
+   "id": "F-06",
+   "verdict": "relocate"
+  },
+  {
+   "file": "src/record.rs",
+   "lines": [
+    1686,
+    1694
+   ],
+   "class": "history",
+   "n_lines": 9,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 1691,
+     "text": "/// damage delta). This USED to run on mk2's HUD-pair fallback; mk2 now"
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 1691,
+     "text": "/// damage delta). This USED to run on mk2's HUD-pair fallback; mk2 now"
+    }
+   ],
+   "id": "F-07",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md"
+  },
+  {
+   "file": "src/training.rs",
+   "lines": [
+    1198,
+    1206
+   ],
+   "class": "dated-log",
+   "n_lines": 9,
+   "fingerprints": [
+    "iso-date",
+    "measurement-log"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "iso-date",
+     "line": 1201,
+     "text": "/// 2026-09-01, port 4030: release-gap 7 fails at every guard-hold length"
+    },
+    {
+     "fingerprint": "measurement-log",
+     "line": 1200,
+     "text": "/// input-eat OUTLIVES the Block release by ~8 frames (live-measured"
+    }
+   ],
+   "id": "F-08",
+   "verdict": "relocate"
+  },
+  {
+   "file": "src/debug/mod.rs",
+   "lines": [
+    582,
+    589
+   ],
+   "class": "history",
+   "n_lines": 8,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 586,
+     "text": "/// read it) so a silent dummy explains itself instead of looking broken"
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 587,
+     "text": "/// \u2014 an abort is exactly the case that USED to freeze on a stale"
+    }
+   ],
+   "id": "F-09",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md"
+  },
+  {
+   "file": "src/debug/panels/training.rs",
+   "lines": [
+    395,
+    398
+   ],
+   "class": "history",
+   "n_lines": 4,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 398,
+     "text": "/// be a single hardcoded constant; this is that same knob, now a setting."
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 397,
+     "text": "/// macro starts relative to its trigger. `training::PUNISH_DELAY` used to"
+    }
+   ],
+   "id": "F-10",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md"
+  },
+  {
+   "file": "src/training.rs",
+   "lines": [
+    46,
+    49
+   ],
+   "class": "history",
+   "n_lines": 4,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 48,
+     "text": "/// globals are the same pairing). Deriving it from live X instead \u2014 as this"
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 49,
+     "text": "/// used to \u2014 mis-attributes the dummy the moment the fighters cross up."
+    }
+   ],
+   "id": "F-11",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md"
+  },
+  {
+   "file": "src/debug/panels/controls.rs",
+   "lines": [
+    194,
+    195
+   ],
+   "class": "history",
+   "n_lines": 2,
+   "fingerprints": [
+    "contrast",
+    "history-weak"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "contrast",
+     "line": 194,
+     "text": "/// Controls that previously emitted this action's chord and were removed"
+    },
+    {
+     "fingerprint": "history-weak",
+     "line": 194,
+     "text": "/// Controls that previously emitted this action's chord and were removed"
+    }
+   ],
+   "id": "F-12",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md"
+  },
+  {
+   "file": "src/profile.rs",
+   "lines": [
+    411,
+    417
+   ],
+   "class": "dated-log",
+   "n_lines": 7,
+   "fingerprints": [
+    "iso-date"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "iso-date",
+     "line": 417,
+     "text": "/// 2026-09-02)."
+    }
+   ],
+   "id": "F-13",
+   "verdict": "keep"
+  },
+  {
+   "file": "src/record.rs",
+   "lines": [
+    1088,
+    1090
+   ],
+   "class": "history",
+   "n_lines": 3,
+   "fingerprints": [
+    "version-delta"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "version-delta",
+     "line": 1089,
+     "text": "// 0, so `health_in_range` fails and the gate must be CLOSED (v1's gate"
+    }
+   ],
+   "id": "F-14",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md"
+  },
+  {
+   "file": "src/input_config.rs",
+   "lines": [
+    446,
+    446
+   ],
+   "class": "history",
+   "n_lines": 1,
+   "fingerprints": [
+    "version-delta"
+   ],
+   "evidence": [
+    {
+     "fingerprint": "version-delta",
+     "line": 446,
+     "text": "// v1 files wrote keyboard values as bare buttons; v2 is chord lists."
+    }
+   ],
+   "id": "F-15",
+   "verdict": "relocate",
+   "dest": "CHANGELOG.md"
+  }
+ ],
+ "ratified": "2026-09-09"
+}
