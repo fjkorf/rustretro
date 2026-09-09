@@ -1148,16 +1148,7 @@ fn tick_with(ds: &mut DebugState, frame: u64, p: &GameProfile) {
     }
 }
 
-/// Frames between the contact trigger and the macro's first input: the
-/// dummy keeps guarding through hit-freeze + its own blockstun, then
-/// punishes — inputs played into the freeze are eaten by the game
-/// (live-observed on MK2 arcade, 2026-08-28). This is
-/// [`crate::debug::ReversalTiming`]'s DEFAULT (`Explicit(PUNISH_DELAY)`) —
-/// unchanged behaviour on a fresh install: 26 ≈ hit-freeze (~10) + jab
-/// blockstun (~14) + slack — a chord played at +16 was still eaten while a
-/// motion whose chord lands at +21 came out — live-calibrated on MK2 arcade
-/// 2026-08-28. See [`PUNISH_DELAY_FAST`]/[`PUNISH_DELAY_LATE`] for
-/// `ReversalTiming::Fast`/`Late`.
+// (moved to DEBUGGING.md — loom F-06)
 pub const PUNISH_DELAY: u64 = 26;
 
 /// `ReversalTiming::Fast`'s floor: one frame below this (+16 — see

@@ -214,7 +214,17 @@
     }
    ],
    "id": "F-06",
-   "verdict": "relocate"
+   "verdict": "relocate",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "DEBUGGING.md",
+    "pointer": "// (moved to DEBUGGING.md \u2014 loom F-06)",
+    "stripped_text": "Frames between the contact trigger and the macro's first input: the\ndummy keeps guarding through hit-freeze + its own blockstun, then\npunishes \u2014 inputs played into the freeze are eaten by the game\n(live-observed on MK2 arcade, 2026-08-28). This is\n[`crate::debug::ReversalTiming`]'s DEFAULT (`Explicit(PUNISH_DELAY)`) \u2014\nunchanged behaviour on a fresh install: 26 \u2248 hit-freeze (~10) + jab\nblockstun (~14) + slack \u2014 a chord played at +16 was still eaten while a\nmotion whose chord lands at +21 came out \u2014 live-calibrated on MK2 arcade\n2026-08-28. See [`PUNISH_DELAY_FAST`]/[`PUNISH_DELAY_LATE`] for\n`ReversalTiming::Fast`/`Late`.",
+    "moved_sha256": "3eb8cff8e862",
+    "src_lines_before": 2528,
+    "src_lines_after": 2519
+   },
+   "change_id": "nwlukyuy"
   },
   {
    "file": "src/record.rs",
