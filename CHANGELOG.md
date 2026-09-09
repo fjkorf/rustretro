@@ -44,3 +44,14 @@ there) — see the mk2-specific test below.
 A bare DebugState has no regions, so all reads return 0: healths are
 0, so `health_in_range` fails and the gate must be CLOSED (v1's gate
 was true here — the broken-permissive bug the v2 rewrite fixed).
+
+## Relocated from src/debug/mod.rs:582-589 (loom lint F-09, ratified 2026-09-09)
+
+Human-readable BlockPunish phase, refreshed every frame the mode
+runs: "guarding — armed" / "cooling (Nf)" / "punishing: slide" /
+"aborted — <reason>" / "unavailable …". The ONE place this is
+computed (panel, Lua `training.punish_state()`, and any overlay all
+read it) so a silent dummy explains itself instead of looking broken
+— an abort is exactly the case that USED to freeze on a stale
+"punishing: slide" while the gate was closed (misdiagnosed live);
+this field must say "aborted" instead (MACRO_ACTIONS §10.1).

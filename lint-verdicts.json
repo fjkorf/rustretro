@@ -337,7 +337,17 @@
    ],
    "id": "F-09",
    "verdict": "relocate",
-   "dest": "CHANGELOG.md"
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-09)",
+    "stripped_text": "Human-readable BlockPunish phase, refreshed every frame the mode\nruns: \"guarding \u2014 armed\" / \"cooling (Nf)\" / \"punishing: slide\" /\n\"aborted \u2014 <reason>\" / \"unavailable \u2026\". The ONE place this is\ncomputed (panel, Lua `training.punish_state()`, and any overlay all\nread it) so a silent dummy explains itself instead of looking broken\n\u2014 an abort is exactly the case that USED to freeze on a stale\n\"punishing: slide\" while the gate was closed (misdiagnosed live);\nthis field must say \"aborted\" instead (MACRO_ACTIONS \u00a710.1).",
+    "moved_sha256": "4ecc27f703a8",
+    "src_lines_before": 2227,
+    "src_lines_after": 2220
+   },
+   "change_id": "psvpvlpt"
   },
   {
    "file": "src/debug/panels/training.rs",
