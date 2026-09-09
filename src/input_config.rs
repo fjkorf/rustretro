@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn keymap_v1_single_button_values_still_parse() {
-        // v1 files wrote keyboard values as bare buttons; v2 is chord lists.
+        // (moved to CHANGELOG.md — loom F-15)
         let cfg: InputConfig = serde_json::from_str(
             r#"{"ports":[{"keyboard":{"KeyZ":"B","KeyX":["A","Y"]},"gamepad":{"South":["B"]}}]}"#,
         )

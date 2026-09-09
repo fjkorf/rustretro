@@ -536,7 +536,17 @@
    ],
    "id": "F-15",
    "verdict": "relocate",
-   "dest": "CHANGELOG.md"
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-15)",
+    "stripped_text": "v1 files wrote keyboard values as bare buttons; v2 is chord lists.",
+    "moved_sha256": "1624e4de4e27",
+    "src_lines_before": 624,
+    "src_lines_after": 624
+   },
+   "change_id": "xrznxsrv"
   }
  ],
  "ratified": "2026-09-09"

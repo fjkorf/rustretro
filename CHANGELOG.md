@@ -67,3 +67,7 @@ be a single hardcoded constant; this is that same knob, now a setting.
 
 Controls that previously emitted this action's chord and were removed
 (the replace-binding semantics). Does not include `control` itself.
+
+## Relocated from src/input_config.rs:446-446 (loom lint F-15, ratified 2026-09-09)
+
+v1 files wrote keyboard values as bare buttons; v2 is chord lists.
