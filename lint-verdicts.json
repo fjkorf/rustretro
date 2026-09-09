@@ -269,7 +269,17 @@
     }
    ],
    "id": "F-08",
-   "verdict": "relocate"
+   "verdict": "relocate",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "DEBUGGING.md",
+    "pointer": "// (moved to DEBUGGING.md \u2014 loom F-08)",
+    "stripped_text": "Neutral frames between releasing the guard and the macro's first press.\nThis is the load-bearing constant of the whole punish: MK2's block-stance\ninput-eat OUTLIVES the Block release by ~8 frames (live-measured\n2026-09-01, port 4030: release-gap 7 fails at every guard-hold length\ntried, 8 succeeds at all of them; ~10 needed after very short holds), so\nthe old value of 4 pressed inside the latch and the punish was EATEN on\n10/10 measured cycles \u2014 the user-reported \"the punish never happens\".\n12 = the measured boundary's worst case (10) plus margin. Evidence:\nw1-blockcancel-evidence.md (wave-1 probe; to be merged into mk2.md).",
+    "moved_sha256": "711c52150955",
+    "src_lines_before": 2536,
+    "src_lines_after": 2528
+   },
+   "change_id": "wrplsqsw"
   },
   {
    "file": "src/debug/mod.rs",

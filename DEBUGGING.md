@@ -177,3 +177,15 @@ the PRE-press gap ([`PUNISH_RELEASE`], see its doc). What remains for
 the hold-off is only the input-fold edge (a chord needs ≥2 clean frames,
 MACRO_ACTIONS §11, and a kick chorded with a same-frame Block fold is
 eaten), so 2 frames of neutral after the macro's last press is enough.
+
+## Relocated from src/training.rs:1198-1206 (loom lint F-08, ratified 2026-09-09)
+
+Neutral frames between releasing the guard and the macro's first press.
+This is the load-bearing constant of the whole punish: MK2's block-stance
+input-eat OUTLIVES the Block release by ~8 frames (live-measured
+2026-09-01, port 4030: release-gap 7 fails at every guard-hold length
+tried, 8 succeeds at all of them; ~10 needed after very short holds), so
+the old value of 4 pressed inside the latch and the punish was EATEN on
+10/10 measured cycles — the user-reported "the punish never happens".
+12 = the measured boundary's worst case (10) plus margin. Evidence:
+w1-blockcancel-evidence.md (wave-1 probe; to be merged into mk2.md).
