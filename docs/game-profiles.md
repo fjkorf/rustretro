@@ -35,7 +35,9 @@ architecture for game #2 (sf2ce) and beyond (MK2 arcade/Genesis).
   by signature because its base moves every fight (mk2.md "The round timer,
   closed").
 
-Loaded once at startup: `--game library/<game>` (default `library/asurabld`)
+Loaded once at startup: `--game library/<game>` (omitting it still defaults
+to `library/asurabld` but prints a loud warning banner — the silent default
+once pointed an arcade profile at a NES core; pass `--game` explicitly)
 → `profile::init(dir)`; consumers call `profile::current()`. The Python side
 (`shadow_train.profile`) reads the SAME files. Model `meta.json` carries
 `family` + `port`; deploy warns on port mismatch (cross-port shadows are a

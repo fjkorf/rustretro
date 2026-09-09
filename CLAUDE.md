@@ -35,6 +35,7 @@ for iteration. The dev binary is `target/release-dev/rustretro`.
 ./target/release-dev/rustretro \
   --core "$HOME/Library/Application Support/RetroArch/cores/fbalpha2012_libretro.dylib" \
   --rom ~/games/roms/asurabld.zip \
+  --game library/asurabld \
   --bus-map library/asurabld/asurabld.busmap.json \
   --training --script library/asurabld/training.lua \
   --mcp --mcp-port 4025 \

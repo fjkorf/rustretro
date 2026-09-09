@@ -43,8 +43,11 @@ struct Args {
     /// (a directory with optional `/port_name` suffix for multi-port games).
     /// Each path loads family.json from its directory plus the matching port
     /// profile (see docs/game-profiles.md). Loaded once at startup before
-    /// anything else touches game-specific memory knowledge.
-    #[arg(long, value_name = "PATH", default_value = "library/asurabld")] game: String,
+    /// anything else touches game-specific memory knowledge. Omitting it
+    /// falls back to `library/asurabld` with a loud warning (the default
+    /// applied silently once cost a session probing a NES core through an
+    /// arcade profile).
+    #[arg(long, value_name = "PATH")] game: Option<String>,
     #[arg(long)] fullscreen: bool,
     #[arg(long, value_name = "PATH", default_value = ".")] save_dir: PathBuf,
     #[arg(long, value_name = "PATH", default_value = ".")] system_dir: PathBuf,
@@ -106,6 +109,26 @@ struct Args {
     #[arg(long, value_name = "PATH_OR_SLOT")] load_state: Option<String>,
 }
 
+const DEFAULT_GAME: &str = "library/asurabld";
+
+/// Resolve `--game` into the profile directory to load, plus an optional
+/// warning banner when the caller relied on the default instead of naming a
+/// profile explicitly. Pure/testable: no I/O, no process state.
+fn resolve_game_arg(game: Option<&str>) -> (PathBuf, Option<String>) {
+    match game {
+        Some(g) => (PathBuf::from(g), None),
+        None => (
+            PathBuf::from(DEFAULT_GAME),
+            Some(format!(
+                "no --game given — defaulting to '{DEFAULT_GAME}'. If this core/ROM \
+                 is not asurabld, every address, gate, and CPU-register capture from \
+                 here on reads the WRONG game's profile. Pass --game explicitly to \
+                 silence this warning."
+            )),
+        ),
+    }
+}
+
 /// Parse the --load-state argument: a bare 1-9 selects a slot; anything else
 /// is an explicit state-file path.
 fn parse_load_state(spec: &str) -> debug::StateOp {
@@ -161,7 +184,12 @@ fn main() -> Result<()> {
     // game-specific memory knowledge — record/training/frontend all resolve
     // addresses via `profile::current()` from this point on. A malformed or
     // missing profile is a hard startup error, same posture as --shadow.
-    let game_dir = PathBuf::from(&args.game);
+    let (game_dir, game_default_warning) = resolve_game_arg(args.game.as_deref());
+    if let Some(w) = &game_default_warning {
+        eprintln!("############################################################");
+        eprintln!("[game] WARNING: {w}");
+        eprintln!("############################################################");
+    }
     profile::init(&game_dir).map_err(|e| {
         anyhow::anyhow!("--game {}: failed to load game profile: {e}", game_dir.display())
     })?;
@@ -1146,6 +1174,26 @@ fn show_tutorial_pages(mut ctx: EguiContexts, mut tutorials: ResMut<TutorialPage
 
 
 // ─── Window title ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod resolve_game_arg_tests {
+    use super::{resolve_game_arg, DEFAULT_GAME};
+    use std::path::PathBuf;
+
+    #[test]
+    fn explicit_game_has_no_warning() {
+        let (dir, warn) = resolve_game_arg(Some("library/sf2ce"));
+        assert_eq!(dir, PathBuf::from("library/sf2ce"));
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn missing_game_defaults_and_warns() {
+        let (dir, warn) = resolve_game_arg(None);
+        assert_eq!(dir, PathBuf::from(DEFAULT_GAME));
+        assert!(warn.is_some());
+    }
+}
 
 #[cfg(test)]
 mod load_state_arg_tests {

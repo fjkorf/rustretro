@@ -25,6 +25,13 @@ pub struct Frontend {
     /// Some(false) = probed and absent (stop retrying — and stop re-running
     /// dlsym probes every frame), Some(true) = live.
     bus_bridge_ok: Option<bool>,
+    /// Whether this core actually backs the profile's declared `memory.cpu`
+    /// debug API: None = not yet probed (also left None on a lock-contended
+    /// first frame, so it retries), Some(false) = probed and the core exposes
+    /// no Sek/Zet symbols — stop retrying, same discipline as `bus_bridge_ok`.
+    /// (The tcsurfdesign bring-up found the old code re-attempting 18 FFI
+    /// register reads every frame forever on a NES core.)
+    cpu_capture_ok: Option<bool>,
     /// Optional per-frame trace recorder (`--record`) for the shadow project.
     recorder: Option<crate::record::FrameRecorder>,
     /// Optional in-app shadow bot (`--shadow`): drives controller port 1 from
@@ -128,6 +135,7 @@ impl Frontend {
             did_memory_fallback: false,
             busmap_path: busmap_path.clone(),
             bus_bridge_ok: None,
+            cpu_capture_ok: None,
             recorder: None,
             shadow: None,
             shadow_info_dirty: false,
@@ -1126,11 +1134,20 @@ impl Frontend {
     }
 
     /// Capture M68K and Z80 CPU state from the core (fbalpha2012-specific).
-    fn capture_cpu_state(&self) {
+    fn capture_cpu_state(&mut self) {
         // The Sek debug API exists in cores (FBNeo) for EVERY game, but only
         // a 68k driver initializes its context — calling it under e.g. a
         // TMS34010 driver segfaults. Gate on the profile's declared CPU.
+        // (A profile that sets a non-68k cpu — e.g. tcsurfdesign's "6502" —
+        // never reaches the probe below; this gate and the probe cache are
+        // complementary, not redundant: the cache also covers the no---game
+        // default-profile case where cpu reads "m68k" against a non-FBNeo core.)
         if crate::profile::current().port.memory.cpu != "m68k" {
+            return;
+        }
+        // Probed once and the core has no Sek/Zet symbols: stop retrying
+        // (18 dlsym+FFI attempts per frame), same discipline as bus_bridge_ok.
+        if self.cpu_capture_ok == Some(false) {
             return;
         }
         if let Ok(mut ds) = self.debug_state.try_lock() {
@@ -1153,11 +1170,7 @@ impl Frontend {
                         ds.m68k_d_regs[i as usize] = val;
                         any_success = true;
                     }
-                    Err(e) => {
-                        if i == 0 && self.frame_count % 300 == 0 {
-                            eprintln!("[CPU] M68K D{} read failed: {}", i, e);
-                        }
-                    }
+                    Err(_) => {}
                 }
             }
             
@@ -1173,11 +1186,7 @@ impl Frontend {
                         ds.m68k_a_regs[i as usize] = val;
                         any_success = true;
                     }
-                    Err(e) => {
-                        if i == 0 && self.frame_count % 300 == 0 {
-                            eprintln!("[CPU] M68K A{} read failed: {}", i, e);
-                        }
-                    }
+                    Err(_) => {}
                 }
             }
             
@@ -1188,22 +1197,14 @@ impl Frontend {
                     *ds.pc_heatmap.entry(pc).or_insert(0) += 1;
                     any_success = true;
                 }
-                Err(e) => {
-                    if self.frame_count % 300 == 0 {
-                        eprintln!("[CPU] M68K PC read failed: {}", e);
-                    }
-                }
+                Err(_) => {}
             }
             match self.core.get_m68k_register(SekRegister::SR) {
                 Ok(sr) => {
                     ds.m68k_sr = sr;
                     any_success = true;
                 }
-                Err(e) => {
-                    if self.frame_count % 300 == 0 {
-                        eprintln!("[CPU] M68K SR read failed: {}", e);
-                    }
-                }
+                Err(_) => {}
             }
 
             // Try to read Z80 registers (need to be careful about which CPU)
@@ -1212,11 +1213,7 @@ impl Frontend {
                     ds.z80_pc = (pc & 0xFFFF) as u16;
                     any_success = true;
                 }
-                Err(e) => {
-                    if self.frame_count % 300 == 0 {
-                        eprintln!("[CPU] Z80 PC read failed: {}", e);
-                    }
-                }
+                Err(_) => {}
             }
             match self.core.get_z80_bc(0) {
                 Ok(bc) => {
@@ -1333,7 +1330,19 @@ impl Frontend {
             if self.frame_count % 300 == 0 && any_success {
                 eprintln!("[CPU] ✓ CPU state captured (M68K PC=${:06X})", ds.m68k_pc);
             }
+            let (next, warn_once) = cpu_capture_transition(self.cpu_capture_ok, any_success);
+            self.cpu_capture_ok = next;
+            if warn_once {
+                eprintln!(
+                    "[CPU] profile '{}' declares memory.cpu==\"m68k\" but this core exposes \
+                     no Sek/Zet debug symbols — CPU register capture disabled for this \
+                     session (check --game matches the loaded core/ROM)",
+                    crate::profile::current().port.port
+                );
+            }
         } else if self.frame_count % 300 == 0 {
+            // Lock contended: no probe result recorded — cpu_capture_ok stays
+            // as it was (None retries next frame; a decided value is kept).
             eprintln!("[CPU] Failed to acquire debug_state lock");
         }
     }
@@ -2175,6 +2184,17 @@ pub struct InputsLive {
 /// holding the lock `run_frame` will next acquire) is already
 /// happens-before the very next `run_frame` call's pause check, by plain
 /// single-thread program order. No cross-thread visibility race to close.
+/// Decide the next cached `cpu_capture_ok` state and whether the one-shot
+/// "core has no CPU debug API" diagnostic should print, given the previous
+/// cached value and whether this attempt read at least one register.
+/// Pure/FFI-free — testable without a loaded core.
+fn cpu_capture_transition(prev: Option<bool>, any_success: bool) -> (Option<bool>, bool) {
+    match prev {
+        Some(_) => (prev, false),
+        None => (Some(any_success), !any_success),
+    }
+}
+
 fn state_op_forces_pause(pause_after: bool, is_load: bool, succeeded: bool) -> bool {
     pause_after && is_load && succeeded
 }
@@ -2592,6 +2612,27 @@ mod state_tests {
             ds.pending_state_op.take(),
             Some(StateOp::Load(PathBuf::from("/tmp/x.state")))
         );
+    }
+}
+
+#[cfg(test)]
+mod cpu_capture_tests {
+    use super::cpu_capture_transition;
+
+    #[test]
+    fn first_success_locks_in_ok_without_warning() {
+        assert_eq!(cpu_capture_transition(None, true), (Some(true), false));
+    }
+
+    #[test]
+    fn first_failure_locks_in_unavailable_and_warns_once() {
+        assert_eq!(cpu_capture_transition(None, false), (Some(false), true));
+    }
+
+    #[test]
+    fn already_decided_never_warns_again() {
+        assert_eq!(cpu_capture_transition(Some(false), false), (Some(false), false));
+        assert_eq!(cpu_capture_transition(Some(true), false), (Some(true), false));
     }
 }
 
