@@ -38,3 +38,9 @@ damage delta). This USED to run on mk2's HUD-pair fallback; mk2 now
 ships `contact_signal` field=health direction=decrease, whose every
 event carries damage by construction (blocked contact always chips
 there) — see the mk2-specific test below.
+
+## Relocated from src/record.rs:1088-1090 (loom lint F-14, ratified 2026-09-09)
+
+A bare DebugState has no regions, so all reads return 0: healths are
+0, so `health_in_range` fails and the gate must be CLOSED (v1's gate
+was true here — the broken-permissive bug the v2 rewrite fixed).

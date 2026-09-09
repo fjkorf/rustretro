@@ -1085,9 +1085,7 @@ mod tests {
     #[test]
     fn recorder_writes_v3_jsonl_and_gates_closed_without_state() {
         let p = crate::profile::init_for_tests();
-        // A bare DebugState has no regions, so all reads return 0: healths are
-        // 0, so `health_in_range` fails and the gate must be CLOSED (v1's gate
-        // was true here — the broken-permissive bug the v2 rewrite fixed).
+        // (moved to CHANGELOG.md — loom F-14)
         let ds = DebugState::new();
         let path = tmp("shadow_rec_v3");
         {

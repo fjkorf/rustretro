@@ -474,7 +474,17 @@
    ],
    "id": "F-14",
    "verdict": "relocate",
-   "dest": "CHANGELOG.md"
+   "dest": "CHANGELOG.md",
+   "applied": {
+    "date": "2026-09-09",
+    "dest": "CHANGELOG.md",
+    "pointer": "// (moved to CHANGELOG.md \u2014 loom F-14)",
+    "stripped_text": "A bare DebugState has no regions, so all reads return 0: healths are\n0, so `health_in_range` fails and the gate must be CLOSED (v1's gate\nwas true here \u2014 the broken-permissive bug the v2 rewrite fixed).",
+    "moved_sha256": "012491b995a2",
+    "src_lines_before": 1864,
+    "src_lines_after": 1862
+   },
+   "change_id": "zszquoon"
   },
   {
    "file": "src/input_config.rs",
