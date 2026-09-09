@@ -421,7 +421,7 @@ pub const BYTES_PER_4BPP_TILE: usize = 32;
 /// max=white), so structure is visible WITHOUT knowing the real palette. With
 /// `levels == 4` (2bpp) the ramp is 0/85/170/255; with 16 (4bpp) it is the 16
 /// evenly-spaced steps. Returned as an opaque RGBA quad.
-fn gray_ramp_rgba(index: u8, levels: u8) -> [u8; 4] {
+pub(crate) fn gray_ramp_rgba(index: u8, levels: u8) -> [u8; 4] {
     let levels = levels.max(2);
     let max = (levels - 1) as u32;
     let v = ((index.min(levels - 1) as u32) * 255 / max) as u8;
@@ -453,6 +453,27 @@ pub fn decode_2bpp_planar_indices(bytes: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Encode one row of 8 palette indices (0..=3) back into the two 2bpp planar
+/// bitplane bytes `(plane0, plane1)` — the inverse of the per-row bit-math in
+/// [`decode_2bpp_planar_indices`]. Pixel `x`'s bit lives at `(7 - x)`: the low
+/// bit of the index goes into `plane0`, the high bit into `plane1`. Only the
+/// low 2 bits of each index are consulted (matching how a 2bpp tile has no
+/// room for more).
+///
+/// PURE and unit-tested (round-trips through the decoder). Lives here, next to
+/// the decoder, as the single place that knows the CHR 2bpp bit layout — the
+/// CHR editor debug panel calls this rather than re-deriving the bit math.
+pub fn encode_2bpp_planar_row(indices: &[u8; 8]) -> (u8, u8) {
+    let mut plane0 = 0u8;
+    let mut plane1 = 0u8;
+    for (x, &idx) in indices.iter().enumerate() {
+        let bit = 7 - x;
+        plane0 |= (idx & 1) << bit;
+        plane1 |= ((idx >> 1) & 1) << bit;
+    }
+    (plane0, plane1)
 }
 
 /// Decode 4bpp PLANAR tiles (Genesis VDP layout) into palette indices (0..=15),
@@ -1251,6 +1272,31 @@ mod tests {
         assert_eq!(&idx[8..16], &[8, 8, 8, 8, 8, 8, 8, 8]); // row1 → 8
         assert_eq!(&idx[16..24], &[15, 15, 15, 15, 15, 15, 15, 15]); // row2 → 15
         assert_eq!(&idx[24..32], &[1, 0, 0, 0, 0, 0, 0, 0]); // row3 → x0=1
+    }
+
+    #[test]
+    fn encode_2bpp_planar_row_round_trips_through_decode() {
+        // Representative set: all four indices in one row, plus every
+        // all-same-index row, plus the hand-picked rows from the tile above.
+        let cases: &[[u8; 8]] = &[
+            [0, 1, 2, 3, 0, 1, 2, 3],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [1, 1, 1, 1, 1, 1, 1, 1],
+            [2, 2, 2, 2, 2, 2, 2, 2],
+            [3, 3, 3, 3, 3, 3, 3, 3],
+            [1, 0, 0, 0, 0, 0, 0, 1],
+            [3, 1, 3, 1, 3, 1, 3, 1],
+        ];
+        for row in cases {
+            let (p0, p1) = encode_2bpp_planar_row(row);
+            // Decode a synthetic one-row-tall tile to reuse the real decoder:
+            // put this row at row 0, zero elsewhere.
+            let mut tile = [0u8; 16];
+            tile[0] = p0;
+            tile[8] = p1;
+            let decoded = decode_2bpp_planar_indices(&tile);
+            assert_eq!(&decoded[0..8], row, "round-trip failed for row {row:?}");
+        }
     }
 
     #[test]

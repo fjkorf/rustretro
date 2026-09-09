@@ -1,3 +1,4 @@
+pub mod chr_editor;
 pub mod frame_inspector;
 pub mod hex_dump;
 pub mod input_monitor;

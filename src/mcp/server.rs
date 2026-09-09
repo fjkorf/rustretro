@@ -34,7 +34,7 @@ use rmcp::RoleServer;
 use serde_json::{json, Map, Value};
 
 use crate::debug::{SharedDebugState, StateOp, Watch, WatchFormat};
-use crate::mcp::ines::parse_ines;
+use crate::mcp::ines::{chr_span, parse_ines};
 use crate::mcp::snapshot::{
     decode_tiles_to_rgba, memory_capability, memory_map, parse_hex_bytes, read_region_bytes,
     rgba_to_png, scan_buffer, search_bytes, top_heatmap, AiSnapshot, TileFormat,
@@ -723,17 +723,16 @@ impl RetroMcpServer {
                 "ROMFILE:PRG",
             ),
             "chr" => {
-                if info.chr_is_ram {
-                    return Err("this cart uses CHR-RAM: there is no CHR-ROM in the file to \
-                                decode (the graphics may live compressed in PRG-ROM, or only \
-                                appear in live CHR-RAM via the core)"
-                        .to_string());
-                }
-                (
-                    info.chr_offset,
-                    info.chr_offset + info.chr_rom_size,
-                    "ROMFILE:CHR",
-                )
+                // Single source of truth for the CHR span: chr_span (src/mcp/ines.rs)
+                // is also what the CHR editor debug panel calls, so both readers of
+                // this file agree on the iNES CHR-offset math.
+                let (start, end) = chr_span(&bytes).map_err(|e| {
+                    format!(
+                        "{e} (the graphics may live compressed in PRG-ROM, or only \
+                         appear in live CHR-RAM via the core)"
+                    )
+                })?;
+                (start, end, "ROMFILE:CHR")
             }
             other => {
                 return Err(format!(
