@@ -46,16 +46,44 @@ select screen.
 |---|---|---|
 | boots + runs 60fps | ✓ | ✓ |
 | memory map | none — `get_memory_data` fallback: one region, "System RAM (fallback)" 2KB @0x0 | `SET_MEMORY_MAPS`: 10×1KB CPU-RAM pages (unnamed → classified "Unmapped", `has_system_ram:false` — cosmetic; reads by address work) + **PPUREG/NTARAM/PALRAM/OAM** classified VRAM |
-| PPU regions readable? | n/a | **NO — "declared but not backed by readable memory (virtual descriptor)"**: the frontend does not capture host pointers for address-space-selected descriptors. Frontend enhancement would unlock live OAM/nametable/palette. |
+| PPU regions readable? | n/a | **YES since the H1 fix (PR #49, commit e355711, 2026-09-09).** Was NO — the frontend's `host_ptr_for_addr` stripped the `disconnect` mask (0x80000000 PPU-space bit) from the address but not the region start, underflowing the offset so OAM/NTARAM/PALRAM/PPUREG read as "virtual descriptors". Fixed to mask both sides; all four now read live (proven: PALRAM 32 valid bytes, NTARAM changes 988/1024 title→gameplay, OAM shows the Big Wave surfer's 5-region metasprite). |
 | RAM[0..32] content | `00 00 24 00 00 00 04 00 …` | identical — same reads by address |
 | save/load round trip | ✓ (armed load; RAM within 19 bytes of save point on a running instance — timers re-run, exact revert not observable without pausing) | ✓ (within 7 bytes, same method) |
 | core name string (live boot line) | `Nestopia` | `FCEUmm` |
 
 **Decision:** `provenance_core: "fceumm"` — everything nestopia does works
-identically, plus from-source trust and the declared PPU regions that one
-frontend fix unlocks. nestopia remains a verified fallback.
-`requires.save_states: true` (both verified); `requires.memory_regions`
-stays `false` until PPU regions actually read.
+identically, plus from-source trust and the now-live PPU regions (H1).
+nestopia remains a verified fallback. `requires.save_states: true`.
+
+## Character rendering — MODE-DEPENDENT (live-probed 2026-09-09)
+
+How a character becomes on-screen pixels differs by mode; this is load-bearing
+for any sprite-swap or character-art work:
+
+- **Street Skate (mode 0): the skater is drawn in the BACKGROUND nametable,
+  NOT as sprites.** Zero player OAM sprites active, grounded AND airborne,
+  confirmed in both live PPU OAM and the $0200 CPU shadow (same read path shows
+  5 sprites in Big Wave, so it is not a tooling gap). The skater is
+  screen-locked (auto-scroller); animation is nametable-tile rewriting. There
+  is NO player metasprite / player CHR-sprite tile set to capture or swap here.
+- **Big Wave (mode 1): the surfer IS an OAM metasprite.** Base pose = a 2×2
+  block of 8×8 sprites (OAM slots 60-63, tiles 0x08/0x09 over 0x18/0x19,
+  palette 3, PPUCTRL 0x90 → 8×8 sprites, sprite pattern table $0000). Holding a
+  direction GROWS the metasprite to ~19 sprites (adds tiles 0x53-0x55,
+  0x5d-0x5f, 0x63-0x65, 0x6d-0x6f, 0x78, 0x7d-0x7f) for the active/turn pose.
+  Animation = swapping which CHR tiles the OAM entries point at. THIS is the
+  swappable target. (Wood & Water uses the surfers too — likely same mechanism,
+  TO-VERIFY.)
+- **Collateral risk for a swap:** the surfer's base tiles are LOW indices
+  (0x08/0x09/0x18/0x19) — the range where font/HUD/shared graphics usually
+  live, so `tiles_shared_with_nonplayer` is likely large, not a footnote. A
+  tile-sharing scan (which non-player OAM slots + nametable cells reference
+  these tiles) is a prerequisite before any swap.
+- **CNROM active bank is a RUNTIME fact, not in the file** (mapper latch is
+  write-only; fceumm doesn't expose it). The CHR-editor / nametable / sprite
+  panels handle this with a "pick the bank that matches the screen" selector.
+  The session-1 "$0214-$026B player OAM shadow" claim is mode-specific (a
+  sprite-based mode), not a universal.
 
 ## Regions
 
@@ -140,11 +168,13 @@ older plans; the VRAM descriptors remain unreadable).
 
 ### TO-VERIFY (blocked observations, not guesses)
 
-- **Character-id byte / roster count** — the A-vs-B-entry RAM diff is confounded
-  by auto-scroll phase (states not frame-aligned), so no clean char-id isolated.
-  Operator's "4 characters" neither confirmed nor refuted; measured structure is
-  2 selectable characters per mode via A/B. Needs a frame-aligned capture (same
-  scroll phase) or the char-id read at the charsel screen before entry.
+- ~~**Character-id byte / roster count**~~ — **RESOLVED (session #3).** Frame-
+  aligned (gate-open anchored) capture isolated the selection latch **$0704**
+  (mirror $0709): 0=A-pedestal char, 1=B-pedestal char. Roster = **4 distinct
+  characters (2 skaters + 2 surfers)** reused across the 3 modes (Street=skaters,
+  BigWave=surfers, Wood=all 4), proven by $0330–$034F HUD-block byte-identity
+  across modes — confirms the operator's "4 characters." See the session-#3
+  Roster entry.
 - **Round timer** — ZP $0037/$0039/$003E/$0044 all decrement over ~2.5s of play
   (candidates for the min:sec:tenths HUD "TIME"); not individually mapped.
   **RESOLVED (session #2):** the HUD "TIME" is stored as separate display
@@ -158,6 +188,14 @@ older plans; the VRAM descriptors remain unreadable).
   test was possible. LIFE hearts stayed 4; poke-tests of every stably-4 byte
   and of 0x0F-bitmask candidates left the hearts display unchanged. Neither
   isolated.
+  **PARTIALLY RESOLVED (session #3):** the 000000 was a STREET-mode artifact —
+  score DOES accrue in **Big Wave** via tricks (000040→000100→…). Hi-score is a
+  6-digit-per-byte array at $0380/$0388/$0390 (=010000) but poking it didn't
+  re-render → derived copy; the live current-score byte is still not isolated
+  (candidate +1 event-counter $072E). LIFE: **$0477** is the lives register
+  (=0 at charsel, inits to 4 Street / 3 Big Wave, matches the hearts at stable
+  play; the drawn hearts misreport during recoverable wipeouts). A true
+  death-decrement was not captured. See the session-#3 Score & lives entries.
 - **Pause/high-score/game-over screens** not visited — the $0047 gate is
   validated only against title/menu/charsel/gameplay; an unmapped screen could
   in principle also read $0047≠0.
@@ -167,6 +205,14 @@ older plans; the VRAM descriptors remain unreadable).
   $0047 stays $04, hearts stay 4). Game-over (all lives) and high-score/continue
   screens still NOT reached — no scriptable crash/lose mechanic found. See the
   session-#2 Gate entry for the inverse-cross-check revision this forced.
+  **FURTHER RESOLVED (session #3):** Big Wave rounds END back at the TITLE
+  ($0047=$00,$0058=$02) — no distinct game-over or high-score-entry screen exists
+  on the reachable path. $0047 is multi-valued (0/1/2/3/4/5): 1/2/3/5 are
+  wipeout/transition sub-states WITHIN a gameplay session, so `byte_nonzero
+  $0047` stays correct (OPEN through the wipeout animation, CLOSED at round-end
+  and title/menu). No non-gameplay SCREEN reads $0047≠0. All-lives-lost
+  game-over still not forced (wipeouts all recovered). See the session-#3 phase-
+  register table.
 
 ### Gate-condition draft (closed vocabulary)
 
@@ -286,3 +332,114 @@ candidates ($0333,$0603) were poke-tested — none changed the on-screen hearts
 ($009F/$00D0/$06A2 re-derived back to 4; the rest held the poke but the hearts
 render was unaffected). Both remain TO-VERIFY; they need a real heart-loss /
 scoring event to anchor a difference-based search.
+
+## Work RAM — RE session #3 (headless, fceumm, port 4028, 2026-09-09)
+
+Third live-RE pass. Scope: char-id/roster (A), score (B), lives (C),
+game-over/gate (D), physics/gravity (E). All navigation was deterministic-
+replay from three char-select save-states (`cs_street`/`cs_bigwave`/`cs_wood`,
+saved by menu-macro from a `menu.state` at the SELECTION screen); there is NO
+MCP `reset`/`power` tool and no Lua reset, so a fresh title requires a process
+relaunch — the branch point is a `save_state` at the menu, not a reset. The
+`load_state`-doesn't-drain-while-paused trap bit once (a "fresh" entry that was
+really stale prior gameplay); every load below is `resume → load_state → verify
+$0047` (charsel=$00 / gameplay=$04) BEFORE acting. Frame-aligned captures anchor
+on the $0047 gate-open transition, which removed the auto-scroll-phase confound
+that blocked session #1's char-id diff.
+
+### Confirmed globals (write-test / difference-based / negative-control)
+
+| name | addr | width | sign | confidence | how confirmed |
+|---|---|---|---|---|---|
+| char_select_latch | $0704 | 1 | enum | confirmed | **0 = A-pedestal char, 1 = B-pedestal char.** Difference-based A-vs-B entry from the same charsel state is deterministic across ALL 3 modes; persists ≥90 frames into live gameplay; NEGATIVE CONTROL: pressing B during live gameplay does NOT flip it (stays at the selection) — so it is the latched selection, not an input echo. |
+| char_select_latch_mirror | $0709 | 1 | enum | confirmed | Exact mirror of $0704 (identical 0/1 in every trial). Use $0704. |
+| lives_count | $0477 | 1 | unsigned | probable | =$00 at char-select; INITIALIZES $00→N at gameplay start (Street N=**4**, Big Wave N=**3**) matching the on-screen LIFE hearts at stable gameplay. Holds constant through RECOVERABLE wipeouts where the DRAWN hearts transiently show one fewer (e.g. $47=2 wipeout frame renders 2 hearts while $0477=3, and recovery restores the 3-heart render) — anchor on $0477, not the display. A true death-decrement was NOT captured (the game recovers from every wipeout reached); decrement-on-death therefore unconfirmed. Prior "stably-4" byte; prior pokes didn't move the drawn hearts because the HUD redraws only on a change event. |
+
+### Phase register — $0047 is multi-valued (extends the gate model)
+
+$0047 is NOT binary. Observed value set:
+
+| $0047 | meaning | $0058 |
+|---|---|---|
+| $00 | non-gameplay: title / SELECTION menu / char-select / **round-end** | $02 (menu/title) or **$00 (round-end frame)** |
+| $04 | active gameplay | $00 |
+| $01/$02/$03/$05 | wipeout / transition sub-states WITHIN a gameplay session ($02 = wiped-out/foam; surfer + HUD still on screen) | $00 |
+
+**Gate verdict:** primary `byte_nonzero $0047` HOLDS — OPEN across active play
+AND the wipeout animation (all still "in a gameplay session"), CLOSED ($00) at
+true round-end and at title/menu/charsel. No non-gameplay SCREEN was found
+reading $0047≠0. Caveat for consumers that treat $47 as strictly 0/4: the
+1/2/3/5 sub-states exist. The round-END frame reads $0047=$00 / $0058=$00, so
+the session-#2 inverse `$0058 < 2` STILL misclassifies it as gameplay — keep
+$0047 as the sole primary; do not trust the $0058 inverse.
+
+### Roster (A) — RESOLVED: 4 characters
+
+**Measured answer: 4 distinct characters = 2 skaters + 2 surfers, reused across
+the 3 modes; the pick is a single A/B bit ($0704).** Layout at char-select:
+- Street Skate (mode $5A=0): TOP pedestals only = 2 skaters (B-skater / A-skater).
+- Big Wave (mode $5A=1): BOTTOM pedestals only = 2 surfers (B-surfer / A-surfer).
+- Wood & Water (mode $5A=2): ALL 4 pedestals (both skaters + both surfers) —
+  you play skate AND surf segments.
+
+Character SHARING proven by byte-identity of frame-aligned gate-open snapshots:
+the skater HUD block **$0330–$034F** is identical `street_a==wood_a` and
+`street_b==wood_b` (skaters shared Street↔Wood) and `street_a != street_b` (the
+A and B skaters are genuinely different); the surfer sprite block **$0245–$0263**
+is identical `bigwave==wood` (surfers shared BigWave↔Wood). So the roster is 4,
+not 6 (modes reuse characters) and not 2 — **confirms the operator's "4
+characters."** (Surfer A vs B are visually distinct on the charsel screen —
+orange vs green creature — but their sprite block did not differ at the gate-open
+frame, so A/B surfer identity rests on $0704 + the charsel render, not a sprite-
+byte diff.)
+
+Menu/flow refinement: SELECTION-menu cursor = **$005A cycling 0..5** via SELECT
+(3 modes × 1P/2P rows); at char-select-entry $005A COLLAPSES to the mode index
+(rows 0/1→0 Street, 2/3→1 BigWave, 4/5→2 Wood). During the ~4 s "GAME START"
+splash $0047 is already $04 but the pad is NOT live and $0703 holds the
+selection button ($80=A / $40=B); it becomes the live pad ($0703 tracks input,
+verified via get_input) only once gameplay proper begins. Snapshots taken at the
+gate-open frame are during the splash — settle past it before reading live input.
+
+### Score (B) — advanced, live byte not isolated
+
+- Score ACCRUES in Big Wave via tricks (000040 → 000100 → … observed, HUD top-
+  left with the surfboard icon). Street score stays **000000** (re-confirmed) —
+  session #1/#2's zero was a Street-mode artifact, not a game-wide fact.
+- **High score** is stored as a 6-digit-per-byte array (one decimal digit per
+  byte, most-significant first); THREE identical copies at **$0380 / $0388 /
+  $0390** each = 010000. WRITE-TEST: poking the $0380 array did NOT change the
+  displayed HI → these are working/derived copies (or the HUD only redraws HI on
+  change), NOT the confirmed render source.
+- Live CURRENT-score byte not cleanly isolated: it is not stored as a digit
+  array next to the hi-score, and toggle-intersect of two trick-bumps left a
+  clean +1 event-counter at **$072E** (increments once per scoring action) as the
+  only tidy candidate — not the displayed 6-digit value itself.
+
+### Game-over / high-score screens (D)
+
+Big Wave rounds END by returning straight to the **TITLE** screen
+($0047=$00, $0058=$02). No distinct game-over or high-score-ENTRY screen was
+reached (dense per-~18-frame capture through the whole end sequence found only:
+active → wipeout sub-states $47=2/3/1 → round-end $47=0 → title). Game-over via
+all-lives-lost still not forced (no irrecoverable death mechanic found; every
+wipeout recovered). Gate classification verified correct at every screen visited
+(see the phase-register table).
+
+### Physics / gravity (E) — one confirmed cell
+
+Street / skater-A jump (hold A from grounded $0428=2), difference-based vs a
+no-input control from the identical `street_play.state` (control $048C is
+FLAT at 160 — pure difference, satisfies the no-absolute-motion law):
+- Apex $048C ≈ **121–122** (rise ≈ **38–39 px** above ground 160).
+- Airtime ≈ **29–30 frames**, arc roughly symmetric.
+- $0428 reads 1 (airborne) through the arc, flips to 2 exactly at landing.
+
+Determinism-repeat (second rig): the arc is reproducible in SHAPE but NOT
+frame-exact — per-frame dY jitters ±1–2 px run-to-run from the same load. This
+matches session #2's "velocity computed-not-stored, no subpixel byte": the drawn
+$048C rounds a fractional position, so a per-frame gravity CONSTANT is not
+extractable at integer precision here. The ballistic ENVELOPE (apex ≈38 px /
+airtime ≈29 f, Street·skater-A) is the confirmed cell; the per-frame constant
+needs the pause→step→let-frame-finish discipline (my resume+poll stepping slips
+sub-frame).

@@ -42,6 +42,8 @@ CONFIG = {
     action_state    = { reader = "u8", label = "ACT" },  -- $40A: 0 idle,1-4 dir,5 B,6 A/air (latches airborne)
     ground_air_flag = { reader = "u8", label = "GND" },  -- $428: 2=grounded 1=airborne
     mode_index      = { reader = "u8", label = "MODE" },
+    char_select_latch = { reader = "u8", label = "CHR" }, -- $704: 0=A char, 1=B char
+    lives_count     = { reader = "u8", label = "LIVES" }, -- $477: true lives (hearts misreport on wipeout)
     engine_clock    = { reader = "u8", label = "CLK" },   -- $04: freezes on pause
     time_sec_tens   = { reader = "u8", label = "T10s" },
     time_sec_ones   = { reader = "u8", label = "T1s" },
@@ -222,9 +224,14 @@ local function draw_mode()
     time_txt = string.format("TIME %d%d.%d", t10, t1, tt)
     time_col = CONFIG.colors.ok
   end
+  -- character (A/B pedestal) and true lives count
+  local ch = read_field("char_select_latch")
+  local ch_txt = ch == nil and "CHR --" or ("CHR " .. (ch == 0 and "A" or "B"))
   draw_panel(L.x, L.y, 58, {
     { text = mode_txt, color = mode_col },
     { text = time_txt, color = time_col },
+    { text = ch_txt, color = ch and CONFIG.colors.ok or CONFIG.colors.dim },
+    line("lives_count"),
   })
 end
 
