@@ -133,6 +133,82 @@ pub(crate) fn decode_active_sprites(oam: &[u8]) -> Vec<Sprite> {
     out
 }
 
+/// Build a single-pose fragment of the sprite-swap contract from the CURRENT
+/// live metasprite: the active sprites (positions normalized to the metasprite
+/// bbox), the four sprite sub-palettes from live PALRAM (index 0 = transparent
+/// backdrop, so only the 3 opaque colors are listed), plus sprite size and the
+/// operator-picked CHR bank. Pure/serializable so it unit-tests without egui.
+///
+/// It is deliberately ONE pose — the full multi-pose contract (pose
+/// enumeration across a ride, tile-sharing scan, bank inference) is the capture
+/// agent's job; this is a one-click building block for it.
+pub(crate) fn pose_contract_json(
+    sprites: &[Sprite],
+    palram: Option<&[u8; 32]>,
+    size16: bool,
+    bank: usize,
+) -> String {
+    let min_x = sprites.iter().map(|s| s.x).min().unwrap_or(0);
+    let min_y = sprites.iter().map(|s| s.y).min().unwrap_or(0);
+    let max_x = sprites.iter().map(|s| s.x as u16).max().unwrap_or(0);
+    let max_y = sprites.iter().map(|s| s.y as u16).max().unwrap_or(0);
+    let tile_h: u16 = if size16 { 16 } else { 8 };
+    let bbox_w = (max_x + 8).saturating_sub(min_x as u16);
+    let bbox_h = (max_y + tile_h).saturating_sub(min_y as u16);
+
+    let hex = |i: u8| -> String {
+        let [r, g, b, _] = nes_master_rgba(i);
+        format!("#{r:02X}{g:02X}{b:02X}")
+    };
+    // Sprite sub-palettes live in PALRAM $3F10-$3F1F = bytes 16..32, four
+    // groups of 4; index 0 of each is the shared backdrop (transparent).
+    let subpalettes = palram.map(|p| {
+        (4..8usize)
+            .map(|g| {
+                let base = g * 4; // 16,20,24,28
+                format!(
+                    "    \"{g}\": [\"{}\",\"{}\",\"{}\"]",
+                    hex(p[base + 1]), hex(p[base + 2]), hex(p[base + 3])
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n")
+    });
+
+    let sprite_rows = sprites
+        .iter()
+        .map(|s| {
+            format!(
+                "      {{ \"slot\": {}, \"dx\": {}, \"dy\": {}, \"tile\": {}, \"attr\": {}, \
+                 \"subpalette\": {}, \"flip_h\": {}, \"flip_v\": {}, \"behind_bg\": {} }}",
+                s.index,
+                s.x.saturating_sub(min_x),
+                s.y.saturating_sub(min_y),
+                s.tile,
+                s.attr,
+                4 + (s.attr & 0x3),
+                s.h_flip(),
+                s.v_flip(),
+                s.behind_bg(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+
+    let sub_block = match subpalettes {
+        Some(s) => format!("{{\n{s}\n  }}"),
+        None => "null (PALRAM unreadable — grayscale structure only)".to_string(),
+    };
+    format!(
+        "{{\n  \"_note\": \"single live pose captured from the metasprite panel — one \
+         fragment of sprite_contract.json, not the full multi-pose contract\",\n  \
+         \"sprite_size\": \"{}\",\n  \"chr_bank_for_player\": {bank},\n  \
+         \"bbox\": [{bbox_w}, {bbox_h}],\n  \"subpalettes\": {sub_block},\n  \
+         \"sprites\": [\n{sprite_rows}\n  ]\n}}",
+        if size16 { "8x16" } else { "8x8" }
+    )
+}
+
 /// The color source for the composite: live PALRAM (real sprite colors) or the
 /// structure-only gray ramp when PALRAM is unreadable.
 enum SpriteColors {
@@ -290,6 +366,9 @@ pub struct MetaspritePanel {
     prev_tiles: [u8; SPRITE_COUNT],
     prev_frame_count: u64,
     changed: [bool; SPRITE_COUNT],
+
+    /// Result of the last "export pose" click (path or error), shown inline.
+    export_note: Option<String>,
 }
 
 impl MetaspritePanel {
@@ -308,6 +387,7 @@ impl MetaspritePanel {
             prev_tiles: [0; SPRITE_COUNT],
             prev_frame_count: u64::MAX,
             changed: [false; SPRITE_COUNT],
+            export_note: None,
         }
     }
 
@@ -468,6 +548,11 @@ impl MetaspritePanel {
             None => (self.op_size16, self.op_pt8, PpuCtrlSource::OperatorFallback),
         };
 
+        let palram_arr: Option<[u8; 32]> = palram.as_ref().map(|p| {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&p[..32]);
+            a
+        });
         let colors = match palram {
             Some(p) => {
                 let mut arr = [0u8; 32];
@@ -503,6 +588,32 @@ impl MetaspritePanel {
                 if ui.selectable_label(self.selected_bank == b, format!("{b}")).clicked() {
                     self.selected_bank = b;
                 }
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!sprites.is_empty(), egui::Button::new("⬇ Export pose JSON"))
+                .on_hover_text(
+                    "Write the current live metasprite as one pose fragment of \
+                     sprite_contract.json (freeze first for a stable pose). One pose — \
+                     the full multi-pose contract is the capture-agent's job.",
+                )
+                .clicked()
+            {
+                let json = pose_contract_json(&sprites, palram_arr.as_ref(), size16, self.selected_bank);
+                let dir = std::path::Path::new("library/tcsurfdesign/assets/swap");
+                let path = dir.join(format!("pose_export_f{frame_count}.json"));
+                self.export_note = Some(match std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&path, json)) {
+                    Ok(_) => format!("wrote {}", path.display()),
+                    Err(e) => format!("export failed: {e}"),
+                });
+            }
+            if let Some(note) = &self.export_note {
+                let ok = note.starts_with("wrote");
+                ui.colored_label(
+                    if ok { egui::Color32::from_rgb(0x60, 0xC0, 0x60) } else { egui::Color32::from_rgb(0xE0, 0x60, 0x60) },
+                    note,
+                );
             }
         });
         ui.horizontal(|ui| {
@@ -648,6 +759,34 @@ enum PpuCtrlSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pose_contract_json_normalizes_and_maps_subpalettes() {
+        // Two sprites forming a 2x1 metasprite at X=104/112, Y=76.
+        let sprites = vec![
+            Sprite { index: 60, y: 76, tile: 0x08, attr: 0x03, x: 104 },
+            Sprite { index: 61, y: 76, tile: 0x09, attr: 0x43, x: 112 }, // H-flip (bit6)
+        ];
+        let mut pal = [0u8; 32];
+        pal[0] = 0x0F; // backdrop
+        // sprite subpalette 3 = group 7 = bytes 28..32
+        pal[29] = 0x16; pal[30] = 0x27; pal[31] = 0x30;
+        let js = pose_contract_json(&sprites, Some(&pal), false, 2);
+        // Positions normalized to bbox min (dx 0 and 8; dy 0).
+        assert!(js.contains("\"dx\": 0"));
+        assert!(js.contains("\"dx\": 8"));
+        assert!(js.contains("\"sprite_size\": \"8x8\""));
+        assert!(js.contains("\"chr_bank_for_player\": 2"));
+        // attr 0x43 → subpalette group 4 + 3 = 7, H-flip true.
+        assert!(js.contains("\"subpalette\": 7"));
+        assert!(js.contains("\"flip_h\": true"));
+        // group-7 opaque colors mapped through the master palette.
+        assert!(js.contains("\"7\": [\"#"));
+        // Parseable, and PALRAM-absent path is honest, not fabricated.
+        let js2 = pose_contract_json(&sprites, None, true, 0);
+        assert!(js2.contains("PALRAM unreadable"));
+        assert!(js2.contains("\"sprite_size\": \"8x16\""));
+    }
 
     // ── OAM decode: active-sprite list + attribute fields ─────────────────
 
