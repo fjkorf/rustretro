@@ -71,12 +71,14 @@ that moves on its own — sample and believe the sustained majority.
 The corrected picture — **both modes render the player as an OAM metasprite**
 (so both are sprite-swappable):
 
-- **Street Skate (mode 0):** ~17-sprite skater metasprite (OAM slots 5-21,
-  tiles ~$41-$74). Sprite X's track `player_x_screen $478` pokes (poke +$20 →
-  sprite Xs 104→136), confirming they ARE the player. The skater is
-  screen-locked at cruise and the BACKGROUND scrolls behind it — "auto-scroller"
-  is true, but that means scrolling background + a sprite character, NOT a
-  background-drawn character.
+- **Street Skate (mode 0): ~17-sprite skater metasprite, CHR bank 1 / PT0**
+  (framebuffer-verified — a DIFFERENT bank from the surfer's bank 2). Sprite
+  X's track `player_x_screen $478` pokes, confirming they ARE the player. The
+  skater is screen-locked at cruise and the BACKGROUND scrolls behind it —
+  "auto-scroller" means scrolling background + a sprite character, NOT a
+  background-drawn character. The two SKATERS use DISTINCT tile sets (A=$41-$74,
+  B=$c1-$f4), unlike the surfers — see the ai04 region block. Contract:
+  `assets/swap/sprite_contract_skater.json`.
 - **Big Wave (mode 1): surfer metasprite, CHR bank 2 / PT0** (8×8 sprites,
   PPUCTRL $90). Base/idle ≈19 sprites; grows to ~26 for carves. 4 characters =
   2 skaters + 2 surfers; surfer A/B share the same 170 tiles and differ only by
@@ -110,6 +112,10 @@ Plain 2bpp planar, 2048 tiles, ~490-508/512 non-blank per bank (sprites, score f
 
 ::: region kind=character_sprite id=ai03 addr=0x00C010-0x00D010 author=ai confidence=confirmed label="Big Wave surfer metasprite — CHR bank 2, sprite pattern table PT0 (file offset = 0x8010 + 2*0x2000)"
 The Big Wave surfer (mode 1) is an 8x8 OAM metasprite (PPUCTRL=$90: bit5=0 → 8x8 sprites, bit3=0 → sprite pattern table $0000). Its animation frames live in **CHR bank 2, PT0** (file offset 0xC010, i.e. 0x8010 + 2*0x2000, spanning the first 0x1000 of the bank). Active player bank = **bank 2, framebuffer-VERIFIED** (2026-09-10, independent second rig, upgrading Phase A's visual inference). CNROM latch is write-only/not exposed, so the bank is inferred by rendering the live metasprite's exact OAM tiles from each of the 4 banks in the live PALRAM colors and comparing to an app://screen crop at the surfer's OAM bbox: on a 19-sprite carve, **bank 2 is the single compact surfer matching the on-screen figure**; bank 1 garbled, bank 3 a DOUBLED/oversized body (coherent enough to fool a glance — which is why the panel's bank picker is operator-judged, not auto), bank 0 incoherent. Two independent rigs (Phase A + this) agree on bank 2. Tiles observed across a ~40s ride (union of surfer A+B, 170 of 256 PT0 tiles — the sheet is nearly all surfer): 00 02 03 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 18 19 1a 1b 1c 1d 1e 1f 20 21 22 23 28 29 30 31 32 33 38 39 46 47 48 49 4a 4b 53 54 55 56 57 58 59 5a 5b 5c 5d 5e 5f 60 61 62 63 64 65 66 67 68 69 6a 6b 6c 6d 6e 6f 70 71 72 73 74 75 76 77 78 79 7a 7b 7c 7d 7e 7f 81 82 83 84 8a 8b 8c 91 92 93 96 97 98 99 9a 9b a1 a2 a3 a5 a6 a7 a8 a9 aa ab b0 b1 b2 b5 b6 b7 b9 ba bb bd be c0 c1 c2 c6 c7 c9 ca cb cd ce d0 d1 d2 d4 d5 d8 d9 da db dc dd de e0 e1 e2 e4 e5 e6 e7 e8 e9 f0 f6 f7 f8 f9. Base/idle pose (matches doc): slots 60-63 tiles 08/09/18/19 over the carve extension. Live-probed 2026-09-10, port 4028. Full contract: assets/swap/sprite_contract.json.
+:::
+
+::: region kind=character_sprite id=ai04 addr=0x00A010-0x00B010 author=ai confidence=confirmed label="Street Skate skater metasprite — CHR bank 1, sprite PT0 (file offset = 0x8010 + 1*0x2000)"
+The Street Skate skater (mode 0) is an 8x8 OAM metasprite, ~17 sprites (OAM slots 5-21 at capture, but slots reshuffle — group by geometry), PPUCTRL=$90 (sprite PT $0000, bg PT $1000, register-confirmed disjoint). It lives in **CHR bank 1** (file offset 0xA010) — NOT bank 2 like the surfer; the two swap targets are in DIFFERENT banks. Bank framebuffer-VERIFIED: the live 17-sprite idle metasprite rendered from each bank in live PALRAM colors → ONLY bank 1 reproduces the on-screen skater (0/2/3 garbled). CNROM latch static (no per-frame cycling seen). **The two SKATERS use DISTINCT tile sets** (unlike the surfers, which shared tiles + differed only by palette): skater A idle = 01 41 42 46 47 4b 51 52 5b 61 62 63 64 72 73 74; skater B idle = 81 c1 c2 c6 c7 cb d1 d2 db e1 e2 e3 e4 f2 f3 f4 — both bank 1 PT0, both live-captured (B is a genuinely different character: red hair/blue shorts vs A's pink shirt/green pants). char_select_latch $0704 selects the two skaters (0=A, 1=B), same latch as the surfers. Cleanly swappable (NTARAM index overlap is false collateral by PT-disjointness; zero foreign OAM slots use skater tiles). COVERAGE: idle pose only so far; push/ollie/trick + full motion tile-union are TO-VERIFY (Street's short timer + OAM clear cadence made multi-pose inline capture expensive). Live-probed 2026-09-10, port 4033. Contract: assets/swap/sprite_contract_skater.json (SEPARATE from the surfer's, to protect that validated artifact).
 :::
 
 ## Work RAM — RE session 2026-09-09 (headless, fceumm, port 4028)

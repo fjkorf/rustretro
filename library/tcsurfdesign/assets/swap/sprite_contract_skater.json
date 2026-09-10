@@ -1,0 +1,514 @@
+{
+ "rom_sha1": "7114bc8b0aad3094e59ccedba2845c1c032b15cc",
+ "sprite_size": "8x8",
+ "chr_bank_for_player": 1,
+ "bank_evidence": "Framebuffer-VERIFIED: the live 17-sprite idle metasprite's exact OAM tiles rendered from each of the 4 CHR banks in live PALRAM colors; ONLY bank 1 reproduces the on-screen skater (banks 0/2/3 garbled). NOTE this DIFFERS from the surfer (bank 2) \u2014 the two swap targets live in different CHR banks. CNROM latch static bank 1 across the stepped capture (no per-frame cycling observed).",
+ "sprite_pattern_table": "$0000 (PPUCTRL=$90, bit3=0)",
+ "bg_pattern_table": "$1000 (PPUCTRL=$90, bit4=1) \u2014 register-confirmed disjoint from sprites",
+ "subpalettes_skater_A": {
+  "4": [
+   "#A01464",
+   "#ECB4B0",
+   "#000000"
+  ],
+  "5": [
+   "#3032EC",
+   "#ECB4B0",
+   "#000000"
+  ],
+  "6": [
+   "#087C00",
+   "#ECB4B0",
+   "#000000"
+  ],
+  "7": [
+   "#982220",
+   "#ECEEEC",
+   "#000000"
+  ]
+ },
+ "subpalettes_skater_B": {
+  "4": [
+   "#982220",
+   "#ECB4B0",
+   "#000000"
+  ],
+  "5": [
+   "#A01464",
+   "#ECB4B0",
+   "#000000"
+  ],
+  "6": [
+   "#3032EC",
+   "#ECB4B0",
+   "#000000"
+  ],
+  "7": [
+   "#087C00",
+   "#ECEEEC",
+   "#000000"
+  ]
+ },
+ "modes": [
+  {
+   "mode_index": 0,
+   "mode_name": "street_skate",
+   "character": "skater_A",
+   "poses": [
+    {
+     "pose_id": "skate_idle",
+     "anim_bytes_0400": "static (disproven as anim key on the surfer; not used)",
+     "bbox": [
+      40,
+      40
+     ],
+     "sprites": [
+      {
+       "slot": 5,
+       "dx": 8,
+       "dy": 0,
+       "tile": 65,
+       "attr": 0,
+       "subpalette": 4,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 6,
+       "dx": 16,
+       "dy": 0,
+       "tile": 66,
+       "attr": 0,
+       "subpalette": 4,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 7,
+       "dx": 8,
+       "dy": 8,
+       "tile": 81,
+       "attr": 0,
+       "subpalette": 4,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 8,
+       "dx": 16,
+       "dy": 8,
+       "tile": 82,
+       "attr": 0,
+       "subpalette": 4,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 9,
+       "dx": 8,
+       "dy": 16,
+       "tile": 97,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 10,
+       "dx": 16,
+       "dy": 16,
+       "tile": 98,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 11,
+       "dx": 24,
+       "dy": 16,
+       "tile": 75,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 12,
+       "dx": 0,
+       "dy": 24,
+       "tile": 99,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 13,
+       "dx": 8,
+       "dy": 24,
+       "tile": 100,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 14,
+       "dx": 16,
+       "dy": 24,
+       "tile": 114,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 15,
+       "dx": 24,
+       "dy": 24,
+       "tile": 91,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 16,
+       "dx": 0,
+       "dy": 32,
+       "tile": 115,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 17,
+       "dx": 8,
+       "dy": 32,
+       "tile": 116,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 18,
+       "dx": 8,
+       "dy": 32,
+       "tile": 1,
+       "attr": 3,
+       "subpalette": 7,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 19,
+       "dx": 16,
+       "dy": 32,
+       "tile": 70,
+       "attr": 3,
+       "subpalette": 7,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 20,
+       "dx": 24,
+       "dy": 32,
+       "tile": 70,
+       "attr": 67,
+       "subpalette": 7,
+       "flip_h": true,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 21,
+       "dx": 32,
+       "dy": 32,
+       "tile": 71,
+       "attr": 3,
+       "subpalette": 7,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      }
+     ]
+    }
+   ],
+   "unique_tiles": [
+    1,
+    65,
+    66,
+    70,
+    71,
+    75,
+    81,
+    82,
+    91,
+    97,
+    98,
+    99,
+    100,
+    114,
+    115,
+    116
+   ],
+   "tiles_shared_with_nonplayer": []
+  },
+  {
+   "mode_index": 0,
+   "mode_name": "street_skate",
+   "character": "skater_B",
+   "poses": [
+    {
+     "pose_id": "skate_idle",
+     "anim_bytes_0400": "static",
+     "bbox": [
+      40,
+      40
+     ],
+     "sprites": [
+      {
+       "slot": 5,
+       "dx": 8,
+       "dy": 0,
+       "tile": 193,
+       "attr": 0,
+       "subpalette": 4,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 6,
+       "dx": 16,
+       "dy": 0,
+       "tile": 194,
+       "attr": 0,
+       "subpalette": 4,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 7,
+       "dx": 8,
+       "dy": 8,
+       "tile": 209,
+       "attr": 0,
+       "subpalette": 4,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 8,
+       "dx": 16,
+       "dy": 8,
+       "tile": 210,
+       "attr": 0,
+       "subpalette": 4,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 9,
+       "dx": 8,
+       "dy": 16,
+       "tile": 225,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 10,
+       "dx": 16,
+       "dy": 16,
+       "tile": 226,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 11,
+       "dx": 24,
+       "dy": 16,
+       "tile": 203,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 12,
+       "dx": 0,
+       "dy": 24,
+       "tile": 227,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 13,
+       "dx": 8,
+       "dy": 24,
+       "tile": 228,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 14,
+       "dx": 16,
+       "dy": 24,
+       "tile": 242,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 15,
+       "dx": 24,
+       "dy": 24,
+       "tile": 219,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 16,
+       "dx": 0,
+       "dy": 32,
+       "tile": 243,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 17,
+       "dx": 8,
+       "dy": 32,
+       "tile": 244,
+       "attr": 2,
+       "subpalette": 6,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 18,
+       "dx": 8,
+       "dy": 32,
+       "tile": 129,
+       "attr": 3,
+       "subpalette": 7,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 19,
+       "dx": 16,
+       "dy": 32,
+       "tile": 198,
+       "attr": 3,
+       "subpalette": 7,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 20,
+       "dx": 24,
+       "dy": 32,
+       "tile": 198,
+       "attr": 67,
+       "subpalette": 7,
+       "flip_h": true,
+       "flip_v": false,
+       "behind_bg": false
+      },
+      {
+       "slot": 21,
+       "dx": 32,
+       "dy": 32,
+       "tile": 199,
+       "attr": 3,
+       "subpalette": 7,
+       "flip_h": false,
+       "flip_v": false,
+       "behind_bg": false
+      }
+     ]
+    }
+   ],
+   "unique_tiles": [
+    129,
+    193,
+    194,
+    198,
+    199,
+    203,
+    209,
+    210,
+    219,
+    225,
+    226,
+    227,
+    228,
+    242,
+    243,
+    244
+   ],
+   "tiles_shared_with_nonplayer": []
+  }
+ ],
+ "reference_captures": [
+  "assets/swap/pose_skater_A_idle.png",
+  "assets/swap/pose_skater_B_idle.png"
+ ],
+ "notes": {
+  "char_latch": "$0704 confirmed to select the two SKATERS in mode 0 (0=A pedestal, 1=B) \u2014 same latch as the surfers.",
+  "skater_A_vs_B": "UNLIKE the surfers (which shared 170 tiles and differed only by subpalette), the two SKATERS use DISTINCT tile sets: A=$41-$74, B=$c1-$f4 (both bank 1 PT0). They are different art, not palette-swaps. Confirmed by live capture of both, not assumed.",
+  "bank_method": "per-bank compose vs app://screen crop; bank 1 only coherent match.",
+  "palette_method": "live PALRAM groups 4-7 at a frozen gameplay frame; A and B rotate which subpalette holds what.",
+  "tile_sharing_scan": "NTARAM shares 156 cells by tile INDEX with skater A's set, but this is FALSE collateral: sprites use PT $0000 and background uses PT $1000 (PPUCTRL bits 3/4, register-confirmed), so the physical CHR bytes are disjoint within the 8KB bank. Zero FOREIGN OAM slots used skater tiles. Slot 0 is the inert Y=$BE tile-$FF junk sprite (no sprite-0-hit dependency evident; PPUSTATUS bit-6 polling not instrumented \u2014 flagged for Phase D).",
+  "verdict": "CLEANLY SWAPPABLE (both skaters), same PT-disjointness basis as the surfer.",
+  "coverage": "CAPTURED: idle pose for skater A and B, bank+palette+tile-sharing verified. NOT YET CAPTURED (TO-VERIFY, needs extended sustained capture): push/ollie-jump/trick poses and the full unique_tiles union across a 60s ride incl. later auto-scroll phases. The idle unique_tiles listed are the idle-pose set, NOT the complete motion set. Street Skate's short round timer + OAM clear-frame cadence made multi-pose capture expensive inline; recommend a dedicated pose-enumeration pass (freeze+step per pose) to complete before patching motion frames.",
+  "capture_method_note": "OAM reads all-parked on clear/DMA-rebuild frames (peer-confirmed mechanism); captured via freeze-then-step + player-X spatial clustering + majority sampling. Grouping by geometry not slot, per NESdev flicker caveat."
+ }
+}
