@@ -16,6 +16,7 @@ pub mod help;
 pub mod hex_tint;
 pub mod matchup;
 pub mod nametable;
+pub mod metasprite;
 pub mod hunt;
 pub mod framelab;
 pub mod state;

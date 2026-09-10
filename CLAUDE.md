@@ -67,7 +67,7 @@ frame while loaded — MK2 Genesis uses it to hold the 6-button-mode flags.
 | F12, Space | debugger, pause |
 
 The F12 debugger groups panels into regions: Canvas (Frame/Disasm/Hex/Tiles/**CHR
-Editor**/**Nametables**, center), Live (Watch/CPU/Input/**Input Log**, top right), Control (💾 State / 🎯 Training /
+Editor**/**Nametables**/**Sprites**, center), Live (Watch/CPU/Input/**Input Log**, top right), Control (💾 State / 🎯 Training /
 Audio, bottom right), Tools (bottom strip). The ☰ toolbar menu saves/resets
 the layout and reopens closed panels; the sidecar is `rustretro_layout_v2.json`
 (cwd, gitignored). Hotkey docs live in ONE place: `KEYBINDINGS` in
