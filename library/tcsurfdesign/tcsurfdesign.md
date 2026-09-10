@@ -55,35 +55,46 @@ select screen.
 identically, plus from-source trust and the now-live PPU regions (H1).
 nestopia remains a verified fallback. `requires.save_states: true`.
 
-## Character rendering — MODE-DEPENDENT (live-probed 2026-09-09)
+## Character rendering — BOTH modes use OAM metasprites (corrected 2026-09-10)
 
-How a character becomes on-screen pixels differs by mode; this is load-bearing
-for any sprite-swap or character-art work:
+**Correction of a wrong earlier finding.** An initial probe (2026-09-09)
+concluded "Street Skate's skater is background-rendered, zero player OAM
+sprites." **That was an under-sampling error and is FALSE.** A sustained
+re-probe (2026-09-10, port 4031, Phase A independently caught it first) shows
+Street Skate DOES have a player metasprite. The trap: **OAM intermittently
+reads all-parked (0 active sprites) on clear/DMA frames** — sampled 16×, the
+counts were `[0,17,17,17,17,0,17,0,17,...]`. The original single read hit a
+0-frame and I published the absolute observation without the sustained control.
+The law held in the breach: never conclude from one absolute read on a system
+that moves on its own — sample and believe the sustained majority.
 
-- **Street Skate (mode 0): the skater is drawn in the BACKGROUND nametable,
-  NOT as sprites.** Zero player OAM sprites active, grounded AND airborne,
-  confirmed in both live PPU OAM and the $0200 CPU shadow (same read path shows
-  5 sprites in Big Wave, so it is not a tooling gap). The skater is
-  screen-locked (auto-scroller); animation is nametable-tile rewriting. There
-  is NO player metasprite / player CHR-sprite tile set to capture or swap here.
-- **Big Wave (mode 1): the surfer IS an OAM metasprite.** Base pose = a 2×2
-  block of 8×8 sprites (OAM slots 60-63, tiles 0x08/0x09 over 0x18/0x19,
-  palette 3, PPUCTRL 0x90 → 8×8 sprites, sprite pattern table $0000). Holding a
-  direction GROWS the metasprite to ~19 sprites (adds tiles 0x53-0x55,
-  0x5d-0x5f, 0x63-0x65, 0x6d-0x6f, 0x78, 0x7d-0x7f) for the active/turn pose.
-  Animation = swapping which CHR tiles the OAM entries point at. THIS is the
-  swappable target. (Wood & Water uses the surfers too — likely same mechanism,
-  TO-VERIFY.)
-- **Collateral risk for a swap:** the surfer's base tiles are LOW indices
-  (0x08/0x09/0x18/0x19) — the range where font/HUD/shared graphics usually
-  live, so `tiles_shared_with_nonplayer` is likely large, not a footnote. A
-  tile-sharing scan (which non-player OAM slots + nametable cells reference
-  these tiles) is a prerequisite before any swap.
-- **CNROM active bank is a RUNTIME fact, not in the file** (mapper latch is
-  write-only; fceumm doesn't expose it). The CHR-editor / nametable / sprite
-  panels handle this with a "pick the bank that matches the screen" selector.
-  The session-1 "$0214-$026B player OAM shadow" claim is mode-specific (a
-  sprite-based mode), not a universal.
+The corrected picture — **both modes render the player as an OAM metasprite**
+(so both are sprite-swappable):
+
+- **Street Skate (mode 0):** ~17-sprite skater metasprite (OAM slots 5-21,
+  tiles ~$41-$74). Sprite X's track `player_x_screen $478` pokes (poke +$20 →
+  sprite Xs 104→136), confirming they ARE the player. The skater is
+  screen-locked at cruise and the BACKGROUND scrolls behind it — "auto-scroller"
+  is true, but that means scrolling background + a sprite character, NOT a
+  background-drawn character.
+- **Big Wave (mode 1): surfer metasprite, CHR bank 2 / PT0** (8×8 sprites,
+  PPUCTRL $90). Base/idle ≈19 sprites; grows to ~26 for carves. 4 characters =
+  2 skaters + 2 surfers; surfer A/B share the same 170 tiles and differ only by
+  PALRAM subpalette (board color: A red $16, B green $2a). Full contract in
+  `assets/swap/sprite_contract.json`; reference PNGs in `assets/swap/`.
+- **Wood & Water (mode 2):** opens on a skate segment (same skater metasprite as
+  Street); its surf segment reuses the Big Wave surfer — TO-VERIFY.
+- **Swap collateral (Big Wave surfer): CLEANLY SWAPPABLE.** No foreign OAM
+  slots use the surfer tiles; the 810 NTARAM cells sharing an index are FALSE
+  collateral — background uses PT1 ($1000), sprites PT0 ($0000), so the physical
+  CHR bytes are disjoint within the 8KB bank. Caveat: a tile edit reskins BOTH
+  surfer A and B (shared tiles).
+- **CNROM active bank is a RUNTIME fact, not in the file** (write-only latch);
+  inferred visually (compose-from-bank vs framebuffer crop → bank 2 for the
+  surfer). The panels' "pick the bank" selector is the right handling.
+- **`$0400-$0407` is NOT the animation key** (session-1 guess disproven): it's
+  static across Big Wave poses. Poses are keyed by the normalized OAM
+  (tile,attr,dx,dy) set instead.
 
 ## Regions
 
@@ -95,6 +106,10 @@ NMI=$814F (frame loop), RESET=$8001, IRQ=$8000 — parsed from PRG file bytes, p
 
 ::: region kind=sprite_sheet id=ai02 addr=0x008010-0x010010 author=ai confidence=confirmed label="CHR-ROM (rom_file offset, NOT a live PPU address)"
 Plain 2bpp planar, 2048 tiles, ~490-508/512 non-blank per bank (sprites, score font, 'SKATEBOARDING' text tiles, T&C logo). Mapper 3 (CNROM) bank-switches this as four 8KB CHR banks into PPU $0000-$1FFF — no single live CPU/PPU address covers the span, hence file-offset addressing. rom_info + render_tiles(source=rom_file:chr, format=nes_chr) decode it. Verified 2026-09-09.
+:::
+
+::: region kind=character_sprite id=ai03 addr=0x00C010-0x00D010 author=ai confidence=confirmed label="Big Wave surfer metasprite — CHR bank 2, sprite pattern table PT0 (file offset = 0x8010 + 2*0x2000)"
+The Big Wave surfer (mode 1) is an 8x8 OAM metasprite (PPUCTRL=$90: bit5=0 → 8x8 sprites, bit3=0 → sprite pattern table $0000). Its animation frames live in **CHR bank 2, PT0** (file offset 0xC010, i.e. 0x8010 + 2*0x2000, spanning the first 0x1000 of the bank). Active player bank inferred VISUALLY (CNROM latch is write-only, not exposed by fceumm): the live metasprite composed from each bank and cropped-compared to app://screen matches bank 2 exactly (idle + a 23-sprite carve both reproduced); banks 0/1 incoherent, bank 3 wrong body. Tiles observed across a ~40s ride (union of surfer A+B, 170 of 256 PT0 tiles — the sheet is nearly all surfer): 00 02 03 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 18 19 1a 1b 1c 1d 1e 1f 20 21 22 23 28 29 30 31 32 33 38 39 46 47 48 49 4a 4b 53 54 55 56 57 58 59 5a 5b 5c 5d 5e 5f 60 61 62 63 64 65 66 67 68 69 6a 6b 6c 6d 6e 6f 70 71 72 73 74 75 76 77 78 79 7a 7b 7c 7d 7e 7f 81 82 83 84 8a 8b 8c 91 92 93 96 97 98 99 9a 9b a1 a2 a3 a5 a6 a7 a8 a9 aa ab b0 b1 b2 b5 b6 b7 b9 ba bb bd be c0 c1 c2 c6 c7 c9 ca cb cd ce d0 d1 d2 d4 d5 d8 d9 da db dc dd de e0 e1 e2 e4 e5 e6 e7 e8 e9 f0 f6 f7 f8 f9. Base/idle pose (matches doc): slots 60-63 tiles 08/09/18/19 over the carve extension. Live-probed 2026-09-10, port 4028. Full contract: assets/swap/sprite_contract.json.
 :::
 
 ## Work RAM — RE session 2026-09-09 (headless, fceumm, port 4028)
@@ -443,3 +458,70 @@ extractable at integer precision here. The ballistic ENVELOPE (apex ≈38 px /
 airtime ≈29 f, Street·skater-A) is the confirmed cell; the per-frame constant
 needs the pause→step→let-frame-finish discipline (my resume+poll stepping slips
 sub-frame).
+
+## Sprite-swap Phase A — Big Wave surfer metasprite (2026-09-10, headless fceumm, port 4028)
+
+Deliverable: the metasprite CONTRACT an external image generator must satisfy
+to reskin the Big Wave surfer, plus reference PNGs and a tile-sharing scan.
+Contract + assets live under `assets/swap/` (`sprite_contract.json`, 12 pose
+PNGs). All facts live-probed; PPU OAM/PALRAM/PPUREG read directly via
+`read_region` (H1 fix confirmed working).
+
+### What was established (confidence: confirmed unless tagged)
+
+- **Sprite size = 8x8, sprite pattern table = $0000.** PPUCTRL ($2000 shadow /
+  PPUREG[0]) = `$90` throughout: bit5=0 (8x8), bit3=0 (PT0), bit4=1 (background
+  uses PT1 $1000). This PT0/PT1 split is the whole swappability story (below).
+- **Player CHR bank = 2** (probable — visual inference; the CNROM latch is
+  write-only and fceumm does not expose it, and the CHR pattern tables are NOT a
+  live-readable region so `vram_to_rom` cannot corroborate). Method: compose the
+  live metasprite (exact OAM tile/attr/x/y) from each of the 4 banks' PT0 and
+  crop-compare to `app://screen`. Bank 2 reproduces the surfer exactly on both an
+  idle frame and a 23-sprite carve frame; banks 0/1 are incoherent, bank 3
+  renders a wrong body. Bank 2 PT1 (rendered) holds the HUD font
+  ("0123456789 POINT SURF LIFE") + wave tiles, not surfer art.
+- **Roster / A-vs-B.** Surfer A ($704=0, A-pedestal) and Surfer B ($704=1)
+  **share one sprite tile set** in bank 2 (168 tiles identical; the 2-tile delta
+  is sampling noise) and are distinguished **purely by PALETTE**: PALRAM sprite
+  subpalettes 4/6/7 differ. Board color = subpalette 7 index2: A=$16 (red),
+  B=$2a (green). One tile swap therefore reskins BOTH surfers.
+- **Poses.** The surfer is screen-ANCHORED on the wave — the doc's
+  poke-$478/$48C player-ID test does NOT apply in Big Wave (both re-derive each
+  frame; the metasprite does not translate with them). Player sprites = ALL
+  active OAM except slot 0 (a parked tile-$FF junk sprite at x0/y190); across a
+  ~40s ride for A and B, NO active OAM sprite ever appeared outside the surfer
+  cluster (nonplayer_oam scan empty). The metasprite is driven by wave momentum
+  + input over continuous play (~165-172 distinct normalized (tile,attr,dx,dy)
+  configs per character; ~25-28 single-cluster). $0400-$0407 is STATIC
+  (`589804d000143cf0`) in Big Wave — NOT the per-pose key the session-1 doc
+  guessed. 6 curated single-cluster reference poses per character were captured
+  (tuck=10, idle/base=19, carve=20/23/25/26 sprites); the compose pipeline was
+  validated by exact crop-match to the live framebuffer on a non-idle pose.
+
+### Tile-sharing scan — Phase-A GATE — VERDICT: cleanly swappable
+
+- **OAM:** in Big Wave the only active sprites are the surfer + the inert slot-0
+  junk sprite; zero foreign sprites reference the surfer tiles →
+  `tiles_shared_with_nonplayer = []`.
+- **NTARAM:** 810 / 2048 background cells hold an index that also appears in the
+  surfer tile set, but this is **FALSE collateral**: background uses pattern
+  table 1 ($1000) while sprites use PT0 ($0000). Nametable value V →
+  bank_base+$1000+V*$10; surfer sprite tile V → bank_base+V*$10 — DISJOINT
+  physical bytes. Swapping the surfer's PT0 tiles cannot touch the HUD/wave
+  graphics. **Caveat:** the edit reskins both surfer A and B (shared tiles) and,
+  if bank 2 is reused by the Wood surf segment, that segment too.
+
+### Correction / discrepancy (measurement over doc)
+
+- **Street Skate (mode 0) is NOT zero-OAM.** Contradicting this doc's
+  "Character rendering" section and the Phase-A brief: live PPU OAM in Street
+  gameplay (mode 0, gate=$04) shows a ~17-sprite skater metasprite (OAM slots
+  5-21, tiles $41-$74) clustered exactly at the on-screen skater
+  (x104-136,y120-152) — the skater IS OAM sprites at the skate-segment START,
+  not background-rendered. The prior "zero player OAM in Street" claim was not
+  reproduced; it may have described a later auto-scroll phase. Flagged
+  TO-VERIFY. (The doc's Big Wave surfer claims WERE independently reproduced.)
+- **Wood & Water (mode 2)** OPENS on a skate segment visually identical to
+  Street (same skater metasprite, tiles $41-$74), not the surfer; its surf
+  segment was not reached this session (TO-VERIFY — expected to reuse the Big
+  Wave surfer per the roster-sharing finding).
