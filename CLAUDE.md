@@ -35,6 +35,7 @@ for iteration. The dev binary is `target/release-dev/rustretro`.
 ./target/release-dev/rustretro \
   --core "$HOME/Library/Application Support/RetroArch/cores/fbalpha2012_libretro.dylib" \
   --rom ~/games/roms/asurabld.zip \
+  --game library/asurabld \
   --bus-map library/asurabld/asurabld.busmap.json \
   --training --script library/asurabld/training.lua \
   --mcp --mcp-port 4025 \
@@ -65,8 +66,8 @@ frame while loaded — MK2 Genesis uses it to hold the 6-button-mode flags.
 | F8 / F10 / F11 | tutorials / Lua script panel / controls (rebind) |
 | F12, Space | debugger, pause |
 
-The F12 debugger groups panels into regions: Canvas (Frame/Disasm/Hex/Tiles,
-center), Live (Watch/CPU/Input/**Input Log**, top right), Control (💾 State / 🎯 Training /
+The F12 debugger groups panels into regions: Canvas (Frame/Disasm/Hex/Tiles/**CHR
+Editor**/**Nametables**/**Sprites**, center), Live (Watch/CPU/Input/**Input Log**, top right), Control (💾 State / 🎯 Training /
 Audio, bottom right), Tools (bottom strip). The ☰ toolbar menu saves/resets
 the layout and reopens closed panels; the sidecar is `rustretro_layout_v2.json`
 (cwd, gitignored). Hotkey docs live in ONE place: `KEYBINDINGS` in

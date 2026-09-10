@@ -148,6 +148,23 @@ pub fn parse_ines(bytes: &[u8]) -> Option<InesInfo> {
     })
 }
 
+/// Locate a cart's CHR-ROM span within its raw FILE bytes, via the iNES/NES
+/// 2.0 header. Returns `(start, end)` file offsets. Errors — rather than
+/// `None` — so a caller can surface WHY: a non-iNES file, or a CHR-RAM cart
+/// (no CHR-ROM bytes exist in the file to slice; the graphics live only in
+/// live CHR-RAM via the core, if at all).
+///
+/// Single source of truth for this computation: both the MCP `rom_file:chr`
+/// source ([`crate::mcp::server`]'s `slice_rom_file`) and the CHR editor debug
+/// panel call this instead of re-deriving the iNES CHR-offset math twice.
+pub fn chr_span(bytes: &[u8]) -> Result<(usize, usize), &'static str> {
+    let info = parse_ines(bytes).ok_or("not an iNES (.nes) file: no magic header")?;
+    if info.chr_is_ram {
+        return Err("this cart uses CHR-RAM: there is no CHR-ROM span in the file");
+    }
+    Ok((info.chr_offset, info.chr_offset + info.chr_rom_size))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +259,27 @@ mod tests {
         let info = parse_ines(&rom).expect("valid NES2 exponent");
         assert!(info.is_nes2);
         assert_eq!(info.chr_rom_size, 1024);
+    }
+
+    #[test]
+    fn chr_span_tcsurfdesign_shaped_header() {
+        // Mapper 3 (CNROM), PRG=32KiB, CHR=32KiB, no trainer — the same shape
+        // as the real tcsurfdesign.nes cart (65552-byte file total).
+        let file_len = 16 + 0x8000 + 0x8000;
+        let rom = hdr(2, 4, 0x30, 0x00, &[], file_len);
+        assert_eq!(chr_span(&rom), Ok((0x8010, 0x10010)));
+    }
+
+    #[test]
+    fn chr_span_errs_on_chr_ram_cart() {
+        let rom = hdr(2, 0, 0x00, 0x00, &[], 16 + 0x8000);
+        let err = chr_span(&rom).unwrap_err();
+        assert!(err.contains("CHR-RAM"), "err {err:?}");
+    }
+
+    #[test]
+    fn chr_span_errs_on_non_ines_file() {
+        assert!(chr_span(b"not a rom").is_err());
     }
 
     #[test]

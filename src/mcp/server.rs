@@ -34,10 +34,10 @@ use rmcp::RoleServer;
 use serde_json::{json, Map, Value};
 
 use crate::debug::{SharedDebugState, StateOp, Watch, WatchFormat};
-use crate::mcp::ines::parse_ines;
+use crate::mcp::ines::{chr_span, parse_ines};
 use crate::mcp::snapshot::{
-    decode_tiles_to_rgba, memory_capability, memory_map, parse_hex_bytes, read_region_bytes,
-    rgba_to_png, scan_buffer, search_bytes, top_heatmap, AiSnapshot, TileFormat,
+    decode_tiles_to_rgba_paletted, memory_capability, memory_map, parse_hex_bytes,
+    read_region_bytes, rgba_to_png, scan_buffer, search_bytes, top_heatmap, AiSnapshot, TileFormat,
 };
 
 /// How long the `run_lua` tool waits for the main thread to execute a script
@@ -552,6 +552,44 @@ impl RetroMcpServer {
     /// Returns an image `Content` (base64 PNG, mime `image/png` — the same
     /// mechanism the `app://screen` resource uses to hand a viewable image to the
     /// MCP client) plus a small text `Content` describing dimensions/tile count.
+    /// Resolve the `palette` arg to a 4-index NES sub-palette (or None for the
+    /// grayscale ramp) plus a label for the response. `"live"` / `"live:N"`
+    /// (N in 0..=7) reads live PALRAM: sub-palette N is PALRAM[N*4..N*4+4],
+    /// except every group's index 0 is forced to the universal backdrop
+    /// PALRAM[0] (the NES PPU rule). Falls back to grayscale — with an honest
+    /// label saying why — for a non-NES format, unreadable PALRAM, or an
+    /// out-of-range group.
+    fn resolve_render_palette(
+        &self,
+        palette: Option<&str>,
+        format: TileFormat,
+    ) -> (Option<[u8; 4]>, String) {
+        let gray = "grayscale ramp (structure-only)".to_string();
+        let Some(spec) = palette else { return (None, gray) };
+        if !spec.starts_with("live") {
+            return (None, format!("grayscale ramp (unknown palette spec '{spec}')"));
+        }
+        if !matches!(format, TileFormat::Nes2bpp) {
+            return (None, format!("grayscale ramp (live palette is NES-only, not {format:?})"));
+        }
+        let group: usize = spec
+            .split_once(':')
+            .and_then(|(_, n)| n.parse().ok())
+            .unwrap_or(0);
+        if group > 7 {
+            return (None, "grayscale ramp (live sub-palette must be 0-7)".to_string());
+        }
+        match self.clone_region_bytes("PALRAM") {
+            Ok((_, _, pal)) if pal.len() >= 32 => {
+                let base = group * 4;
+                let sub = [pal[0], pal[base + 1], pal[base + 2], pal[base + 3]];
+                (Some(sub), format!("live PALRAM sub-palette {group} [{:02X} {:02X} {:02X} {:02X}]",
+                    sub[0], sub[1], sub[2], sub[3]))
+            }
+            _ => (None, "grayscale ramp (PALRAM unreadable — no live core / non-NES)".to_string()),
+        }
+    }
+
     fn render_tiles(
         &self,
         source: &str,
@@ -559,9 +597,16 @@ impl RetroMcpServer {
         len: usize,
         format: TileFormat,
         tiles_per_row: usize,
+        palette: Option<&str>,
     ) -> Result<CallToolResult, ErrorData> {
         let len = len.min(MAX_RENDER_TILES_LEN);
         let tiles_per_row = tiles_per_row.clamp(1, MAX_TILES_PER_ROW);
+
+        // `palette=live[:N]` colors NES tiles through sub-palette N (0-7:
+        // 0-3 background, 4-7 sprite) of live PALRAM instead of the grayscale
+        // ramp. Absent PALRAM or a non-NES format falls back to grayscale with
+        // an honest label — never a fabricated color.
+        let (subpalette, palette_label) = self.resolve_render_palette(palette, format);
 
         // Resolve `source` to bytes — a live memory region OR the on-disk rom_file
         // (the cart bytes the core may not expose, e.g. NES CHR-ROM). Clones the
@@ -582,15 +627,16 @@ impl RetroMcpServer {
         let end = (offset + len).min(all_bytes.len());
         let span = &all_bytes[offset..end];
 
-        let img = decode_tiles_to_rgba(span, format, tiles_per_row).ok_or_else(|| {
-            ErrorData::invalid_params(
-                format!(
-                    "not enough bytes at offset 0x{offset:X} of '{region_name}' to decode even one \
-                     {format:?} tile"
-                ),
-                None,
-            )
-        })?;
+        let img = decode_tiles_to_rgba_paletted(span, format, tiles_per_row, subpalette)
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!(
+                        "not enough bytes at offset 0x{offset:X} of '{region_name}' to decode even \
+                         one {format:?} tile"
+                    ),
+                    None,
+                )
+            })?;
 
         let png = rgba_to_png(&img.rgba, img.width, img.height)
             .ok_or_else(|| ErrorData::internal_error("tile PNG encoding failed", None))?;
@@ -609,7 +655,7 @@ impl RetroMcpServer {
             "tile_count": img.tile_count,
             "tiles_per_row": tiles_per_row,
             "image_px": format!("{}x{}", img.width, img.height),
-            "palette": "grayscale ramp (real palette unknown; structure-only)",
+            "palette": palette_label,
             "note": "Visual evidence stream: compare this rendering to app://screen. \
                      Complements vram_to_rom (byte-content match) — use both for \
                      convergent evidence.",
@@ -723,17 +769,16 @@ impl RetroMcpServer {
                 "ROMFILE:PRG",
             ),
             "chr" => {
-                if info.chr_is_ram {
-                    return Err("this cart uses CHR-RAM: there is no CHR-ROM in the file to \
-                                decode (the graphics may live compressed in PRG-ROM, or only \
-                                appear in live CHR-RAM via the core)"
-                        .to_string());
-                }
-                (
-                    info.chr_offset,
-                    info.chr_offset + info.chr_rom_size,
-                    "ROMFILE:CHR",
-                )
+                // Single source of truth for the CHR span: chr_span (src/mcp/ines.rs)
+                // is also what the CHR editor debug panel calls, so both readers of
+                // this file agree on the iNES CHR-offset math.
+                let (start, end) = chr_span(&bytes).map_err(|e| {
+                    format!(
+                        "{e} (the graphics may live compressed in PRG-ROM, or only \
+                         appear in live CHR-RAM via the core)"
+                    )
+                })?;
+                (start, end, "ROMFILE:CHR")
             }
             other => {
                 return Err(format!(
@@ -2218,7 +2263,8 @@ impl RetroMcpServer {
                     "offset": { "type": "integer", "description": "Byte offset WITHIN the source region/file (default 0)" },
                     "len":    { "type": "integer", "description": "Number of bytes to decode (capped at 65536)" },
                     "format": { "type": "string", "description": "Tile pixel format: 2bpp | nes_chr (NES, 16 B/tile, 4 colors) or 4bpp | genesis (Genesis, 32 B/tile, 16 colors)" },
-                    "tiles_per_row": { "type": "integer", "description": "Tiles laid out per row in the image grid (default 16, max 64)" }
+                    "tiles_per_row": { "type": "integer", "description": "Tiles laid out per row in the image grid (default 16, max 64)" },
+                    "palette": { "type": "string", "description": "Coloring (NES only): omit for the grayscale structure ramp, or \"live\" / \"live:N\" to color through sub-palette N (0-7: 0-3 background, 4-7 sprite) of LIVE PALRAM. Falls back to grayscale with an honest label when PALRAM is unreadable." }
                 },
                 "required": ["source", "format"]
             });
@@ -3187,7 +3233,8 @@ impl ServerHandler for RetroMcpServer {
                     let len = get_u("len").unwrap_or(MAX_RENDER_TILES_LEN as u64) as usize;
                     let tiles_per_row =
                         get_u("tiles_per_row").unwrap_or(DEFAULT_TILES_PER_ROW as u64) as usize;
-                    this.render_tiles(source, offset, len, format, tiles_per_row)
+                    let palette = args.get("palette").and_then(|v| v.as_str());
+                    this.render_tiles(source, offset, len, format, tiles_per_row, palette)
                 }
                 "scan_regions" => {
                     // `source` defaults to "rom" (the structure stream's usual target).

@@ -31,6 +31,14 @@ fn rd16(ds: &DebugState, addr: u32, little: bool) -> u16 {
 /// collapse to 0, matching the recorder's `unwrap_or(0)` semantics. 16-bit
 /// reads honor the profile's `memory.endianness` per the contract.
 pub(crate) fn eval_gate(ds: &DebugState, p: &GameProfile) -> bool {
+    // An empty gate list means "no in-fight knowledge exists for this game",
+    // not "always in a fight": `.all()` on an empty iterator is vacuously
+    // true, which made Lua's game.controllable() report always-controllable
+    // on stub profiles while training and the recorder each refused
+    // separately. Closed = the honest answer, matching their posture.
+    if p.port.gate.is_empty() {
+        return false;
+    }
     let little = p.port.memory.endianness == "little";
     // Profile load validates that every gate global resolves, so a miss here
     // is impossible in practice; 0 keeps the closure total anyway.
@@ -62,6 +70,20 @@ pub(crate) fn eval_gate(ds: &DebugState, p: &GameProfile) -> bool {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// A stub profile with no gate conditions must read CLOSED, not
+    /// vacuously open: `.all()` on empty is true, and that leak made Lua's
+    /// game.controllable() report always-controllable on boot-stub profiles
+    /// (found during the tcsurfdesign NES bring-up).
+    #[test]
+    fn empty_gate_reads_closed_not_vacuously_open() {
+        let p = crate::profile::GameProfile::load(Path::new("library/mk2")).unwrap();
+        let ds = DebugState::new();
+        assert!(!p.port.gate.is_empty(), "precondition: mk2 ships a real gate");
+        let mut stub = p;
+        stub.port.gate.clear();
+        assert!(!eval_gate(&ds, &stub));
+    }
 
     /// MK2 arcade's `screen_state` is a BITFIELD, not an enum: 2-human play
     /// sets 0x100 plus varying low bits (260 and 276 both observed live,

@@ -27,6 +27,7 @@ use crate::audio::AudioOutput;
 use crate::debug::DebugState;
 use crate::debug::panels::{
     audio_controls::AudioControls,
+    chr_editor::ChrEditor,
     cpu_state::CpuState,
     disassembly::Disassembly,
     frame_inspector::FrameInspector,
@@ -34,6 +35,8 @@ use crate::debug::panels::{
     help::HelpPanel,
     hex_dump::HexDump,
     matchup::MatchupPanel,
+    nametable::NametablePanel,
+    metasprite::MetaspritePanel,
     hunt::HuntPanel,
     framelab::FramelabPanel,
     input_log::InputLogPanel,
@@ -59,6 +62,9 @@ pub enum Tab {
     FrameInspector,
     HexDump,
     TileViewer,
+    ChrEditor,
+    Nametables,
+    Metasprite,
     InputMonitor,
     InputLog,
     FrameLog,
@@ -81,10 +87,13 @@ pub enum Tab {
 /// variant missing from a saved sidecar) and the toolbar Panels menu — adding
 /// a variant without extending this list is a compile-time-invisible bug, so
 /// the `default_layout_contains_all_tabs` test cross-checks it.
-pub const ALL_TABS: [Tab; 19] = [
+pub const ALL_TABS: [Tab; 22] = [
     Tab::FrameInspector,
     Tab::HexDump,
     Tab::TileViewer,
+    Tab::ChrEditor,
+    Tab::Nametables,
+    Tab::Metasprite,
     Tab::InputMonitor,
     Tab::InputLog,
     Tab::FrameLog,
@@ -109,6 +118,9 @@ impl Tab {
             Tab::FrameInspector => "🖼 Frame",
             Tab::HexDump => "📋 Hex",
             Tab::TileViewer => "🧩 Tiles",
+            Tab::ChrEditor => "🎨 CHR Editor",
+            Tab::Nametables => "🗺 Nametables",
+            Tab::Metasprite => "🐾 Sprites",
             Tab::InputMonitor => "🕹 Input",
             Tab::InputLog => "📜 Input Log",
             Tab::FrameLog => "🧾 Log",
@@ -137,6 +149,9 @@ pub struct Panels {
     pub input_monitor: InputMonitor,
     pub input_log_panel: InputLogPanel,
     pub tile_viewer: TileViewer,
+    pub chr_editor: ChrEditor,
+    pub nametable_panel: NametablePanel,
+    pub metasprite_panel: MetaspritePanel,
     pub frame_log: FrameLog,
     pub triggers: Triggers,
     pub cpu_state: CpuState,
@@ -160,6 +175,9 @@ impl Panels {
             input_monitor: InputMonitor::new(),
             input_log_panel: InputLogPanel::new(),
             tile_viewer: TileViewer::new(),
+            chr_editor: ChrEditor::new(),
+            nametable_panel: NametablePanel::new(),
+            metasprite_panel: MetaspritePanel::new(),
             frame_log: FrameLog::new(),
             triggers: Triggers::new(),
             cpu_state: CpuState::new(),
@@ -203,6 +221,9 @@ impl<'a> egui_dock::TabViewer for DockViewer<'a> {
             // shape: &mut self, ui, ctx, &Arc<Mutex<DebugState>>
             Tab::FrameInspector => self.panels.frame_inspector.show(ui, &ctx, self.state),
             Tab::TileViewer => self.panels.tile_viewer.show(ui, &ctx, self.state),
+            Tab::ChrEditor => self.panels.chr_editor.show(ui, &ctx, self.state),
+            Tab::Nametables => self.panels.nametable_panel.show(ui, &ctx, self.state),
+            Tab::Metasprite => self.panels.metasprite_panel.show(ui, &ctx, self.state),
 
             // shape: &mut self, ui, &Arc<Mutex<DebugState>>
             Tab::HexDump => self.panels.hex_dump.show(ui, self.state),
@@ -316,7 +337,8 @@ impl<'a> egui_dock::TabViewer for DockViewer<'a> {
 /// +----------------------------+--------------------------+
 /// |  CANVAS (tabbed)           |  LIVE: Watch|CPU|Input|  |
 /// |                            |        Input Log        |
-/// |  Frame|Disasm|Hex|Tiles    +--------------------------+
+/// |  Frame|Disasm|Hex|Tiles|   +--------------------------+
+/// |  CHR Editor|Nametables     |
 /// |                            |  CONTROL: State|Training |
 /// |                            |           |Audio         |
 /// +----------------------------+--------------------------+
@@ -332,6 +354,9 @@ pub fn default_layout() -> DockState<Tab> {
         Tab::Disasm,
         Tab::HexDump,
         Tab::TileViewer,
+        Tab::ChrEditor,
+        Tab::Nametables,
+        Tab::Metasprite,
     ]);
 
     let surface = dock.main_surface_mut();

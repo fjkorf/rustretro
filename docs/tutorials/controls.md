@@ -97,6 +97,19 @@ DPad** switch mode: top row L/M/H → South/West/North → B/A/Y, weapon-toss ch
 both trigger-2 buttons, directions on the d-pad. Recalibrate with `--calibrate` if a
 stick differs from this, and use `--pad-debug` to see the raw button names it reports.
 
+## NES (RetroPad) layout
+
+RetroPad's NES mapping is native — B/A/Select/Start/d-pad need no translation layer.
+The default keyboard map already covers it: **Z=B, X=A, Enter=Start, Shift=Select,
+Arrows=d-pad**, no changes needed. A standard gamepad's South/West buttons give B/A;
+run `--calibrate` once against the game (e.g. `--game library/tcsurfdesign`) for a
+clean per-ROM sidecar instead of relying on the F300-tuned chorded default (its extra
+chords are harmless no-ops on NES, just odd). Two profile keys make a console family
+read correctly on every surface: `select_label` in family.json renames the Select bit
+(arcade families say "Coin"; NES says "Select"), and `attack_chords` must name the
+pad's action buttons (`{"A": ["a"], "B": ["b"]}`) — the wizard can only prompt for
+profile-named actions, so an empty map would make A/B uncalibratable.
+
 ## Why it matters
 
 Every human-facing surface — this panel, the wizard, Help, the Input monitor — renders

@@ -421,11 +421,43 @@ pub const BYTES_PER_4BPP_TILE: usize = 32;
 /// max=white), so structure is visible WITHOUT knowing the real palette. With
 /// `levels == 4` (2bpp) the ramp is 0/85/170/255; with 16 (4bpp) it is the 16
 /// evenly-spaced steps. Returned as an opaque RGBA quad.
-fn gray_ramp_rgba(index: u8, levels: u8) -> [u8; 4] {
+pub(crate) fn gray_ramp_rgba(index: u8, levels: u8) -> [u8; 4] {
     let levels = levels.max(2);
     let max = (levels - 1) as u32;
     let v = ((index.min(levels - 1) as u32) * 255 / max) as u8;
     [v, v, v, 255]
+}
+
+/// NES master palette: 64 RGB triples indexed by the 6-bit color values PALRAM
+/// holds. Canonical NTSC 2C02 table from the NesDev wiki "PPU palettes" page
+/// (blargg's full_palette output, the FCEUX/Nestopia default). Rows $00-$0F,
+/// $10-$1F, $20-$2F, $30-$3F. Single source shared by the CHR editor, the
+/// nametable viewer, and render_tiles' live-palette mode.
+#[rustfmt::skip]
+pub(crate) const NES_MASTER_PALETTE: [[u8; 3]; 64] = [
+    [ 84,  84,  84], [  0,  30, 116], [  8,  16, 144], [ 48,   0, 136],
+    [ 68,   0, 100], [ 92,   0,  48], [ 84,   4,   0], [ 60,  24,   0],
+    [ 32,  42,   0], [  8,  58,   0], [  0,  64,   0], [  0,  60,   0],
+    [  0,  50,  60], [  0,   0,   0], [  0,   0,   0], [  0,   0,   0],
+    [152, 150, 152], [  8,  76, 196], [ 48,  50, 236], [ 92,  30, 228],
+    [136,  20, 176], [160,  20, 100], [152,  34,  32], [120,  60,   0],
+    [ 84,  90,   0], [ 40, 114,   0], [  8, 124,   0], [  0, 118,  40],
+    [  0, 102, 120], [  0,   0,   0], [  0,   0,   0], [  0,   0,   0],
+    [236, 238, 236], [ 76, 154, 236], [120, 124, 236], [176,  98, 236],
+    [228,  84, 236], [236,  88, 180], [236, 106, 100], [212, 136,  32],
+    [160, 170,   0], [116, 196,   0], [ 76, 208,  32], [ 56, 204, 108],
+    [ 56, 180, 204], [ 60,  60,  60], [  0,   0,   0], [  0,   0,   0],
+    [236, 238, 236], [168, 204, 236], [188, 188, 236], [212, 178, 236],
+    [236, 174, 236], [236, 174, 212], [236, 180, 176], [228, 196, 144],
+    [204, 210, 120], [180, 222, 120], [168, 226, 144], [152, 226, 180],
+    [160, 214, 228], [160, 162, 160], [  0,   0,   0], [  0,   0,   0],
+];
+
+/// Map a PALRAM byte (a 6-bit NES master-palette index) to an opaque RGBA quad.
+/// The `& 0x3F` mask guards a garbage read from indexing out of bounds.
+pub(crate) fn nes_master_rgba(index: u8) -> [u8; 4] {
+    let [r, g, b] = NES_MASTER_PALETTE[(index & 0x3F) as usize];
+    [r, g, b, 255]
 }
 
 /// Decode 2bpp PLANAR tiles in the NES CHR layout into a flat vector of palette
@@ -453,6 +485,27 @@ pub fn decode_2bpp_planar_indices(bytes: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Encode one row of 8 palette indices (0..=3) back into the two 2bpp planar
+/// bitplane bytes `(plane0, plane1)` — the inverse of the per-row bit-math in
+/// [`decode_2bpp_planar_indices`]. Pixel `x`'s bit lives at `(7 - x)`: the low
+/// bit of the index goes into `plane0`, the high bit into `plane1`. Only the
+/// low 2 bits of each index are consulted (matching how a 2bpp tile has no
+/// room for more).
+///
+/// PURE and unit-tested (round-trips through the decoder). Lives here, next to
+/// the decoder, as the single place that knows the CHR 2bpp bit layout — the
+/// CHR editor debug panel calls this rather than re-deriving the bit math.
+pub fn encode_2bpp_planar_row(indices: &[u8; 8]) -> (u8, u8) {
+    let mut plane0 = 0u8;
+    let mut plane1 = 0u8;
+    for (x, &idx) in indices.iter().enumerate() {
+        let bit = 7 - x;
+        plane0 |= (idx & 1) << bit;
+        plane1 |= ((idx >> 1) & 1) << bit;
+    }
+    (plane0, plane1)
 }
 
 /// Decode 4bpp PLANAR tiles (Genesis VDP layout) into palette indices (0..=15),
@@ -549,15 +602,28 @@ pub struct TileImage {
 
 /// Decode `bytes` as `format` tiles, laid out `tiles_per_row` tiles wide, into
 /// an RGBA grid using the default grayscale ramp (since the real palette is
-/// usually unknown). The final row is padded with black tiles so the buffer is
-/// a clean rectangle. Returns `None` if there isn't even one complete tile or
-/// `tiles_per_row == 0`.
+/// usually unknown). See [`decode_tiles_to_rgba_paletted`] for live-color mode.
 ///
 /// PURE — no locking, no globals — so the grid layout is unit-testable.
 pub fn decode_tiles_to_rgba(
     bytes: &[u8],
     format: TileFormat,
     tiles_per_row: usize,
+) -> Option<TileImage> {
+    decode_tiles_to_rgba_paletted(bytes, format, tiles_per_row, None)
+}
+
+/// Like [`decode_tiles_to_rgba`], but when `nes_subpalette` is `Some([i0..i3])`
+/// (four NES master-palette indices, e.g. a 4-byte slice of live PALRAM) each
+/// 2bpp pixel index 0..=3 maps through those real colors instead of the
+/// grayscale ramp. Only meaningful for `Nes2bpp`; ignored for other formats.
+/// The final row is padded with black tiles so the buffer is a clean rectangle.
+/// Returns `None` if there isn't even one complete tile or `tiles_per_row == 0`.
+pub fn decode_tiles_to_rgba_paletted(
+    bytes: &[u8],
+    format: TileFormat,
+    tiles_per_row: usize,
+    nes_subpalette: Option<[u8; 4]>,
 ) -> Option<TileImage> {
     if tiles_per_row == 0 {
         return None;
@@ -568,6 +634,10 @@ pub fn decode_tiles_to_rgba(
     }
     let indices = format.decode_indices(bytes); // tile-major, 64 indices/tile
     let levels = format.levels();
+    let sub = match format {
+        TileFormat::Nes2bpp => nes_subpalette,
+        _ => None,
+    };
 
     let cols = tiles_per_row;
     let rows = tile_count.div_ceil(cols);
@@ -584,7 +654,10 @@ pub fn decode_tiles_to_rgba(
         for ty in 0..TILE_PX {
             for tx in 0..TILE_PX {
                 let idx = indices[t * TILE_PX * TILE_PX + ty * TILE_PX + tx];
-                let [r, g, b, a] = gray_ramp_rgba(idx, levels);
+                let [r, g, b, a] = match sub {
+                    Some(pal) => nes_master_rgba(pal[(idx & 0x3) as usize]),
+                    None => gray_ramp_rgba(idx, levels),
+                };
                 let dst = ((py0 + ty) * width + (px0 + tx)) * 4;
                 rgba[dst] = r;
                 rgba[dst + 1] = g;
@@ -1254,6 +1327,31 @@ mod tests {
     }
 
     #[test]
+    fn encode_2bpp_planar_row_round_trips_through_decode() {
+        // Representative set: all four indices in one row, plus every
+        // all-same-index row, plus the hand-picked rows from the tile above.
+        let cases: &[[u8; 8]] = &[
+            [0, 1, 2, 3, 0, 1, 2, 3],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [1, 1, 1, 1, 1, 1, 1, 1],
+            [2, 2, 2, 2, 2, 2, 2, 2],
+            [3, 3, 3, 3, 3, 3, 3, 3],
+            [1, 0, 0, 0, 0, 0, 0, 1],
+            [3, 1, 3, 1, 3, 1, 3, 1],
+        ];
+        for row in cases {
+            let (p0, p1) = encode_2bpp_planar_row(row);
+            // Decode a synthetic one-row-tall tile to reuse the real decoder:
+            // put this row at row 0, zero elsewhere.
+            let mut tile = [0u8; 16];
+            tile[0] = p0;
+            tile[8] = p1;
+            let decoded = decode_2bpp_planar_indices(&tile);
+            assert_eq!(&decoded[0..8], row, "round-trip failed for row {row:?}");
+        }
+    }
+
+    #[test]
     fn decode_2bpp_ignores_trailing_partial_tile() {
         // 16 + 5 bytes: only one complete tile decoded.
         let bytes = vec![0u8; 16 + 5];
@@ -1293,6 +1391,41 @@ mod tests {
         assert!(decode_tiles_to_rgba(&[0u8; 8], TileFormat::Nes2bpp, 16).is_none());
         // Zero tiles_per_row → None.
         assert!(decode_tiles_to_rgba(&[0u8; 16], TileFormat::Nes2bpp, 0).is_none());
+    }
+
+    #[test]
+    fn nes_master_palette_anchors_and_wrap() {
+        assert_eq!(nes_master_rgba(0x00), [84, 84, 84, 255]);
+        assert_eq!(nes_master_rgba(0x0F), [0, 0, 0, 255]);
+        assert_eq!(nes_master_rgba(0x20), [236, 238, 236, 255]);
+        assert_eq!(nes_master_rgba(0x21), [76, 154, 236, 255]);
+        // Indices are masked to 6 bits, never out of bounds.
+        assert_eq!(nes_master_rgba(0x40), nes_master_rgba(0x00));
+        assert_eq!(nes_master_rgba(0xFF), nes_master_rgba(0x3F));
+    }
+
+    #[test]
+    fn paletted_decode_maps_2bpp_indices_through_subpalette() {
+        // One tile: row 0 = pixels 0,1,2,3,3,3,3,3 (plane0=0b00111110=0x3E,
+        // plane1=0b00011100=0x1C gives idx 0,1,3,3,2,2,... — just assert the
+        // corner pixels resolve to the sub-palette's colors, not the ramp.
+        let mut tile = [0u8; 16];
+        tile[0] = 0b0101_0101; // plane0 row0
+        tile[8] = 0b0011_0011; // plane1 row0 → idx per pixel: 0,1,2,3,0,1,2,3
+        let sub = [0x0F, 0x16, 0x27, 0x30]; // black, red, orange, white
+        let img = decode_tiles_to_rgba_paletted(&tile, TileFormat::Nes2bpp, 1, Some(sub)).unwrap();
+        let px = |x: usize| {
+            let o = x * 4;
+            [img.rgba[o], img.rgba[o + 1], img.rgba[o + 2]]
+        };
+        let rgb = |i: u8| { let [r, g, b, _] = nes_master_rgba(i); [r, g, b] };
+        assert_eq!(px(0), rgb(0x0F)); // idx 0 → sub[0]
+        assert_eq!(px(1), rgb(0x16)); // idx 1 → sub[1]
+        assert_eq!(px(2), rgb(0x27)); // idx 2 → sub[2]
+        assert_eq!(px(3), rgb(0x30)); // idx 3 → sub[3]
+        // No sub-palette → grayscale ramp (unchanged default behavior).
+        let gray = decode_tiles_to_rgba_paletted(&tile, TileFormat::Nes2bpp, 1, None).unwrap();
+        assert_eq!(&gray.rgba[0..4], &gray_ramp_rgba(0, 4));
     }
 
     #[test]

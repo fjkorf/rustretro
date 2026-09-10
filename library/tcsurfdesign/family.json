@@ -1,0 +1,9 @@
+{
+  "_STATUS": "Scaffold (Step B1, 2026-09-09) — no live RAM/roster facts exist yet. This is an NES sports/platformer (operator describes 4 characters and 2 modes — TO-VERIFY on-screen, deliberately NOT recorded as roster entries until read off a live select screen). attack_classes/attack_chords ARE populated despite this not being a fighting game: they exist purely to drive action_rows/--calibrate/F11 naming (the wizard can only prompt for profile-named actions — its descriptor table is empty pre-boot), not to size any model head; leaving them empty would make the A and B buttons permanently uncalibratable. select_label keeps the RETRO Select bit reading 'Select' instead of the arcade 'Coin'. Note: --game library/tcsurfdesign (bare dir) is the resolvable form; a /nes suffix will not resolve.",
+  "family": "tcsurfdesign",
+  "title": "T&C Surf Design",
+  "roster": [],
+  "move_classes": [],
+  "attack_classes": ["None", "A", "B"],
+  "select_label": "Select"
+}

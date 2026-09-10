@@ -1,3 +1,4 @@
+pub mod chr_editor;
 pub mod frame_inspector;
 pub mod hex_dump;
 pub mod input_monitor;
@@ -14,6 +15,8 @@ pub mod ram_search;
 pub mod help;
 pub mod hex_tint;
 pub mod matchup;
+pub mod nametable;
+pub mod metasprite;
 pub mod hunt;
 pub mod framelab;
 pub mod state;

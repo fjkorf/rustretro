@@ -49,3 +49,6 @@ scratchpad/
 
 # Frame lab authoring store (derived; the committed artifact is library/<family>/<port>.frames.json)
 shadow/framelab/
+
+# metasprite panel scratch pose exports (frame-numbered, transient)
+library/*/assets/swap/pose_export_*.json

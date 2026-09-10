@@ -40,6 +40,12 @@ pub struct Family {
     pub roster: Vec<RosterEntry>,
     pub move_classes: Vec<String>,
     pub attack_classes: Vec<String>,
+    /// Display name for the RETRO `Select` bit in the action vocabulary
+    /// (arcade families call it "Coin"; console families keep their pad's
+    /// own name, e.g. NES "Select"). Defaults to "Coin" so every existing
+    /// family.json is untouched.
+    #[serde(default = "d_select_label")]
+    pub select_label: String,
     #[serde(default)]
     pub block: BlockStyle,
     /// Family-level move vocabulary (shadow/MACRO_ACTIONS.md §1), keyed by
@@ -226,6 +232,10 @@ pub struct StepSpec {
 }
 fn d_step_frames() -> u8 {
     3
+}
+
+fn d_select_label() -> String {
+    "Coin".to_string()
 }
 
 /// One pinned RAM value: a named global asserted to `value` for the session.
@@ -1806,6 +1816,56 @@ mod tests {
         let _ = fs::remove_dir_all(&path); // Clean up if it exists
         fs::create_dir_all(&path).ok();
         path
+    }
+
+    #[test]
+    fn shipped_tcsurfdesign_scaffold_loads_with_nes_shape() {
+        let p = GameProfile::load(Path::new("library/tcsurfdesign")).expect("scaffold loads");
+        assert_eq!(p.family.family, "tcsurfdesign");
+        assert_eq!(p.port.port, "nes");
+        // The two schema defaults a console port must override, and the
+        // select-bit label that keeps F11/--calibrate from saying "Coin".
+        assert_eq!(p.port.memory.cpu, "6502");
+        assert_eq!(p.port.memory.endianness, "little");
+        assert_eq!(p.family.select_label, "Select");
+        // The wizard can only prompt profile-named actions: A and B must be
+        // in the vocabulary or they are uncalibratable (not a fighting-game
+        // borrowing — an input-naming necessity).
+        assert!(p.family.attack_classes.contains(&"A".to_string()));
+        assert!(p.port.attack_chords.contains_key("A"));
+        assert!(p.port.attack_chords.contains_key("B"));
+        // T1: the gate is real (validated live across pause + timer-reset)
+        // and its global resolves. Session #2 dropped the $58 inverse cross-
+        // check (it's 0=active/1=paused/2=menu, not a pure complement), so
+        // $47 alone is the gate.
+        assert!(!p.port.gate.is_empty());
+        assert!(p.global("gameplay_gate").is_some());
+        assert!(p.global("engine_clock").is_some());
+    }
+
+    /// Every tcsurfdesign global must sit inside NES CPU RAM ($0000-$07FF).
+    /// The engine's read path (lua_engine::read1, gate's rd8/rd16) folds an
+    /// out-of-map read into 0 — a global declared outside the mapped 2KB
+    /// would render a plausible, permanently-wrong 0 indistinguishable from
+    /// a real value. This bound is the one mechanical defense.
+    #[test]
+    fn tcsurfdesign_globals_stay_inside_nes_cpu_ram() {
+        let p = GameProfile::load(Path::new("library/tcsurfdesign")).expect("scaffold loads");
+        assert!(!p.port.memory.globals.is_empty(), "T1 profile should carry globals");
+        for (name, addr) in &p.port.memory.globals {
+            assert!(
+                addr.0 < 0x800,
+                "global {name} = {:#x} is outside NES CPU RAM 0x0-0x7FF — \
+                 the engine would silently read 0 there",
+                addr.0
+            );
+        }
+    }
+
+    #[test]
+    fn select_label_defaults_to_coin_for_existing_families() {
+        let p = init_for_tests();
+        assert_eq!(p.family.select_label, "Coin");
     }
 
     #[test]
