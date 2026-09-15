@@ -7119,3 +7119,150 @@ the start" is still unsound on this game (a round trip never nets to zero
 frames), which was the actual point of the original line. `CLAUDE.md`'s
 gotcha is corrected to the measured per-character values below rather than
 the disproven single pair.
+
+# Four things the confirm bot had to measure (2026-09-15, Tier-2 bot wave)
+
+Headless FBNeo, `--pace 0`, MCP port **4026** (never 4025).
+`core_id=fbneo_libretro.dylib:sha256:972e8fb8c8394979`,
+`rom_id=mk2.zip:sha256:e8d3f2f8cefe1aab`. Stage: the `m-gap-*` ladder,
+**Mileena P1 (block1/port0, char 5) vs Reptile P2 (block2/port1, char 9)**,
+loaded through MCP `load_state` with `pause_after` and the gap verified
+against each rung's own `.gap.json` before every trial. All inputs via
+`input.hold`/`input.release` from Lua on port 0 (never `press_buttons`);
+the defender is the native `Block` dummy (`training.set_guard("all")` unless
+stated). Anchor: struct health `block+0x0E`, decrease only. Frames only, no
+wall clock.
+
+Everything here was found the same way: `library/mk2/confirm_bot.lua` did not
+work, and each failure turned out to be a number nobody had measured. All
+four are stored as prose + the bot's own CONFIG citations; none of them is a
+row in `arcade.frames.json` (they are not advantage cells).
+
+## 1. The block-stance latch is a stance LIFETIME, not a release tail
+
+The W1 section above ("Block vs a normal in progress") bracketed the latch as
+"release-gap 7 fails / 8 succeeds for every hold ≥15; the one short hold
+measured, 8 frames, needed 10", and `src/training.rs` ships
+`PUNISH_RELEASE = 12` on that basis. **12 is not enough for a short hold.**
+The first build of the bot whiffed **13 of 13** opening jabs: its neutral
+guard is often 1–2 frames long, and a short Block hold has a LONGER latch.
+
+Swept directly — hold Block for N frames, release, wait G frames, press HP for
+3 frames, read Reptile's chip. 2 reps per cell, **every cell deterministic**:
+
+| Block hold (frames) | minimum release gap for the press to come out |
+|---|---|
+| 1 | 17 (16 fails) |
+| 2 | 16 (15 fails) |
+| 4 | 14 (13 fails) |
+| 6 | 12 (11 fails) |
+| 8 | **10** (9 fails) |
+| 10 | 8 (7 fails) |
+| 12 | 8 (7 fails) |
+| 15 | **8** (7 fails) |
+| 30 | 8 |
+
+which is exactly
+
+> **min_release_gap = max(8, 18 − block_hold_frames)**
+
+— a ~18-frame minimum LIFETIME of the block stance measured from the frame
+Block goes DOWN, plus an 8-frame tail measured from the frame it comes UP;
+whichever floor is later wins. The two previously published cells (hold 8 →
+10, hold ≥15 → 8) **reproduce exactly**; this only extends the bracket
+downward, where nothing had been measured.
+
+Swept again with HK instead of HP (hold 1 → 17, hold 15 → 8, identical
+boundaries): **the latch is NOT per-button**, unlike the same-frame eat,
+which W1 found to be HK-specific.
+
+Consequence for `src/training.rs`: `PUNISH_RELEASE = 12` is correct for the
+BlockPunish dummy *as it is used* (the dummy guards for long stretches, so it
+lives in the ≥12-hold row where 8 suffices) — **not corrected**. It would be
+wrong for any caller that guards briefly.
+
+## 2. The bot's own spacing bands — and the HP proximity boundary, narrowed
+
+The chip AMOUNT names the variant that came out (24/4 = 6 close, 11/4 = 3
+far), so the proximity boundary is directly observable. Swept 61 → 87 px in
+2 px steps (walking P1 back from `m-gap-45` and letting it settle 8 frames),
+guarding defender:
+
+| gap | far HP press | chain HP (pressed at f12 of a blocked first one) |
+|---|---|---|
+| 61, 63 px | chip **6** → CLOSE HP | — |
+| 65 … 73 px | chip 3 → FAR HP | chip 3 — **connects** |
+| 75 … 81 px | chip 3 → FAR HP | 0 — **whiffs** |
+| 83 px | 0 — whiffs | — |
+
+- **The HP proximity boundary is between 63 and 65 px**, narrowing the
+  2026-09-14 bracket ("between 63 and 69") by four pixels.
+- **The chain reaches 8 px less far than the jab that opened the string, and
+  it is not the move's fault.** Blocked-contact pushback is a ~9 px SLIDE
+  spread over the following ~10 frames, not an instant teleport — per-frame
+  trace of one blocked jab: `71,71,72,73,74,74,75,76,77,77,78,79`. The chain
+  is pressed at f12 and contacts ~10 frames later, by which time the defender
+  has slid out from under it.
+- The `far` row's stored `connect_range` is 83; this sweep whiffed AT 83 and
+  connected at 81. An earlier arm of the same sweep, walking out from
+  `m-gap-39` instead, connected at 83/85/87 — **the two arms disagree above
+  81 px** and the difference is almost certainly residual walk drift in the
+  settle window rather than a property of the move. Recorded, not resolved;
+  the bot takes the conservative bound (81).
+
+## 3. The crouch stance needs a lead-in, and the clock starts at ACTIONABILITY
+
+`Down + LK` pressed together does **not** produce cLK. Measured from idle at
+`m-gap-39`, 2 reps per cell, deterministic:
+
+| frames of Down held before the LK press | what comes out |
+|---|---|
+| 0, 1, 2, 3, 4, 5 | **nothing at all** (0 damage) |
+| 6, 7, 8, 12 | cLK — 6 damage on hit, **2 chip** on block |
+
+The 2-damage chip is itself new: the profile's `_STATUS` says blocked normals
+"always chip 3/6/8 on this port". cLK chips 2.
+
+**The lead-in cannot be hidden inside another move's recovery.** Holding Down
+through a blocked far HP's recovery so the LK press lands exactly on the jab's
+measured earliest free frame f19 produced a standing **far LK** (26 damage,
+`mileena/LK/far`) every time, three runs — a −20-on-block, −25-on-hit move,
+while the bot's own log said "cLK, −2". Swept from f19 instead, 2 reps per
+cell, deterministic:
+
+| extra Down frames after f19 | what comes out |
+|---|---|
+| 6, 10, 12, 14 | nothing |
+| **8** | a **close LK** (chip 4) — a non-monotone island, unexplained |
+| 15, 16, 17, 18, 20 | cLK (chip 2) |
+
+So the stance clock starts when the fighter becomes ACTIONABLE, not when the
+direction is first held, and it costs ~15 frames there against ~6 from idle.
+This is CLAUDE.md's "a default correct for two subjects is not a law" in its
+stance-lead-in form: the lead-in is per subject AND per entry condition.
+
+## 4. cLK is NOT reachable as a follow-up to a blocked far HP — a timing refusal
+
+Combining §3 with the published rows: after a blocked far HP the bot is +13
+and its own earliest press is f19, so the cLK button lands at **f19 + 15 =
+f34**. The defender's earliest press after that same blocked far HP is
+**f32** (2026-09-14 attack-press rig, reproduced above). **The ender is 2
+frames late — the +13 is spent before the move comes out.**
+
+This is `docs/frames.md` §1's third clause again (a published number
+neutralised by a clause outside the number), in the same family as the
+unpunishable blocked teleport kick: `mileena/cLK`'s −2 is not wrong, it is
+simply unreachable from the only pressure that would want it. Not a
+correction; the row stands. `confirm_bot.lua` ships with
+`CONFIG.ender_enabled = false` and the refusal written next to it, and ends
+its strings by re-guarding — which the +13 pays for comfortably.
+
+## What was NOT measured
+
+- The non-monotone "lead 8 → close LK" island in §3 (reproduced 2/2, not
+  explained).
+- Whether §1's `max(8, 18 − hold)` rule holds for LP/LK, for other
+  characters, or after a move (all cells above start from idle or from a
+  blocked far HP).
+- The §2 disagreement above 81 px between the two walk-out arms.
+- Any of it on Genesis MK2.
