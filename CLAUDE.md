@@ -239,8 +239,10 @@ settings now persist to `rustretro_training_v1.json` (cwd, gitignored).
   `via: "object_ptr"` field form resolves it per frame and yields ABSENT,
   never 0, when the pointer is stale. The old `p1_x`/`p2_x` globals are
   DISPROVEN — never use them for position or liveness.
-- MK2 walk speeds are ASYMMETRIC (+12 px/6f forward vs +5 px/6f backward), so
-  any check shaped "hold a direction, undo it, expect to return" is wrong.
+- MK2 walk speeds are ASYMMETRIC and PER-CHARACTER (measured, differential:
+  Mileena 3.0 px/frame forward vs 2.0 backward; Reptile ~2.5 forward vs 2.0
+  backward — mk2.md "Three loose ends, closed"), so any check shaped "hold a
+  direction, undo it, expect to return" is wrong.
 - The app rewrites `library/asurabld/asurabld.busmap.json` (pretty-printed)
   on sidecar saves — don't commit that churn.
 - Block `+0x54/+0x56` positions are recomputed outputs: writes hold only

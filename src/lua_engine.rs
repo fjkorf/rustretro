@@ -43,6 +43,12 @@
 //! game.addr(name)                   -> integer|nil  (named global from the profile)
 //! game.block1() / game.block2()     -> integer  (fighter block base addresses)
 //! game.field_off(name)              -> integer|nil  (fighter-field offset)
+//! game.read_field(block, name)      -> number|nil  (fighter-field VALUE for
+//!                                                block 1/2, resolved through
+//!                                                the profile — pointer-
+//!                                                indirected `via: "object_ptr"`
+//!                                                fields included; nil on any
+//!                                                unresolved/stale field, never 0)
 //! game.char_name(id)                -> string   (roster name; "c<N>" fallback)
 //! game.matchup_slug(me, opp)        -> string   ("goat-vs-rosemary")
 //! game.stage_value_for(opp)         -> integer|nil  (stage-selector value)
@@ -60,6 +66,14 @@
 //! training.set_punish(pool)                     (write-gated; BlockPunish pool:
 //!                                                {{weight=3, move="slide"}, {weight=2, attack="HP"},
 //!                                                 {weight=1, continue_frames=30}, ...})
+//! training.reversal()               -> string|integer|table  (current
+//!                                                ReversalTiming: "fast" | "late" |
+//!                                                an integer (Explicit frames) |
+//!                                                {min=A, max=B} (Delay))
+//! training.set_reversal(spec)                   (write-gated; same vocabulary
+//!                                                as training.reversal()'s return —
+//!                                                "fast" | "late" | a number | a
+//!                                                {min=A, max=B} table)
 //! shadow.on()                       -> bool|nil (nil = no model loaded)
 //! shadow.model()                    -> string|nil  (loaded model name)
 //! shadow.toggle()                                (queue a shadow on/off toggle)
@@ -299,6 +313,89 @@ fn parse_state_target(v: &mlua::Value, load: bool) -> Result<crate::debug::State
             "savestate: expected a slot number (1-9) or a path string, got {}",
             other.type_name()
         )),
+    }
+}
+
+/// Parse the `training.set_reversal` argument into a
+/// [`crate::debug::ReversalTiming`] — the same vocabulary
+/// [`reversal_spec_to_lua`] hands back, so a script can read, tweak, and
+/// write the value without a translation layer of its own. Accepts:
+/// `"fast"` | `"late"` | a number (`Explicit` frames) | a table
+/// `{min=A, max=B}` (`Delay`). Anything else is an error naming the
+/// accepted forms.
+fn parse_reversal_spec(v: &mlua::Value) -> Result<crate::debug::ReversalTiming, String> {
+    use crate::debug::ReversalTiming;
+    match v {
+        mlua::Value::String(s) => match s.to_string_lossy().as_ref() {
+            "fast" => Ok(ReversalTiming::Fast),
+            "late" => Ok(ReversalTiming::Late),
+            other => Err(format!(
+                "training.set_reversal: unknown string '{other}' (expected \"fast\" or \"late\")"
+            )),
+        },
+        mlua::Value::Integer(n) => Ok(ReversalTiming::Explicit((*n).max(0) as u64)),
+        mlua::Value::Number(f) if f.fract() == 0.0 => {
+            Ok(ReversalTiming::Explicit(f.max(0.0) as u64))
+        }
+        mlua::Value::Table(t) => {
+            let min: Option<i64> = t.get("min").map_err(|e| e.to_string())?;
+            let max: Option<i64> = t.get("max").map_err(|e| e.to_string())?;
+            match (min, max) {
+                (Some(min), Some(max)) => {
+                    Ok(ReversalTiming::Delay { min: min.max(0) as u64, max: max.max(0) as u64 })
+                }
+                _ => Err("training.set_reversal: table form needs {min=A, max=B}".to_string()),
+            }
+        }
+        other => Err(format!(
+            "training.set_reversal: expected \"fast\"/\"late\", a number (Explicit frames), \
+             or {{min=A, max=B}} (Delay); got {}",
+            other.type_name()
+        )),
+    }
+}
+
+/// [`parse_reversal_spec`]'s inverse — encodes a live
+/// [`crate::debug::ReversalTiming`] back into the same Lua vocabulary its
+/// setter accepts, for `training.reversal()`'s round-trip.
+fn reversal_spec_to_lua(lua: &Lua, timing: crate::debug::ReversalTiming) -> mlua::Result<mlua::Value> {
+    use crate::debug::ReversalTiming;
+    Ok(match timing {
+        ReversalTiming::Fast => mlua::Value::String(lua.create_string("fast")?),
+        ReversalTiming::Late => mlua::Value::String(lua.create_string("late")?),
+        ReversalTiming::Explicit(n) => mlua::Value::Integer(n as i64),
+        ReversalTiming::Delay { min, max } => {
+            let t = lua.create_table()?;
+            t.set("min", min)?;
+            t.set("max", max)?;
+            mlua::Value::Table(t)
+        }
+    })
+}
+
+/// Endian-correct a raw multi-byte read of `size` bytes (1/2/4) for
+/// `game.read_field` — mirrors `record.rs`/`training.rs`/`shadow_runner.rs`'s
+/// private `endian_fix` (duplicated rather than shared; each module owns its
+/// own cross-module coupling, same rationale as those three).
+fn endian_fix(v: u32, size: u8, little: bool) -> u32 {
+    if little {
+        return v;
+    }
+    match size {
+        2 => (v as u16).swap_bytes() as u32,
+        4 => v.swap_bytes(),
+        _ => v,
+    }
+}
+
+/// Sign-extend a raw, already-natural-order value of `size` bytes (1 or 2)
+/// to `i64` — mirrors `profile.rs`'s private `sign_extend`, used the same
+/// way: only for a fighter field declared `signed: true`.
+fn sign_extend(raw: u32, size: u8) -> i64 {
+    match size {
+        1 => raw as u8 as i8 as i64,
+        2 => raw as u16 as i16 as i64,
+        _ => raw as i64,
     }
 }
 
@@ -814,6 +911,58 @@ impl LuaEngine {
             game.set("field_off", f)?;
         }
 
+        // read_field(block, name) -> number|nil — ONE fighter-field read path
+        // covering both address forms the profile schema allows: fixed
+        // (block base + offset, or a per-block global) and pointer-resolved
+        // (`via: "object_ptr"`, docs/frames.md §5 — MK2 arcade's `x`/`y`,
+        // behind a TMS34010 bit-address pointer that moves every frame).
+        // Pointer-resolved fields go through `GameProfile::object_ptr_field`
+        // — the SAME resolution the recorder and shadow_runner use — rather
+        // than re-decoding the pointer here. Returns nil (ABSENT, never a
+        // synthesized 0 — RECORDER_V3 law) when `name` is unknown, a fixed
+        // field's global doesn't resolve, or an object_ptr field's pointer /
+        // char-id cross-check fails THIS frame (a stale pool slot).
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(
+                move |_, (block, name): (u8, String)| -> mlua::Result<Option<i64>> {
+                    if block != 1 && block != 2 {
+                        return Err(mlua::Error::external(format!(
+                            "game.read_field: block must be 1 or 2, got {block}"
+                        )));
+                    }
+                    let p = crate::profile::current();
+                    let little = p.port.memory.endianness == "little";
+                    let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                    if p.field_is_object_ptr(&name) {
+                        return Ok(p.object_ptr_field(block, &name, |addr, size| {
+                            endian_fix(
+                                ds.read_addr(addr as usize, size as usize).unwrap_or(0),
+                                size,
+                                little,
+                            )
+                        }));
+                    }
+                    let Some((addr, size)) = p.field_addr(block, &name) else {
+                        return Ok(None);
+                    };
+                    let raw = endian_fix(
+                        ds.read_addr(addr as usize, size as usize).unwrap_or(0),
+                        size,
+                        little,
+                    );
+                    let signed = p
+                        .port
+                        .memory
+                        .fighter_fields
+                        .iter()
+                        .any(|f| f.name == name && f.signed);
+                    Ok(Some(if signed { sign_extend(raw, size) } else { raw as i64 }))
+                },
+            )?;
+            game.set("read_field", f)?;
+        }
+
         // char_name(id) -> string; matchup_slug(me, opp) -> string.
         {
             let f = lua.create_function(|_, id: u8| -> mlua::Result<String> {
@@ -947,6 +1096,17 @@ impl LuaEngine {
             })?;
             training.set("guard_mode", f)?;
         }
+        // reversal() -> the current ReversalTiming, in the same vocabulary
+        // set_reversal accepts ("fast"/"late"/a number/{min=,max=}) — lets a
+        // script read-modify-write without its own translation layer.
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |lua, ()| -> mlua::Result<mlua::Value> {
+                let ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                reversal_spec_to_lua(lua, ds.training.reversal_timing)
+            })?;
+            training.set("reversal", f)?;
+        }
         // Setters — the headless twin of F5/F1/the panel's pool steppers
         // (agents drive training over run_lua; hotkeys need a window). All
         // behind the ONE write gate (`--training` arms it, MCP enable_writes
@@ -1058,6 +1218,30 @@ impl LuaEngine {
                 Ok(())
             })?;
             training.set("set_punish", f)?;
+        }
+        // set_reversal(spec) — headless twin of the panel's Fast/Delay/Late/
+        // Explicit combo (src/debug/panels/training.rs reversal_section).
+        // Accepts the same vocabulary `training.reversal()` hands back:
+        // "fast" | "late" | a number (Explicit frames) | {min=A, max=B}
+        // (Delay). Setting `ds.training.reversal_timing` directly is enough
+        // to reach both the panel (reads the field live every frame it
+        // draws) and the settings sidecar (the panel's `autosave_settings`
+        // persists any change to the field on its next render, scripted or
+        // not — same as every other training setter here).
+        {
+            let dbg = SharedDebugState::clone(debug);
+            let f = lua.create_function(move |_, spec: mlua::Value| -> mlua::Result<()> {
+                let timing = parse_reversal_spec(&spec).map_err(mlua::Error::external)?;
+                let mut ds = dbg.lock().map_err(|e| mlua::Error::external(e.to_string()))?;
+                if !ds.lua_writes_enabled {
+                    return Err(mlua::Error::external(
+                        "training.set_reversal blocked: writes disabled (enable_writes)",
+                    ));
+                }
+                ds.training.reversal_timing = timing;
+                Ok(())
+            })?;
+            training.set("set_reversal", f)?;
         }
         globals.set("training", training)?;
 
@@ -2116,6 +2300,105 @@ mod tests {
     fn api_sentinel_is_v3() {
         let (eng, _dbg) = engine_with_ram();
         assert_eq!(eng.eval_to_string("_RUSTRETRO_API").unwrap(), "3");
+    }
+
+    #[test]
+    fn reversal_setter_round_trips_all_four_forms_and_is_gated() {
+        use crate::debug::ReversalTiming;
+        let (eng, dbg) = engine_with_ram();
+
+        // Gate off (default): refused, naming the gate, like every other
+        // training setter — and the field is untouched.
+        let before = dbg.lock().unwrap().training.reversal_timing;
+        let err = eng.eval_to_string("training.set_reversal('fast')").unwrap_err();
+        assert!(err.contains("writes disabled"), "{err}");
+        assert_eq!(dbg.lock().unwrap().training.reversal_timing, before);
+
+        dbg.lock().unwrap().lua_writes_enabled = true;
+
+        // "fast" / "late" strings.
+        eng.eval_to_string("training.set_reversal('fast')").unwrap();
+        assert_eq!(dbg.lock().unwrap().training.reversal_timing, ReversalTiming::Fast);
+        assert_eq!(eng.eval_to_string("training.reversal()").unwrap(), "fast");
+
+        eng.eval_to_string("training.set_reversal('late')").unwrap();
+        assert_eq!(dbg.lock().unwrap().training.reversal_timing, ReversalTiming::Late);
+        assert_eq!(eng.eval_to_string("training.reversal()").unwrap(), "late");
+
+        // A bare number -> Explicit.
+        eng.eval_to_string("training.set_reversal(17)").unwrap();
+        assert_eq!(
+            dbg.lock().unwrap().training.reversal_timing,
+            ReversalTiming::Explicit(17)
+        );
+        assert_eq!(eng.eval_to_string("training.reversal()").unwrap(), "17");
+
+        // {min=,max=} -> Delay; round-trips as a table with both fields.
+        eng.eval_to_string("training.set_reversal({min=5, max=9})").unwrap();
+        assert_eq!(
+            dbg.lock().unwrap().training.reversal_timing,
+            ReversalTiming::Delay { min: 5, max: 9 }
+        );
+        assert_eq!(eng.eval_to_string("training.reversal().min").unwrap(), "5");
+        assert_eq!(eng.eval_to_string("training.reversal().max").unwrap(), "9");
+
+        // Rejected shapes name the accepted forms and leave the field alone.
+        let before = dbg.lock().unwrap().training.reversal_timing;
+        for bad in ["training.set_reversal(true)", "training.set_reversal('slow')", "training.set_reversal({min=1})"]
+        {
+            let err = eng.eval_to_string(bad).unwrap_err();
+            assert!(
+                err.contains("training.set_reversal"),
+                "{bad}: error must name the setter: {err}"
+            );
+        }
+        assert_eq!(dbg.lock().unwrap().training.reversal_timing, before);
+    }
+
+    #[test]
+    fn game_read_field_matches_fixed_offsets_and_nils_on_unknown_or_bad_block() {
+        let (eng, dbg) = engine_with_profile_and_wram();
+        let p = crate::profile::current();
+        // asurabld's fighter fields are all fixed-offset (no `via: object_ptr`
+        // in this port) — the object_ptr branch is exercised live on MK2
+        // arcade instead (docs/frames.md §5; profile.rs's own suite already
+        // covers `object_ptr_field`'s decode/staleness invariants directly).
+        assert!(!p.field_is_object_ptr("health"));
+        let (health_off, _) = p.field_off("health").unwrap();
+        {
+            let mut ds = dbg.lock().unwrap();
+            assert!(ds.write_addr((p.block1() + health_off) as usize, 1, 0x64));
+            assert!(ds.write_addr((p.block2() + health_off) as usize, 1, 0x32));
+        }
+        assert_eq!(eng.eval_to_string("game.read_field(1, 'health')").unwrap(), "100");
+        assert_eq!(eng.eval_to_string("game.read_field(2, 'health')").unwrap(), "50");
+        // An unknown field name is ABSENT — nil, never a synthesized 0.
+        assert_eq!(
+            eng.eval_to_string("game.read_field(1, 'no_such_field') == nil").unwrap(),
+            "true"
+        );
+        // A bad block argument is a clear, named error, not a silent 0.
+        let err = eng.eval_to_string("game.read_field(3, 'health')").unwrap_err();
+        assert!(err.contains("block must be 1 or 2"), "{err}");
+    }
+
+    #[test]
+    fn endian_fix_and_sign_extend_match_the_declared_widths() {
+        // endian_fix: little is a no-op; big swaps 2/4-byte words, leaves 1
+        // untouched (mirrors profile.rs/record.rs/training.rs's identical
+        // private helpers — see this file's doc comment on why it's a
+        // deliberate duplicate, not a shared import).
+        assert_eq!(endian_fix(0x1234, 2, true), 0x1234);
+        assert_eq!(endian_fix(0x1234, 2, false), 0x3412);
+        assert_eq!(endian_fix(0x1234_5678, 4, false), 0x7856_3412);
+        assert_eq!(endian_fix(0xAB, 1, false), 0xAB);
+
+        // sign_extend: only 1/2-byte widths sign-extend; others pass through.
+        assert_eq!(sign_extend(0xFF, 1), -1);
+        assert_eq!(sign_extend(0x7F, 1), 127);
+        assert_eq!(sign_extend(0xFFFF, 2), -1);
+        assert_eq!(sign_extend(0x8000, 2), -32768);
+        assert_eq!(sign_extend(0x1234, 4), 0x1234);
     }
 
     #[test]
