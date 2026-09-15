@@ -1,0 +1,130 @@
+{
+  "name": "Knockdown currency",
+  "arena": "shadow/arenas/mk2/m-gap-25.state",
+  "family": "mk2",
+  "port": "arcade",
+  "citation": "library/mk2/arcade.frames.json: reptile/slide -> damage 13, knockdown 1, on_block -12, on_hit NULL (a knockdown has no on-hit advantage: docs/frames.md 1.1). reptile/HP/far -> on_hit +4, on_block +13, damage 11.",
+  "claim": "Reptile's slide knocks Mileena down for 13. What the knockdown actually buys is measured, not assumed: he can walk again at f53, she at f68, and she lands 160 px away. Fifteen frames and a walk -- enough to re-establish jab range and meet her rising with pressure, NOT enough for a meaty.",
+  "pair": {
+    "p1": "mileena (char id 5)",
+    "p2": "reptile (char id 9)"
+  },
+  "beats": [
+    {
+      "name": "slide-hits-knockdown",
+      "kind": "raw",
+      "frames": 45,
+      "note": "slide = back + LK+LP+Block, one 8-frame chord (the profile's own encoding). Contact f11, 13 damage. Knockdown verified on the VICTIM'S OWN y leaving its resting value (87 -> apex 42 -> 87), frames 12-41; docs/frames.md 10 forbids a scalar GROUND_Y.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 1,
+          "held": [
+            "right",
+            "a",
+            "b",
+            "l"
+          ]
+        },
+        {
+          "frame": 8,
+          "port": 1,
+          "held": []
+        }
+      ],
+      "expect": {
+        "contact_port": 0,
+        "contact": true,
+        "health_deltas": {
+          "0": 13
+        },
+        "guard_port": 0,
+        "guard_check_frame": 0,
+        "guard": false
+      }
+    },
+    {
+      "name": "the-wakeup-clock",
+      "kind": "raw",
+      "frames": 41,
+      "note": "Wakeup clock, measured differentially (hold a direction from well before actionability; first frame x diverges from the no-input control, 3 reps identical): Reptile f53, Mileena f68 -- the knockdown is worth +15 frames at a 160 px gap. He spends all of it closing 160 px -> 77 px; she holds Block from f59 and rises into guard at f68.",
+      "events": [
+        {
+          "frame": 5,
+          "port": 1,
+          "held": [
+            "left"
+          ]
+        },
+        {
+          "frame": 39,
+          "port": 1,
+          "held": []
+        },
+        {
+          "frame": 14,
+          "port": 0,
+          "held": [
+            "l"
+          ]
+        }
+      ],
+      "expect": {
+        "contact_port": 0,
+        "contact": false,
+        "health_deltas": {
+          "0": 0,
+          "1": 0
+        }
+      }
+    },
+    {
+      "name": "jab-pressure-resumes",
+      "kind": "raw",
+      "frames": 44,
+      "note": "Two far HPs, both blocked (3 chip each, 11 would be a hit), 19 frames apart -- Reptile's own +13-on-block jab loop, the sequence-1 pattern handed to the other side. The knockdown's currency was the APPROACH.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 1,
+          "held": [
+            "y"
+          ]
+        },
+        {
+          "frame": 2,
+          "port": 1,
+          "held": []
+        },
+        {
+          "frame": 19,
+          "port": 1,
+          "held": [
+            "y"
+          ]
+        },
+        {
+          "frame": 21,
+          "port": 1,
+          "held": []
+        }
+      ],
+      "expect": {
+        "contact_port": 0,
+        "contact": true,
+        "health_deltas": {
+          "0": 6
+        },
+        "guard_port": 0,
+        "guard_check_frame": 0,
+        "guard": true
+      }
+    }
+  ],
+  "notes": [
+    "Rung: m-gap-25 (gap_px 114). Slide travel is a step function of gap (it stops on contact) -- mk2.md; this sequence is pinned to one rung and nothing is interpolated."
+  ],
+  "refusals": [
+    "The brief's okizeme beat -- 'the attacker is standing over Mileena on wakeup with jab pressure resuming' -- is REFUSED as a MEATY. Reason: the slide launches the victim to a 160 px gap (measured identically from 4 rungs), Reptile's longest connect range is 110 px, and he can walk again at f53 against her wakeup at f68. Fifteen free frames cannot cover the 83 px of approach (~2.5 px/frame), so the earliest he can threaten her is f97 -- 29 frames AFTER she is actionable. What the knockdown really buys is the free approach, and that is what the beats claim."
+  ]
+}

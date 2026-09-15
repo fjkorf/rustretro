@@ -1,0 +1,116 @@
+{
+  "name": "Jabs don't pass the turn",
+  "arena": "shadow/arenas/mk2/m-gap-39.state",
+  "family": "mk2",
+  "port": "arcade",
+  "citation": "library/mk2/arcade.frames.json: mileena/HP/far/gap_px 71 -> on_hit +4, on_block +13, damage 11, hitstop 0 (high confidence). reptile/HK/far -> damage 32 (the counter Reptile attempts).",
+  "claim": "Mileena's far HP is +13 ON BLOCK. A blocked jab does not give the turn back: she acts again 13 frames before Reptile can, so a jab loop is a true blockstring, and the frame Reptile spends trying to take his turn is the frame he gets hit.",
+  "pair": {
+    "p1": "mileena (char id 5)",
+    "p2": "reptile (char id 9)"
+  },
+  "beats": [
+    {
+      "name": "jab-1-blocked",
+      "kind": "attack",
+      "port": 0,
+      "move": "HP",
+      "hold_frames": 2,
+      "frames": 19,
+      "guard": {
+        "port": 1
+      },
+      "note": "far HP at gap 71; contact f11; chip 3 (blocked contact chips, docs/frames.md 2.6 -- zero damage would mean WHIFF).",
+      "expect": {
+        "contact_port": 1,
+        "contact": true,
+        "health_deltas": {
+          "1": 3
+        },
+        "guard_port": 1,
+        "guard_check_frame": 2,
+        "guard": true
+      }
+    },
+    {
+      "name": "jab-2-blocked",
+      "kind": "attack",
+      "port": 0,
+      "move": "HP",
+      "hold_frames": 2,
+      "frames": 19,
+      "guard": {
+        "port": 1,
+        "release_at": 12
+      },
+      "note": "pressed at global f19 -- Mileena's OWN earliest actionable frame after the blocked jab (measured: f19 works, f15-f18 do not). Reptile drops guard at contact+1 to arm his counter (punish.py's guard-release law).",
+      "expect": {
+        "contact_port": 1,
+        "contact": true,
+        "health_deltas": {
+          "1": 3
+        },
+        "guard_port": 1,
+        "guard_check_frame": 2,
+        "guard": true
+      }
+    },
+    {
+      "name": "jab-3-stuffs-the-counter",
+      "kind": "raw",
+      "frames": 60,
+      "note": "Reptile's earliest actionable frame after jab 2 is global f51 (= contact f30 + 21). Mileena steps in and jabs at her own f44; contact f55 beats his f59 -- he takes a full 11 (a HIT, not the 3 chip) and lands nothing. The CONTROL (same defender program, no jab 3) is in VERIFICATION.md: his HK lands 32 on her.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 0,
+          "held": [
+            "right"
+          ]
+        },
+        {
+          "frame": 5,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 6,
+          "port": 0,
+          "held": [
+            "y"
+          ]
+        },
+        {
+          "frame": 8,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 13,
+          "port": 1,
+          "held": [
+            "x"
+          ]
+        },
+        {
+          "frame": 15,
+          "port": 1,
+          "held": []
+        }
+      ],
+      "expect": {
+        "contact_port": 0,
+        "contact": false,
+        "health_deltas": {
+          "1": 11,
+          "0": 0
+        }
+      }
+    }
+  ],
+  "notes": [
+    "Rung: m-gap-39 (.gap.json gap_px 71, char ids 5 vs 9, inputs_live both). Gap is part of the move's identity: at gap <= 63 the same button is Mileena's CLOSE HP (24 damage, -2 on block).",
+    "Pushback is real: each blocked far HP adds +9 px, so jab 3 needs a 5-frame step-in to stay inside far HP's 83 px connect range.",
+    "A CHAIN window also exists and is deliberately not used here: a second far HP pressed at f12/f13/f14 comes out immediately (contact f23/f24/f25), while f15-f18 produce nothing and f19 is her own earliest free re-press. The sequence uses f19 because that is the frame the +13 number is about."
+  ]
+}

@@ -6824,3 +6824,167 @@ training-off count-down control from the identical anchor:**
 
 Not re-tested: boss/endurance rounds, 2P-arcade if its path differs, whether
 the record can ever land outside `[0xC000, 0xF000)`.
+
+# A second RIG for advantage: the earliest-ATTACK-press sweep (2026-09-14, task A3, demo authoring)
+
+Everything below was measured on port 4026 (headless, `fbneo_libretro.dylib`,
+`mk2.zip`) while authoring `shadow/demos/mk2/*.beats.json`; the full per-beat
+report and every control run is in `shadow/demos/mk2/VERIFICATION.md`. Stage
+for all of it: the `m-gap-*` ladder, **Mileena P1 (id 5) vs Reptile P2 (id 9)**,
+loaded through `LabSession.load_state` (atomic `pause_after` + verifier).
+Anchor: struct health `block+0x0E`. No `press_buttons`, no wall clock.
+
+## The rig
+
+`framelab/probe.py`'s act-again sweep asks **"can the fighter start a WALK"**.
+This one asks **"can the fighter start an ATTACK"**: drive the move, then
+sweep the frame `k` at which a port's next attack button is asserted (held 2
+frames) and find the smallest `k` that produces a contact edge on the other
+port's damage register. `advantage = defender_earliest_k − attacker_earliest_k`
+— a difference of two absolute schedule frames, so it is origin-independent.
+The defender's guard is released at contact+1 in every defender sweep
+(punish.py's law: dropping Block and pressing the counter 1-3 frames later
+produces NO attack; a ~20-frame release lead does).
+
+It is a second RIG, not a second observable, which is the only kind of
+agreement docs/frames.md §8.4 says buys anything.
+
+## Four rows reproduced EXACTLY
+
+| row (arcade.frames.json) | defender's earliest press | attacker's earliest press | difference | table |
+|---|---|---|---|---|
+| `mileena/HP/far`, blocked, gap 71 (`m-gap-39`) | f32 (f30/f31 dead) | f19 (f15–f18 dead) | **+13** | +13 |
+| `mileena/HK/far`, blocked, gap 71 (`m-gap-39`) | f29 (f24–f28 dead) | f49 (f48 dead) | **−20** | −20 |
+| `mileena/cLK`, blocked, gap 61 (`m-gap-45`) | f37 (f24–f36 dead) | f39 (f24–f38 dead) | **−2** | −2 |
+| `mileena/HK/close`, blocked, gap 61 (`m-gap-45`) | f28 (f14–f27 dead) | f42 (f38–f41 dead) | **−14** | −14 |
+
+Every sweep was deterministic: the boundary frame reproduced on every repeat,
+and the contact frame moved 1:1 with the press frame above it (f19→contact
+f30, f20→f31, … — so these are actionability boundaries, not buffering).
+
+## One row that DISAGREES: the roll
+
+`mileena/roll`, blocked, gap 192 (`m-gap-0`): Reptile's earliest press **f56**
+(f40–f55 dead), Mileena's earliest re-press **f84** (f64–f83 dead, swept with
+her far LK — the only button of hers with enough range at the post-roll 103 px
+gap). **56 − 84 = −28**, against the table's **−34**.
+
+**This is not published as a correction.** The two rigs measure different
+predicates and docs/frames.md §1 already records that guard returns before the
+walk does (≥7 frames for Mileena after cHK), which predicts a walk-based probe
+reading MORE negative than an attack-based one. But the same rig reproduced
+four other rows exactly, so "systematic walk-vs-attack offset" is not an
+obvious explanation either. Recorded as: **the lab's two rigs disagree by 6
+frames on the most negative row in the MK2 table.** Settling it means
+re-running the roll through the act-again probe, not averaging.
+
+## Cross-defender: Reptile's mirror-measured rows against a MILEENA defender
+
+Reptile's rows were measured on the Reptile-vs-Reptile mirror. Blockstun is a
+DEFENDER-side quantity, so they were re-measured here.
+
+- **`reptile/HK/far` on_block = −17 vs Mileena, not the mirror's −16.**
+  Mileena (defender) earliest press f28 (f24–f27 dead), Reptile (attacker)
+  earliest re-press f45 (f42–f44 dead), at gap 71 → 95 px. Contact f8, 32 on
+  hit / 8 chip — the damage and FAF transfer, the blockstun is 1 frame longer
+  against Mileena. Classification (punishable) is unchanged.
+- **`reptile/HK/far` on_hit vs Mileena: REFUSED, reason RANGE.** The hit
+  leaves a 150 px gap and Mileena's longest connect range is 114 px (far LK),
+  so this rig has no button to sweep. The mirror's `+7` is left
+  uncorroborated rather than reused as though confirmed.
+- **`reptile/HP/close`** (medium confidence, sample_n 1 in the table)
+  reproduced against Mileena at gap 61: contact at press+8, **24** damage,
+  6 chip on block.
+- **`reptile/HP/far` reaches at 77 px against Mileena**, where the mirror's
+  `connect_range` column says 72. Connect range is a property of the
+  attacker/defender hurtbox PAIR; it does not transfer across defenders.
+
+## Range clauses that neutralise a published negative number
+
+Two of the demo's five sequences hit docs/frames.md §1's third clause, both
+measured:
+
+- **The blocked teleport kick is unpunishable at every distance it can be
+  thrown from.** It lands Mileena at a FIXED **153 px** gap from every rung
+  tested (192/146/114/99/83/71 px — contact always f37, chip always 4). No
+  Reptile row has a `connect_range` above 110. `on_block −25`, and no punish
+  exists.
+- **Mileena's blocked far HK (−20) cannot be punished by Reptile's close HP**
+  (the fastest thing he owns, contact at press+8): the block adds **+24 px**
+  of pushback and his HP's connect range is 72 px, so no rung of this ladder
+  (floor 61 px) leaves him in range. Likewise **cLK's blocked pushback is
+  +32 px** (61 → 93), which puts his close HP out of range there too — a
+  −2 move made doubly safe.
+
+## Blocked-contact pushback, measured on the m-ladder
+
+| move (blocked) | gap change |
+|---|---|
+| Mileena far HP | +9 px (71 → 80 → 89 over two jabs) |
+| Mileena far HK | +24 px (71 → 95) |
+| Mileena close HK | **0 px** (61 → 61) |
+| Mileena cLK | +32 px (61 → 93) |
+| Mileena roll | ends at 103 px from 192 |
+| Mileena teleport kick | ends at **153 px from every rung** |
+| Reptile slide (blocked) | ends at 62 px; **on hit** ends at 160 px |
+
+## A punch CHAIN window on far HP
+
+A second far HP pressed at **f12/f13/f14** after a blocked first one (contact
+f11) comes out IMMEDIATELY — contact f23/f24/f25 — which is 7 frames before
+Mileena's own earliest free re-press at f19. **f15–f18 produce nothing at
+all.** So the window is not a buffer (a buffer would fire at f19 regardless);
+it is a chain cancel that opens ~1 frame after contact and closes at f14, with
+a dead gap before actionability resumes. Not used by any demo beat, because
+the +13 number is about f19.
+
+## Guard stance vs. the button, both directions
+
+- **Arming a counter**: releasing Block and pressing the counter 1–3 frames
+  later produces NO attack (swept: guard released at f31, presses at f32…f48
+  all dead where f51 with the same release lands). Corroborates punish.py's
+  header from a different move.
+- **Losing guard**: releasing Block **1 frame before** an incoming contact
+  takes the FULL hit; releasing **on** the contact frame still blocks. Swept
+  f45…f50 against a f50 contact: rel f49 → 11 damage, rel f50 → 3 chip.
+
+## Mileena's proximity boundaries, narrowed
+
+The table carries `close` rows at 61 px and `far` rows at 71 px. Measured by
+damage signature on the m-ladder:
+
+- **HP**: 24 damage (close) at **63 px**, 11 damage (far) at **69 px** — the
+  boundary is between 63 and 69.
+- **HK**: 4 chip (close) at **63 px**, 8 chip (far) at **66 px** — the
+  boundary is between 63 and 66.
+
+## Slide knockdown: the wakeup clock, and why it is not okizeme
+
+`m-gap-25`, Reptile's slide on hit. Measured differentially (hold a direction
+from well before actionability; first frame `x` diverges from the identical
+no-input control — 3 reps, identical):
+
+| quantity | value |
+|---|---|
+| contact / damage | f11 / 13 |
+| victim airborne (`y` off its OWN resting 87, apex 42) | f12 – f41, lands f42 |
+| Reptile's first walk frame | **f53** |
+| Mileena's first walk frame | **f68** |
+| knockdown advantage | **+15 frames, at a 160 px gap** |
+
+**There is no meaty.** 15 free frames at ~2.5 px/frame buy ~38 px of the 83 px
+Reptile needs to reach jab range, and his longest connect range is 110 px. In
+the executed demo his first threatening button contacts at f97 — **29 frames
+after she is actionable**. The knockdown's currency on MK2 arcade is the free
+APPROACH, not a wakeup mix-up.
+
+## Walk speed note (flagged, not corrected)
+
+Mileena's forward walk on the m-ladder measures **131 px over 45 held frames**
+(≈2.9 px/frame, the ladder's own 192 → 61 rung spacing), and 6 held frames
+move 15 px with ~3 px of post-release momentum. `CLAUDE.md`'s gotcha line says
+"+12 px/6f forward vs +5 px/6f backward". The forward figure does not match
+what this ladder measures for Mileena; it may be Reptile's, or measured with a
+different settle convention. Flagged here rather than edited, because nothing
+in this session measured the BACKWARD number and a half-checked asymmetry is
+worse than a flagged one.
