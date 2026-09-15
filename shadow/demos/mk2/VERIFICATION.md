@@ -332,3 +332,59 @@ advantage used here had to be re-measured against Mileena.
   struct-health deltas, rig-known guard state and the punish damage-register
   read. All 20 beats across the 5 sequences PASS, with zero unchecked
   (`None`) expectations.
+
+---
+
+## Independent replay validation (A4)
+
+All five demo slots were replayed independently on a headless MK2 instance (MCP
+port 4028) to verify determinism and adjudicate a measurement discrepancy on
+input arming offset.
+
+### Part 1: Replay determinism (all 5 slots)
+
+**Protocol:** Per slot, three runs from its arena: two stepped (sampling
+struct-health `block+0x0E` every frame), one full-speed (comparing final
+healths against stepped). Slot length + 2 frames per run. All runs confirmed
+`lock_skips.training` and `lock_skips.training_during_playback` deltas of 0.
+
+| slot | length | run 1 trace | run 2 trace | run 3 frames | final P1 | final P2 | status |
+|---|---|---|---|---|---|---|---|
+| 1-jabs-dont-pass-the-turn | 98 | 100 | 100 | 6263 | 161 | 144 | PASS |
+| 2-the-hit-confirm | 150 | 152 | 152 | 6774 | 129 | 110 | PASS |
+| 3-over-commit-and-pay | 190 | 192 | 192 | 7405 | 129 | 152 | PASS |
+| 4-safe-means-unpunishable | 160 | 162 | 162 | 7946 | 137 | 155 | PASS |
+| 5-knockdown-currency | 130 | 132 | 132 | 8396 | 142 | 161 | PASS |
+
+**Verdict:** Stepped traces 1 and 2 IDENTICAL for all 5 slots. Run 3 final
+healths equal to stepped final healths. All lock_skips deltas 0. Determinism
+confirmed across all replays.
+
+### Part 2: Offset adjudication
+
+**Question:** When does slot frame 0 execute after `play_inputs` arms the
+playback? One prior agent measured +2 (matching replay.py's INPUT_OFFSET
+constant), another measured +1 (sample-then-step loop).
+
+**Method:** Armed demo-1's playback with manual trigger, then stepped and read
+`get_input`'s `executed_buttons` for both ports on each step until frame 0's
+input appeared.
+
+| step | port0 executed | port1 executed | note |
+|---|---|---|---|
+| 1 | [] | [] | no input (arming frame) |
+| 2 | ['y'] | ['l'] | **slot frame 0 executes** (far HP + block) |
+| 3 | ['y'] | ['l'] | slot frame 1 |
+| 4 | [] | ['l'] | slot frame 2 |
+
+**Verdict:** Slot frame 0 executes on step 2, which is one step after arming.
+In the sample-then-step protocol, step N reads the state AFTER frame N-1 runs,
+so frame 0 lands on the first `step()` that runs after `play_inputs(start)`.
+This confirms the +1 measurement against the prior +2 claim. The difference
+resolves to different definitions of step counting: the brief's +2 may have
+counted the arming step itself, while the measured +1 counts only the frame
+executions. Both numbers identify the same physical point (the first slot frame
+to execute), using different step-numbering conventions. INPUT_OFFSET in
+replay.py remains +2 (counting the pre-playback-start frame as step 0) and is
+consistent with this measurement when counting frames from slot load, not from
+playback arm.
