@@ -1,0 +1,206 @@
+{
+  "name": "The hit-confirm",
+  "arena": "shadow/arenas/mk2/m-gap-39.state",
+  "family": "mk2",
+  "port": "arcade",
+  "citation": "library/mk2/arcade.frames.json: mileena/HK/far/gap_px 71 -> on_hit +3, on_block -20, damage 32, hitstop 12, connect_range 99. mileena/HP/far/gap_px 71 -> on_hit +4, damage 11. reptile/HK/far -> damage 32, connect_range 110.",
+  "claim": "Mileena's far HK is +3 on hit and -20 on block. The SAME button, the same frame, the same spacing: the only variable is whether Reptile held Block. Hit -> she keeps the turn and walks back in for free. Blocked -> the turn transfers and she eats a 32-damage punish through her own guard.",
+  "pair": {
+    "p1": "mileena (char id 5)",
+    "p2": "reptile (char id 9)"
+  },
+  "beats": [
+    {
+      "name": "far-HK-hits",
+      "kind": "raw",
+      "frames": 20,
+      "note": "Reptile is NOT guarding: 32 damage, contact f8. Mileena then holds Block from f3 for the rest of the sequence, so every later counter is classified by chip-vs-full damage.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 0,
+          "held": [
+            "x"
+          ]
+        },
+        {
+          "frame": 2,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 3,
+          "port": 0,
+          "held": [
+            "l"
+          ]
+        }
+      ],
+      "expect": {
+        "contact_port": 1,
+        "contact": true,
+        "health_deltas": {
+          "1": 32
+        },
+        "guard_port": 1,
+        "guard_check_frame": 0,
+        "guard": false
+      }
+    },
+    {
+      "name": "no-punish-on-hit",
+      "kind": "raw",
+      "frames": 25,
+      "note": "The IDENTICAL punish program Reptile runs in the blocked branch (far HK at contact+29) -- here it reaches nothing: the hit knocked him to a 149 px gap, outside his 110 px connect range, and he is in hitstun besides.",
+      "events": [
+        {
+          "frame": 17,
+          "port": 1,
+          "held": [
+            "x"
+          ]
+        },
+        {
+          "frame": 19,
+          "port": 1,
+          "held": []
+        }
+      ],
+      "expect": {
+        "contact_port": 0,
+        "contact": false,
+        "health_deltas": {
+          "0": 0
+        }
+      }
+    },
+    {
+      "name": "she-keeps-the-turn",
+      "kind": "raw",
+      "frames": 51,
+      "note": "+3 on hit is spent on APPROACH: she drops guard, walks 30 frames back from 154 px to 75 px, and lands far HP for 11. Reptile starts guarding at local f47.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 1,
+          "port": 0,
+          "held": [
+            "right"
+          ]
+        },
+        {
+          "frame": 31,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 32,
+          "port": 0,
+          "held": [
+            "y"
+          ]
+        },
+        {
+          "frame": 34,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 47,
+          "port": 1,
+          "held": [
+            "l"
+          ]
+        }
+      ],
+      "expect": {
+        "contact_port": 1,
+        "contact": true,
+        "health_deltas": {
+          "1": 11
+        }
+      }
+    },
+    {
+      "name": "same-button-blocked",
+      "kind": "raw",
+      "frames": 29,
+      "note": "Same far HK, same f8 contact -- but Reptile is holding Block, so it is 8 chip instead of 32, and she is -20. She re-guards at local f3; he drops guard at contact+1.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 0,
+          "held": [
+            "x"
+          ]
+        },
+        {
+          "frame": 2,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 3,
+          "port": 0,
+          "held": [
+            "l"
+          ]
+        },
+        {
+          "frame": 9,
+          "port": 1,
+          "held": []
+        }
+      ],
+      "expect": {
+        "contact_port": 1,
+        "contact": true,
+        "health_deltas": {
+          "1": 8
+        },
+        "guard_port": 1,
+        "guard_check_frame": 0,
+        "guard": true
+      }
+    },
+    {
+      "name": "the-turn-transfers",
+      "kind": "raw",
+      "frames": 25,
+      "note": "Reptile counters at HIS earliest actionable frame (contact+21). It lands 32 on a Mileena who has been holding Block for 26 frames -- her guard has not returned, so this is a PUNISH, not a hit she chose to eat.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 1,
+          "held": [
+            "x"
+          ]
+        },
+        {
+          "frame": 2,
+          "port": 1,
+          "held": []
+        }
+      ],
+      "expect": {
+        "punish_port": 0,
+        "punish_from": 0,
+        "punish": true,
+        "health_deltas": {
+          "0": 32
+        },
+        "guard_port": 0,
+        "guard_check_frame": 0,
+        "guard": true
+      }
+    }
+  ],
+  "notes": [
+    "Rung: m-gap-39 (gap_px 71).",
+    "The brief's close HP punisher is IMPOSSIBLE here and that is a finding, not a substitution: a blocked far HK adds +24 px of pushback, and Reptile's HP has a 72 px connect range, so no rung of this ladder (floor 61 px) leaves him inside HP range afterwards. The punisher that works is his far HK (110 px)."
+  ]
+}

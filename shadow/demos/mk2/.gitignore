@@ -1,0 +1,3 @@
+# GIFs are rendered artifacts (large); slots + beat sheets are the committed source
+*.gif
+frames/

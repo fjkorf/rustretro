@@ -99,6 +99,7 @@ __all__ = [
     "calibrate_probe_latency",
     "find_anchor",
     "replay",
+    "run_schedule",
     "sweep_actionable",
     "measure_advantage",
     "advantage_rows",
@@ -391,7 +392,36 @@ def replay(
         guard_release_at=guard_release_at,
     )
     session.load_state(rig.arena)
+    trace = run_schedule(
+        session, sched, total_frames, sample_fn=sample_fn, sample_from=sample_from
+    )
+    session.release_all_ports()
+    return trace
 
+
+def run_schedule(
+    session: LabSession,
+    sched: Dict[int, Dict[int, Tuple[str, ...]]],
+    total_frames: int,
+    *,
+    sample_fn: Optional[Sampler] = None,
+    sample_from: int = 0,
+) -> list:
+    """The executor loop, factored out of `replay` (task A1/choreo.py) so a
+    caller with its own frame -> port -> held-set schedule — not one built
+    from a `Rig` + `MoveScript` — gets the identical, battle-tested next-stop
+    / pending-held / batching behaviour rather than a second copy of it that
+    can drift out of sync. `replay` is unchanged in observable behaviour: it
+    now builds `sched` via `_schedule` and hands it here, and the existing
+    test suite (which exercises `replay`, never this function, before and
+    after this split) is the proof that nothing moved.
+
+    Does NOT load state or release ports — the caller owns both, exactly as
+    `replay` always has (load before, `release_all_ports` after). See
+    `replay`'s own docstring for what "batched" means and why it is safe:
+    that documentation was not duplicated here to avoid two copies drifting
+    apart; read it there.
+    """
     trace: list = [None] * (total_frames + 1)
     sampling = sample_fn is not None
 
@@ -427,7 +457,6 @@ def replay(
         f = stop
         pending.update(sched.get(f, {}))
         sample(f)
-    session.release_all_ports()
     return trace
 
 

@@ -1,0 +1,229 @@
+{
+  "name": "Over-commit and pay",
+  "arena": "shadow/arenas/mk2/m-gap-0.state",
+  "family": "mk2",
+  "port": "arcade",
+  "citation": "library/mk2/arcade.frames.json: mileena/roll/gap_px 192 -> on_block -34, damage 21, knockdown 1. mileena/teleport_kick/gap_px 192 -> on_hit -5, on_block -25, damage 32. reptile/HK/far -> damage 32, connect_range 110.",
+  "claim": "The two biggest commitments in Mileena's kit, blocked. The roll is -34 and pays for it: Reptile blocks, counters, and lands 32 through her guard. The teleport kick is -25 and gets away with it -- because the blocked teleport always leaves a 153 px gap and nothing Reptile owns reaches past 110. A negative number is not a verdict.",
+  "pair": {
+    "p1": "mileena (char id 5)",
+    "p2": "reptile (char id 9)"
+  },
+  "beats": [
+    {
+      "name": "roll-blocked",
+      "kind": "raw",
+      "frames": 34,
+      "note": "roll = back . back . down . HK, the profile's own special_inputs encoding played with 2 neutral frames between steps (a direction chorded with its trigger does not register). Contact f33, 5 chip. She guards from f19.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 1,
+          "held": [
+            "l"
+          ]
+        },
+        {
+          "frame": 0,
+          "port": 0,
+          "held": [
+            "left"
+          ]
+        },
+        {
+          "frame": 3,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 5,
+          "port": 0,
+          "held": [
+            "left"
+          ]
+        },
+        {
+          "frame": 8,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 10,
+          "port": 0,
+          "held": [
+            "down"
+          ]
+        },
+        {
+          "frame": 13,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 15,
+          "port": 0,
+          "held": [
+            "x"
+          ]
+        },
+        {
+          "frame": 18,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 19,
+          "port": 0,
+          "held": [
+            "l"
+          ]
+        }
+      ],
+      "expect": {
+        "contact_port": 1,
+        "contact": true,
+        "health_deltas": {
+          "1": 5
+        },
+        "guard_port": 1,
+        "guard_check_frame": 33,
+        "guard": true
+      }
+    },
+    {
+      "name": "roll-punished",
+      "kind": "raw",
+      "frames": 56,
+      "note": "Reptile drops guard at contact+1 and counters at his earliest actionable frame (global f56 = contact+23). 32 damage on a Mileena who has held Block since f19.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 1,
+          "held": []
+        },
+        {
+          "frame": 22,
+          "port": 1,
+          "held": [
+            "x"
+          ]
+        },
+        {
+          "frame": 24,
+          "port": 1,
+          "held": []
+        }
+      ],
+      "expect": {
+        "punish_port": 0,
+        "punish_from": 22,
+        "punish": true,
+        "health_deltas": {
+          "0": 32
+        },
+        "guard_port": 0,
+        "guard_check_frame": 0,
+        "guard": true
+      }
+    },
+    {
+      "name": "teleport-blocked",
+      "kind": "raw",
+      "frames": 43,
+      "note": "teleport_kick = forward . forward . LK. Contact f132, 4 chip. The blocked teleport lands Mileena at a FIXED distance: every rung from 61 px to 192 px ends at a 153 px gap (measured, 6 rungs).",
+      "events": [
+        {
+          "frame": 0,
+          "port": 1,
+          "held": [
+            "l"
+          ]
+        },
+        {
+          "frame": 5,
+          "port": 0,
+          "held": [
+            "right"
+          ]
+        },
+        {
+          "frame": 8,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 10,
+          "port": 0,
+          "held": [
+            "right"
+          ]
+        },
+        {
+          "frame": 13,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 15,
+          "port": 0,
+          "held": [
+            "a"
+          ]
+        },
+        {
+          "frame": 18,
+          "port": 0,
+          "held": []
+        }
+      ],
+      "expect": {
+        "contact_port": 1,
+        "contact": true,
+        "health_deltas": {
+          "1": 4
+        },
+        "guard_port": 1,
+        "guard_check_frame": 42,
+        "guard": true
+      }
+    },
+    {
+      "name": "punish-refused-by-range",
+      "kind": "raw",
+      "frames": 57,
+      "note": "The same punish program that collected 32 damage off the roll. -25 and it reaches NOTHING: the gap is 151 px and Reptile's longest connect range is 110 px (far HK / far LK). docs/frames.md 1, the range clause.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 1,
+          "held": []
+        },
+        {
+          "frame": 20,
+          "port": 1,
+          "held": [
+            "x"
+          ]
+        },
+        {
+          "frame": 22,
+          "port": 1,
+          "held": []
+        }
+      ],
+      "expect": {
+        "contact_port": 0,
+        "contact": false,
+        "health_deltas": {
+          "0": 0
+        }
+      }
+    }
+  ],
+  "notes": [
+    "Rung: m-gap-0 (gap_px 192) -- the rung both specials were measured at. mk2.md refuses roll/teleport rows at any other gap because both moves make x discontinuous."
+  ],
+  "refusals": [
+    "The brief's 'blocked teleport_kick -> punished again' is REFUSED. Reason: RANGE. The blocked teleport leaves a 153 px gap from every starting rung measured (192/146/114/99/83/71 px all end at 153 px); no Reptile move in arcade.frames.json has a connect_range above 110. The beat is kept as an empirically executed NON-punish rather than dropped, because the refusal is the lesson."
+  ]
+}

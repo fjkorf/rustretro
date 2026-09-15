@@ -9,6 +9,7 @@ description = "Shadow AI trainer/runtime for the Asura Blade behavioral-cloning 
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
+    "pillow",
 ]
 
 [tool.setuptools]

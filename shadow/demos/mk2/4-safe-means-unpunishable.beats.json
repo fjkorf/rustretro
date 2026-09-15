@@ -1,0 +1,208 @@
+{
+  "name": "Safe means unpunishable",
+  "arena": "shadow/arenas/mk2/m-gap-45.state",
+  "family": "mk2",
+  "port": "arcade",
+  "citation": "library/mk2/arcade.frames.json: mileena/cLK/gap_px 61 -> on_hit -11, on_block -2, damage 6. mileena/HK/close/gap_px 61 -> on_hit -7, on_block -14, damage 16. reptile/HP/close/gap_px 62 -> FAF 8 (the fastest punisher), damage 24. reptile/HK -> damage 32 far / 16 close.",
+  "claim": "One punisher, one program, two moves. Against Mileena's cLK (-2) Reptile's counter is thrown at his earliest actionable frame and she BLOCKS it -- 8 chip, not 32. Against her close HK (-14) the identical counter lands 16 on her while she holds Block from 13 frames earlier. punishable <=> advantage <= -(punisher's first_active_frame).",
+  "pair": {
+    "p1": "mileena (char id 5)",
+    "p2": "reptile (char id 9)"
+  },
+  "beats": [
+    {
+      "name": "safe-move-blocked",
+      "kind": "raw",
+      "frames": 21,
+      "note": "cLK with a 10-frame crouch lead-in (kit.MoveSpec: down+button on the same frame enters something that contacts nothing). Contact f20, 2 chip.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 1,
+          "held": [
+            "l"
+          ]
+        },
+        {
+          "frame": 0,
+          "port": 0,
+          "held": [
+            "down"
+          ]
+        },
+        {
+          "frame": 10,
+          "port": 0,
+          "held": [
+            "down",
+            "a"
+          ]
+        },
+        {
+          "frame": 12,
+          "port": 0,
+          "held": []
+        }
+      ],
+      "expect": {
+        "contact_port": 1,
+        "contact": true,
+        "health_deltas": {
+          "1": 2
+        },
+        "guard_port": 1,
+        "guard_check_frame": 0,
+        "guard": true
+      }
+    },
+    {
+      "name": "fastest-punish-fails",
+      "kind": "raw",
+      "frames": 45,
+      "note": "Reptile drops guard at contact+1 and attacks at global f37 -- his earliest actionable frame, measured. Mileena is actionable at f39 and guards from there; his f45 contact registers 8 (chip), not 32. Classified by the damage register, never by zero-damage: a blocked MK2 hit still chips.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 1,
+          "held": []
+        },
+        {
+          "frame": 16,
+          "port": 1,
+          "held": [
+            "x"
+          ]
+        },
+        {
+          "frame": 18,
+          "port": 1,
+          "held": []
+        },
+        {
+          "frame": 18,
+          "port": 0,
+          "held": [
+            "l"
+          ]
+        }
+      ],
+      "expect": {
+        "contact_port": 0,
+        "contact": true,
+        "health_deltas": {
+          "0": 8
+        }
+      }
+    },
+    {
+      "name": "reset-to-point-blank",
+      "kind": "raw",
+      "frames": 28,
+      "note": "Staging, not a claim: cLK's +32 px of blocked pushback has to be walked back off before the same rung's close HK exists again. Reptile re-guards at local f22.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 0,
+          "held": [
+            "right"
+          ]
+        },
+        {
+          "frame": 26,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 22,
+          "port": 1,
+          "held": [
+            "l"
+          ]
+        }
+      ],
+      "expect": {
+        "health_deltas": {
+          "0": 0,
+          "1": 0
+        }
+      }
+    },
+    {
+      "name": "unsafe-move-blocked",
+      "kind": "raw",
+      "frames": 28,
+      "note": "gap 63 px -> this is CLOSE HK (4 chip / 16 on hit), not the far HK of sequence 2. She re-guards at local f13 -- as early as the input allows.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 0,
+          "held": [
+            "x"
+          ]
+        },
+        {
+          "frame": 2,
+          "port": 0,
+          "held": []
+        },
+        {
+          "frame": 13,
+          "port": 0,
+          "held": [
+            "l"
+          ]
+        },
+        {
+          "frame": 12,
+          "port": 1,
+          "held": []
+        }
+      ],
+      "expect": {
+        "contact_port": 1,
+        "contact": true,
+        "health_deltas": {
+          "1": 4
+        },
+        "guard_port": 1,
+        "guard_check_frame": 0,
+        "guard": true
+      }
+    },
+    {
+      "name": "the-punish-lands",
+      "kind": "raw",
+      "frames": 38,
+      "note": "Identical counter, identical guard-release discipline, thrown at his earliest actionable frame (press+28). 16 damage through her held Block: her guard has not returned. -14 <= -8, so it is punishable; -2 was not.",
+      "events": [
+        {
+          "frame": 0,
+          "port": 1,
+          "held": [
+            "x"
+          ]
+        },
+        {
+          "frame": 2,
+          "port": 1,
+          "held": []
+        }
+      ],
+      "expect": {
+        "punish_port": 0,
+        "punish_from": 0,
+        "punish": true,
+        "health_deltas": {
+          "0": 16
+        },
+        "guard_port": 0,
+        "guard_check_frame": 0,
+        "guard": true
+      }
+    }
+  ],
+  "notes": [
+    "Rung: m-gap-45 (gap_px 61, the collision floor).",
+    "Reptile's close HP (FAF 8, the brief's punisher) is measured here as contact at press+8 for 24 damage at gap 61 -- but after cLK's +32 px pushback the gap is 93 px, outside HP's 72 px connect range, so the far-reaching HK is the punisher both halves of the differential use. Running the SAME button in both halves is what keeps this a one-variable comparison."
+  ]
+}

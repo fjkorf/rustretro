@@ -41,7 +41,14 @@ shadow/recordings/
 shadow/models/
 shadow/arenas/*/current.state
 shadow/arenas/*/current.meta.json
-shadow/inputs/
+# Recorded/ad-hoc input slots are scratch, but the DEMO slots are committed
+# artifacts (they are the replayable half of shadow/demos/<family>/*.beats.json).
+# A negation cannot reach inside an excluded DIRECTORY, so the directories are
+# re-included and their contents excluded instead.
+shadow/inputs/*
+!shadow/inputs/mk2/
+shadow/inputs/mk2/*
+!shadow/inputs/mk2/demo-*.slot.json
 scratchpad/
 .DS_Store
 .claude/settings.local.json
