@@ -58,9 +58,12 @@ event.onframeend(function)        console.log(str)
 emu.framecount()                  emu.paused()
 game.controllable()               game.addr(name)
 game.block1() / game.block2()     game.field_off(name)
+game.read_field(block, name)      -- block 1/2; nil (never 0) if absent/stale
 game.char_name(id)                game.matchup_slug(me, opp)
 game.stage_value_for(opp)         game.calibration(key)
 training.enabled()                training.refill()            training.dummy()
+training.reversal()               training.set_reversal(spec)  -- gated; spec:
+                                   -- "fast" | "late" | number | {min=A, max=B}
 shadow.on()                       shadow.model()                shadow.toggle()
 record.active()                   record.path()                 record.frames()
 record.start(path [, style])      record.stop()                 -- queued
@@ -94,7 +97,13 @@ loaded profile's gate condition list — the same evaluator the recorder uses �
 of a script keeping its own copy. `game.addr(name)` / `game.block1()`/`block2()` /
 `game.field_off(name)` resolve by NAME from the loaded profile
 (`library/<game>/<game>.profile.json`); **scripts never hardcode raw addresses**. A game
-port is a new profile, not a script rewrite. `training.*` reads the native
+port is a new profile, not a script rewrite. `game.read_field(block, name)` goes one step
+further and reads the field's live VALUE by name, honoring whichever address form the
+profile declares — including `via: "object_ptr"` fields (MK2 arcade's fighter `x`/`y`,
+which live behind a pointer that moves every frame): the same Rust resolution the
+recorder and the frame lab use, never reimplemented in Lua. It returns `nil` — never a
+synthesized `0` — the frame a pointer-resolved field can't be resolved (stale pointer,
+failed staleness cross-check). `training.*` reads the native
 training-mode state (enforcement — credits/timer/health — is owned by native code, not
 Lua); `shadow.*` reads/toggles the loaded shadow bot; `record.*` reads and drives the
 native jsonl session recorder.

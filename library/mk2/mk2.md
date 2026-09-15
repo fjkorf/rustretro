@@ -6988,3 +6988,134 @@ what this ladder measures for Mileena; it may be Reptile's, or measured with a
 different settle convention. Flagged here rather than edited, because nothing
 in this session measured the BACKWARD number and a half-checked asymmetry is
 worse than a flagged one.
+
+# Three loose ends, closed (2026-09-14, mk2-confirm-bot wave)
+
+Headless FBNeo, `--pace 0`, MCP port 4027 (never 4025). Stage: `m-gap-*` /
+`m-v-r.state`, Mileena P1 (block1/port0, char5) vs Reptile P2 (block2/port1,
+char9). `core_id=fbneo_libretro.dylib:sha256:972e8fb8c8394979`,
+`rom_id=mk2.zip:sha256:e8d3f2f8cefe1aab`. Scripts and raw reports live under
+`shadow/framelab/scratch/` (gitignored, not committed).
+
+**First finding, orthogonal to all three items below: the emulator was
+launched without `--pace 0`.** Five minutes and 45 seconds of wall clock
+bought 10 CPU-seconds of progress on the roll re-measurement below (§3.6's
+"pace 1" real-time cap makes every MCP round trip wait on the host clock).
+Restarting with `--pace 0` reproduced the identical result in under a
+second of real work. Recorded because `docs/frames.md`'s wall-clock ban is
+about units, not runtime — but a session that skips `--pace 0` pays for it
+in minutes per cell, invisibly, until someone notices the process has not
+printed anything.
+
+## Item 1 — the roll's on_block: −34 REPRODUCES, and the 6-frame gap is real but not what it looks like
+
+Re-ran Mileena's blocked roll through the canonical act-again WALK probe
+(`shadow_train.framelab.specials`, `--arena m-v-r.state --char mileena --move
+roll`), the exact command that produced the shipped row. **−34 reproduces
+exactly, both observables agreeing to the frame**: contact f33, `on_block`
+`struct_velocity=-34` / `pointer_x=-34`. No correction — the store's roll row
+is untouched.
+
+So the disagreement with the 2026-09-14 attack-press rig's −28 is not a wrong
+number on either side; both are right about what they each measure, and the
+gap between them decomposes into two PER-SIDE effects that happen to sum to
+6 frames on this move — not one systematic "attack beats walk" or "walk beats
+attack" rule.
+
+Measured directly, in the identical rerun (same contact frame 33, same
+blocked roll), the earliest-WALK manifest is already in the specials report;
+the earliest-ATTACK-CONTACTS frame was measured fresh with a punish-rig sweep
+(`docs/frames.md` §8.3: release Block at contact+1 — same-frame release+press
+produces no attack at all, confirmed again here — then sweep the press frame
+and read the OTHER side's health register):
+
+| side | earliest WALK (manifest) | earliest ATTACK connects | delta |
+|---|---|---|---|
+| Reptile (defender, blocking) | f52 (struct_velocity) / f53 (pointer_x) | **f56** | attack **3–4f LATER** than walk |
+| Mileena (attacker, recovering from her own roll) | f86 / f87 | **f84** | attack **2–3f EARLIER** than walk |
+
+Both directly-measured numbers **exactly reproduce** the 2026-09-14
+attack-press session's f56 and f84 — a second rig (punish-style press sweep
+vs. that session's raw press schedule) landing on the same frame is the kind
+of agreement `docs/frames.md` §8.4 calls out as actually buying something.
+
+The reconciliation: Reptile's ATTACK becomes available a few frames *after*
+his WALK (unsurprising — a scripted normal has its own startup beyond "can
+this fighter act at all"), while Mileena's ATTACK becomes available a few
+frames *before* her WALK (her own recovery apparently allows a move input to
+cancel it slightly before a plain walk cycle can start). `(86−84) + (56−52) =
+6` and `(87−84) + (56−53) = 6` — either observable pairing accounts for the
+whole gap. **Neither rig is wrong; "the earliest frame this fighter can walk"
+and "the earliest frame this fighter can land a specific attack" are
+genuinely different questions, and on this move they diverge in opposite
+directions on the two sides.** `docs/frames.md`'s own convention rule (§4.3
+item 1: "state the convention... earliest-attack = walk-manifest − 2") is
+therefore not a fixed per-side offset — it does not hold here in either
+magnitude or sign for both sides at once, and should not be read as a
+constant beyond the case it was measured on.
+
+## Item 2 — Reptile's far HK on_hit vs a Mileena defender: **+3**, not the mirror's +7 — and a whiff at the range gap 25 rung
+
+The 2026-09-14 session refused `on_hit` for RANGE (the post-hit gap exceeded
+Mileena's longest connect range, so its ATTACK-PRESS rig had no counter to
+sweep). The act-again WALK probe does not need the defender to swing, so it
+was run directly: `shadow_train.framelab.kit`'s `measure_cell`, roles
+swapped (Reptile = attacker on block2/port1, Mileena = defender on
+block1/port0; `walk_directions_by_port` is POSITION-keyed in the profile, so
+it needed no change for the swap — only `contact_read` had to be rebuilt
+against Mileena's own health address, since `kit.main()` hardcodes "the
+defender is block2").
+
+- **m-gap-39 (71 px, closest to his mirror's 72 px far-HK rung): CONNECTS.**
+  Contact f8, damage 32. `on_hit = +3` (both observables agree exactly).
+  `on_block = -17` — reproducing the 2026-09-14 session's cross-defender
+  on_block finding exactly, a second confirmation of that number by the
+  canonical rig. **Both rows written to the store** (ids 199/200,
+  `gap_walk_frames=39`, `gap_px=71`) — `+3` differs from the mirror's `+7` by
+  4 frames, and per the task's instruction a differing measured cell is
+  stored, not left as prose alone. The mirror's `+7` row (`gap_walk_frames`
+  30/45) is untouched; both are now in the table at their own gap keys,
+  because the schema has no defender column and a matchup-specific number is
+  only unambiguous when it is not squeezed into the same key.
+- **m-gap-25 (114 px, closest to his mirror's 110 px far-HK rung):
+  REFUSED — genuine whiff.** "The contact signal never changed across 48
+  frames" — his far HK does not reach a Mileena defender at 114 px, though
+  the mirror's 110 px rung connects. Her hurtbox is evidently narrower here
+  by a few pixels than Reptile's own. No row written; this is the honest
+  result, not a widened search (raising `anchor_frames` would not help — the
+  move's own recovery ends well inside 48 frames when it whiffs).
+
+## Item 3 — walk speed: the CLAUDE.md line was wrong in both magnitude and origin
+
+Differential (probe run minus a no-input control from the same base arena,
+`m-v-r.state`; control drift was **exactly 0 px** at every K for every
+trial — idle fighters do not move, so the raw probe displacement already
+equals the differenced one), forward AND backward, both characters, 3
+independent repeats each (all three reproduced to the pixel, every K).
+
+| character | direction | px/frame | shape |
+|---|---|---|---|
+| Mileena | forward (toward opponent) | **3.0**, ticking to 4 roughly every 8th frame (≈3.1 avg) | flat from K=1, no ramp |
+| Mileena | backward (away) | **2.0** | flat from K=1, no ramp |
+| Reptile | forward (toward opponent) | **~2.5** (alternates 2/3 each frame) | flat from K=1, no ramp |
+| Reptile | backward (away) | **2.0** | flat from K=1, no ramp |
+
+Both characters show one dead frame (K=0→1 moves nothing), matching every
+prior walk-curve measurement on this port.
+
+**The old CLAUDE.md figure (+12 px/6f forward = 2.0 px/frame, +5 px/6f
+backward ≈ 0.83 px/frame) matches neither character in either direction.**
+Its likely origin is now clear from an earlier session's own finding: the
+gap-ladder LIVENESS PROBE "walks 6 frames out and 6 back" and the shipped
+`gap-0.state` measured 12 px of NET closing from that round trip (this
+mk2.md, "Two generator fixes were needed...") — a probe artifact from an
+out-then-back motion, not a clean single-direction hold. It was never a
+walk-speed measurement at all.
+
+**The asymmetry itself holds, per character, and in a different shape than
+originally stated**: for both Mileena (1.5×) and Reptile (1.25×), forward is
+faster than backward — so "hold a direction, undo it, expect to return to
+the start" is still unsound on this game (a round trip never nets to zero
+frames), which was the actual point of the original line. `CLAUDE.md`'s
+gotcha is corrected to the measured per-character values below rather than
+the disproven single pair.
