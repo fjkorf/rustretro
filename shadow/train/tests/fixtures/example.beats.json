@@ -1,0 +1,40 @@
+{
+  "name": "example-jab-then-punish",
+  "arena": "shadow/arenas/mk2/gap-45.state",
+  "family": "mk2",
+  "port": "arcade",
+  "citation": "unit-test fixture only -- not measured content (see shadow/demos/mk2/ for the real beat sheets)",
+  "beats": [
+    {
+      "name": "p1-jab-blocked",
+      "kind": "attack",
+      "port": 0,
+      "move": "HP",
+      "hold_frames": 2,
+      "frames": 30,
+      "guard": {"port": 1},
+      "expect": {
+        "contact_port": 1,
+        "contact": true,
+        "guard_port": 1,
+        "guard_check_frame": 2,
+        "guard": true
+      }
+    },
+    {
+      "name": "p2-punish",
+      "kind": "punish",
+      "attacker_port": 0,
+      "defender_port": 1,
+      "counter": "HP",
+      "contact_frame": 0,
+      "counter_at": 18,
+      "counter_hold": 2,
+      "expect": {
+        "punish_port": 0,
+        "punish_from": 18,
+        "punish": true
+      }
+    }
+  ]
+}
